@@ -17,7 +17,6 @@ use std::vec::Vec;
 use blaze_hash::HashMap;
 use blaze_id::ItemKey as LibKey;
 use blaze_lower::machine::sig;
-pub use blaze_lower::head::signature_needs_fn_body;
 use blaze_lower::{CfgAnswer, Lowered, View, form as lf, head};
 use blaze_own::Alloc;
 use blaze_scope::crate_roots::TextMarks;
@@ -97,6 +96,12 @@ pub enum Seeded {
 /// A seed could not file a need's cell; the seed keeps why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SeedFailed;
+
+impl HeadError {
+    pub(super) fn declaration_cycle(by: Option<Want>, need: Want) -> Self {
+        Self::Cycle(cycle(&[by.unwrap_or(need), need]))
+    }
+}
 
 impl core::fmt::Display for HeadError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -741,6 +746,11 @@ pub struct Store<'n> {
     pub seeds: Option<&'n dyn super::tables::seeds::HeadSeed<'n>>,
     /// Why the last seed failed ([`HeadError::Seed`] names the need; this, why).
     pub seed_error: Option<super::tables::seeds::SeedError>,
+    /// During a shared freeze, evaluator fills must use the same frozen cells as its
+    /// signature. A missing fill suspends evaluation until the freeze driver imports it.
+    pub(super) evaluating_head: bool,
+    pub eval_head_need: Option<Want>,
+    pub eval_head_reads: Vec<Want, Alloc<'static>>,
     /// The wants this store made by lowering (a step that made its want: `Store::step`),
     /// not counting those filed from frozen records ([`Store::file_heads`]): the measure a
     /// seeded freeze is held to (front2/tables/head_tests.rs).
@@ -971,18 +981,56 @@ fn own_defaults<'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys: &mut Port
     Ok(())
 }
 
-/// One item's signature, lowered from `text` under its crate's cfg.
-pub(super) fn lower<'n, S: super::source::NamesSource<'n>>(names: S, key: LibKey, text: &'n str) -> Result<Lowered<'static, 'n>, HeadError> {
+fn signature_inputs<'n, S: NamesSource<'n>>(names: S, key: LibKey) -> Result<(blaze_surface::Edition, CrateCfg<'n>), HeadError> {
     let krate = names.crate_of(key).ok_or(HeadError::NoText(key))?;
     // Over records a crate with no items record has no atoms and no edition: the source filed
     // why (`source::SourceError::NoRecord`), and the item has no text to lower.
-    let mut cfg = CrateCfg(names.cfg_atoms(krate).ok_or(HeadError::NoText(key))?);
+    let cfg = CrateCfg(names.cfg_atoms(krate).ok_or(HeadError::NoText(key))?);
     let edition = names.edition_of(krate).ok_or(HeadError::NoText(key))?;
+    Ok((edition, cfg))
+}
+
+/// One item's signature, lowered from `text` under its crate's cfg.
+pub(super) fn lower<'n, S: super::source::NamesSource<'n>>(names: S, key: LibKey, text: &'n str) -> Result<Lowered<'static, 'n>, HeadError> {
+    let (edition, mut cfg) = signature_inputs(names, key)?;
     blaze_lower::lower_signature(text, edition, &mut cfg, Alloc::global()).map_err(|_| HeadError::Cfg(key))
+}
+
+/// The signature columns used while making one stack of heads over immutable names.
+/// Item keys identify owner texts and declaration order distinguishes even cfg-alternative
+/// members with the same name. A resumed step borrows the same columns in place.
+pub(super) struct Signatures<'n> {
+    rows: Rows<(LibKey, Option<usize>), Lowered<'static, 'n>>,
+    alloc: Alloc<'static>,
+}
+
+impl<'n> Signatures<'n> {
+    pub(super) fn new(alloc: Alloc<'static>) -> Self {
+        Self { rows: Rows::new_in(alloc), alloc }
+    }
+
+    fn get<S: NamesSource<'n>>(&self, names: S, owner: LibKey, member: Option<usize>, text: &'n str) -> Result<&Lowered<'static, 'n>, HeadError> {
+        // Each reader owns its cfg and edition reads, including on a hit.
+        let (edition, mut cfg) = signature_inputs(names, owner)?;
+        let key = (owner, member);
+        if let Some(row) = self.rows.get(&key) {
+            return Ok(row);
+        }
+        let row = blaze_lower::lower_signature(text, edition, &mut cfg, self.alloc).map_err(|_| HeadError::Cfg(owner))?;
+        Ok(self.rows.insert_absent(key, row).expect("signature inserted in the task's single-writer table"))
+    }
+
+    fn member<S: NamesSource<'n>>(&self, names: S, owner: LibKey, member: &Member<'n>) -> Result<&Lowered<'static, 'n>, Why> {
+        self.get(names, owner, Some(member.index), member.text).map_err(|error| {
+            let reason = blaze_own::text::format(self.alloc, format_args!("{error}"));
+            Why::Program(reason.as_str().into(), Range::new(0, 0))
+        })
+    }
 }
 
 /// A member of a trait or an impl: its name, kind and text, as the names library lists it.
 struct Member<'n> {
+    index: usize,
     name: &'n str,
     detail: ItemDetail,
     text: &'n str,
@@ -1009,7 +1057,7 @@ fn members<'n, S: super::source::NamesSource<'n>>(names: S, key: LibKey) -> Resu
             return;
         }
         match m.detail {
-            Some(detail) => out.push(Member { name: m.name.unwrap_or(""), detail, text: m.text, written_by: m.written_by }),
+            Some(detail) => out.push(Member { index: out.len(), name: m.name.unwrap_or(""), detail, text: m.text, written_by: m.written_by }),
             None => {
                 names.gap("a member's outline detail beyond its kind (heads.rs: members)", Some(m.key));
                 no_detail = true;
@@ -1064,6 +1112,9 @@ impl<'n> Store<'n> {
             more_needs: Vec::new_in(Global),
             seeds: None,
             seed_error: None,
+            evaluating_head: false,
+            eval_head_need: None,
+            eval_head_reads: Vec::new_in(alloc),
             // `First` until `All` is proven on clap-root: under `All`, clap's `Cmd` was refused
             // with a cycle among core's `Iterator`, `Rev`, `DoubleEndedIterator`,
             // `ExactSizeIterator`, `FnMut`, `TrustedRandomAccessNoCoerce` (lane FL, 2026-11-17;
@@ -1108,6 +1159,17 @@ impl<'n> Store<'n> {
     /// need, at the moment it is met, before it is made). Over a store that held nothing, that
     /// is every head `want`'s making read beside its own (front2/tables/head.rs `freeze`).
     pub fn ensure_noting<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, want: Want, noted: &mut dyn FnMut(Want)) -> Result<(), HeadError> {
+        if self.evaluating_head && !super::tables::seeds::of_the_body(self, want) {
+            // Anonymous heads filed by this very evaluation have no names record.
+            if !self.made(want) {
+                self.eval_head_need.get_or_insert(want);
+                return Err(HeadError::Seed { need: want, by: want });
+            }
+            if names.text_of(want.key()).is_some() && !self.eval_head_reads.contains(&want) {
+                self.eval_head_reads.push(want);
+            }
+            return Ok(());
+        }
         let Some(seeds) = self.seeds else {
             return self.ensure_seeded(names, keys, want, noted, &mut |_, _, _| Ok(Seeded::Lower));
         };
@@ -1145,6 +1207,19 @@ impl<'n> Store<'n> {
         noted: &mut dyn FnMut(Want),
         seed: &mut dyn FnMut(&mut Store<'n>, &mut Keys, Want) -> Result<Seeded, SeedFailed>,
     ) -> Result<(), HeadError> {
+        let signatures = Signatures::new(self.tys.alloc());
+        self.ensure_with_signatures(names, keys, want, noted, seed, &signatures)
+    }
+
+    pub(super) fn ensure_with_signatures<S: NamesSource<'n>>(
+        &mut self,
+        names: S,
+        keys: &mut Keys,
+        want: Want,
+        noted: &mut dyn FnMut(Want),
+        seed: &mut dyn FnMut(&mut Store<'n>, &mut Keys, Want) -> Result<Seeded, SeedFailed>,
+        signatures: &Signatures<'n>,
+    ) -> Result<(), HeadError> {
         let _cost = super::tables::cost::Cost::enter_want(self.cost, want);
         let mut stack = Vec::new_in(Global);
         stack.push(want);
@@ -1155,7 +1230,7 @@ impl<'n> Store<'n> {
             let Some(&top) = stack.last() else { return Ok(()) };
             let stepped = super::tables::cost::Cost::step_start(self.cost);
             self.more_needs.clear();
-            let step = self.step(names, keys, top)?;
+            let step = self.step(names, keys, top, signatures)?;
             super::tables::cost::Cost::step_end(self.cost, stepped, matches!(step, Step::Need(_)));
             let more = core::mem::replace(&mut self.more_needs, Vec::new_in(Global));
             let need = match step {
@@ -1204,7 +1279,7 @@ impl<'n> Store<'n> {
         Err(HeadError::Cycle(cycle(&stack)))
     }
 
-    fn step<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, want: Want) -> Result<Step, HeadError> {
+    fn step<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, want: Want, signatures: &Signatures<'n>) -> Result<Step, HeadError> {
         let key = want.key();
         let ck = checker_of(key);
         // The one test the world's answers share (front2 by_origin.rs `Store::made`).
@@ -1218,7 +1293,7 @@ impl<'n> Store<'n> {
             if !self.impls.contains_key(&ck) {
                 return Ok(Step::First(Want::Impl(impl_)));
             }
-            return match self.member_fn(names, keys, impl_, f) {
+            return match self.member_fn(names, keys, impl_, f, signatures) {
                 Ok(()) => {
                     self.lowered += 1;
                     Ok(Step::Done)
@@ -1238,13 +1313,20 @@ impl<'n> Store<'n> {
                 (detail, it.text, it.module)
             }
         };
-        let low = lower(names, key, text)?;
+        // These rows need the declaration before their fields or members. Defer parsing
+        // until the step can consume the columns.
+        match (want, detail) {
+            (Want::Adt(_), ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union) if !self.maps.generics.contains_key(&key) => return Ok(Step::Need(key)),
+            (Want::Members(_), ItemDetail::Trait) if !self.maps.traits.contains_key(&key) => return Ok(Step::Need(key)),
+            _ => {}
+        }
+        let low = signatures.get(names, key, None, text)?;
         let v = low.view();
         let got = match (want, detail) {
             (Want::Head(_), ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union) => {
                 self.adt_head(names, key, module, &v)
             }
-            (Want::Head(_), ItemDetail::Trait) => self.trait_head(names, keys, key, module, &v, text),
+            (Want::Head(_), ItemDetail::Trait) => self.trait_head(names, keys, key, module, &v, signatures),
             (Want::Head(_), ItemDetail::TraitAlias) => self.trait_alias(names, keys, key, module, &v),
             (Want::Head(_), ItemDetail::TypeAlias) => match self.alias(names, key, module, &v) {
                 Err(why @ (Why::Need(_) | Why::NeedConst(..))) => Err(why),
@@ -1256,18 +1338,12 @@ impl<'n> Store<'n> {
                 Ok(()) => Ok(()),
             },
             (Want::Adt(_), ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union) => {
-                if !self.maps.generics.contains_key(&key) {
-                    return Ok(Step::Need(key));
-                }
                 self.adt(names, keys, key, module, &v, detail)
             }
             (Want::Members(_), ItemDetail::Trait) => {
-                if !self.maps.traits.contains_key(&key) {
-                    return Ok(Step::Need(key));
-                }
-                self.trait_members(names, keys, key, module, &v)
+                self.trait_members(names, keys, key, module, &v, signatures)
             }
-            (Want::Impl(_), ItemDetail::Impl) => self.impl_(names, keys, key, module, &v),
+            (Want::Impl(_), ItemDetail::Impl) => self.impl_(names, keys, key, module, &v, signatures),
             // A free constant's head is its type as a fn of no inputs (the checker reads a
             // `Def::Const` through `fn_sig`); its body is lowered by `lower_fn` like a fn's.
             (Want::Fn(_), ItemDetail::Fn { .. } | ItemDetail::Const { .. }) => {
@@ -1360,8 +1436,11 @@ impl<'n> Store<'n> {
                     self.fns.insert(key, head);
                 }
                 Head::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless } => {
-                    if let Some(l) = life {
-                        self.file_adt_life(key, l);
+                    // A declaration answers the name and generic parameter queries. A
+                    // reader must still ask for the complete cell to inspect any fields.
+                    let declaration = matches!(want, Want::Head(_));
+                    if declaration && (key != lib || !row.fields.is_empty() || !row.variants.is_empty()) {
+                        return Err(HeadError::Filed { want, at, what: "an ADT declaration containing a definition or naming another item" });
                     }
                     let ck = checker_of(key);
                     if let Some(n) = fieldless {
@@ -1369,6 +1448,12 @@ impl<'n> Store<'n> {
                     }
                     self.maps.generics.insert(key, (row.generics, defaults.iter().copied().collect()));
                     self.maps.const_params.insert(key, const_params.iter().copied().collect());
+                    if declaration {
+                        continue;
+                    }
+                    if let Some(l) = life {
+                        self.file_adt_life(key, l);
+                    }
                     self.field_defaults.insert(ck, field_defaults.iter().copied().collect());
                     if let Some(p) = preds {
                         self.preds.insert(ck, p);
@@ -1560,7 +1645,7 @@ impl<'n> Store<'n> {
         Ok(())
     }
 
-    fn trait_head<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>, _text: &'n str) -> Result<(), Why> {
+    fn trait_head<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>, signatures: &Signatures<'n>) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let written = v.head[head::FLAGS];
         if written & sig::TRAIT_ALIAS != 0 {
@@ -1599,7 +1684,7 @@ impl<'n> Store<'n> {
         let ms = members(names, key).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
         let mut members = Vec::new_in(Global);
         for m in &ms {
-            let low = lower(names, key, m.text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
+            let low = signatures.member(names, key, m)?;
             if low.view().cfg_out() {
                 continue;
             }
@@ -1651,7 +1736,7 @@ impl<'n> Store<'n> {
     /// A trait's predicates (its supertraits and where clauses on its generics, `Self` =
     /// `Param(0)`) and its fns' signatures, each fn's clauses its trait's plus
     /// `Self: Trait<params>`.
-    fn trait_members<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
+    fn trait_members<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>, signatures: &Signatures<'n>) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let ck = checker_of(key);
         let mut ps = Vec::new_in(Global);
@@ -1685,22 +1770,53 @@ impl<'n> Store<'n> {
                 supers.push((lib, args));
             }
         }
+        // A GAT's const parameter types belong to its declaration. In particular an
+        // earlier method may name a later GAT, or reach it through another trait.
+        // Make its parameter environment first and retain a refusal under the member's
+        // own key when we file its bounds below.
+        let alloc = self.tys.alloc();
+        let ms = members(names, key).map_err(|e| {
+            let text = blaze_own::text::format(alloc, format_args!("{e}"));
+            Why::Program(text.as_str().into(), whole)
+        })?;
+        let mut parameters = Vec::new_in(alloc);
+        for m in ms.iter().filter(|m| matches!(m.detail, ItemDetail::TypeAlias)) {
+            let mv = signatures.member(names, key, m)?.view();
+            if mv.cfg_out() {
+                continue;
+            }
+            let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
+            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+            let mut own_ps = ps.clone();
+            let mut own_cs = cs.clone();
+            let count = match own_generics(&b, &mut self.tys, module, &mv, own + 1, &mut own_ps, &mut own_cs) {
+                Ok(count) => {
+                    let mut mine = Vec::new_in(*own_cs.allocator());
+                    mine.extend(own_cs[cs.len()..].iter().map(|&(i, t)| (i - own - 1, t)));
+                    self.maps.assoc_consts.insert((key, Name::of(m.name)), mine);
+                    Ok(count)
+                }
+                Err(why @ (Why::Need(_) | Why::NeedConst(..))) => return Err(why),
+                Err(why) => Err(why),
+            };
+            parameters.push((own_ps, own_cs, count));
+        }
+        let mut parameters = parameters.into_iter();
+        // Filed, then read back: `Rows::insert` returns the row it REPLACED, never the new one.
+        self.maps.supers.insert(key, supers);
+        let supers = self.maps.supers[&key].as_slice();
         // A trait's `Self` is `MetaSized` unless its header states a sizedness (self_size.rs;
         // core's `Write::write_fmt` needs it for its block impl's `W: ?Sized` at `W = Self`): a
         // clause of every member's env, as `Self: Trait` is; not a supertrait (vtables).
-        if let Some(meta) = super::self_size::implied_self_size(&self.maps, key, &supers, self.sized)? {
+        if let Some(meta) = super::self_size::implied_self_size(&self.maps, key, supers, self.sized)? {
             let self_list = intern_list(&mut self.tys, &[me])?;
             inherited.push(PClause::Trait { trait_: self.maps.checker(meta), args: self_list });
         }
-        self.maps.supers.insert(key, supers);
         let mut assoc = Vec::new_in(Global);
         let mut consts: Vec<(Name, ItemKey), Global> = Vec::new_in(Global);
-        // Each associated type's own const parameters (own position, type): filed after the
-        // loop into `Maps::assoc_consts`.
-        let mut assoc_consts: Vec<(Name, Vec<(u32, PTy), Global>), Global> = Vec::new_in(Global);
         let mut needs: Vec<LibKey, Global> = Vec::new_in(Global);
-        for m in &members(names, key).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))? {
-            let low = lower(names, key, m.text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
+        for m in &ms {
+            let low = signatures.member(names, key, m)?;
             let mv = low.view();
             if mv.cfg_out() {
                 continue;
@@ -1737,13 +1853,9 @@ impl<'n> Store<'n> {
                     // A generic associated type (`type Out<T>: B;`): its own type and const
                     // parameters follow the trait's, in the alias's list and in scope for
                     // its bounds (gat.rs; the checker's `AssocGenerics`).
-                    let mut own_ps = Vec::new_in(Global);
-                    own_ps.extend_from_slice(&ps);
-                    let mut own_cs = Vec::new_in(Global);
-                    own_cs.extend_from_slice(&cs);
-                    let of_type = match own_generics(&b, &mut self.tys, module, &mv, own + 1, &mut own_ps, &mut own_cs) {
+                    let (own_ps, own_cs, count) = parameters.next().ok_or(Why::Unsupported("a trait member without its associated type parameters", whole))?;
+                    let of_type = match count {
                         Ok(n) => n,
-                        Err(why @ (Why::Need(_) | Why::NeedConst(..))) => return Err(why),
                         Err(why) => {
                             self.preds.remove(&item);
                             self.fn_gaps.insert(item, why);
@@ -1751,13 +1863,6 @@ impl<'n> Store<'n> {
                             continue;
                         }
                     };
-                    // Its own const parameters: those of `own_cs` past the trait's (indices
-                    // `own + 1 ..`), at their position among its own parameters.
-                    let mut mine = Vec::new_in(Global);
-                    for &(i, t) in own_cs.iter().filter(|(i, _)| *i > own) {
-                        mine.push((i - own - 1, t));
-                    }
-                    assoc_consts.push((Name::of(m.name), mine));
                     let own_env = Env { params: &own_ps, consts: &own_cs, ..env };
                     let alias_args = params(&mut self.tys, 0, own + 1 + of_type, &own_cs)?;
                     let alias = intern(&mut self.tys, PNode::Alias { trait_: ck, name: Name::of(m.name), args: alias_args })?;
@@ -1829,9 +1934,6 @@ impl<'n> Store<'n> {
             self.more_needs.clear();
             self.more_needs.extend_from_slice(rest);
             return Err(Why::Need(first));
-        }
-        for (name, mine) in assoc_consts {
-            self.maps.assoc_consts.insert((key, name), mine);
         }
         self.trait_defs.insert(ck, TraitExtra { supertraits, assoc, consts });
         self.preds.insert(ck, preds);
@@ -2000,7 +2102,7 @@ impl<'n> Store<'n> {
         Ok(())
     }
 
-    fn impl_<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
+    fn impl_<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>, signatures: &Signatures<'n>) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let mut polarity = if v.head[head::FLAGS] & sig::NEGATIVE != 0 { tc::ImplPolarity::Negative } else { tc::ImplPolarity::Positive };
         for &n in v.rows(v.list(head::ATTRS))? {
@@ -2056,7 +2158,7 @@ impl<'n> Store<'n> {
         let mut fn_self = Vec::new_in(Global);
         let mut const_texts = Vec::new_in(Global);
         for m in &ms {
-            let low = lower(names, key, m.text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
+            let low = signatures.member(names, key, m)?;
             let mv = low.view();
             if mv.cfg_out() {
                 continue;
@@ -2093,7 +2195,7 @@ impl<'n> Store<'n> {
                 }
                 ItemDetail::Const { .. } => {
                     let mk = keys.member(ck, MemberKind::Const, m.name).map_err(|c| Why::Program(format!("{c}").into_boxed_str(), whole))?;
-                    const_texts.push((Name::of(m.name), mk, m.text, m.written_by));
+                    const_texts.push((Name::of(m.name), mk, m, low));
                 }
                 d => return Err(Why::Unsupported(crate::front::detail_name(d), whole)),
             }
@@ -2102,8 +2204,8 @@ impl<'n> Store<'n> {
         let mut preds = Preds::new();
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
         let mut consts = Vec::with_capacity_in(const_texts.len(), Global);
-        for &(name, mk, text, written_by) in &const_texts {
-            let low = lower(names, key, text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
+        for &(name, mk, member, low) in &const_texts {
+            let (text, written_by) = (member.text, member.written_by);
             let cv = low.view();
             let at = Range::new(0, text.len() as u32);
             let t = cv.head_opt(head::TY).ok_or(Why::Unsupported("an associated constant with no type", at))?;
@@ -2288,7 +2390,8 @@ impl<'n> Store<'n> {
         } else {
             self.type_misses.insert(key, misses);
         }
-        let whole = Range::new(0, text.len() as u32);
+        let text_prefix = v.fn_text_prefix(detail)?;
+        let whole = Range::new(0, text_prefix.unwrap_or(text.len() as u32));
         if flags & sig::GEN != 0 {
             return Err(Why::Unsupported("a `gen fn`", whole));
         }
@@ -2391,7 +2494,6 @@ impl<'n> Store<'n> {
                 legacy_positions(v.text_at(a.args)?, r, &mut legacy_const_generics)?;
             }
         }
-        let text_prefix = v.fn_text_prefix(detail)?;
         self.fns.insert(key, FnHead { lib, text, text_prefix, container, parent, own, declared, self_param, header, c_variadic, legacy_const_generics, inputs, output, has_body, module, params: ps, consts: cs, bounds, self_, self_assoc });
         Ok(())
     }

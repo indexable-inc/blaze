@@ -159,7 +159,7 @@ pub fn inits<A: Allocator + Clone>(flow: &Flow<A>, plant: Plant, alloc: A) -> Re
     loop {
         passes += 1;
         if passes > limit {
-            return Err(Bound { what: "move dataflow passes", limit });
+            return Err(Bound::Passes { what: "move dataflow passes", limit });
         }
         let mut changed = false;
         for s in 0..n {

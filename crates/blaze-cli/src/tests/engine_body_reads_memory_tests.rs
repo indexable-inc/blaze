@@ -2,10 +2,9 @@
 //! written). On tempo the Bodies stage was stopped by memory: what the request's arena kept a
 //! body was its row's read list at the capacity of the list BEFORE widening (engine_bodies.rs
 //! `widen` made it with the recorded count, and the dedup kept the block), and a dependency's
-//! bucket reads one cell a bucket probed. Now the check works in the body's scratch (front2
-//! tables/task.rs `check_body_split`, two allocators), the row is copied out at its length
-//! (`row_of`), and a dependency's buckets are its tables' `WHOLE` (engine_scope_reads.rs, "A
-//! DEPENDENCY'S BUCKETS"). The profile's `bodies memory:` line (engine_bodies.rs `BodyMemLive`,
+//! bucket reads one cell a bucket probed. Now the check records distinct keys in the body's
+//! scratch. The row is copied out at its length (`row_of`), and all settled dependencies
+//! share the graph's cell. The profile's `bodies memory:` line (engine_bodies.rs `BodyMemLive`,
 //! written by the status printer) says the row a body, its floor, and the cells by kind.
 //!
 //! THE FIXTURE: a toolchain whose `std` (a dependency: its crate defines no cell table) holds
@@ -122,6 +121,9 @@ struct MemLine {
     scope: u64,
     recorder: u64,
     recorder_floor: u64,
+    ids_made: u64,
+    offers: u64,
+    memo_hits: u64,
 }
 
 fn mem_line(profile: &str) -> MemLine {
@@ -145,6 +147,9 @@ fn mem_line(profile: &str) -> MemLine {
         scope: number_after("scope crates "),
         recorder: number_in(scratch_part, "recorder "),
         recorder_floor: number_in(scratch_part, "; floor "),
+        ids_made: number_after("ids made "),
+        offers: number_after(" against "),
+        memo_hits: number_after("memo hits "),
     }
 }
 
@@ -182,6 +187,8 @@ fn a_body_leaves_its_row_alone_at_its_length() {
     assert!(m.row <= ROW_MOST, "a body keeps {} bytes in the request's arena, over {ROW_MOST}: {m:?}", m.row);
     assert!(m.after < m.before, "the widening did not narrow the reads: {m:?}");
     assert!(m.recorded > 0 && m.recorder >= m.recorder_floor, "the scratch's recorder is counted: {m:?}");
+    assert!(m.ids_made > 0 && m.memo_hits > 0 && m.ids_made < m.offers, "the repeated calls reuse IDs: {m:?}");
+    println!("READ IDS: {} made for {} recorded reads, {} memo hits", m.ids_made, m.offers, m.memo_hits);
 }
 
 /// THE CAUSES, ONE AT A TIME (rule 23), the answer unchanged by each: (1) the old row planted
@@ -237,4 +244,158 @@ fn an_edit_a_body_read_still_enters_it_under_the_coarse_reads() {
     assert!(equal, "the answer after the edit is not a fresh world's (stale under the coarse reads)\nafter the edit:\n{}\nfresh:\n{}", edited.lines(), fresh.lines());
     assert_eq!(edited.errors(), BODIES, "every body whose tail is `base()` entered and found its E0308:\n{}", edited.lines());
     assert!(entered as usize >= BODIES, "the edit entered {entered} bodies, not every one that read `base`");
+}
+
+fn dependency_answer(io: &Io, fresh: bool) -> Answer {
+    let before = stdout(io).len();
+    let mut options = opts(io, 2, fresh);
+    options.place.cargo_home = Some("/c");
+    options.scope_reads = crate::engine_scope_reads::ScopeReadsAs::Cells;
+    let (ids, checked) = engine_opts(io, options);
+    Answer { ids, said: stdout(io).split_off(before), checked }
+}
+
+const CALLER: &str = "pub fn caller() -> u8 {\n    dep::value()\n}\n";
+const BYTE: &str = "pub fn value() -> u8 {\n    1\n}\n";
+const WIDE: &str = "pub fn value() -> u16 {\n    1\n}\n";
+const DEP_MANIFEST: &str = "[package]\nname = \"dep\"\nversion = \"1.0.0\"\nedition = \"2024\"\n";
+const MISMATCH: &str = "error[types]: found `u16`, expected `u8`";
+
+/// Install a real tar.gz in the simulated Cargo cache and put its SHA-256 in the lockfile.
+/// Replacing the archive keeps the package name, version, and caller's text identical.
+fn registry(io: &Io, source: &str) -> blaze_drive::Name {
+    use blaze_tar::{Make, Writer};
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut tar = blaze_own::Vec::new_in(alloc);
+    let mut writer = Writer::new();
+    writer.entry("dep-1.0.0/Cargo.toml", Make::File { exec: false }, DEP_MANIFEST.as_bytes(), &mut tar).expect("manifest");
+    writer.entry("dep-1.0.0/src/lib.rs", Make::File { exec: false }, source.as_bytes(), &mut tar).expect("library");
+    writer.finish(&mut tar).expect("tar trailer");
+    let mut archive = blaze_own::Vec::new_in(alloc);
+    blaze_deflate::gzip(&tar, blaze_deflate::Level::Fast, alloc, &mut archive).expect("a .crate archive");
+    let sha256 = blaze_sha256::digest(&archive);
+    let checksum = crate::fetch::key_hex(&blaze_ids::ContentId(sha256));
+    let checksum = core::str::from_utf8(&checksum).expect("hex digits");
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("simulated filesystem");
+    let path = Path::new("c/registry/cache/index.crates.io-1949cf8c6b5b557f/dep-1.0.0.crate").expect("cache path");
+    io.need_fs().expect("files").root().publish(&cx, &path, Content::bytes(&archive), Durable::No).expect("publish archive");
+    write(io, "Cargo.lock", &format!("version = 4\n\n[[package]]\nname = \"wide\"\nversion = \"0.1.0\"\ndependencies = [\n \"dep\",\n]\n\n[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n"));
+    let source_id = blaze_fetch::SourceId::Crate { name: "dep", version: "1.0.0", sha256 };
+    blaze_drive::Name::new(blaze_drive::Kind::Fetch, source_id.key())
+}
+
+fn with_dependency_rows<R>(io: &Io, inspect: impl FnOnce(&blaze_engine::pages::Kept<'_>) -> R) -> R {
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("simulated filesystem");
+    let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("checkout path")).expect("checkout");
+    let mut phases = Phases::new(io.need_clock().expect("clock"));
+    let err = io.need_err().expect("err");
+    crate::engine_why::with_kept(&cx, io, &root, &opts(io, 2, false), &mut phases, &err, inspect).expect("open answer").expect("persisted answer")
+}
+
+/// Check the fetch, the graph it fed, and the proof the caller actually persisted.
+/// Return the digest so the edit must also change the value of that same cell.
+fn check_archive_row(io: &Io, fetch: blaze_drive::Name, graph: blaze_engine::CellId) -> blaze_ids::ContentId {
+    use blaze_drive::Kind;
+    use crate::engine_tasks::{CELLS, WHOLE};
+    with_dependency_rows(io, |kept| {
+        let rows = &kept.answer.rows;
+        let fetched = rows.get(&fetch).expect("a Fetch row for the locked checksum");
+        assert_eq!(fetched.out, fetch.subject, "Fetch must hold the pinned archive");
+        let published = rows.get(&graph.of).expect("the request's UnitGraph row");
+        assert!(!published.failed, "UnitGraph failed after Fetch held {fetch:?}");
+        assert!(published.defines.contains(&(graph.cell, published.out)), "UnitGraph must publish its whole record");
+        let mut bodies = 0;
+        for (_, row) in rows.iter().filter(|(name, _)| name.kind == Kind::BodyCheck) {
+            bodies += 1;
+            assert_eq!(row.file, blaze_drive::Name::file(b"src/lib.rs"));
+            assert_eq!(row.read_of(&graph).0, Some(published.out), "caller reads {:?}", row.reads);
+            assert!(row.reads.windows(2).all(|w| w[0].0 < w[1].0));
+            for (id, _) in &row.reads {
+                match id.of.kind {
+                    Kind::CrateScope => assert!(rows[&id.of].defines.iter().any(|(cell, _)| *cell == CELLS), "redundant dependency names read {id:?}"),
+                    Kind::ImplBucket => assert_ne!(id.cell, WHOLE, "redundant dependency tables read {id:?}"),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(bodies, 1, "one workspace caller");
+        published.out
+    })
+}
+
+fn assert_body_read_moved(answer: &Answer, id: blaze_engine::CellId) {
+    let because = &answer.checked.because;
+    assert!(because.iter().any(|(group, count)| {
+        group.stage == blaze_engine::Stage::Bodies && group.cause == "read moved" && group.definer == Some(id.of)
+            && group.cell == Some(crate::engine_scope_reads::CellKind::of(&id)) && *count > 0
+    }), "expected Bodies to enter on {id:?}, got {because:?}");
+}
+
+/// The caller's tail can return the original u8. Returning the new u16 requires an explicit
+/// conversion, so its one error must appear on the incremental request too.
+#[test]
+fn a_changed_archive_checksum_enters_the_body_through_the_graph() {
+    let io = Io::simulated(SimWorld::new(61, Limits::USUAL));
+    write(&io, "Cargo.toml", &format!("{MANIFEST}\n[dependencies]\ndep = \"1\"\n"));
+    write(&io, "src/lib.rs", CALLER);
+    let graph = blaze_engine::CellId { of: blaze_drive::Name::unit_graph(), cell: crate::engine_tasks::WHOLE };
+    let original = registry(&io, BYTE);
+    let cold = dependency_answer(&io, false);
+    assert_eq!(cold.errors(), 0, "{}", cold.lines());
+    let before = check_archive_row(&io, original, graph);
+    let replacement = registry(&io, WIDE);
+    assert_ne!(original, replacement, "the edit changes the archive checksum");
+    let edited = dependency_answer(&io, false);
+    assert_ne!(before, check_archive_row(&io, replacement, graph), "the checksum edit must move the persisted graph cell");
+    assert_body_read_moved(&edited, graph);
+    let fresh = dependency_answer(&io, true);
+    assert_eq!((&edited.ids, edited.lines(), edited.checked.status.0), (&fresh.ids, fresh.lines(), fresh.checked.status.0));
+    assert_eq!(edited.errors(), 1, "{}", edited.lines());
+    assert!(edited.lines().contains(MISMATCH), "{}", edited.lines());
+    println!("ARCHIVE: checksum changed, graph entered caller, 1 {MISMATCH}");
+}
+
+#[test]
+fn a_path_dependency_edit_needs_its_own_cell() {
+    for plant in [false, true] {
+        let io = Io::simulated(SimWorld::new(67, Limits::USUAL));
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"app\", \"dep\"]\nresolver = \"2\"\n");
+        write(&io, "dep/Cargo.toml", DEP_MANIFEST);
+        write(&io, "dep/src/lib.rs", BYTE);
+        write(&io, "app/Cargo.toml", &format!("{MANIFEST}\n[dependencies]\ndep = {{ path = \"../dep\" }}\n"));
+        write(&io, "app/src/lib.rs", CALLER);
+        let cold = crate::engine_bodies::PLANT_ALL_DEPENDENCIES_SETTLED.with(|p| {
+            p.set(plant);
+            let answer = dependency_answer(&io, false);
+            p.set(false);
+            answer
+        });
+        assert_eq!(cold.errors(), 0, "{}", cold.lines());
+        write(&io, "dep/src/lib.rs", WIDE);
+        let edited = dependency_answer(&io, false);
+        if !plant {
+            let head = with_dependency_rows(&io, |kept| {
+                let rows = &kept.answer.rows;
+                let app = blaze_drive::Name::file(b"app/src/lib.rs");
+                let (caller, _) = rows.iter().find(|(name, row)| name.kind == blaze_drive::Kind::BodyCheck && row.file == app).expect("app's caller");
+                let (request, cause) = kept.causes[caller];
+                assert_eq!(request, kept.answer.serial, "the edited request must enter the caller");
+                let blaze_engine::Cause::ReadMoved { read, .. } = cause else { panic!("caller entered for {cause:?}") };
+                assert_eq!(crate::engine_scope_reads::CellKind::of(&read), crate::engine_scope_reads::CellKind::HeadCell);
+                assert_eq!(rows[&read.of].file, blaze_drive::Name::file(b"dep/src/lib.rs"), "the caller read dep::value's head");
+                read
+            });
+            assert_body_read_moved(&edited, head);
+        }
+        let fresh = dependency_answer(&io, true);
+        assert_eq!(fresh.errors(), 1, "{}", fresh.lines());
+        assert!(fresh.lines().contains(MISMATCH), "{}", fresh.lines());
+        if plant {
+            assert_eq!(edited.errors(), 0, "the plant must retain the stale u8 answer: {}", edited.lines());
+            assert_ne!(edited.ids, fresh.ids);
+        } else {
+            assert_eq!((&edited.ids, edited.lines(), edited.checked.status.0), (&fresh.ids, fresh.lines(), fresh.checked.status.0));
+        }
+        println!("PATH: all dependencies planted settled = {plant}, incremental {}, fresh 1 ({MISMATCH})", edited.errors());
+    }
 }

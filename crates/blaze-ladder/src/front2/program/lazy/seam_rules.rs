@@ -26,6 +26,10 @@ use crate::front2::program::head_abi::BuildAbi;
 use crate::front2::source::NamesSource;
 use crate::seam::PositionGap;
 
+mod local_position;
+mod position_source;
+pub use position_source::PositionSource;
+
 pub(in crate::front2::program) struct LlvmRow {
     pub(in crate::front2::program) kind: FnKind,
     pub(in crate::front2::program) build: BuildAbi,
@@ -106,11 +110,9 @@ pub(in crate::front2::program) fn fn_abi<'n, S: NamesSource<'n>>(tabled: Option<
     crate::front2::program::head_abi::head_abi(names, store, key, || Box::from("")).ok().map(|read| read.abi)
 }
 
-/// THE TRACK-CALLER RULE: `own(k)` is fn `k`'s own `#[track_caller]` (`None`: the program
-/// cannot answer for `k`). A fn that says it is tracked; else a method of a trait impl answers
-/// with its trait's declaration of the method of its name; any other fn (a free fn, a trait's
-/// own method, an inherent method) answers with its own attribute alone. `None` when the
-/// declaration is not filed or `own` cannot answer for it: never guessed `false`.
+/// The Reference, “The `track_caller` attribute”: “When applied to a function in a trait
+/// declaration, the attribute applies to all implementations.” This includes overrides of
+/// provided methods. An attribute on the impl method itself suffices independently.
 pub(in crate::front2::program) fn track_caller(keys: &Keys, store: &Store<'_>, key: ItemKey, own: impl Fn(ItemKey) -> Option<bool>) -> Option<bool> {
     if own(key)? {
         return Some(true);
@@ -118,27 +120,86 @@ pub(in crate::front2::program) fn track_caller(keys: &Keys, store: &Store<'_>, k
     let Some(crate::front2::keys::Origin::Member { container, kind: MemberKind::Fn, name }) = keys.origin(key) else {
         return Some(false);
     };
-    // A trait's own member, or an inherent impl's: its own attribute is the whole answer.
-    let Some(trait_) = store.impls.get(container).and_then(|imp| imp.trait_) else {
+    let Some(imp) = store.impls.get(container) else {
+        // A trait method's own attribute is decisive. A missing impl head would leave
+        // inheritance unknown, so require positive evidence that the owner is a trait.
+        if store.trait_defs.contains_key(container) {
+            return Some(false);
+        }
+        let lib = match keys.origin(*container) {
+            Some(crate::front2::keys::Origin::Item(lib)) => *lib,
+            _ => store.fns.get(&key)?.lib,
+        };
+        return store.maps.traits.contains_key(&lib).then_some(false);
+    };
+    let Some(trait_) = imp.trait_ else {
         return Some(false);
     };
     let declared = keys.filed_member(trait_, MemberKind::Fn, name)?;
     own(declared)
 }
 
-/// THE CALLER-SITE RULE: expression `expr` of `owner`'s lowered `body` as a code record keeps
-/// it: `owner`, the expression's first byte from the item's (`View::site`: or the outermost
-/// macro call's range when the call is in an expansion), and the shown path of the file the
-/// item is written in (`NamesSource::file_shown`). `None`: the expression has no range, or the
-/// item is not written in a file of its crate (an expansion's item), or the source does not
-/// answer.
-pub(in crate::front2::program) fn caller_site<'n, S: NamesSource<'n>>(names: S, keys: &Keys, owner: ItemKey, body: &Body<'_>, expr: ExprId) -> Option<blaze_build::CallerSite<'n>> {
+/// A function row already holds its own attribute. Without that row, use the function's
+/// signature text. In particular an impl head files its members' identities before making
+/// their signatures, and a trait declaration can supply the attribute without a body.
+pub(in crate::front2::program) fn track_caller_from<'n, S: NamesSource<'n>>(
+    names: S, keys: &Keys, store: &Store<'n>, key: ItemKey, tabled: impl Fn(ItemKey) -> Option<bool>,
+) -> Option<bool> {
+    track_caller(keys, store, key, |k| {
+        if let Some(tracked) = tabled(k) {
+            return Some(tracked);
+        }
+        if store.ctors.contains_key(&k) {
+            return Some(false);
+        }
+        let (lib, text) = if let Some(head) = store.fns.get(&k) {
+            (head.lib, head.text)
+        } else if let Some(crate::front2::keys::Origin::Member { container, kind: MemberKind::Fn, name }) = keys.origin(k) {
+            let lib = keys.library_in(names, *container)?;
+            let mut text = None;
+            let listed = names.each_member(lib, &mut |member| {
+                if member.kind == blaze_surface::ItemKind::Function && member.name == Some(name.as_ref()) {
+                    text = Some(member.text);
+                }
+            });
+            if !listed {
+                return None;
+            }
+            (lib, text?)
+        } else if let Some(local) = store.locals.head(k) {
+            if local.kind != crate::front2::locals::LocalKind::Fn {
+                return None;
+            }
+            (local.lib, local.text)
+        } else {
+            let lib = keys.library_in(names, k)?;
+            if names.kind_of_item(lib)? != blaze_surface::ItemKind::Function {
+                return None;
+            }
+            (lib, names.text_of(lib)?.text)
+        };
+        symbols_of(names, lib, text, "").ok().map(|symbols| symbols.track_caller)
+    })
+}
+
+/// Keep the stable identity of the declaration that supplies the expression's
+/// text and its item-relative byte. The lowering maps an in-body expansion to
+/// its outermost invocation. For a whole generated item placement follows the
+/// item-producing invocation, so the byte within that invocation is zero.
+pub(in crate::front2::program) fn caller_site<'n, S: PositionSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, owner: ItemKey, body: &Body<'_>, expr: ExprId) -> Option<blaze_build::CallerSite<'n>> {
     let offset = expr_offset(body, expr)?;
-    let lib = keys.library_in(names, owner)?;
-    let place = names.place_of(lib)?;
-    let blaze_scope::resolve::At::File(i) = place.at else { return None };
-    let file = names.file_shown(place.krate, i)?;
-    Some(blaze_build::CallerSite { file, item: owner, offset })
+    let point = body_anchor(names, keys, store, owner, offset)?;
+    let (krate, file, first) = point.anchor.placement(names, store.tys.alloc()).ok()?;
+    let (item, offset) = match (first, point.local) {
+        (Start::Invocation(_) | Start::MemberInvocation(..), _) => (keys.item(point.anchor.lib()).ok()?, 0),
+        (_, Some((live, relative))) => {
+            let declaration = point.offset.checked_sub(relative)?;
+            let source = local_position::key_at(names, krate, point.anchor, declaration, store.tys.alloc()).ok()?;
+            (keys.file_source_local(source, live).ok()?, relative)
+        }
+        (_, None) => (keys.item(point.anchor.lib()).ok()?, point.offset),
+    };
+    Some(blaze_build::CallerSite { file: names.file_shown(krate, file)?, item, offset })
 }
 
 /// THE TRAP-SITE RULE: [`caller_site`]'s offset alone, `expr`'s first byte from its item's
@@ -150,14 +211,188 @@ pub(in crate::front2::program) fn expr_offset(body: &Body<'_>, expr: ExprId) -> 
     Some(view.site(view.expr_range(expr).ok()?).ok()?.start)
 }
 
-/// The file item `item`'s text is in, as the program observes it (`file!()`, as
-/// [`caller_site`] gives it): what a fault's report names a trap's construct by, with
-/// [`source_position`]'s line and column. `None` for an item written by a macro's expansion.
-pub(in crate::front2::program) fn item_file<'n, S: NamesSource<'n>>(names: S, keys: &Keys, item: ItemKey) -> Option<&'n str> {
-    let lib = keys.library_in(names, item)?;
-    let place = names.place_of(lib)?;
-    let blaze_scope::resolve::At::File(i) = place.at else { return None };
-    names.file_shown(place.krate, i)
+use blaze_scope::resolve::At as TextAt;
+use crate::front2::source::MemberOf;
+
+/// The names row relative to which a byte is counted. Ordinary associated items
+/// have a member row but no item row. Its outline index is its own, even when
+/// adjacent members have identical bodies.
+#[derive(Clone, Copy)]
+enum Anchor<'n> {
+    Item(LibKey),
+    Member { container: LibKey, row: MemberOf<'n> },
+}
+
+impl<'n> Anchor<'n> {
+    fn lib(self) -> LibKey {
+        match self {
+            Self::Item(lib) => lib,
+            Self::Member { row, .. } => row.key,
+        }
+    }
+
+    fn from_lib<S: NamesSource<'n>>(names: S, lib: LibKey) -> Option<Self> {
+        if names.has_text(lib) {
+            return Some(Self::Item(lib));
+        }
+        let (container, _) = names.member_owner(lib)?;
+        let row = member_row(names, container, lib)?;
+        Some(Self::Member { container, row })
+    }
+
+    /// A whole item written by a macro uses the invocation. A function-like invocation
+    /// itself has an item row (or an unnamed member row). Derives and attributes
+    /// describe their invoking outline entry in the expansion origins.
+    fn placement<S: PositionSource<'n>>(self, names: S, alloc: Alloc<'_>) -> Result<(usize, u32, Start<'n>), PositionGap> {
+        let krate = names.crate_of(self.lib()).ok_or(PositionGap::NoItem)?;
+        let mut anchor = self;
+        let mut expanded = false;
+        let mut copied = AVec::new_in(alloc);
+        for _ in 0..=crate::front2::expansion_origin::MOST_LEVELS {
+            let (at, start) = match anchor {
+                Self::Item(lib) => {
+                    let (at, first) = names.item_start(lib).ok_or(PositionGap::NoItem)?;
+                    (at, Start::Byte(first))
+                }
+                Self::Member { container, row } => {
+                    let at = match row.written_by {
+                        Some(call) => TextAt::Expansion(call),
+                        None => names.item_start(container).ok_or(PositionGap::NoItem)?.0,
+                    };
+                    (at, Start::Entry(row.item, row.text))
+                }
+            };
+            let call = match at {
+                TextAt::File(file) => {
+                    let start = if copied.is_empty() { start } else {
+                        let text = names.file_text(krate, file).ok_or(PositionGap::NoFile)?;
+                        let mut first = start.byte(names, krate, text, alloc)?;
+                        let mut body = anchor.text(names).ok_or(PositionGap::NoItem)?;
+                        let edition = names.edition_of(krate).ok_or(PositionGap::NoFile)?;
+                        // Work inward in the current file. A change inside an outer
+                        // copied declaration can move an inner one independently.
+                        while let Some(chain) = copied.pop() {
+                            let range = local_position::written_range(body, chain, edition, alloc)?;
+                            first = first.checked_add(range.start).ok_or(PositionGap::PastText)?;
+                            body = body.get(range.start as usize..range.end as usize).ok_or(PositionGap::PastText)?;
+                        }
+                        Start::Copied(first, body)
+                    };
+                    return Ok((krate, file, if expanded { start.invocation() } else { start }));
+                }
+                TextAt::Expansion(call) => call,
+            };
+            if let Self::Member { container, .. } = anchor
+                && let Some(row) = member_row(names, container, call)
+            {
+                anchor = Self::Member { container, row };
+            } else if names.has_text(call) {
+                anchor = Self::Item(call);
+            } else if let Some((parent, chain)) = local_position::copied_declaration(names, krate, anchor, call, alloc)? {
+                copied.push(chain);
+                anchor = parent;
+                continue;
+            } else {
+                let mut call = call;
+                for _ in 0..crate::front2::expansion_origin::MOST_LEVELS {
+                    let origin = names.call_origin(krate, call).map_err(|_| PositionGap::NoFile)?;
+                    match origin.view.text {
+                        TextAt::File(file) => return Ok((krate, file, Start::Invocation(origin.entry.0))),
+                        TextAt::Expansion(parent) => call = parent,
+                    }
+                }
+                return Err(PositionGap::NoFile);
+            }
+            copied.clear();
+            expanded = true;
+        }
+        Err(PositionGap::NoFile)
+    }
+
+    fn text<S: NamesSource<'n>>(self, names: S) -> Option<&'n str> {
+        match self {
+            Self::Item(lib) => Some(names.text_of(lib)?.text),
+            Self::Member { row, .. } => Some(row.text),
+        }
+    }
+}
+
+fn member_row<'n, S: NamesSource<'n>>(names: S, container: LibKey, lib: LibKey) -> Option<MemberOf<'n>> {
+    let mut row = None;
+    names.each_member(container, &mut |m| {
+        if m.key == lib {
+            row = Some(m);
+        }
+    });
+    row
+}
+
+#[derive(Clone, Copy)]
+enum Start<'n> {
+    Byte(u32),
+    Copied(u32, &'n str),
+    Entry(blaze_surface::ItemIndex, &'n str),
+    Invocation(u32),
+    MemberInvocation(blaze_surface::ItemIndex, &'n str),
+}
+
+impl<'n> Start<'n> {
+    fn invocation(self) -> Self {
+        match self {
+            Self::Byte(at) | Self::Copied(at, _) => Self::Invocation(at),
+            Self::Entry(i, text) => Self::MemberInvocation(i, text),
+            other => other,
+        }
+    }
+}
+
+/// Body-local items have a range in the lowering of their enclosing item. An
+/// expanded declaration has a copied text, and its entire range stands for one
+/// invocation. A written declaration is a slice of its parent, so its inner
+/// expression's offset is retained. Closures and async blocks keep the owner's
+/// expression IDs and consequently use exactly the same rule.
+struct BodySite<'n> {
+    anchor: Anchor<'n>,
+    offset: u32,
+    /// The innermost declaration actually written in the top item's text,
+    /// and the expression (or generating macro invocation) relative to it.
+    local: Option<(ItemKey, u32)>,
+}
+
+fn body_anchor<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, mut owner: ItemKey, mut offset: u32) -> Option<BodySite<'n>> {
+    let mut leaf = None;
+    for _ in 0..=store.locals.kept() {
+        if let Some(local) = store.locals.head(owner) {
+            let enclosing = store.fns.get(&local.enclosing)?.text;
+            let range = local.range;
+            let written = enclosing.get(range.start as usize..range.end as usize)?;
+            if written == local.text {
+                leaf.get_or_insert((owner, offset));
+                offset = range.start.checked_add(offset)?;
+            } else {
+                leaf = None;
+                offset = range.start;
+            }
+            owner = local.enclosing;
+            continue;
+        }
+        let anchor = match keys.origin(owner) {
+            Some(crate::front2::keys::Origin::Member { .. }) => {
+                let (container, row) = keys.source_member(names, owner, store.fns.get(&owner)?.text)?;
+                Anchor::Member { container, row }
+            }
+            _ => Anchor::from_lib(names, keys.library_in(names, owner)?)?,
+        };
+        return Some(BodySite { anchor, offset, local: leaf });
+    }
+    None
+}
+
+/// The file of a trap row's body owner. The trap always keeps a body-relative offset.
+pub(in crate::front2::program) fn item_file<'n, S: PositionSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: ItemKey) -> Option<&'n str> {
+    let point = body_anchor(names, keys, store, item, 0)?;
+    let (krate, file, _) = point.anchor.placement(names, store.tys.alloc()).ok()?;
+    names.file_shown(krate, file)
 }
 
 /// THE POSITION RULE: the line and column (each from 1; the column in chars) of byte `site` of
@@ -165,13 +400,135 @@ pub(in crate::front2::program) fn item_file<'n, S: NamesSource<'n>>(names: S, ke
 /// today's text of its file (`NamesSource::file_text`), counted there. What a `#[track_caller]`
 /// `Location`'s line and column are when the program is placed: the code record holds only
 /// `item` and `site` (rule 71).
-pub(in crate::front2::program) fn source_position<'n, S: NamesSource<'n>>(names: S, keys: &Keys, item: ItemKey, site: u32) -> Result<(u32, u32), PositionGap> {
-    let lib = keys.library_in(names, item).ok_or(PositionGap::NoItem)?;
-    let (at, start) = names.item_start(lib).ok_or(PositionGap::NoItem)?;
-    let blaze_scope::resolve::At::File(i) = at else { return Err(PositionGap::NoFile) };
-    let krate = names.crate_of(lib).ok_or(PositionGap::NoItem)?;
+pub(in crate::front2::program) fn source_position<'n, S: PositionSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: ItemKey, site: u32) -> Result<(u32, u32), PositionGap> {
+    if keys.origin(item).is_none() {
+        return position_of_source_key(names, item, site, store.tys.alloc());
+    }
+    let owner = keys.source_local_body(item).unwrap_or(item);
+    let point = body_anchor(names, keys, store, owner, site).ok_or(PositionGap::NoItem)?;
+    position_in_file(names, point.anchor, point.offset, store.tys.alloc())
+}
+
+impl<'n> crate::front2::source::Records<'n> {
+    /// Reads the origins of an item-producing expansion directly from the two
+    /// stored parts. The call identifies an entry in the calling text's outline.
+    /// That index is valid against the text whose digest the record proves.
+    pub(crate) fn recorded_call_origin(
+        &'n self, loader: &dyn crate::front2::source::Load<'n>, krate: usize, call: LibKey, alloc: Alloc<'_>,
+    ) -> Result<crate::front2::expansion_origin::CallOrigin<'n>, crate::front2::expansion_origin::Unmapped> {
+        use crate::front2::expansion_origin::{CallOrigin, Unmapped};
+        let (header, column) = loader.expansion_origins(krate, call).ok_or(Unmapped::NotServed { call })?;
+        let mut view = blaze_scope::expansion_origins::OriginsView::open_parts(header, column)
+            .map_err(|error| Unmapped::Origins { call, error })?;
+        let edition = self.edition_of(krate).ok_or(Unmapped::NoText { call })?;
+        let shown = match view.text {
+            TextAt::File(file) => self.file_shown(krate, file),
+            TextAt::Expansion(_) => self.root_module(krate).and_then(|root| self.module_path(root)),
+        }.ok_or(Unmapped::NoText { call })?;
+        if let TextAt::File(file) = view.text {
+            // The origins hold the entry number in the outline when the call
+            // ran. If that entry has an item row (e.g. a derive's struct),
+            // that row's chain finds it even after other entries have moved.
+            let record = self.items_record(krate).ok_or(Unmapped::NoText { call })?;
+            for i in 0..record.items() {
+                let row = record.item_at(i).map_err(|_| Unmapped::NoText { call })?.ok_or(Unmapped::NoText { call })?;
+                if row.outline == view.item && row.text.is_some_and(|span| span.at == view.text) {
+                    let (at, first) = self.item_start(row.key).ok_or(Unmapped::NoText { call })?;
+                    if at != view.text {
+                        return Err(Unmapped::NoText { call });
+                    }
+                    let entry = self.text_of(row.key).ok_or(Unmapped::NoText { call })?;
+                    let current = blaze_file_items::outline_item(entry.text, edition, alloc);
+                    let item = current.items().first().ok_or(Unmapped::Input { call })?;
+                    let pieces = record.pieces_at(i).map_err(|_| Unmapped::Input { call })?;
+                    if item.hash != pieces.body {
+                        return Err(Unmapped::Input { call });
+                    }
+                    // The item hash proves its tokens. Trivia can still change
+                    // their bytes, so rebuild the input's byte range by the same
+                    // rule as task/lower.rs fn_like_call and call_in_text.
+                    let input = match view.shape {
+                        blaze_expand::origin_column::InputShape::Whole => entry.text,
+                        blaze_expand::origin_column::InputShape::Inside => {
+                            let blaze_surface::ItemDetail::MacroCall { input: Some(range), .. } = item.detail else {
+                                return Err(Unmapped::Input { call });
+                            };
+                            blaze_scope::task::inside(item.text(entry.text, range))
+                        }
+                    };
+                    view.input_start = blaze_scope::expansion_origins::offset_in(entry.text, input).ok_or(Unmapped::Input { call })?;
+                    view.input_len = u32::try_from(input.len()).map_err(|_| Unmapped::Input { call })?;
+                    let len = u32::try_from(entry.text.len()).map_err(|_| Unmapped::NoText { call })?;
+                    let end = first.checked_add(len).ok_or(Unmapped::NoText { call })?;
+                    let text = self.file_text(krate, file).ok_or(Unmapped::NoText { call })?;
+                    return Ok(CallOrigin { view, text, shown, entry: (first, end), edition });
+                }
+            }
+        }
+        let text = self.whole_text(krate, view.text).ok_or(Unmapped::NoText { call })?;
+        let outline = blaze_file_items::outline(text, edition, alloc);
+        let entry = outline.items().get(view.item.0 as usize).ok_or(Unmapped::NoText { call })?.range;
+        Ok(CallOrigin { view, text, shown, entry: (entry.start, entry.end), edition })
+    }
+
+    /// Places a stored caller site before a code-store hit has constructed a lazy program.
+    /// Members are indexed separately by their library key in the member owners section.
+    pub fn source_position(&'n self, item: ItemKey, site: u32, alloc: Alloc<'_>) -> Result<(u32, u32), PositionGap> {
+        position_of_source_key(self, item, site, alloc)
+    }
+}
+
+/// The source key may have been produced by a different program. A member has
+/// a named member row. A written local has a lexical key under a body row.
+fn position_of_source_key<'n, S: PositionSource<'n>>(names: S, item: ItemKey, site: u32, alloc: Alloc<'_>) -> Result<(u32, u32), PositionGap> {
+    let first = item.0.to_be_bytes();
+    if let Some(lib) = names.key_beginning(first) {
+        return position_in_file(names, Anchor::from_lib(names, lib).ok_or(PositionGap::NoItem)?, site, alloc);
+    }
+    let mut whole = [0; 32];
+    whole[..16].copy_from_slice(&first);
+    let krate = names.crate_of(LibKey(ContentId(whole))).ok_or(PositionGap::NoItem)?;
+    if let Some(lib) = names.member_beginning(krate, item)? {
+        return position_in_file(names, Anchor::from_lib(names, lib).ok_or(PositionGap::NoItem)?, site, alloc);
+    }
+    if first[8] & LibKey::INNER == 0 {
+        return Err(PositionGap::NoItem);
+    }
+    local_position::in_source(names, krate, item, site, alloc)
+}
+
+impl<'n> Start<'n> {
+    fn byte<S: NamesSource<'n>>(self, names: S, krate: usize, text: &str, alloc: Alloc<'_>) -> Result<u32, PositionGap> {
+        match self {
+            Start::Byte(at) | Start::Copied(at, _) | Start::Invocation(at) => Ok(at),
+            Start::Entry(index, part) | Start::MemberInvocation(index, part) => {
+                // The member row already has today's outline index. A loader may hand
+                // back independent buffers for the file and the member's text.
+                if let Some(at) = blaze_scope::expansion_origins::offset_in(text, part) {
+                    return Ok(at);
+                }
+                let outline = blaze_file_items::outline(text, names.edition_of(krate).ok_or(PositionGap::NoFile)?, alloc);
+                let range = outline.items().get(index.0 as usize).ok_or(PositionGap::NoItem)?.range;
+                if text.get(range.start as usize..range.end as usize) != Some(part) {
+                    return Err(PositionGap::NoItem);
+                }
+                Ok(range.start)
+            }
+        }
+    }
+}
+
+fn position_in_file<'n, S: PositionSource<'n>>(names: S, anchor: Anchor<'n>, site: u32, alloc: Alloc<'_>) -> Result<(u32, u32), PositionGap> {
+    position_at(names, anchor.placement(names, alloc)?, site, alloc)
+}
+
+fn position_at<'n, S: NamesSource<'n>>(names: S, (krate, i, start): (usize, u32, Start<'n>), site: u32, alloc: Alloc<'_>) -> Result<(u32, u32), PositionGap> {
     let text = names.file_text(krate, i).ok_or(PositionGap::NoFile)?;
-    line_and_column(text, start, site)
+    let site = match start {
+        Start::Invocation(_) | Start::MemberInvocation(..) => 0,
+        _ => site,
+    };
+    line_and_column(text, start.byte(names, krate, text, alloc)?, site)
 }
 
 /// Byte `start + site` of `text` as a line and a column, each from 1, the column in chars.

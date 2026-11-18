@@ -850,7 +850,7 @@ fn run_of(payload: &[u8], cell: Cell) -> Result<Option<(usize, usize)>, &'static
 
 /// Each run of one head task's payload: its want's bytes, its cell's, where its frozen bytes
 /// start and their length; a payload that is not whole runs is refused.
-fn each_run(payload: &[u8], each: &mut dyn FnMut(&[u8], &[u8], usize, usize)) -> Result<(), &'static str> {
+pub(crate) fn each_run(payload: &[u8], each: &mut dyn FnMut(&[u8], &[u8], usize, usize)) -> Result<(), &'static str> {
     const MALFORMED: &str = "a head task's payload is not runs of a cell's want, its cell, a length and its frozen bytes (engine_heads.rs `heads_of`)";
     let mut at = 0usize;
     while at < payload.len() {

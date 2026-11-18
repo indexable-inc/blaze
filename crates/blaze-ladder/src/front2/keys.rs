@@ -3,10 +3,9 @@
 //! library's: its crate prefix (bytes 0..8) and 64 bits of its hash. Two library keys under
 //! one checker key are refused by name (rule 21), never truncated silently.
 //!
-//! The library keys module-level items, variants and macro-made items; it keys no member of a
-//! trait or an impl. A member's checker key is made here from its container's key, its kind
-//! and its name ([`Keys::member`]), the container's crate prefix kept, and filed in the same
-//! map, so one table answers "what is this checker key".
+//! The library keeps a trait or impl's members in a separate table. A member's
+//! checker identity comes from its container, kind and name ([`Keys::member`]).
+//! Its source identity is its member-row key ([`Keys::source_member`]).
 
 use std::alloc::Global;
 
@@ -64,7 +63,7 @@ impl core::fmt::Display for KeyClash {
 pub struct Keys {
     /// Filed through `&self` ([`super::rows::Rows`]): a head imported during a body's check
     /// files its keys while the check holds the map.
-    origins: super::rows::Rows<ItemKey, Origin>,
+    origins: super::rows::Rows<ItemKey, (Origin, Option<ItemKey>)>,
     /// The kind of each item declared in a body ([`Keys::local`]): the names library keys no
     /// such item and holds no outline entry for it, so what it is is told here, beside its
     /// origin, and never guessed from a missing entry.
@@ -186,11 +185,27 @@ pub fn opaque_key(fn_: ItemKey, index: u32) -> ItemKey {
 
 impl Keys {
     fn file(&self, k: ItemKey, origin: Origin) -> Result<ItemKey, KeyClash> {
+        self.file_with_body(k, origin, None)
+    }
+
+    /// A written local declaration has a lexical source identity even when body
+    /// expansion contributes other declarations to the checker's scope. Keep its
+    /// live body for warm placement. The records reader derives the lexical key
+    /// from today's declarations without expanding or checking any body.
+    pub(super) fn file_source_local(&self, local: LibKey, live: ItemKey) -> Result<ItemKey, KeyClash> {
+        self.file_with_body(checker_of(local), Origin::Item(local), Some(live))
+    }
+
+    pub(super) fn source_local_body(&self, key: ItemKey) -> Option<ItemKey> {
+        self.origins.get(&key)?.1
+    }
+
+    fn file_with_body(&self, k: ItemKey, origin: Origin, live: Option<ItemKey>) -> Result<ItemKey, KeyClash> {
         match self.origins.get(&k) {
-            Some(first) if *first == origin => Ok(k),
-            Some(first) => Err(KeyClash { key: k, first: first.clone(), second: origin }),
+            Some((first, body)) if *first == origin && *body == live => Ok(k),
+            Some((first, _)) => Err(KeyClash { key: k, first: first.clone(), second: origin }),
             None => {
-                self.origins.insert(k, origin);
+                self.origins.insert(k, (origin, live));
                 Ok(k)
             }
         }
@@ -198,7 +213,7 @@ impl Keys {
 
     /// What `key` stands for; `None` for a key this map never made.
     pub fn origin(&self, key: ItemKey) -> Option<&Origin> {
-        self.origins.get(&key)
+        self.origins.get(&key).map(|(origin, _)| origin)
     }
 
     /// The library key of an item key; `None` for a member or a key that is no item's. The ONE
@@ -213,10 +228,44 @@ impl Keys {
     /// names. Two library keys under one checker key are refused where the source finds them
     /// (`source::SourceError::KeysBeginAlike`).
     pub fn library_in<'n, S: super::source::NamesSource<'n>>(&self, names: S, key: ItemKey) -> Option<LibKey> {
-        match self.origins.get(&key) {
+        match self.origin(key) {
             Some(Origin::Item(k)) => Some(*k),
             Some(Origin::Member { .. }) => None,
             None => names.key_beginning(key.0.to_be_bytes()),
+        }
+    }
+
+    /// The member row whose text was actually lowered. The checker keys a method by
+    /// container, kind and name. Its library row supplies the stable identity of its
+    /// source, including for a method produced by a macro in the container.
+    pub(super) fn source_member<'n, S: super::source::NamesSource<'n>>(
+        &self, names: S, key: ItemKey, text: &str,
+    ) -> Option<(LibKey, super::source::MemberOf<'n>)> {
+        let Origin::Member { container, kind, name } = self.origin(key)? else { return None };
+        let kind = match kind {
+            MemberKind::Fn => blaze_surface::ItemKind::Function,
+            MemberKind::Const => blaze_surface::ItemKind::Const,
+            _ => return None,
+        };
+        let owner = self.library_in(names, *container)?;
+        let mut first = None;
+        let mut exact = None;
+        let mut count = 0;
+        let mut matches = 0;
+        names.each_member(owner, &mut |m| {
+            if m.kind == kind && m.name == Some(name.as_ref()) {
+                first.get_or_insert(m);
+                count += 1;
+                if m.text == text {
+                    exact = Some(m);
+                    matches += 1;
+                }
+            }
+        });
+        match (count, matches) {
+            (1, _) => Some((owner, first?)),
+            (_, 1) => Some((owner, exact?)),
+            _ => None,
         }
     }
 

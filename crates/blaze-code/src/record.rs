@@ -9,6 +9,8 @@
 //! - `frame`: the function's compact unwind word (the emitter's encoding, opaque here) and
 //!   `pads`: its landing pads, item-relative.
 //! - Outside names (the C library's) are kept as text by symbol, for the launcher's `dlsym`.
+//! - `positions`: the item-relative source of each zero line or column slot in code or relro.
+//!   Placement fills the slot from the item's current source.
 //! - `traps`: per `brk` of an `unreachable` the code holds, WHICH construct it ends ([`TrapRow`]:
 //!   its kind, and the construct's first byte counted from its item's first byte, rule 71):
 //!   what `blaze run` says when the program strikes one (blaze-cli run_fault.rs). Data only:
@@ -26,14 +28,15 @@ use blaze_own::{AVec, Alloc, Vec};
 /// The first eight bytes of every encoded record: the form's version. `bzcode04` added the trap
 /// table ([`TrapRow`]), `bzcode05` its held values ([`Held`]) and subjects ([`Subject`]),
 /// `bzcode06` the alignment each part asks of its placement ([`CodeRecord::code_align`],
-/// [`CodeRecord::relro_align`]: data aligned past 16, as `vzipq_u8`'s 64-aligned table); `02`
+/// [`CodeRecord::relro_align`]: data aligned past 16, as `vzipq_u8`'s 64-aligned table).
+/// `bzcode07` adds item-relative source positions ([`PositionRow`]). `02`
 /// and `03` are blaze-tier's own forms (record/form.rs), so this form skips them and a record
 /// of one form is never read as another's. A record of an older form of this one is refused
 /// naming its form ([`DecodeError::Older`]) and rebuilt, never read (rule 26).
-pub const MAGIC: [u8; 8] = *b"bzcode06";
+pub const MAGIC: [u8; 8] = *b"bzcode07";
 
 /// The forms before [`MAGIC`] that were this record's: refused by name, never read.
-const OLDER: [[u8; 8]; 2] = [*b"bzcode04", *b"bzcode05"];
+const OLDER: [[u8; 8]; 3] = [*b"bzcode04", *b"bzcode05", *b"bzcode06"];
 
 /// The least alignment, as log2, of a record's code: 16 bytes, what every placement gives
 /// (image.rs `lay_out`, blaze-launch-rt run_mode.rs) and what a 16-aligned data row of the code
@@ -47,8 +50,8 @@ pub const LEAST_RELRO_ALIGN: u8 = 3;
 pub const MOST_PART_ALIGN: u8 = 12;
 
 /// The bytes before the sections: magic, frame, the two parts' alignments and two zero bytes,
-/// ten counts (so the first section starts 8-aligned).
-const HEAD: usize = 56;
+/// eleven counts and four zero bytes (so the first section starts 8-aligned).
+const HEAD: usize = 64;
 
 /// A [`Word`]'s target meaning this record's own code: the word holds the address of code byte
 /// `addend`.
@@ -162,6 +165,76 @@ pub struct Word {
     pub at: u32,
     pub target: u32,
     pub addend: i64,
+}
+
+/// The part containing a source-position slot, in canonical sort order.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[repr(u8)]
+pub enum PositionPart {
+    Code = 0,
+    Relro = 1,
+}
+
+/// Which one-based number of the site's source position the slot will hold.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum PositionField {
+    Line = 0,
+    Col = 1,
+}
+
+impl PositionField {
+    pub fn value(self, (line, col): (u32, u32)) -> u32 {
+        match self {
+            Self::Line => line,
+            Self::Col => col,
+        }
+    }
+}
+
+/// A four-byte, little-endian slot that placement fills. `site` counts bytes from the first
+/// byte of `item`'s text. Only the placed copy holds the corresponding line or column.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PositionRow {
+    pub part: PositionPart,
+    pub at: u32,
+    pub item: u128,
+    pub site: u32,
+    pub field: PositionField,
+}
+
+impl PositionRow {
+    fn slot(&self) -> (PositionPart, u32) {
+        (self.part, self.at)
+    }
+
+    /// Check the same slot contract when sealing builder input and when opening stored bytes.
+    fn check_slot(&self, code: &[u8], relro: &[u8], previous: Option<(PositionPart, u32)>) -> Result<(), RecordError> {
+        let (part, at) = self.slot();
+        if at % 4 != 0 {
+            return Err(RecordError::PositionMisaligned { part, at });
+        }
+        let bytes = match part {
+            PositionPart::Code => code,
+            PositionPart::Relro => relro,
+        };
+        let start = at as usize;
+        let Some(slot) = bytes.get(start..).and_then(|tail| tail.get(..4)) else {
+            return Err(RecordError::PositionOutside { part, at, len: bytes.len() as u32 });
+        };
+        if slot != &[0; 4] {
+            return Err(RecordError::PositionNonzero { part, at });
+        }
+        if let Some(prev) = previous {
+            if prev == (part, at) {
+                return Err(RecordError::PositionsTwice { part, at });
+            }
+            if prev > (part, at) {
+                return Err(RecordError::PositionsUnsorted { part, at });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A landing pad: a call in `[start, start + len)` that unwinds lands at `landing` with
@@ -353,6 +426,13 @@ pub enum RecordError {
     WordMisaligned { at: u32 },
     /// Two words at `at`.
     WordsOverlap { at: u32 },
+    PositionMisaligned { part: PositionPart, at: u32 },
+    PositionOutside { part: PositionPart, at: u32, len: u32 },
+    PositionNonzero { part: PositionPart, at: u32 },
+    PositionsTwice { part: PositionPart, at: u32 },
+    PositionsUnsorted { part: PositionPart, at: u32 },
+    PositionOverlapsReference { part: PositionPart, at: u32 },
+    UnresolvedPosition { operation: &'static str, row: PositionRow },
     /// A landing pad's range from `start`, or its landing, is not inside the code.
     PadOutside { start: u32 },
     /// An outside target with no name kept for it.
@@ -383,6 +463,13 @@ impl fmt::Display for RecordError {
             RecordError::WordOutside { at, relro } => write!(f, "a code record's relro word at {at} is past its {relro} relro bytes"),
             RecordError::WordMisaligned { at } => write!(f, "a code record's relro word at {at} is not 8-aligned"),
             RecordError::WordsOverlap { at } => write!(f, "a code record has two relro words at {at}"),
+            RecordError::PositionMisaligned { part, at } => write!(f, "a code record's {part:?} source-position slot at {at} is not 4-aligned"),
+            RecordError::PositionOutside { part, at, len } => write!(f, "a code record's four-byte source-position slot at {at} extends past its {len}-byte {part:?} part"),
+            RecordError::PositionNonzero { part, at } => write!(f, "a code record's {part:?} source-position slot at {at} must contain four zero bytes"),
+            RecordError::PositionsTwice { part, at } => write!(f, "a code record has two source-position rows on the {part:?} slot at {at}"),
+            RecordError::PositionsUnsorted { part, at } => write!(f, "a code record's {part:?} source-position slot at {at} is out of order"),
+            RecordError::PositionOverlapsReference { part, at } => write!(f, "a code record's {part:?} source-position slot at {at} overlaps a reference"),
+            RecordError::UnresolvedPosition { operation, row } => write!(f, "{operation} cannot resolve {:?} for item {:032x} at byte {} (record {:?} slot at {})", row.field, row.item, row.site, row.part, row.at),
             RecordError::PadOutside { start } => write!(f, "a code record's landing pad from {start} is not inside its code"),
             RecordError::NameMissing { symbol } => write!(f, "a code record names the outside symbol {symbol} but keeps no name for it"),
             RecordError::TooLarge { what } => write!(f, "a code record's {what} is longer than a u32 counts"),
@@ -408,6 +495,7 @@ pub struct CodeRecord<'a> {
     pub targets: AVec<'a, Target>,
     pub sites: AVec<'a, Site>,
     pub words: AVec<'a, Word>,
+    pub positions: AVec<'a, PositionRow>,
     pub frame: u32,
     /// log2 of the alignment the code's first byte is placed at: the most its data rows ask
     /// (each row's offset in `code` is a multiple of its own alignment), at least
@@ -434,6 +522,7 @@ impl<'a> CodeRecord<'a> {
             targets: Vec::new_in(alloc),
             sites: Vec::new_in(alloc),
             words: Vec::new_in(alloc),
+            positions: Vec::new_in(alloc),
             frame: 0,
             code_align: LEAST_CODE_ALIGN,
             relro_align: LEAST_RELRO_ALIGN,
@@ -464,7 +553,7 @@ impl<'a> CodeRecord<'a> {
     /// sites and words sorted by offset, pads by start, names by symbol; every rule of the form
     /// checked once here, so a [`Sealed`] needs no check again (rule 74).
     pub fn seal(self) -> Result<Sealed<'a>, RecordError> {
-        let CodeRecord { code, relro, targets, mut sites, mut words, frame, code_align, relro_align, mut pads, mut traps, names, text, alloc } = self;
+        let CodeRecord { code, relro, targets, mut sites, mut words, mut positions, frame, code_align, relro_align, mut pads, mut traps, names, text, alloc } = self;
         if !(LEAST_CODE_ALIGN..=MOST_PART_ALIGN).contains(&code_align) {
             return Err(RecordError::Align { part: "code", align: code_align });
         }
@@ -545,6 +634,14 @@ impl<'a> CodeRecord<'a> {
                 return Err(RecordError::WordOutside { at: word.at, relro: relro_len });
             }
         }
+        fits(positions.len(), "source-position table")?;
+        positions.sort_unstable_by_key(PositionRow::slot);
+        let mut previous = None;
+        for row in positions.iter() {
+            row.check_slot(&code, &relro, previous)?;
+            previous = Some(row.slot());
+        }
+        check_position_references(&positions, |row| (row.part as u8, row.at), sites.iter().copied(), words.iter().copied())?;
         pads.sort_unstable_by_key(|p| (p.start, p.len, p.landing, p.action));
         for pad in pads.iter() {
             let past = u64::from(pad.start) + u64::from(pad.len);
@@ -611,6 +708,7 @@ impl<'a> CodeRecord<'a> {
             targets: sorted,
             sites,
             words,
+            positions,
             frame,
             code_align,
             relro_align,
@@ -630,6 +728,29 @@ fn fits(len: usize, what: &'static str) -> Result<(), RecordError> {
     }
 }
 
+/// A position and an address patch must never own the same bytes. Search only when the
+/// record has position rows, using the already checked slot order, in memory or on disk.
+fn check_position_references<T>(
+    positions: &[T], slot: impl Fn(&T) -> (u8, u32), sites: impl Iterator<Item = Site>, words: impl Iterator<Item = Word>,
+) -> Result<(), RecordError> {
+    if positions.is_empty() {
+        return Ok(());
+    }
+    let code = sites.map(|s| (PositionPart::Code, s.at, s.kind.len()));
+    let relro = words.map(|w| (PositionPart::Relro, w.at, 8));
+    for (part, at, len) in code.chain(relro) {
+        // A malformed reference could start within a position slot, so include the slot
+        // containing its first byte in the search.
+        let i = positions.partition_point(|row| slot(row) < (part as u8, at & !3));
+        if let Some((tag, offset)) = positions.get(i).map(&slot)
+            && tag == part as u8 && u64::from(offset) < u64::from(at) + u64::from(len)
+        {
+            return Err(RecordError::PositionOverlapsReference { part, at: offset });
+        }
+    }
+    Ok(())
+}
+
 /// A record in its canonical form ([`CodeRecord::seal`]): the only form that encodes.
 pub struct Sealed<'a>(CodeRecord<'a>);
 
@@ -647,9 +768,10 @@ impl<'a> Sealed<'a> {
         put32(out, r.frame);
         out.extend_from_slice(&[r.code_align, r.relro_align, 0, 0]);
         let subjects = r.traps.iter().filter(|t| t.subject.is_some()).count();
-        for count in [r.code.len(), r.relro.len(), r.targets.len(), r.sites.len(), r.words.len(), r.pads.len(), r.names.len(), r.text.len(), r.traps.len(), subjects] {
+        for count in [r.code.len(), r.relro.len(), r.targets.len(), r.sites.len(), r.words.len(), r.pads.len(), r.names.len(), r.text.len(), r.traps.len(), subjects, r.positions.len()] {
             put32(out, count as u32);
         }
+        put32(out, 0);
         out.extend_from_slice(&r.code);
         pad8(out, start);
         out.extend_from_slice(&r.relro);
@@ -710,6 +832,14 @@ impl<'a> Sealed<'a> {
         }
         out.extend_from_slice(&r.text);
         pad8(out, start);
+        for row in r.positions.iter() {
+            out.extend_from_slice(&row.item.to_le_bytes());
+            put32(out, row.site);
+            put32(out, row.at);
+            out.push(row.part as u8);
+            out.push(row.field as u8);
+            out.extend_from_slice(&[0; 6]);
+        }
     }
 }
 
@@ -730,6 +860,7 @@ const PAD_ROW: usize = 16;
 const NAME_ROW: usize = 40;
 const TRAP_ROW: usize = 32;
 const SUBJECT_ROW: usize = 24 + 8 * SUBJECT_SHOWN;
+const POSITION_ROW: usize = 32;
 
 /// Why bytes are not a code record.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -748,6 +879,12 @@ pub enum DecodeError {
     Held { row: u32 },
     /// Subject row `row` is not the subject of a trap row (offsets rising, each a trap row's).
     Subject { row: u32 },
+    /// The source-position row has an unknown tag or a nonzero reserved byte.
+    PositionByte { row: u32, what: &'static str, byte: u8 },
+    /// The decoded position would violate the same slot contract as builder input.
+    Position(RecordError),
+    /// The word after the header counts is reserved and must be zero.
+    Reserved { value: u32 },
     /// The bytes are a record of an older form of this one (`form` its eight-byte head, e.g.
     /// `bzcode05`, which held no part alignments): never read, rebuilt (rule 26).
     Older { form: [u8; 8] },
@@ -759,10 +896,10 @@ pub enum DecodeError {
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            DecodeError::Magic => write!(f, "the bytes are not a code record: no `bzcode06` head"),
+            DecodeError::Magic => write!(f, "the bytes are not a code record: no `bzcode07` head"),
             DecodeError::Older { form } => write!(
                 f,
-                "the bytes are a code record of the older form `{}`, which held no part alignments: rebuilt, never read (rule 26)",
+                "the bytes are a code record of the older form `{}`, which held no source-position table: rebuilt, never read (rule 26)",
                 core::str::from_utf8(&form).unwrap_or("bzcode0?")
             ),
             DecodeError::Align { part, align } => write!(
@@ -772,6 +909,9 @@ impl fmt::Display for DecodeError {
             DecodeError::TrapKind { row, byte } => write!(f, "a code record's trap row {row} has the unknown kind {byte}"),
             DecodeError::Held { row } => write!(f, "a code record's trap row {row} has a malformed held value (an unknown tag or a register past x30)"),
             DecodeError::Subject { row } => write!(f, "a code record's subject row {row} is not the subject of one of its trap rows"),
+            DecodeError::PositionByte { row, what, byte } => write!(f, "a code record's source-position row {row} has invalid {what} byte {byte}"),
+            DecodeError::Position(error) => fmt::Display::fmt(&error, f),
+            DecodeError::Reserved { value } => write!(f, "a code record's reserved word after the header counts is {value}, expected zero"),
             DecodeError::Length { need, have } => write!(f, "a code record's head counts {need} bytes; it has {have}"),
             DecodeError::Space { row, byte } => write!(f, "a code record's target {row} has the unknown space {byte}"),
             DecodeError::Kind { row, byte } => write!(f, "a code record's site {row} has the unknown kind {byte}"),
@@ -783,16 +923,17 @@ impl core::error::Error for DecodeError {}
 
 /// An encoded record read in place. Layout (little-endian; every section starts 8-aligned from
 /// the record's first byte): `MAGIC`; `frame: u32`, `code_align: u8`, `relro_align: u8` (log2
-/// of each part's placement alignment), two zero bytes; ten `u32` counts (code
-/// bytes, relro bytes, targets, sites, words, pads, names, text bytes, traps, subjects); the
+/// of each part's placement alignment), two zero bytes; eleven `u32` counts (code
+/// bytes, relro bytes, targets, sites, words, pads, names, text bytes, traps, subjects,
+/// positions) and four zero bytes; the
 /// code; the relro part; targets (space `u8`, 7 zero bytes, symbol 32); sites (`at: u32`, kind
 /// `u8`, 3 zero bytes, `target: u32`, `addend: u32`); words (`at: u32`, `target: u32`, `addend:
 /// i64`); pads (four `u32`); traps (`at: u32`, kind `u8`, held tag `u8` (0 unknown, 1 a
 /// register, 2 a stack slot), held register `u8`, a zero byte, `site: u32` (`u32::MAX` for
 /// none), held stack offset `u32`, `item: u128`, 0 for none), by `at`; subjects (`at: u32` of
 /// its trap row, `count: u32`, `item: u128`, eight `u64` discriminants), by `at`; names
-/// (symbol 32, text `at: u32`, `len: u32`); the text. `bzcode05` added the held value and the
-/// subjects, `bzcode06` the two alignments (in the word `bzcode05` held as a zero `flags`).
+/// (symbol 32, text `at: u32`, `len: u32`); the padded text; source positions (`item: u128`,
+/// `site: u32`, `at: u32`, part and field tags, six zero bytes), ordered by (part, at).
 #[derive(Clone, Copy)]
 pub struct CodeView<'b> {
     bytes: &'b [u8],
@@ -807,6 +948,7 @@ pub struct CodeView<'b> {
     pads: &'b [u8],
     traps: &'b [u8],
     subjects: &'b [u8],
+    positions: &'b [[u8; POSITION_ROW]],
     names: &'b [u8],
     text: &'b [u8],
 }
@@ -837,12 +979,29 @@ fn symbol_at(b: &[u8], at: usize) -> Symbol {
     Symbol(s)
 }
 
+fn decode_position(bytes: &[u8; POSITION_ROW], index: usize) -> Result<PositionRow, DecodeError> {
+    let row = index as u32;
+    let part = match bytes[24] {
+        0 => PositionPart::Code,
+        1 => PositionPart::Relro,
+        byte => return Err(DecodeError::PositionByte { row, what: "part", byte }),
+    };
+    let field = match bytes[25] {
+        0 => PositionField::Line,
+        1 => PositionField::Col,
+        byte => return Err(DecodeError::PositionByte { row, what: "field", byte }),
+    };
+    let mut item = [0u8; 16];
+    item.copy_from_slice(&bytes[..16]);
+    Ok(PositionRow { part, field, item: u128::from_le_bytes(item), site: get32(bytes, 16), at: get32(bytes, 20) })
+}
+
 impl<'b> CodeView<'b> {
     /// Reads the record at the start of `bytes`, which must be exactly one record. The lengths and
     /// every tag byte are checked here, once: the accessors below index without checking again.
     pub fn read(bytes: &'b [u8]) -> Result<CodeView<'b>, DecodeError> {
-        if bytes.len() < HEAD {
-            return Err(DecodeError::Length { need: HEAD, have: bytes.len() });
+        if bytes.len() < MAGIC.len() {
+            return Err(DecodeError::Length { need: MAGIC.len(), have: bytes.len() });
         }
         if bytes[..8] != MAGIC {
             let mut form = [0u8; 8];
@@ -851,6 +1010,13 @@ impl<'b> CodeView<'b> {
                 true => DecodeError::Older { form },
                 false => DecodeError::Magic,
             });
+        }
+        if bytes.len() < HEAD {
+            return Err(DecodeError::Length { need: HEAD, have: bytes.len() });
+        }
+        let reserved = get32(bytes, 60);
+        if reserved != 0 {
+            return Err(DecodeError::Reserved { value: reserved });
         }
         let frame = get32(bytes, 8);
         let (code_align, relro_align) = (bytes[12], bytes[13]);
@@ -875,6 +1041,7 @@ impl<'b> CodeView<'b> {
             up8(count(7)),
             count(8) * TRAP_ROW,
             count(9) * SUBJECT_ROW,
+            count(10) * POSITION_ROW,
         ];
         let need = HEAD + lens.iter().sum::<usize>();
         if need != bytes.len() {
@@ -891,6 +1058,16 @@ impl<'b> CodeView<'b> {
         let subjects = part(bytes, &mut at, lens[9], lens[9]);
         let names = part(bytes, &mut at, lens[6], lens[6]);
         let text = part(bytes, &mut at, lens[7], count(7));
+        let (positions, _) = part(bytes, &mut at, lens[10], lens[10]).as_chunks::<POSITION_ROW>();
+        let mut previous = None;
+        for (i, bytes) in positions.iter().enumerate() {
+            let position = decode_position(bytes, i)?;
+            if let Some(&byte) = bytes[26..].iter().find(|&&b| b != 0) {
+                return Err(DecodeError::PositionByte { row: i as u32, what: "reserved", byte });
+            }
+            position.check_slot(code, relro, previous).map_err(DecodeError::Position)?;
+            previous = Some(position.slot());
+        }
         for row in 0..count(8) {
             let byte = traps[row * TRAP_ROW + 4];
             if TrapKind::from_byte(byte).is_none() {
@@ -923,7 +1100,14 @@ impl<'b> CodeView<'b> {
                 return Err(DecodeError::Kind { row: row as u32, byte });
             }
         }
-        Ok(CodeView { bytes, frame, code_align, relro_align, code, relro, targets, sites, words, pads, traps, subjects, names, text })
+        let view = CodeView { bytes, frame, code_align, relro_align, code, relro, targets, sites, words, pads, traps, subjects, positions, names, text };
+        check_position_references(
+            positions,
+            |row| (row[24], get32(row, 20)),
+            (0..view.sites()).map(|i| view.site(i)),
+            (0..view.words()).map(|i| view.word(i)),
+        ).map_err(DecodeError::Position)?;
+        Ok(view)
     }
 
     /// log2 of the alignment the code's first byte must be placed at ([`CodeRecord::code_align`]).
@@ -952,6 +1136,23 @@ impl<'b> CodeView<'b> {
 
     pub fn relro(&self) -> &'b [u8] {
         self.relro
+    }
+
+    pub fn positions(&self) -> usize {
+        self.positions.len()
+    }
+
+    pub fn position(&self, i: usize) -> PositionRow {
+        decode_position(&self.positions[i], i).expect("CodeView::read checked every source-position tag")
+    }
+
+    /// Refuse to copy canonical bytes into a form that cannot keep or resolve source slots.
+    pub fn require_positionless(&self, operation: &'static str) -> Result<(), RecordError> {
+        if self.positions.is_empty() {
+            Ok(())
+        } else {
+            Err(RecordError::UnresolvedPosition { operation, row: self.position(0) })
+        }
     }
 
     pub fn targets(&self) -> usize {

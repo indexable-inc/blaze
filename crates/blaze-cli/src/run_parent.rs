@@ -60,7 +60,7 @@ use blaze_ids::producer::{CodeBuilder, ProducerId};
 use blaze_ladder::body_ids::{self, BodyIds, DeclaredList, Form, How, Make, RowKind, Scratch, Unkeyed, Walk, WalkError};
 use blaze_ladder::code_records::{Builder, CodeKey, CodeRecordError, CodeStore, EntryError, NotEmitting, Settings, StoreError, TierName, content_key};
 use blaze_launch::wire::data::Datum;
-use blaze_ladder::run::make_one::{MOST_WALKED, Maker, NamesRecords};
+use blaze_ladder::run::make_one::{LoweringCounts, MOST_WALKED, Maker, NamesRecords};
 use blaze_ladder::run::special::{self, Roots, RootsError, SpecialMade, StartHead, make_special, special_of};
 use blaze_ladder::run::{OverflowChecks, RunError};
 use blaze_launch::wire::run::{Declared, Down, Failure, Needed, Symbol, Up};
@@ -155,6 +155,8 @@ pub enum ParentError {
     NoPersonality { function: Option<ItemKey>, path: Option<Box<str>>, symbol: [u8; 32] },
     /// The code record of `symbol` does not read as a code record (asked whether it lands).
     Decode { symbol: [u8; 32], why: blaze_code::record::DecodeError },
+    /// An item-relative slot of this code record could not be filled from today's source.
+    Position { symbol: [u8; 32], row: blaze_code::record::PositionRow, why: blaze_ladder::seam::PositionGap },
     /// The code record of `symbol` has unwind rows that do not read (asked whether it lands).
     Unwind { symbol: [u8; 32], why: blaze_code::unwind::UnwindError },
     /// The resolver was asked twice for `symbol` (`Needs` asks once: a bug).
@@ -242,6 +244,7 @@ impl fmt::Display for ParentError {
                 )
             }
             ParentError::Decode { symbol, why } => write!(f, "{rule}: the code record of symbol {} does not read: {why}", Hex(symbol)),
+            ParentError::Position { symbol, row, why } => write!(f, "{rule}: symbol {}, {:?} offset {} needs the {:?} of item {:#x} at byte {}: {why}", Hex(symbol), row.part, row.at, row.field, row.item, row.site),
             ParentError::Unwind { symbol, why } => write!(f, "{rule}: the unwind rows of the code record of symbol {}: {why}", Hex(symbol)),
             ParentError::ResolvedTwice { symbol } => write!(f, "{rule}: the symbol {} was resolved twice (run_parent.rs `Needs` asks once a symbol)", Hex(symbol)),
             ParentError::SpecialStatic { symbol } => write!(f, "{rule}: the run's special record {} names a static, and the specials are made over no program (run.md, \"Statics in the run\")", Hex(symbol)),
@@ -372,7 +375,17 @@ pub(crate) enum Resolved<'r> {
 /// at most once a symbol, however many needs name it, and never for a row placed from today's
 /// start list. The command's one impl is [`Lazy`].
 pub(crate) trait Resolve {
+    /// Read a model answer in the slot-bookkeeping tests.
+    #[cfg(test)]
     fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError>;
+    /// Resolve a publication, appending the values for its position rows in sealed order.
+    #[cfg(not(test))]
+    fn publication(&mut self, symbol: &Symbol, values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError>;
+    /// The slot-bookkeeping model's records have no positions.
+    #[cfg(test)]
+    fn publication(&mut self, symbol: &Symbol, _values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {
+        self.resolve(symbol)
+    }
     /// The sink the run's events go to (blaze-screen [`Watch`]): the loop tells it when the
     /// program starts and when a need is answered. [`Unwatched`] unless the resolver has one.
     fn watch(&self) -> &dyn Watch {
@@ -438,9 +451,15 @@ impl Start for Roots<'_> {
     }
 }
 
+/// Prepare a record for publication. Supply its source-position values and, if the
+/// program has no personality, say whether the record needs one.
+pub(crate) trait Publication {
+    fn for_publication(&mut self, symbol: [u8; 32], record: &[u8], no_personality: bool, values: &mut AVec<'_, u8>) -> Result<bool, ParentError>;
+}
+
 /// The front end, made only when a need requires it ([`Lazy`]): the roots on the first call
 /// the start list does not answer, the body ids and the maker on the first row stepped.
-pub(crate) trait Front {
+pub(crate) trait Front: Publication {
     type Start: Start;
     type Ids: Gate;
     type Maker: Make<Error = RunError>;
@@ -466,14 +485,6 @@ pub(crate) trait Front {
     /// malformed entry is refused as `symbol`'s (the instance the entry is of).
     fn each_vtable(&self, symbol: [u8; 32], entry: &[u8], each: &mut dyn FnMut(Symbol, &[u8]) -> Result<(), ParentError>) -> Result<(), ParentError> {
         blaze_ladder::code_records::statics::each_vtable_datum(entry, |vtable, datum| each(Symbol(vtable.0), datum), |why| ParentError::Entry { symbol, why })
-    }
-    /// Whether the code record `record` (of `symbol`) has a row that lands, so that its unwind
-    /// entry names a personality routine (blaze-code unwind.rs `Unwind::lands`). Asked only
-    /// when the run's head names no routine ([`no_routine_lands`]).
-    fn lands(&self, symbol: [u8; 32], record: &[u8]) -> Result<bool, ParentError> {
-        let view = blaze_code::record::CodeView::read(record).map_err(|why| ParentError::Decode { symbol, why })?;
-        let unwind = blaze_code::unwind::read(view).map_err(|why| ParentError::Unwind { symbol, why })?;
-        Ok(unwind.lands())
     }
     /// The item path of fn `item` (`krate::module::name`), for a refusal's words: `None` when
     /// the front cannot name it (the refusal then shows its key). Read only on an error's path.
@@ -506,9 +517,11 @@ pub(crate) trait Front {
 
 /// A code record that lands, refused when the run names no personality routine
 /// ([`ParentError::NoPersonality`]): `personality` is the run's head's; `function`, the record's
-/// fn (`None`: a special record). Nothing is read when the head names a routine.
-fn no_routine_lands<F: Front>(front: &mut F, personality: Option<CodeSymbol>, function: Option<ItemKey>, symbol: [u8; 32], record: &[u8]) -> Result<(), ParentError> {
-    if personality.is_some() || !front.lands(symbol, record)? {
+/// fn (`None`: a special record). The same decoded record supplies the position values.
+fn prepare_publication<F: Front>(
+    front: &mut F, personality: Option<CodeSymbol>, function: Option<ItemKey>, symbol: [u8; 32], record: &[u8], values: &mut AVec<'_, u8>,
+) -> Result<(), ParentError> {
+    if !front.for_publication(symbol, record, personality.is_none(), values)? {
         return Ok(());
     }
     let path = function.and_then(|item| front.path_of(item));
@@ -601,6 +614,59 @@ impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
     fn watch(&self) -> &dyn Watch {
         self.watch
     }
+}
+
+impl Publication for CommandFront<'_, '_, '_> {
+    fn for_publication(&mut self, symbol: [u8; 32], record: &[u8], no_personality: bool, values: &mut AVec<'_, u8>) -> Result<bool, ParentError> {
+        record_publication(symbol, record, no_personality, values, || self.names())
+    }
+}
+
+impl Publication for crate::test_drive::TestFront<'_, '_, '_> {
+    fn for_publication(&mut self, symbol: [u8; 32], record: &[u8], no_personality: bool, values: &mut AVec<'_, u8>) -> Result<bool, ParentError> {
+        record_publication(symbol, record, no_personality, values, || Ok(self.names))
+    }
+}
+
+fn record_publication<'h>(
+    symbol: [u8; 32], record: &[u8], no_personality: bool, values: &mut AVec<'_, u8>,
+    names: impl FnOnce() -> Result<NamesRecords<'h>, ParentError>,
+) -> Result<bool, ParentError> {
+    let view = blaze_code::record::CodeView::read(record).map_err(|why| ParentError::Decode { symbol, why })?;
+    if no_personality && blaze_code::unwind::read(view).map_err(|why| ParentError::Unwind { symbol, why })?.lands() {
+        return Ok(true);
+    }
+    if view.positions() != 0 {
+        // A store hit can be the first need of the run. Resolving the coordinates from
+        // today's names records needs neither a body check nor a maker.
+        let records = names()?.records;
+        let alloc = *values.allocator();
+        position_values(&view, symbol, values, |item, site| records.source_position(item, site, alloc))?;
+    }
+    Ok(false)
+}
+
+fn position_values(
+    view: &blaze_code::record::CodeView<'_>,
+    symbol: [u8; 32],
+    values: &mut AVec<'_, u8>,
+    mut source: impl FnMut(ItemKey, u32) -> Result<(u32, u32), blaze_ladder::seam::PositionGap>,
+) -> Result<(), ParentError> {
+    let mut previous = None;
+    for index in 0..view.positions() {
+        let row = view.position(index);
+        let site = (ItemKey(row.item), row.site);
+        let answer = match previous {
+            Some((last, answer)) if last == site => answer,
+            _ => {
+                let answer = source(site.0, site.1).map_err(|why| ParentError::Position { symbol, row, why })?;
+                previous = Some((site, answer));
+                answer
+            }
+        };
+        values.extend_from_slice(&row.field.value(answer).to_le_bytes());
+    }
+    Ok(())
 }
 
 impl<'h, 'c, 'r> CommandFront<'h, 'c, 'r> {
@@ -760,6 +826,7 @@ impl fmt::Display for StartTally {
 pub(crate) struct RunTally {
     pub codes: Tally,
     pub start: StartTally,
+    pub lowerings: LoweringCounts,
 }
 
 /// The body ids and the maker: made on the first row stepped.
@@ -868,6 +935,13 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
 
     pub(crate) fn tally(&self) -> Tally {
         self.tally
+    }
+
+    pub(crate) fn lowering_counts<'h>(&self) -> LoweringCounts
+    where
+        F: Front<Maker = Maker<'h>>,
+    {
+        self.started.as_ref().and_then(|s| s.heavy.as_ref()).map_or_else(LoweringCounts::default, |heavy| heavy.maker.lowering_counts())
     }
 
     pub(crate) fn folder(&self) -> &D {
@@ -1053,7 +1127,15 @@ fn count(tally: &mut Tally, how: How) {
 }
 
 impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
+    #[cfg(test)]
     fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
+        let mut values = Vec::new_in(self.alloc);
+        let answer = self.publication(symbol, &mut values)?;
+        assert!(values.is_empty(), "the position-free model expected a plain publication");
+        Ok(answer)
+    }
+
+    fn publication(&mut self, symbol: &Symbol, values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {
         let Lazy { cx, front, folder, store, builder, alloc, started, placed, declares, ahead, told, data, statics, named, tally, built } = self;
         // The profile's why (rule 16): the first need that built the front end, by its symbol.
         if started.is_none() && *built == Built::No {
@@ -1086,7 +1168,7 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             cx.span(FIRST_CALL_SPAN).event(HOW_SPECIAL);
             let entry = store.get(made.key).map_err(|why| ParentError::Store { symbol: symbol.0, why })?.ok_or(ParentError::NotStored { symbol: symbol.0 })?;
             let record = front.record_of(entry).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
-            no_routine_lands(&mut *front, started.start.head().personality, None, symbol.0, record)?;
+            prepare_publication(&mut *front, started.start.head().personality, None, symbol.0, record, values)?;
             let id = folder.file(record)?;
             started.list.clear();
             front.form().declared(entry, &mut started.list).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
@@ -1153,7 +1235,7 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             (None, How::Made | How::Unkeyed(_) | How::Waiting) => started.scratch.made(),
         };
         let record = front.record_of(entry).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
-        no_routine_lands(&mut *front, started.start.head().personality, Some(started.walk.tabled(row)), symbol.0, record)?;
+        prepare_publication(&mut *front, started.start.head().personality, Some(started.walk.tabled(row)), symbol.0, record, values)?;
         let id = folder.file(record)?;
         // An unkeyed instance's row in the next list: its entry's content key.
         let key = key.unwrap_or_else(|| content_key(entry));
@@ -1213,6 +1295,9 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
 /// writer tells it before the first record naming it. Whatever is left out is resolved at its
 /// first call like any other (rule 3: nothing is published that is not there). The start's
 /// head: the list's when there is one (nothing of the front end is made), else the roots'.
+/// `Needs::first_answer` omits groups requiring source positions when it writes the list.
+/// This replay therefore needs no source lookup. A later group can still name a static
+/// from an omitted group, which is why its dependencies are checked here.
 /// `kept` holds the rows placed.
 pub(crate) fn ahead_of<F: Front, D: Folder, A: Allocator>(
     today: Option<TodayRows<'_>>,
@@ -1300,6 +1385,9 @@ pub(crate) struct Needs<'a> {
     /// The records published, by id, sorted: every static each names was on the child before
     /// it, so publishing one again needs nothing more.
     cleared: AVec<'a, [u8; 32]>,
+    /// The current run's values for records carrying source positions, kept until its last
+    /// need so a repeat publication sends the same values. These groups cannot be replayed.
+    positioned: ByHash<[u8; 32], AVec<'a, u8>, Alloc<'a>>,
     /// The data of the `Data` at hand (those not sent before), reused.
     batch: AVec<'a, Datum>,
     /// The next message's id.
@@ -1344,6 +1432,7 @@ impl<'a> Needs<'a> {
             first: start_list::Rows::new_in(alloc),
             sent: Vec::new_in(alloc),
             cleared: Vec::new_in(alloc),
+            positioned: ByHash::new_in(alloc),
             batch: Vec::new_in(alloc),
             next_id: 0,
             closed: false,
@@ -1422,7 +1511,10 @@ impl<'a> Needs<'a> {
             }
         }
         let id = self.id();
-        Down::Publish { slot, tier: Tier::Zero, record }.encode(id, out)?;
+        match self.positioned.get(&record.0) {
+            Some(values) => Down::Positioned { slot, tier: Tier::Zero, record, values: values.as_slice() },
+            None => Down::Publish { slot, tier: Tier::Zero, record },
+        }.encode(id, out)?;
         Ok(())
     }
 
@@ -1483,7 +1575,10 @@ impl<'a> Needs<'a> {
     /// may stand on that group's statics), and nothing fails.
     fn first_answer(&mut self, row: Row, named: &[Symbol]) -> Result<(), ParentError> {
         self.answered += 1;
-        if self.closed {
+        // The list has no column for a source file's identity or the values resolved from
+        // it. Keep the whole group off the list, including data first sent with this record.
+        // On replay ahead_of also omits any later group relying on those missing data.
+        if self.closed || self.positioned.contains_key(&row.record.0) {
             return Ok(());
         }
         if !self.first.fits(self.batch.len() + named.len() + 1) {
@@ -1601,12 +1696,16 @@ impl<'a> Needs<'a> {
             Answer::Unknown => self.failed(need, out),
             Answer::NotAsked => {
                 self.resolved += 1;
-                match resolve.resolve(&symbol)? {
+                let mut values = Vec::new_in(self.alloc);
+                match resolve.publication(&symbol, &mut values)? {
                     Resolved::Unknown => {
                         self.settle(symbol, Answer::Unknown);
                         self.failed(need, out)
                     }
                     Resolved::Record { key, record, declares, data, named } => {
+                        if !values.is_empty() {
+                            self.positioned.insert(record.0, values);
+                        }
                         let slot = self.slot_of(symbol)?;
                         for each in declares {
                             self.slot_of(*each)?;
@@ -1640,3 +1739,85 @@ mod tests;
 #[cfg(test)]
 #[path = "run_replay_tests.rs"]
 mod replay_tests;
+
+#[cfg(test)]
+#[test]
+fn positioned_publications_send_current_values_and_leave_the_whole_group_off_the_list() {
+    use blaze_code::record::{CodeRecord, CodeView, PositionField, PositionPart, PositionRow};
+    use blaze_ladder::seam::PositionGap;
+
+    const FUNCTION: Symbol = Symbol([1; 32]);
+    const STATIC: Symbol = Symbol([2; 32]);
+    const OTHER: Symbol = Symbol([3; 32]);
+    const DATUM: Datum = Datum { symbol: STATIC, record: RecordId([4; 32]) };
+    let frame = bstd::mem::Frame::with_reserve(1 << 17, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let mut record = CodeRecord::new_in(alloc);
+    record.relro.resize(8, 0);
+    let line = PositionRow { part: PositionPart::Relro, at: 0, item: 91, site: 17, field: PositionField::Line };
+    record.positions.push(line);
+    record.positions.push(PositionRow { at: 4, field: PositionField::Col, ..line });
+    let mut bytes = Vec::new_in(alloc);
+    record.seal().expect("two four-byte slots").encode(&mut bytes);
+    let view = CodeView::read(&bytes).expect("sealed record");
+
+    struct FromSource<'r> {
+        view: CodeView<'r>,
+        at: Result<(u32, u32), PositionGap>,
+        reads: usize,
+    }
+    impl Resolve for FromSource<'_> {
+        fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
+            Ok(Resolved::Record {
+                record: if *symbol == FUNCTION { RecordId(blaze_blake3::hash(self.view.bytes())) } else { RecordId(symbol.0) },
+                key: CodeKey(blaze_ids::ContentId(symbol.0)),
+                declares: &[],
+                data: if *symbol == FUNCTION { &[DATUM] } else { &[] },
+                named: if *symbol == FUNCTION { &[STATIC] } else { &[] },
+            })
+        }
+        fn publication(&mut self, symbol: &Symbol, values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {
+            if *symbol == FUNCTION {
+                position_values(&self.view, symbol.0, values, |item, site| {
+                    assert_eq!((item, site), (ItemKey(91), 17));
+                    self.reads += 1;
+                    self.at
+                })?;
+            }
+            self.resolve(symbol)
+        }
+    }
+
+    for source_line in [11u32, 14] {
+        let mut front = FromSource { view, at: Ok((source_line, 7)), reads: 0 };
+        let mut needs = Needs::new(alloc);
+        let mut out = std::vec::Vec::new();
+        for need in [Needed::Symbol(FUNCTION), Needed::Slot(Slot(0)), Needed::Symbol(OTHER)] {
+            needs.answer(need, &mut front, &mut out).expect("served");
+        }
+        assert_eq!(front.reads, 1, "one lookup gives both fields and every repeat need");
+        let want = Row { symbol: OTHER, key: CodeKey(blaze_ids::ContentId(OTHER.0)), record: RecordId(OTHER.0) };
+        assert_eq!(needs.first(), &[Line::Code(want)], "the positioned record's data, name and code share its eligibility");
+        let mut position_count = 0;
+        let mut rest = out.as_slice();
+        while let Some((item, len)) = split(rest).expect("whole frame") {
+            if let (_, Down::Positioned { record, slot, values, .. }) = Down::decode(item).expect("valid publication") {
+                assert_eq!((record, slot), (RecordId(blaze_blake3::hash(&bytes)), Slot(0)));
+                assert_eq!(values, [source_line.to_le_bytes(), 7u32.to_le_bytes()].concat().as_slice());
+                position_count += 1;
+            }
+            rest = &rest[len..];
+        }
+        assert_eq!(position_count, 2);
+    }
+
+    // Remove the source entirely. The parent refuses the exact row before any frame is sent.
+    let mut front = FromSource { view, at: Err(PositionGap::Unanswered), reads: 0 };
+    let mut needs = Needs::new(alloc);
+    let mut out = std::vec::Vec::new();
+    let error = needs.answer(Needed::Symbol(FUNCTION), &mut front, &mut out).expect_err("no resolver");
+    assert!(matches!(error, ParentError::Position { symbol, row, why: PositionGap::Unanswered } if symbol == FUNCTION.0 && row == line));
+    assert!(out.is_empty() && needs.first().is_empty());
+    std::println!("positions: (11, 7) then (14, 7), no positioned group replayed, missing source refused");
+}

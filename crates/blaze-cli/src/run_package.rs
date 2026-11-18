@@ -41,11 +41,13 @@ const MOST_PASSES: usize = 64;
 pub struct Select<'a> {
     pub package: Option<&'a str>,
     pub bin: Option<&'a str>,
+    /// Every `-p` in a test command. A run selects its single package above.
+    pub test_packages: &'a [&'a str],
 }
 
 impl Select<'_> {
     /// Neither flag: the rule's defaults.
-    pub const NONE: Select<'static> = Select { package: None, bin: None };
+    pub const NONE: Select<'static> = Select { package: None, bin: None, test_packages: &[] };
 }
 
 /// The program chosen: its package, the package's manifest, the binary's crate root (each
@@ -99,6 +101,8 @@ pub enum PickError {
     DefaultNotMember { path: Owned },
     /// The root's `default-members` is not an array of strings, at its line and column.
     DefaultMembers { line: usize, column: usize },
+    /// The root manifest could not be read as TOML while locating its default members.
+    RootToml(blaze_toml::Error),
 }
 
 /// Each item, back-quoted, comma-separated.
@@ -115,7 +119,7 @@ impl core::fmt::Display for PickError {
         let rule = "run_package.rs";
         match self {
             PickError::NoSuchPackage { asked, packages } => {
-                write!(f, "`blaze run -p {asked}`: the workspace has no package `{asked}`; its packages: ")?;
+                write!(f, "`-p {asked}`: the workspace has no package `{asked}`; its packages: ")?;
                 listed(f, packages)?;
                 write!(f, " ({rule})")
             }
@@ -150,11 +154,12 @@ impl core::fmt::Display for PickError {
                 write!(f, " ({rule})")
             }
             PickError::DefaultNotMember { path } => {
-                write!(f, "`blaze run`: the root's `default-members` names `{path}`, which is no member of the workspace ({rule})")
+                write!(f, "the root's `default-members` names `{path}`, which is no member of the workspace ({rule})")
             }
             PickError::DefaultMembers { line, column } => {
-                write!(f, "`blaze run`: the root's `default-members` at line {line}, column {column} is not an array of paths ({rule})")
+                write!(f, "the root's `default-members` at line {line}, column {column} is not an array of paths ({rule})")
             }
+            PickError::RootToml(error) => write!(f, "the workspace root's Cargo.toml while reading `default-members`: {error} ({rule})"),
         }
     }
 }
@@ -163,16 +168,20 @@ fn owned(text: &str) -> Owned {
     Owned::from(text)
 }
 
+fn named<'u, 'a>(members: &'u [Member<'a>], asked: &str) -> Result<&'u Member<'a>, PickError> {
+    members.iter().find(|member| member.name.as_str() == asked).ok_or_else(|| PickError::NoSuchPackage {
+        asked: owned(asked),
+        packages: members.iter().map(|member| owned(member.name.as_str())).collect(),
+    })
+}
+
 /// The package and binary `select` chooses from the workspace's layout, the root's manifest
 /// text beside it (for `default-members`).
-fn choose<'u, 'a>(units: &'u Units<'a>, root_text: &str, select: Select<'_>) -> Result<(&'u Member<'a>, &'u Target<'a>), PickError> {
+fn choose<'u, 'a>(units: &'u Units<'a>, root_text: &str, select: Select<'_>, frame: &Frame) -> Result<(&'u Member<'a>, &'u Target<'a>), PickError> {
     let members = units.members.as_slice();
     let with_bins = || -> Owneds { members.iter().filter(|member| !member.bins.is_empty()).map(|member| owned(member.name.as_str())).collect() };
     let member = match (select.package, select.bin) {
-        (Some(asked), _) => match members.iter().find(|member| member.name.as_str() == asked) {
-            Some(member) => member,
-            None => return Err(PickError::NoSuchPackage { asked: owned(asked), packages: members.iter().map(|member| owned(member.name.as_str())).collect() }),
-        },
+        (Some(asked), _) => named(members, asked)?,
         (None, Some(asked)) => {
             let mut having = members.iter().filter(|member| member.bins.iter().any(|bin| bin.name.as_str() == asked));
             match (having.next(), having.next()) {
@@ -194,17 +203,13 @@ fn choose<'u, 'a>(units: &'u Units<'a>, root_text: &str, select: Select<'_>) -> 
             None => {
                 // The members `default-members` names that have a binary (each once); with none
                 // written, every member.
-                let defaults = default_members(root_text)?;
-                let mut programs: std::vec::Vec<&'u Member<'a>, std::alloc::Global> = std::vec::Vec::new();
-                for path in defaults.iter() {
-                    let Some(member) = members.iter().find(|member| member.dir.as_str() == path.as_ref()) else {
-                        return Err(PickError::DefaultNotMember { path: path.clone() });
-                    };
+                let mut programs: Vec<&Member<'_>, &Frame> = Vec::new_in(frame);
+                let defaults = for_defaults(root_text, members, frame, |member| {
                     if !member.bins.is_empty() && !programs.iter().any(|seen| core::ptr::eq(*seen, member)) {
                         programs.push(member);
                     }
-                }
-                if defaults.is_empty() {
+                })?;
+                if defaults != DefaultPaths::Listed {
                     programs.extend(members.iter().filter(|member| !member.bins.is_empty()));
                 }
                 match programs.as_slice() {
@@ -234,17 +239,25 @@ fn choose<'u, 'a>(units: &'u Units<'a>, root_text: &str, select: Select<'_>) -> 
     Ok((member, bin))
 }
 
-/// The root's `workspace.default-members`, each path as a member's directory is written
-/// (root-relative, no `./`, no trailing `/`; `.` is the root's own); empty when none is written.
-fn default_members(root_text: &str) -> Result<Owneds, PickError> {
-    let mut paths = Owneds::new();
-    // The layout read this text already: a manifest it refused never comes here.
-    let Ok(doc) = blaze_toml::Document::parse_in(root_text, blaze_toml::Limits::CARGO, std::alloc::Global) else { return Ok(paths) };
-    let Some(item) = doc.root().get("workspace").and_then(|workspace| workspace.get("default-members")) else { return Ok(paths) };
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DefaultPaths {
+    Absent,
+    Empty,
+    Listed,
+}
+
+/// Visit the members named by the root's `workspace.default-members`. An explicitly empty
+/// array selects zero test packages. The existing single-program picker treats it as absent.
+fn for_defaults<'u, 'a>(
+    root_text: &str, members: &'u [Member<'a>], frame: &Frame, mut visit: impl FnMut(&'u Member<'a>),
+) -> Result<DefaultPaths, PickError> {
+    let doc = blaze_toml::Document::parse_in(root_text, blaze_toml::Limits::CARGO, frame).map_err(PickError::RootToml)?;
+    let Some(item) = doc.root().get("workspace").and_then(|workspace| workspace.get("default-members")) else { return Ok(DefaultPaths::Absent) };
     let (line, column) = item.line_col();
     if !item.is_array() {
         return Err(PickError::DefaultMembers { line, column });
     }
+    let mut paths = DefaultPaths::Empty;
     for entry in item.children() {
         let Some(path) = entry.as_str() else {
             let (line, column) = entry.line_col();
@@ -254,7 +267,11 @@ fn default_members(root_text: &str) -> Result<Owneds, PickError> {
         while let Some(rest) = path.strip_prefix("./") {
             path = rest;
         }
-        paths.push(owned(if path == "." { "" } else { path }));
+        let path = if path == "." { "" } else { path };
+        let member = members.iter().find(|member| member.dir.as_str() == path)
+            .ok_or_else(|| PickError::DefaultNotMember { path: owned(path) })?;
+        visit(member);
+        paths = DefaultPaths::Listed;
     }
     Ok(paths)
 }
@@ -266,10 +283,52 @@ fn default_members(root_text: &str) -> Result<Owneds, PickError> {
 /// both is the layout's answer handed here, once the choice can wait for it.
 pub(crate) fn pick<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'_>, frame: &'f Frame) -> Result<Program<'f>, CliError> {
     let cx = cx.span("blaze run: which program");
+    with_layout(&cx, root, frame, |units, root_text| {
+        let (member, bin) = choose(units, root_text, select, frame).map_err(CliError::RunPackage)?;
+        let manifest = units.manifests.get(member.manifest.0 as usize).ok_or(CliError::Text { what: "the layout names a manifest it did not read (run_package.rs)" })?;
+        let edition = match member.edition.blaze {
+            Some(blaze) => blaze.manifest(),
+            None => kept(bstd::mem::format_in!(frame, "{}", member.edition.syntax).as_str(), frame)?,
+        };
+        Ok(Program { package: kept(member.name.as_str(), frame)?, manifest: kept(manifest.as_str(), frame)?, root: kept(bin.root.as_str(), frame)?, edition })
+    })
+}
+
+/// At the workspace root an explicit package overrides the default members. Without explicit
+/// defaults Cargo selects the root package of a real workspace and every member of a virtual one.
+pub(crate) fn test_packages<'f>(cx: &Cx, root: &Dir<ReadWrite>, asked: &[&str], frame: &'f Frame) -> Result<Vec<&'f str, &'f Frame>, CliError> {
+    let cx = cx.span("blaze test: selected packages");
+    with_layout(&cx, root, frame, |units, root_text| {
+        let members = units.members.as_slice();
+        let mut selected = Vec::new_in(frame);
+        if !asked.is_empty() {
+            for package in asked {
+                selected.push(named(members, package).map_err(CliError::RunPackage)?);
+            }
+        } else if for_defaults(root_text, members, frame, |member| selected.push(member)).map_err(CliError::RunPackage)? == DefaultPaths::Absent {
+            match members.iter().find(|member| member.manifest == units.root) {
+                Some(member) => selected.push(member),
+                None => selected.extend(members),
+            }
+        }
+        selected.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        selected.dedup_by(|a, b| core::ptr::eq(*a, *b));
+        let mut names = Vec::with_capacity_in(selected.len(), frame);
+        for member in selected {
+            names.push(kept(member.name.as_str(), frame)?);
+        }
+        Ok(names)
+    })
+}
+
+fn kept<'f>(text: &str, frame: &'f Frame) -> Result<&'f str, CliError> {
+    core::str::from_utf8(Vec::from_slice_in(text.as_bytes(), frame).leak()).map_err(|_| CliError::Text { what: "a manifest is not UTF-8" })
+}
+
+fn with_layout<'f, T>(
+    cx: &Cx, root: &Dir<ReadWrite>, frame: &'f Frame, select: impl FnOnce(&Units<'_>, &str) -> Result<T, CliError>,
+) -> Result<T, CliError> {
     let refused = |why: &dyn core::fmt::Display| CliError::Program(RunError::Manifest { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) });
-    let kept = |text: &str| -> Result<&'f str, CliError> {
-        core::str::from_utf8(Vec::from_slice_in(text.as_bytes(), frame).leak()).map_err(|_| CliError::Text { what: "a manifest is not UTF-8" })
-    };
     // Each manifest read (path, text), for the root's `default-members`.
     let mut read: Vec<(&'f str, &'f str), &'f Frame> = Vec::new_in(frame);
     let erased = blaze_own::Erased::new(frame);
@@ -278,36 +337,31 @@ pub(crate) fn pick<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'_>, frame
         let needs = match layout.pass().map_err(|e| refused(&e))? {
             Pass::Need(needs) => needs,
             Pass::Done(units) => {
-                let root_path = units.manifests.get(units.root.0 as usize).map_or("Cargo.toml", |path| path.as_str());
-                let root_text = read.iter().find(|(path, _)| *path == root_path).map_or("", |(_, text)| *text);
-                let (member, bin) = choose(&units, root_text, select).map_err(CliError::RunPackage)?;
-                let manifest = units.manifests.get(member.manifest.0 as usize).ok_or(CliError::Text { what: "the layout names a manifest it did not read (run_package.rs)" })?;
-                let edition = match member.edition.blaze {
-                    Some(blaze) => blaze.manifest(),
-                    None => kept(bstd::mem::format_in!(frame, "{}", member.edition.syntax).as_str())?,
-                };
-                return Ok(Program { package: kept(member.name.as_str())?, manifest: kept(manifest.as_str())?, root: kept(bin.root.as_str())?, edition });
+                let root_path = units.manifests.get(units.root.0 as usize).ok_or(CliError::Text { what: "the layout names no root manifest (run_package.rs)" })?;
+                let (_, text) = read.iter().find(|(path, _)| *path == root_path.as_str())
+                    .ok_or(CliError::Text { what: "the root manifest is absent from the layout's reads (run_package.rs)" })?;
+                return select(&units, text);
             }
         };
         for need in needs.iter() {
             match need {
                 Need::Manifest(path) => {
                     let mut bytes = Bytes::new_in(frame, "a manifest");
-                    let text = match root.read_all(&cx, &Path::new(path.as_str())?, &mut bytes) {
-                        Ok(_) => Some(kept(core::str::from_utf8(bytes.as_slice()).map_err(|_| CliError::Text { what: "a manifest is not UTF-8" })?)?),
+                    let text = match root.read_all(cx, &Path::new(path.as_str())?, &mut bytes) {
+                        Ok(_) => Some(kept(core::str::from_utf8(bytes.as_slice()).map_err(|_| CliError::Text { what: "a manifest is not UTF-8" })?, frame)?),
                         Err(error) if error.kind == bstd::fs::FsKind::NotFound => None,
                         Err(error) => return Err(error.into()),
                     };
                     if let Some(text) = text {
-                        read.push((kept(path.as_str())?, text));
+                        read.push((kept(path.as_str(), frame)?, text));
                     }
                     layout.manifest(path.as_str(), text).map_err(|e| refused(&e))?;
                 }
                 Need::Listing(dir) => {
                     // `Dir::list` gives no entries for a directory that is not there.
                     let listed = match dir.as_str() {
-                        "" => root.list(&cx, frame)?,
-                        named => root.subdir(&Path::new(named)?).list(&cx, frame)?,
+                        "" => root.list(cx, frame)?,
+                        named => root.subdir(&Path::new(named)?).list(cx, frame)?,
                     };
                     let mut entries: Vec<Entry<'_>, &Frame> = Vec::with_capacity_in(listed.len(), frame);
                     for (path, meta) in listed.iter() {
@@ -330,20 +384,24 @@ mod tests {
 
     use super::*;
 
-    /// The choice `select` makes in a simulated checkout of `files` (path, text), its texts
-    /// copied out of the command's frame.
-    fn picked(files: &[(&str, &str)], select: Select<'_>) -> Result<(std::string::String, std::string::String, std::string::String), PickError> {
+    fn checkout<T>(files: &[(&str, &str)], read: impl FnOnce(&Cx, &Dir<ReadWrite>) -> T) -> T {
         let io = Io::simulated(SimWorld::new(1, Limits::USUAL));
         let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
         let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("data").expect("a path")).expect("open");
         for (path, text) in files {
             root.publish(&cx, &Path::new(path).expect("a path"), Content::bytes(text.as_bytes()), Durable::No).expect("write");
         }
-        match pick(&cx, &root, select, cx.frame()) {
+        read(&cx, &root)
+    }
+
+    /// The choice `select` makes in a simulated checkout of `files` (path, text), its texts
+    /// copied out of the command's frame.
+    fn picked(files: &[(&str, &str)], select: Select<'_>) -> Result<(std::string::String, std::string::String, std::string::String), PickError> {
+        checkout(files, |cx, root| match pick(cx, root, select, cx.frame()) {
             Ok(program) => Ok((program.package.into(), program.manifest.into(), program.root.into())),
             Err(CliError::RunPackage(why)) => Err(why),
             Err(other) => panic!("a refusal that is not the choice's: {other}"),
-        }
+        })
     }
 
     fn package(name: &str) -> std::string::String {
@@ -376,6 +434,31 @@ mod tests {
 
     const THREE: &str = "[workspace]\nmembers = [\"app\", \"tool\", \"lib\"]\n";
 
+    #[test]
+    fn test_selection_honors_workspace_defaults_before_the_root_package() {
+        let project = std::format!("{}\n{THREE}", package("here"));
+        let explicit = std::format!("{project}default-members = [\"./tool/\", \"lib\", \"tool\"]\n");
+        let empty = std::format!("{project}default-members = []\n");
+        for (manifest, expected) in [
+            (THREE, &["app", "lib", "tool"][..]),
+            (project.as_str(), &["here"][..]),
+            (explicit.as_str(), &["lib", "tool"][..]),
+            (empty.as_str(), &[][..]),
+        ] {
+            virtual_three(manifest, |files| {
+                let mut files = files.to_vec();
+                files.push(("src/main.rs", "fn main() {}"));
+                checkout(&files, |cx, root| {
+                    let defaults = test_packages(cx, root, &[], cx.frame()).expect("test's default packages");
+                    assert_eq!(defaults.as_slice(), expected);
+                    let explicit = test_packages(cx, root, &["tool", "app", "tool"], cx.frame()).expect("the named packages");
+                    assert_eq!(explicit.as_slice(), ["app", "tool"]);
+                    assert!(matches!(test_packages(cx, root, &["absent", "app"], cx.frame()), Err(CliError::RunPackage(PickError::NoSuchPackage { .. }))));
+                });
+            });
+        }
+    }
+
     /// The checkout's root is a package with `src/main.rs`: it is the program, with no flag.
     #[test]
     fn the_root_package_is_the_program() {
@@ -391,10 +474,10 @@ mod tests {
     #[test]
     fn a_virtual_root_runs_the_package_p_names() {
         virtual_three(THREE, |files| {
-            assert_eq!(picked(files, Select { package: Some("tool"), bin: None }), Ok(triple("tool", "tool/Cargo.toml", "tool/src/main.rs")));
-            assert_eq!(picked(files, Select { package: Some("lib"), bin: None }), Err(PickError::NoBinary { package: owned("lib") }));
+            assert_eq!(picked(files, Select { package: Some("tool"), ..Select::NONE }), Ok(triple("tool", "tool/Cargo.toml", "tool/src/main.rs")));
+            assert_eq!(picked(files, Select { package: Some("lib"), ..Select::NONE }), Err(PickError::NoBinary { package: owned("lib") }));
             assert_eq!(
-                picked(files, Select { package: Some("nope"), bin: None }),
+                picked(files, Select { package: Some("nope"), ..Select::NONE }),
                 Err(PickError::NoSuchPackage { asked: owned("nope"), packages: strings(&["app", "tool", "lib"]) })
             );
         });
@@ -444,14 +527,14 @@ mod tests {
     fn bin_picks_among_a_packages_binaries() {
         let two = std::format!("{}\n[[bin]]\nname = \"extra\"\npath = \"src/extra.rs\"\n", package("two"));
         let files = [("Cargo.toml", two.as_str()), ("src/main.rs", "fn main() {}"), ("src/extra.rs", "fn main() {}")];
-        assert_eq!(picked(&files, Select { package: None, bin: Some("extra") }), Ok(triple("two", "Cargo.toml", "src/extra.rs")));
-        assert_eq!(picked(&files, Select { package: Some("two"), bin: Some("two") }), Ok(triple("two", "Cargo.toml", "src/main.rs")));
+        assert_eq!(picked(&files, Select { bin: Some("extra"), ..Select::NONE }), Ok(triple("two", "Cargo.toml", "src/extra.rs")));
+        assert_eq!(picked(&files, Select { package: Some("two"), bin: Some("two"), ..Select::NONE }), Ok(triple("two", "Cargo.toml", "src/main.rs")));
         let Err(PickError::WhichBin { package, bins }) = picked(&files, Select::NONE) else { panic!("two binaries and no `--bin`") };
         assert_eq!((package, bins.len()), (owned("two"), 2));
-        assert!(matches!(picked(&files, Select { package: Some("two"), bin: Some("nope") }), Err(PickError::NoSuchBin { package: Some(_), .. })));
+        assert!(matches!(picked(&files, Select { package: Some("two"), bin: Some("nope"), ..Select::NONE }), Err(PickError::NoSuchBin { package: Some(_), .. })));
         virtual_three(THREE, |files| {
-            assert_eq!(picked(files, Select { package: None, bin: Some("app") }), Ok(triple("app", "app/Cargo.toml", "app/src/main.rs")));
-            assert!(matches!(picked(files, Select { package: None, bin: Some("nope") }), Err(PickError::NoSuchBin { package: None, .. })));
+            assert_eq!(picked(files, Select { bin: Some("app"), ..Select::NONE }), Ok(triple("app", "app/Cargo.toml", "app/src/main.rs")));
+            assert!(matches!(picked(files, Select { bin: Some("nope"), ..Select::NONE }), Err(PickError::NoSuchBin { package: None, .. })));
         });
     }
 

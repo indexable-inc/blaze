@@ -176,7 +176,7 @@ pub(crate) fn launcher_beside<'f>(exe: &str, frame: &'f Frame) -> Result<bstd::m
 /// `Effect::StartProgram` site): the list is read under it before the start and written under
 /// it at exit (the module's doc).
 #[expect(clippy::too_many_arguments, reason = "the own-process run's edge: each argument one input, handle or allocator of it")]
-pub(crate) fn run_own<F: Front>(
+pub(crate) fn run_own<'h, F: Front<Maker = blaze_ladder::run::make_one::Maker<'h>>>(
     cx: &Cx,
     launch: &Launch<'_>,
     package: &str,
@@ -257,7 +257,7 @@ pub(crate) fn run_own<F: Front>(
         run_loop::run_program(&cx, &spawner, &started, &mut needs, &mut lazy, &ahead, alloc)
     };
     let tally = lazy.tally();
-    *counted = Some(run_parent::RunTally { codes: tally, start: needs.start_tally(lazy.built(), listed) });
+    *counted = Some(run_parent::RunTally { codes: tally, start: needs.start_tally(lazy.built(), listed), lowerings: lazy.lowering_counts() });
     // A crash the program's handler told by place, named while the walk is alive (rule 19,
     // run_fault.rs): the fn by its path, the trap by the instruction in its record.
     let mut struck_in = bstd::mem::Bytes::new_in(frame, "the code record a crash struck in");

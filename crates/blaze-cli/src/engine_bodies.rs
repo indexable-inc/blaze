@@ -1,6 +1,6 @@
 //! The `Bodies` stage of `blaze engine-check` (engine.md E5/E6, "The design" 4): every body of
 //! the workspace's files type-checked and borrow-checked as ITS OWN engine task, entered once, on
-//! the pool, by lane VW's `check_body` (front2 tables/task.rs) over the read-only view.
+//! the pool, by `check_body_reads` (front2 tables/task.rs) over the read-only view.
 //!
 //! THE PLAN, from text: one `BodyCheck` task per body part of each file's outline (work.rs
 //! `outline_file`: one part per entry with a body of its own, and per entry a macro takes), its
@@ -18,8 +18,8 @@
 //! THE RUNS: the bodies of one member cut into runs of at most [`RUN`], each run a task of one
 //! bstd scope; a run opens its own `Records` over the shared bytes (`Records` opens lazily
 //! through `RefCell`s: never shared between threads, view.rs), and every body of the run is
-//! checked over one `Tables` with its own recorder (task.rs). Nothing mutable is shared between
-//! bodies. A panic fails its body alone (rule 20).
+//! checked over one `Tables` with its own recorder (task.rs). The stretch memoizes the IDs
+//! of distinct questions over those tables. A panic fails its body alone (rule 20).
 //!
 //! WHAT A BODY READS, as the engine keys its readers: the view records names, lang, head and
 //! impl-bucket cells. A crate's `ImplBucket` cell is read as read: the Heads stage defines it
@@ -31,9 +31,8 @@
 //! entry that covers it (engine_heads.rs `Owners::place`; the body still makes the heads it
 //! needs in its own store, task.rs), so a signature edit enters exactly the bodies whose head
 //! read moved; a dependency's head, or one a macro wrote, is its crate's names record whole.
-//! Widened reads
-//! are a superset of the true ones: an edit can enter a body that did not need it, never miss
-//! one. So `Make` made nothing inline here: every cell a body reads is the engine's.
+//! Settled names and impl tables share the graph's cell (engine_scope_reads.rs). Raw read
+//! keys stay in the recorder until distinct, and only final row IDs need the engine's digests.
 
 use core::convert::Infallible;
 use core::num::NonZeroU32;
@@ -41,7 +40,7 @@ use core::num::NonZeroU32;
 use blaze_drive::cells::Cell;
 use blaze_drive::key::ABSENT;
 use blaze_drive::{Input, Kind, Locate, Name};
-use blaze_engine::{Buffer, CellId, Done, Made, Phase, Planned, SVec, Stage, Task, View};
+use blaze_engine::{Buffer, CellId, Done, Phase, Planned, SVec, Stage, Task, View};
 use blaze_id::ItemKey;
 use blaze_ids::{ContentId, Hasher};
 use blaze_ladder::front2::buckets::{ImplShelf, ImplShelfOpts, TableSet};
@@ -52,9 +51,9 @@ use blaze_ladder::front2::source::NamesSource;
 use blaze_ladder::front2::tables::cost::{Cost, Gauge};
 use blaze_ladder::front2::heads::Want;
 use blaze_ladder::front2::tables::head::{CellFailure, ConstValues, FreezeError, NotTheirs, SeededHeads, SeededHeadsOpts, cell_id as head_cell_id};
-use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts};
+use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts, TableRead};
 use blaze_ladder::front2::tables::seeds::{HeadSeed, RequestSeed, RequestSeedOpts, SeedError};
-use blaze_ladder::front2::tables::task::{BodyFrame, Make, MakeRefused, Said as Line, SaidWhat, TaskError, WorkBytes, check_body_split};
+use blaze_ladder::front2::tables::task::{BodyFrame, ReadIds, Said as Line, SaidWhat, TaskError, WorkBytes, check_body_reads};
 use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
 use blaze_own::{SharedAlloc, Vec};
 use blaze_scope::crate_env::EnvLent;
@@ -75,7 +74,8 @@ use crate::engine_head_notes::{Cause, RootKind, Step, leak, root_cause};
 use crate::engine_memory::InStretch;
 use crate::engine_names::NamesStage;
 use crate::engine_records::EngineRecords;
-use crate::engine_tasks::{CELLS, Outlined, WHOLE};
+use crate::engine_scope_reads::ReadGrains;
+use crate::engine_tasks::{Outlined, WHOLE};
 use crate::fetch::FetchEnv;
 use crate::run_names::Crate;
 use crate::work;
@@ -317,6 +317,9 @@ pub(crate) struct BodyMem {
     pub(crate) row_floor: u64,
     /// The cells its check read (each item's, before the evaluator's and the widening).
     pub(crate) recorded: u64,
+    ids_made: u64,
+    memo_hits: u64,
+    offered: u64,
     /// The cells handed to the widening (the evaluator's and the own crate's added).
     pub(crate) before: u64,
     /// The cells of its row, by kind: whole records, names cells, head cells, bucket cells, other.
@@ -335,7 +338,7 @@ pub(crate) struct BodyMem {
 }
 
 /// The parts of [`BodyMem`] a line says, in its order.
-const MEM_PARTS: usize = 19;
+const MEM_PARTS: usize = 22;
 
 impl BodyMem {
     fn parts(&self) -> [u64; MEM_PARTS] {
@@ -360,6 +363,9 @@ impl BodyMem {
             w.verdict,
             w.goal_hits,
             self.scratch,
+            self.ids_made,
+            self.memo_hits,
+            self.offered,
         ]
     }
 
@@ -438,7 +444,7 @@ impl BodyMemLive {
         let ratio = |of: usize, floor: usize| Tenths(sum(of).saturating_mul(10).checked_div(sum(floor)).unwrap_or(0));
         writeln!(
             into,
-            "bodies memory: {n} bodies · row kept to the request's end {} bytes a body (most {}; floor {}, {}x) · read cells a body: recorded {}/{}, before widening {}/{}, after {}/{} (whole records {}, names cells {}, head cells {}, bucket cells {}, other {}; scope crates {}) · freed as it ends, in its scratch: recorder {} bytes (most {}; floor {}, {}x), cells {} (most {}), held {}, said {}, verdict {}, goal hits {}; scratch at its end {} (most {})",
+            "bodies memory: {n} bodies · row kept to the request's end {} bytes a body (most {}; floor {}, {}x) · read cells a body: recorded {}/{}, before widening {}/{}, after {}/{} (whole records {}, names cells {}, head cells {}, bucket cells {}, other {}; scope crates {}) · ids made {} against {} reads recorded, memo hits {} · freed as it ends, in its scratch: recorder {} bytes (most {}; floor {}, {}x), cells {} (most {}), held {}, said {}, verdict {}, goal hits {}; scratch at its end {} (most {})",
             mean(0),
             most(0),
             mean(1),
@@ -455,6 +461,9 @@ impl BodyMemLive {
             mean(8),
             mean(9),
             mean(10),
+            sum(19),
+            sum(21),
+            sum(20),
             mean(11),
             most(11),
             mean(12),
@@ -527,6 +536,7 @@ thread_local! {
     /// reads kept one a bucket (as before) instead of its tables' `WHOLE`. Read on the
     /// coordinator's thread when a phase begins.
     pub(crate) static PLANT_FINE_BUCKETS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    pub(crate) static PLANT_ALL_DEPENDENCIES_SETTLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 /// The memory plants of lane BD3 as the coordinator read them ([`PLANT_ROW_AT_RECORDED`],
@@ -535,11 +545,17 @@ thread_local! {
 struct RowPlants {
     row_at_recorded: bool,
     fine_buckets: bool,
+    #[cfg(test)]
+    all_dependencies_settled: bool,
 }
 
 #[cfg(test)]
 fn planted_rows() -> RowPlants {
-    RowPlants { row_at_recorded: PLANT_ROW_AT_RECORDED.with(core::cell::Cell::get), fine_buckets: PLANT_FINE_BUCKETS.with(core::cell::Cell::get) }
+    RowPlants {
+        row_at_recorded: PLANT_ROW_AT_RECORDED.with(core::cell::Cell::get),
+        fine_buckets: PLANT_FINE_BUCKETS.with(core::cell::Cell::get),
+        all_dependencies_settled: PLANT_ALL_DEPENDENCIES_SETTLED.with(core::cell::Cell::get),
+    }
 }
 
 #[cfg(not(test))]
@@ -596,12 +612,6 @@ struct Group<'f, 'r> {
     lang: Vec<usize, Global>,
     /// Each scope crate's `CrateScope` name, sorted: the whole graph's bucket fact widens to these.
     scope: Vec<Name, Global>,
-    /// Each scope crate's impl tables' task name (front2 buckets/records.rs `impl_tables_name`)
-    /// with its `CrateScope` name, sorted by the first: how [`widen`] tells a dependency's
-    /// bucket read (its crate defines no `CELLS`), which it reads as the tables' `WHOLE`.
-    /// A slice, as `cells_of`'s lists are (the list's allocator handle is no `Sync`, and a
-    /// group is read by every run's worker).
-    buckets: &'f [(Name, Name)],
 }
 
 /// One crate's check scope with its records opened: what the Heads stage files a crate's impls
@@ -852,6 +862,7 @@ type Trees = (&'static [blaze_fetch::PackView<'static>], &'static [(u32, &'stati
 /// What [`BodiesStage::groups`] found: each member's group, each body's place, the files of
 /// member crates, and the members' names.
 struct Found<'f, 'r> {
+    grains: ReadGrains<'static>,
     groups: Vec<Group<'f, 'r>, Global>,
     /// One a body a unit's records found: in the request's heap, never the command's fixed
     /// frame; in the units' order, indexed by `holders`' decisions.
@@ -997,7 +1008,8 @@ impl<'f> BodiesStage<'f> {
         let began = handles.clock.now();
         let heap = handles.env.heap;
         // 1. Each member's check scope and files, and each body's item key, on this thread.
-        let found = self.groups(&cx, store, read, handles, frame)?;
+        let plants = planted_rows();
+        let found = self.groups(&cx, store, read, handles, view, plants, frame)?;
         let (found, stopped) = match found {
             Ok(found) => (Some(found), None),
             Err(why) => (None, Some(why)),
@@ -1011,6 +1023,7 @@ impl<'f> BodiesStage<'f> {
         // Each file's bodies' labels, made once a file the first time a body of it is refused
         // with none ([`planned_label`]); at most one entry an outlined file.
         let mut labels: Labels<'f> = Vec::new_in(frame);
+        let unit_cells = found.as_ref().map(|f| f.holders.unit_cells(&f.grains, heap.alloc()));
         for task in tasks.iter() {
             let name = task.planned.name;
             let file = handles.outlined.binary_search_by(|one| one.name.cmp(&task.planned.file)).map_or(u32::MAX, |at| u32::try_from(at).unwrap_or(u32::MAX));
@@ -1027,26 +1040,33 @@ impl<'f> BodiesStage<'f> {
                     use crate::engine_body_plan::{Decision, OutsideIs};
                     let decided = found.holders.decide(name, file, &mut passed, &mut met);
                     let label_of = |took: Option<u32>| took.and_then(|at| found.took.get(at as usize)).map_or("", |one| one.label);
+                    let plan_cells = || crate::engine_body_plan::Holders::cells(unit_cells.as_deref().expect("a found plan has its unit cells"), &passed, &met, frame);
+                    let ordered = || -> &'f [CellId] {
+                        let mut ids = plan_cells();
+                        ids.sort_unstable();
+                        ids.dedup();
+                        ids.leak()
+                    };
                     match decided {
                         Decision::Taken { took, .. } => {
                             // Held by a second unit too: checked under the first alone (the
                             // per-unit second check is the next piece), counted in the plan's line.
                             self.outside.shared += u32::from(found.holders.held_by_more(name));
-                            let held = found.holders.cells(view, &passed, &met, heap.alloc());
                             match found.took.get(took as usize).map(|one| (one, one.item)) {
                                 Some((one, Ok((group, items)))) => {
+                                    let held = plan_cells().leak();
                                     ones.push(One { task: *task, items, group, file, label: one.label, place: one.place, held });
                                     continue;
                                 }
                                 // A taken body is one its records hold (`BodyIs::Held` is an
                                 // `Ok` item): named if ever not, never skipped (rule 3).
-                                Some((one, Err(why))) => (why, held, one.label),
-                                None => ("its checking unit's find is gone (engine_body_plan.rs `decide`)", held, ""),
+                                Some((one, Err(why))) => (why, ordered(), one.label),
+                                None => ("its checking unit's find is gone (engine_body_plan.rs `decide`)", ordered(), ""),
                             }
                         }
                         // Found by a unit's records, refused by them: their cells, and those of
                         // every unit ranked before that does not hold it.
-                        Decision::Refused { why, took } => (why, found.holders.cells(view, &passed, &met, heap.alloc()), label_of(took)),
+                        Decision::Refused { why, took } => (why, ordered(), label_of(took)),
                         // No unit holds it: no unit's body, never a refusal. Done with no
                         // finding on the cells that say so (each unit's that reaches it), so a
                         // unit that comes to hold it enters it again.
@@ -1055,7 +1075,7 @@ impl<'f> BodiesStage<'f> {
                                 Decision::Absent { took } => (OutsideIs::EntryAbsent, label_of(took)),
                                 _ => (OutsideIs::FileNotHeld, ""),
                             };
-                            let cells = found.holders.cells(view, &passed, &met, heap.alloc());
+                            let cells = ordered();
                             let mut reads: SVec<'a, (CellId, ContentId)> = SVec::with_capacity_in(cells.len(), alloc);
                             for id in cells.iter() {
                                 reads.push((*id, view.cell(id)));
@@ -1094,7 +1114,7 @@ impl<'f> BodiesStage<'f> {
             for id in cells.iter() {
                 reads.push((*id, view.cell(id)));
             }
-            buffer.done.push(crate::engine_tasks::failed_with(task, reads, alloc));
+            buffer.done.push(Done { reads, ..crate::engine_tasks::failed(task, alloc) });
             // A body refused before any records named it is printed by the label a checked body
             // prints (its outline item's name, `groups`), never an empty name (rule 19).
             let label = match label.is_empty() {
@@ -1135,8 +1155,7 @@ impl<'f> BodiesStage<'f> {
         let (packs, corrected) = found.trees;
         let procs = handles.names.and_then(|stage| stage.names.as_ref()).and_then(|names| names.procs());
         let keep_scratch = planted_keep_scratch();
-        let plants = planted_rows();
-        let shared = Shared { listings, root: handles.root, packs, corrected, procs, groups: &found.groups, heads: &found.heads, view, heap, shelf: &self.shelf, seeds: request_heads, heads_failed: &self.heads_failed, scope_reads: self.scope_reads, board: handles.board, keep_scratch, plants };
+        let shared = Shared { grains: &found.grains, listings, root: handles.root, packs, corrected, procs, groups: &found.groups, heads: &found.heads, view, heap, shelf: &self.shelf, seeds: request_heads, heads_failed: &self.heads_failed, scope_reads: self.scope_reads, board: handles.board, keep_scratch, plants };
         // Each run's counts of its seeded bodies, summed after the join.
         let mut tallies: Vec<crate::engine_seeds::SeedTally, Global> = Vec::new_in(Global);
         tallies.resize(runs.len(), crate::engine_seeds::SeedTally::default());
@@ -1221,7 +1240,7 @@ impl<'f> BodiesStage<'f> {
     /// Each member crate's [`Group`] and each body of its files as a [`Took`]; `Err((why,
     /// reads))` when no body can be checked this command: the stop is every body's note, and
     /// `reads` the cells it is a function of (plan row A8; none: owed, see each stop).
-    fn groups<'r>(&mut self, cx: &Cx, store: &mut dyn crate::store::Store<'r>, read: &mut EngineRecords<'r>, handles: &Handles<'_, '_, '_, '_>, frame: &'f Frame) -> Result<Result<Found<'f, 'r>, Stop<'f>>, CliError> {
+    fn groups<'r>(&mut self, cx: &Cx, store: &mut dyn crate::store::Store<'r>, read: &mut EngineRecords<'r>, handles: &Handles<'_, '_, '_, '_>, view: View<'_, '_>, _plants: RowPlants, frame: &'f Frame) -> Result<Result<Found<'f, 'r>, Stop<'f>>, CliError> {
         let heap = handles.env.heap;
         let g = heap.alloc();
         // Set again when this phase finds the members' records whole (the end of this fn).
@@ -1237,11 +1256,7 @@ impl<'f> BodiesStage<'f> {
         let Some(names) = handles.names else {
             return Ok(Err(("this command resolved no crate's names, so no body is checked", &[])));
         };
-        let graph_cell: &'f [CellId] = &*Vec::leak({
-            let mut one: Vec<CellId, blaze_own::Alloc<'static>> = Vec::new_in(g);
-            one.push(CellId { of: graph.name, cell: WHOLE });
-            one
-        });
+        let graph_cell: &'f [CellId] = frame.alloc_slice_copy(&[CellId { of: graph.name, cell: WHOLE }]);
         // The crate list is the `UnitGraph` record's: its world not made is a function of the
         // graph's cell; a new graph record moves it.
         let Some(list) = self.kept.list(cx, store, &graph, frame)? else {
@@ -1255,6 +1270,7 @@ impl<'f> BodiesStage<'f> {
             Ok(trees) => trees,
             Err(why) => return Ok(Err((why, &[]))),
         };
+        let grains = ReadGrains::new(list, packs, graph_cell[0], view, heap.shared());
         let mut groups: Vec<Group<'f, 'r>, Global> = Vec::new_in(Global);
         let mut took: Vec<Took<'f>, blaze_own::Alloc<'static>> = Vec::new_in(g);
         // The first list that could not grow: the stage's typed stop (rule 3).
@@ -1284,11 +1300,11 @@ impl<'f> BodiesStage<'f> {
             let mut ids: Vec<CellId, blaze_own::Alloc<'static>> = Vec::new_in(g);
             ids.push(CellId { of: graph.name, cell: WHOLE });
             for one in crates.iter() {
-                ids.push(CellId { of: *one, cell: WHOLE });
+                ids.push(grains.place(CellId { of: *one, cell: WHOLE }, false));
             }
             ids.sort_unstable();
             ids.dedup();
-            &*ids.leak()
+            frame.alloc_slice_copy(&ids)
         };
         for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at)) {
             // The member's files: what its module tree reaches from its root, the walk the
@@ -1317,7 +1333,7 @@ impl<'f> BodiesStage<'f> {
                 continue;
             };
             members.push(own.name);
-            let (scope, whole) = match scope_of(read, cx, store, names, &list, member, heap) {
+            let (mut scope, whole) = match scope_of(read, cx, store, names, &list, member, heap) {
                 Ok(made) => made,
                 Err(cause) => {
                     // `scope_of` reads the crate's own names record and the check scope the
@@ -1342,14 +1358,17 @@ impl<'f> BodiesStage<'f> {
             cut_reads.extend(scope.scope.iter().copied());
             cut_reads.extend(scope.cut_name(&list));
             let scope_cells = cells_of(&cut_reads);
-            let mut buckets: Vec<(Name, Name), blaze_own::Alloc<'static>> = Vec::with_capacity_in(scope.crates.len(), g);
-            buckets.extend(scope.crates.iter().map(|one| {
-                let key = list.key(one.world_at);
-                (blaze_ladder::front2::buckets::impl_tables_name(key), blaze_drive::key::crate_scope_name(&key))
-            }));
-            buckets.sort_unstable_by_key(|(tables, _)| *tables);
-            let buckets: &'f [(Name, Name)] = &*buckets.leak();
-            let group = Group { own: own.name, crates: scope.crates, env, script, lang: scope.lang, scope: scope.scope, buckets };
+            for name in &mut scope.scope {
+                #[cfg(test)]
+                if _plants.all_dependencies_settled && *name != own.name {
+                    *name = graph.name;
+                    continue;
+                }
+                *name = grains.place(CellId { of: *name, cell: WHOLE }, false).of;
+            }
+            scope.scope.sort_unstable();
+            scope.scope.dedup();
+            let group = Group { own: own.name, crates: scope.crates, env, script, lang: scope.lang, scope: scope.scope };
             // The member's files: its items record's file rows, matched to the planner's outlines.
             let Ok(items) = ItemsRecord::open(own_records.items, g) else {
                 // The items record is the crate's names task's: a function of its cell.
@@ -1589,7 +1608,7 @@ impl<'f> BodiesStage<'f> {
         member_cells.dedup();
         self.uncovered_note = (uncovered > 0).then(|| crate::engine_head_notes::leak(g, format_args!("{}", Uncovered { count: uncovered, named: &uncovered_named })));
         self.groups_found = true;
-        Ok(Ok(Found { groups, took, holders, members, member_cells, heads, uncovered, trees: (packs, corrected) }))
+        Ok(Ok(Found { grains, groups, took, holders, members, member_cells, heads, uncovered, trees: (packs, corrected) }))
     }
 
     /// Body `name`'s block of the request's lines (engine_lines.rs): each finding of its verdict
@@ -1770,6 +1789,7 @@ impl<'f> BodiesStage<'f> {
 
 /// What every run reads: all read-only and shared.
 struct Shared<'s, 'a, 'f, 'r> {
+    grains: &'s ReadGrains<'static>,
     /// The request's listings of each crate's heads, made once a crate (engine_heads.rs
     /// `Listings`, lane OW1): every stretch's `Owners` places its reads in them.
     listings: &'s crate::engine_heads::Listings,
@@ -1904,18 +1924,6 @@ fn seed_cause<'n>(
     Step::End(cell, cause)
 }
 
-/// A body's cells as the engine's view holds them today: every cell a body reads is a cell an
-/// earlier phase defined or none does ([`ABSENT`]); nothing is made inline on this path.
-struct ViewMake<'s, 'a> {
-    view: View<'s, 'a>,
-}
-
-impl<'a> Make<'a> for ViewMake<'_, 'a> {
-    fn make(&self, want: &CellId, _made: &mut SVec<'a, Made<'a>>) -> Result<ContentId, MakeRefused> {
-        Ok(self.view.cell(want))
-    }
-}
-
 /// A stretch's frame past this many bytes takes no further body: the next body opens its
 /// records into a new frame. A body's local items' rows live in the frame until the records go
 /// (`check_body` borrows them for the records' lifetime; no question copies into it any more:
@@ -2003,7 +2011,9 @@ fn run_stretch<'a, 'f>(
     };
     let unused = Recorder::new(RecorderOpts { alloc: g });
     let tables = Tables::new(TablesOpts { records: opened.records, impls: Some(impls), lang_crates: &group.lang, reads: &unused });
-    let make = ViewMake { view: shared.view };
+    // A stack owner drops the memo when this stretch ends. Its caller's heap reclaims old
+    // buffers as it grows; a bump frame would retain every superseded capacity.
+    let mut ids = ReadIds::new(tables, g);
     // `First`: under `All` clap-root's `Cmd` was refused with a false cycle among core's
     // iterator traits (front2 heads.rs `Store::new`; lane FL).
     // The request's frozen heads (engine_seeds.rs): each head a body needs imported from them,
@@ -2015,9 +2025,9 @@ fn run_stretch<'a, 'f>(
     let stretch_heads = shared.seeds.map(|table| crate::engine_seeds::StretchHeads::new(table, shared.heads_failed, opened.records, shared.heads, &group.crates[..], shared.listings, g));
     // The seed freezer's constant evaluator: the head tasks' own (engine_head_consts.rs), its
     // lang index built by the one function a head task builds it by, once a stretch, and what
-    // it reads kept as it grows (`EvalSink`), so each body's read list takes it ([`add_eval_reads`]).
+    // it reads kept as it grows, so each body's read list takes the placed prefix ([`EvalReads`]).
     // Two crates declaring one lang item refuse the stretch by name, as they fail a head task.
-    let evaluated: &crate::engine_head_consts::EvalSink<'_> = frame.alloc(crate::engine_head_consts::EvalSink::new(fa));
+    let evaluated: &Recorder<'_> = frame.alloc(Recorder::new(RecorderOpts { alloc: fa }));
     let index: Option<&blaze_ladder::front2::index::Index<'_>> = match shared.seeds {
         Some(_) => match crate::engine_head_consts::lang_index(tables, evaluated, &group.lang) {
             Ok(index) => Some(&*frame.alloc(index)),
@@ -2027,7 +2037,8 @@ fn run_stretch<'a, 'f>(
     };
     // The reads of building the index alone: a body takes the evaluator's reads only once it
     // evaluated a constant (as a head task takes them when its evaluator was asked).
-    let index_reads = evaluated.len();
+    let index_reads = evaluated.tally().offered;
+    let mut eval = EvalReads { placed: 0, ids: Vec::new_in(fa) };
     let seed: Option<&RequestSeed<'_, '_, '_, _, _>> = match &stretch_heads {
         Some(table) => {
             let mut sized = None;
@@ -2092,7 +2103,9 @@ fn run_stretch<'a, 'f>(
         // Each body the task checks (one; or each an expansion at its entry wrote), merged into
         // the task's one result: its reads the union, its verdict the digest of theirs.
         let mut whole = Hasher::new(ENTRY_DOMAIN);
-        let mut reads: blaze_own::AVec<'_, (CellId, ContentId)> = blaze_own::AVec::new_in(w);
+        let mut reads = blaze_own::AVec::new_in(w);
+        let (made_before, hits_before) = ids.counts();
+        let offered_before = evaluated.tally().offered;
         // One item's verdict digest: the task's out as it is (more items: the merged digest).
         let mut single: Option<ContentId> = None;
         let (mut findings, mut failed, mut said) = (0u32, false, None);
@@ -2114,12 +2127,21 @@ fn run_stretch<'a, 'f>(
         for (at, item) in one.items.iter().enumerate() {
             let mut asked = one.task;
             asked.planned.name = Name::new(Kind::BodyCheck, item.0);
-            match work::unwinding(|| check_body_split(tables, &asked, &body_frame, &make, w, alloc)) {
+            match work::unwinding(|| {
+                let body = check_body_reads(tables, &asked, &body_frame, w)?;
+                reads.reserve(body.reads.len());
+                for read in &body.reads {
+                    if let Some(id) = ids.id(*read)? {
+                        reads.push(id);
+                    }
+                }
+                Ok::<_, TaskError>(body)
+            }) {
                 Ok(Ok(body)) => {
                     tally.reads.add(body.read_tally);
                     whole.update(&body.out.0);
-                    reads.extend_from_slice(&body.cells);
-                    mem.recorded += body.cells.len() as u64;
+                    mem.recorded = reads.len() as u64;
+                    mem.offered += body.read_tally.offered;
                     add_work(&mut mem.work, &body.work);
                     findings = findings.saturating_add(body.findings);
                     // Its findings as `check` files them; a type error a refused macro call may
@@ -2189,7 +2211,6 @@ fn run_stretch<'a, 'f>(
                     if one.items.len() == 1 {
                         single = Some(body.out);
                     }
-                    out.made.extend(body.made);
                 }
                 Ok(Err(error)) => {
                     seed_refused = matches!(error, TaskError::Seed { .. });
@@ -2211,12 +2232,12 @@ fn run_stretch<'a, 'f>(
         // `WHOLE` cell with today's digest, so an edit of the file enters the body again. A file
         // with no FileItems record standing (none, or one that failed) has no cell to read: the
         // body is then refused by name (rule 3), never filed without that read.
-        let mut data_reads: blaze_own::AVec<'_, (CellId, ContentId)> = blaze_own::AVec::new_in(w);
+        let mut data_reads = blaze_own::AVec::new_in(w);
         let mut data_refused: Option<&'static str> = None;
         for (path, _) in opened.sources.0.data.borrow_mut().drain(data_at..) {
             let id = CellId { of: Name::file(path.as_bytes()), cell: WHOLE };
             match shared.view.row(id.of) {
-                Some(row) if !row.failed => data_reads.push((id, shared.view.cell(&id))),
+                Some(row) if !row.failed => data_reads.push(id),
                 _ => {
                     if data_refused.is_none() {
                         data_refused = Some(crate::engine_head_notes::leak(g, format_args!("body `{}` read `{path}` without an available FileItems record", one.label)));
@@ -2233,6 +2254,20 @@ fn run_stretch<'a, 'f>(
         let bytes = frame.used().saturating_sub(at_start) as u64;
         let row = Ran { name, label: one.label, ns, bytes, chain: one.place.chain, note: None, found: FindingRange::default(), file: one.file, stretch };
         running.end(shared.board.now(clock));
+        // A checked verdict and a refusal at a seed both depend on the evaluator. Its
+        // prepared definitions persist across this stretch, so each row takes its prefix.
+        let placed = if let Some(words) = data_refused {
+            Err(words)
+        } else if said.is_none() || seed_refused {
+            eval.update(evaluated, index_reads, &mut ids, opened.records, shared.heads)
+                .map_err(|error| error.words(&group.crates, g))
+        } else {
+            Ok(())
+        };
+        let (made_now, hits_now) = ids.counts();
+        mem.ids_made = made_now - made_before;
+        mem.memo_hits = hits_now - hits_before;
+        mem.offered += evaluated.tally().offered - offered_before + if taken == 1 { index_reads } else { 0 };
         if seed_refused {
             // Refused at a seed; never checked by lowering instead (rule 3). A head that cannot
             // be made is reported once, at the head (its head task's refusal, or `check`'s), and
@@ -2279,17 +2314,16 @@ fn run_stretch<'a, 'f>(
             // stay WHOLE under `Cells` too: the refused check left no list of the cells it read
             // (`TaskError::Seed` carries none), so this class is coarse in lane BH1's census.
             // In the body's scratch until its row is copied out (`row_of`).
-            let mut reads: blaze_own::AVec<'_, (CellId, ContentId)> = blaze_own::AVec::new_in(w);
+            reads.clear();
             for scope in group.scope.iter() {
-                reads.push((CellId { of: *scope, cell: WHOLE }, ABSENT));
+                reads.push(CellId { of: *scope, cell: WHOLE });
             }
             if let Some(want) = head {
-                reads.push((head_cell_id(want), ABSENT));
+                reads.push(head_cell_id(want));
             }
             // What the seed's constant evaluator read for it, as a checked body takes it; a read
             // list it cannot place is no read list: the row is then owed (rule 21), its words
             // after the body's own.
-            let placed = add_eval_reads(evaluated, index_reads, tables, opened.records, shared.heads, &group.crates, &mut reads, g);
             let said = match (placed, said) {
                 (Ok(()), said) => said,
                 (Err(words), Some(Said::Unchecked(own))) => Some(Said::Unchecked(crate::engine_head_notes::leak(g, format_args!("{own}; and its read list is owed: {words}")))),
@@ -2298,12 +2332,15 @@ fn run_stretch<'a, 'f>(
                 (Err(words), None) => Some(Said::Refused(words)),
             };
             let owed = !matches!(placed, Ok(()));
+            reads.extend_from_slice(&eval.ids);
             mem.before = reads.len() as u64;
-            let (mut wide, _) = widen_as(shared.scope_reads, &reads, group, &mut owners, opened.records, shared.view, shared.heads_failed, g, shared.plants.fine_buckets, w);
-            // And who checks it (engine_body_plan.rs), as a checked body's.
-            crate::engine_body_plan::add_reads(&mut wide, one.held, shared.view);
+            mem.work.cells = (reads.capacity() * core::mem::size_of::<CellId>()) as u64;
             let done = match owed {
-                false => crate::engine_tasks::failed_with(&one.task, row_of(&mut wide, &data_reads, reads.len(), shared.plants, &mut mem, alloc), alloc),
+                false => {
+                    let (wide, _) = widen_as(shared, &reads, group, &mut owners, opened.records, w);
+                    let row = row_of(wide, one.held, &data_reads, shared, &mut mem, alloc);
+                    Done { reads: row, ..crate::engine_tasks::failed(&one.task, alloc) }
+                }
                 true => crate::engine_tasks::failed(&one.task, alloc),
             };
             mem.count_done(&done);
@@ -2320,10 +2357,7 @@ fn run_stretch<'a, 'f>(
         // engine_head_consts.rs), taken before the verdict is filed: a read list it cannot
         // place is no read list, so the body is owed, named (rule 21), never filed on part of
         // its reads.
-        let mut eval_reads: blaze_own::AVec<'_, (CellId, ContentId)> = blaze_own::AVec::new_in(w);
-        if said.is_none()
-            && let Err(words) = add_eval_reads(evaluated, index_reads, tables, opened.records, shared.heads, &group.crates, &mut eval_reads, g)
-        {
+        if let Err(words) = placed {
             said = Some(Said::Refused(words));
         }
         if shared.seeds.is_some() && said.is_none() {
@@ -2352,20 +2386,19 @@ fn run_stretch<'a, 'f>(
             None => (whole.finish(), true),
         };
         if one.items.is_empty() {
-            reads.push((CellId { of: group.own, cell: WHOLE }, ABSENT));
+            reads.push(CellId { of: group.own, cell: WHOLE });
         }
-        reads.extend_from_slice(&eval_reads);
+        reads.extend_from_slice(&eval.ids);
         mem.before = reads.len() as u64;
-        let (mut wide, unfrozen) = widen_as(shared.scope_reads, &reads, group, &mut owners, opened.records, shared.view, shared.heads_failed, g, shared.plants.fine_buckets, w);
-        // Who checks it is a function of the units ranked before its checker (engine_body_plan.rs).
-        crate::engine_body_plan::add_reads(&mut wide, one.held, shared.view);
+        mem.work.cells = (reads.capacity() * core::mem::size_of::<CellId>()) as u64;
+        let (wide, unfrozen) = widen_as(shared, &reads, group, &mut owners, opened.records, w);
         // The row, made now from what it keeps: its reads copied out of the scratch at their
         // length, its one define (rule 11; lane BD3).
         let mut defines: SVec<'a, (Cell, ContentId)> = SVec::with_capacity_in(usize::from(defines_verdict), alloc);
         if defines_verdict {
             defines.push((blaze_ladder::front2::tables::task::VERDICT_CELL, out_id));
         }
-        let mut done = Done { name, key: one.task.key, out: out_id, defines, reads: row_of(&mut wide, &data_reads, reads.len(), shared.plants, &mut mem, alloc), findings, failed };
+        let mut done = Done { name, key: one.task.key, out: out_id, defines, reads: row_of(wide, one.held, &data_reads, shared, &mut mem, alloc), findings, failed };
         // A head it read has no frozen head: the body fails by that read (rule 3), naming the
         // head and quoting why (engine_head_notes.rs), its reads kept so the head's repair
         // enters it again.
@@ -2555,165 +2588,136 @@ fn env_in<'l: 'n, 'n>(lent: Option<EnvLent<'_, 'l>>, frame: &'n Frame) -> Result
     Ok(Some(&*blaze_own::Box::leak(blaze_own::Box::new_in(env, frame))))
 }
 
-/// What a stretch's seed evaluator read until now ([`crate::engine_head_consts::EvalSink`]),
-/// into a body's `reads` as a head task takes its evaluator's (engine_heads.rs `heads_of`):
-/// each names cell as front2 names it (tables/task.rs `cell_id`) and, for each item whose text
-/// it read, the cell that moves with that text (engine_head_consts.rs `text_cell`); each read
-/// ABSENT, as [`widen_as`] reads every cell at the view's digest. Nothing when the evaluator
-/// evaluated no constant (`index_reads`: the reads of building its lang index alone). Refused,
-/// with the words a note prints, when a read cannot be placed or the reads were past their cap.
-#[expect(clippy::too_many_arguments, reason = "a body's reads and every table that names them")]
-fn add_eval_reads<'n, A: core::alloc::Allocator>(
-    evaluated: &crate::engine_head_consts::EvalSink<'_>,
-    index_reads: usize,
-    tables: Tables<'_, 'n>,
-    records: &'n blaze_ladder::front2::source::Records<'n>,
-    subjects: &crate::engine_heads::Subjects,
-    crates: &[Crate<'_>],
-    reads: &mut Vec<(CellId, ContentId), A>,
-    g: blaze_own::Alloc<'static>,
-) -> Result<(), &'static str> {
-    if evaluated.len() <= index_reads {
-        return Ok(());
-    }
-    let mut table: Vec<blaze_ladder::front2::tables::recorder::TableRead, blaze_own::Alloc<'static>> = Vec::new_in(g);
-    evaluated
-        .reads(&mut |one| table.push(one))
-        .map_err(|full| crate::engine_head_notes::leak(g, format_args!("its constants' evaluation at the seed read too much: {full}")))?;
-    for one in table.iter() {
-        match blaze_ladder::front2::tables::task::cell_id(tables, *one) {
-            Ok(Some(id)) => reads.push((id, ABSENT)),
-            Ok(None) => {}
-            Err(error) => return Err(crate::engine_head_notes::leak(g, format_args!("a names read of its constants' evaluation at the seed names a crate its scope does not hold: {error} (front2 tables/task.rs `cell_id`)"))),
-        }
-    }
-    crate::engine_head_consts::eval_reads(records, subjects, &table, &mut |id| reads.push((id, ABSENT))).map_err(|unplaced| {
-        let shown = crate::engine_head_consts::UnplacedIn { unplaced: &unplaced, crates };
-        crate::engine_head_notes::leak(g, format_args!("its constants' evaluation at the seed read a text no crate of its scope holds: {shown}"))
-    })
+/// The stretch's evaluator appends distinct keys. Place just the new suffix, retaining at most
+/// two IDs per key (the question and, for an item, its text). Commit a key only after both
+/// placements succeed, so an unplaceable read continues to refuse every row that needs it.
+struct EvalReads<'a> {
+    placed: usize,
+    ids: blaze_own::AVec<'a, CellId>,
 }
 
-/// [`widen`] by the command's strategy (engine_scope_reads.rs, rule 78): the one dispatch from
-/// the runtime choice to a [`crate::engine_scope_reads::ScopeReads`] instantiation.
-#[expect(clippy::too_many_arguments, reason = "the strategy, a body's reads and every table that names them")]
+enum EvalReadError {
+    Full(blaze_ladder::front2::tables::recorder::ReadsFull),
+    Id(TaskError),
+    Text(crate::engine_head_consts::Unplaced),
+}
+
+impl EvalReadError {
+    fn words(&self, crates: &[Crate<'_>], g: blaze_own::Alloc<'static>) -> &'static str {
+        match self {
+            Self::Full(full) => leak(g, format_args!("its constants' evaluation at the seed read too much: {full}")),
+            Self::Id(error) => leak(g, format_args!("a names read of its constants' evaluation at the seed: {error}")),
+            Self::Text(unplaced) => {
+                let shown = crate::engine_head_consts::UnplacedIn { unplaced, crates };
+                leak(g, format_args!("its constants' evaluation at the seed read a text no crate of its scope holds: {shown}"))
+            }
+        }
+    }
+}
+
+impl EvalReads<'_> {
+    fn update<'n>(&mut self, evaluated: &Recorder<'_>, index_reads: u64, memo: &mut ReadIds<'_, '_, '_>,
+        records: &'n blaze_ladder::front2::source::Records<'n>, subjects: &crate::engine_heads::Subjects) -> Result<(), EvalReadError> {
+        let keys = evaluated.keys().map_err(EvalReadError::Full)?;
+        if evaluated.tally().offered == index_reads {
+            return Ok(());
+        }
+        for &key in &keys[self.placed..] {
+            let id = memo.id(key).map_err(EvalReadError::Id)?;
+            if let TableRead::Names(blaze_scope::names_cells::NameCell::Item { key }) = key {
+                let text = crate::engine_head_consts::text_cell(records, subjects, key).map_err(EvalReadError::Text)?;
+                self.ids.extend(text);
+            }
+            self.ids.extend(id);
+            self.placed += 1;
+        }
+        Ok(())
+    }
+}
+
+type DistinctIds<'w> = blaze_hash::HashSet<CellId, blaze_own::Alloc<'w>>;
+
+/// Place each raw read according to the command's scope strategy. Only row_of asks the view
+/// for a digest, after the evaluator, the plan and the data-file reads have all joined.
 fn widen_as<'w, 'n, 's: 'n>(
-    reads_as: crate::engine_scope_reads::ScopeReadsAs,
-    reads: &[(CellId, ContentId)],
+    shared: &Shared<'_, '_, '_, '_>,
+    reads: &[CellId],
     group: &Group<'_, '_>,
     owners: &mut crate::engine_heads::Owners<'s>,
     records: &'n blaze_ladder::front2::source::Records<'n>,
-    view: View<'_, '_>,
-    heads_failed: &crate::engine_head_notes::Failed,
-    g: blaze_own::Alloc<'static>,
-    fine_buckets: bool,
     work: blaze_own::Alloc<'w>,
-) -> (blaze_own::AVec<'w, (CellId, ContentId)>, Option<(Name, Cell)>) {
+) -> (DistinctIds<'w>, Option<(Name, Cell)>) {
     use crate::engine_scope_reads::{Cells, ScopeReadsAs, Whole};
-    match reads_as {
-        ScopeReadsAs::Whole => widen::<Whole>(reads, group, owners, records, view, heads_failed, g, fine_buckets, work),
-        ScopeReadsAs::Cells => widen::<Cells>(reads, group, owners, records, view, heads_failed, g, fine_buckets, work),
+    match shared.scope_reads {
+        ScopeReadsAs::Whole => widen::<Whole>(shared, reads, group, owners, records, work),
+        ScopeReadsAs::Cells => widen::<Cells>(shared, reads, group, owners, records, work),
         #[cfg(test)]
-        ScopeReadsAs::PlantedCells => widen::<crate::engine_scope_reads::PlantedCells>(reads, group, owners, records, view, heads_failed, g, fine_buckets, work),
+        ScopeReadsAs::PlantedCells => widen::<crate::engine_scope_reads::PlantedCells>(shared, reads, group, owners, records, work),
     }
 }
 
-/// Whether `tables` (an `ImplBucket` task's name) are a DEPENDENCY's of `group`'s scope: a
-/// scope crate whose names task defines no cell table (`CELLS` ABSENT: engine_names.rs
-/// `cells_of`, which defines one for a crate whose names read a checkout file, a member's or a
-/// path dependency's). Such a crate's text is keyed by the lock and the shelf, so its tables
-/// move only with a new graph, and [`widen`] reads them whole (engine_scope_reads.rs, "A
-/// DEPENDENCY'S BUCKETS"). A name of no scope crate is not one: read as it was read.
-fn dependency_tables(group: &Group<'_, '_>, view: View<'_, '_>, tables: Name) -> bool {
-    let Ok(at) = group.buckets.binary_search_by_key(&tables, |(name, _)| *name) else { return false };
-    view.cell(&CellId { of: group.buckets[at].1, cell: CELLS }) == ABSENT
-}
-
-/// A body's reads widened to cells a phase defines (module docs), each with the digest the view
-/// holds, sorted and one each, in `work` (the body's scratch: the row is copied out of it at its
-/// own length, [`row_of`]); and the first head it read that was not frozen (its head task
-/// failed whole, or that head of it: engine_head_notes.rs), by task and cell. `fine_buckets`:
-/// the plant that keeps a dependency's bucket reads one a bucket (the coarse step off).
-#[expect(clippy::too_many_arguments, reason = "a body's reads and every table that names them")]
 fn widen<'w, 'n, 's: 'n, S: crate::engine_scope_reads::ScopeReads>(
-    reads: &[(CellId, ContentId)],
+    shared: &Shared<'_, '_, '_, '_>,
+    reads: &[CellId],
     group: &Group<'_, '_>,
     owners: &mut crate::engine_heads::Owners<'s>,
     records: &'n blaze_ladder::front2::source::Records<'n>,
-    view: View<'_, '_>,
-    heads_failed: &crate::engine_head_notes::Failed,
-    g: blaze_own::Alloc<'static>,
-    fine_buckets: bool,
     work: blaze_own::Alloc<'w>,
-) -> (blaze_own::AVec<'w, (CellId, ContentId)>, Option<(Name, Cell)>) {
-    let mut unfrozen: Option<(Name, Cell)> = None;
-    // In the body's scratch, sized to what comes in (a bump frame grows a list by copying it).
-    let mut wide: blaze_own::AVec<'w, (CellId, ContentId)> = blaze_own::AVec::with_capacity_in(reads.len() + 1, work);
-    let mut push = |of: Name, cell: Cell| {
-        let id = CellId { of, cell };
-        wide.push((id, view.cell(&id)));
-    };
-    for (id, _) in reads.iter() {
-        match id.of.kind {
-            // A names read of a crate whose task defines its cell table (engine_names.rs
-            // `cells_of`, marked by `CELLS`) stays its cell: the table holds every cell a walk
-            // can name that holds something, each digest over all the cell answers, so the cell
-            // moves whenever the answer can (rule 21); a cell it does not hold is the name not
-            // found, read ABSENT, and the name added defines it, which moves it. A crate's lang
-            // rows are one such cell (blaze-scope names_cells.rs `NameCell::Lang`).
-            Kind::CrateScope if !S::keeps(group.own, *id) => {}
-            Kind::CrateScope if id.cell != WHOLE && view.cell(&CellId { of: id.of, cell: CELLS }) != ABSENT => push(id.of, id.cell),
-            Kind::CrateScope => push(id.of, WHOLE),
-            // The whole graph's bucket fact: the strategy's (engine_scope_reads.rs).
-            Kind::ImplBucket if id.of.subject == ABSENT => S::incoherent_fact(&group.scope, &mut push),
-            // A head (engine_heads.rs `Owners::place`): a member's, the cell of the head task of
-            // the entry that covers it, a macro-written head's included; a dependency's, a body's
-            // own item's or one no head task holds (the body is refused by its words), its
-            // crate's names record whole. A head of a crate none of the records holds is read as
-            // read.
-            Kind::Signature => match owners.place(records, id, g) {
-                Some(crate::engine_heads::HeadAt::Cell { cell, .. }) => {
-                    if unfrozen.is_none() && (view.row(cell.of).is_some_and(|row| row.failed) || heads_failed.has(cell.of, cell.cell)) {
-                        unfrozen = Some((cell.of, cell.cell));
-                    }
-                    push(cell.of, cell.cell);
-                }
-                Some(crate::engine_heads::HeadAt::Dependency(scope) | crate::engine_heads::HeadAt::OfTheBody(scope) | crate::engine_heads::HeadAt::Unlisted { scope, .. }) => push(scope, WHOLE),
-                None => push(id.of, id.cell),
-            },
-            // A dependency's bucket (lane BD3): its tables' `WHOLE`, the digest of all three of
-            // its records (engine_heads.rs: `defines.push((WHOLE, one.out))`), which moves when
-            // any bucket of it does; one cell a crate however many buckets the body probed.
-            Kind::ImplBucket if !fine_buckets && dependency_tables(group, view, id.of) => push(id.of, WHOLE),
-            // A crate's bucket: its cell as the crate's Heads task defined it (engine_heads.rs),
-            // or ABSENT when the crate files no impl there (a later impl defines it, and the
-            // read moves).
-            _ => push(id.of, id.cell),
+) -> (DistinctIds<'w>, Option<(Name, Cell)>) {
+    let mut unfrozen = None;
+    let mut wide = DistinctIds::new_in(work);
+    #[cfg(test)]
+    let own_key = group.crates[0].records.key;
+    #[cfg(test)]
+    let own_tables = blaze_ladder::front2::buckets::impl_tables_name(own_key);
+    for &id in reads {
+        #[cfg(test)]
+        if shared.plants.all_dependencies_settled && match id.of.kind {
+            Kind::CrateScope => id.of != group.own,
+            Kind::ImplBucket => id.of.subject != ABSENT && id.of != own_tables,
+            Kind::Signature => id.of.subject.0[..8] != own_key.prefix(),
+            _ => false,
+        } {
+            wide.insert(CellId { of: Name::unit_graph(), cell: WHOLE });
+            continue;
         }
+        let placed = match id.of.kind {
+            Kind::CrateScope if !S::keeps(group.own, id) => continue,
+            Kind::ImplBucket if id.of.subject == ABSENT => {
+                S::incoherent_fact(&group.scope, &mut |of, cell| { wide.insert(CellId { of, cell }); });
+                continue;
+            }
+            Kind::Signature => match owners.place(records, &id, shared.heap.alloc()) {
+                Some(crate::engine_heads::HeadAt::Cell { cell, .. }) => {
+                    // Earliest failed cell in canonical order, independent of recording order.
+                    let at = (cell.of, cell.cell);
+                    if unfrozen.is_none_or(|first| at < first) && (shared.view.row(cell.of).is_some_and(|row| row.failed) || shared.heads_failed.has(cell.of, cell.cell)) {
+                        unfrozen = Some(at);
+                    }
+                    cell
+                }
+                Some(crate::engine_heads::HeadAt::Dependency(of) | crate::engine_heads::HeadAt::OfTheBody(of) | crate::engine_heads::HeadAt::Unlisted { scope: of, .. }) => CellId { of, cell: WHOLE },
+                None => id,
+            },
+            _ => id,
+        };
+        wide.insert(shared.grains.place(placed, shared.plants.fine_buckets));
     }
-    // The environment every body was checked under: its script run, whole.
-    if let Some(script) = group.script {
-        push(script, WHOLE);
+    if let Some(of) = group.script {
+        wide.insert(CellId { of, cell: WHOLE });
     }
-    wide.sort_unstable_by_key(|(id, _)| *id);
-    wide.dedup_by_key(|(id, _)| *id);
     (wide, unfrozen)
 }
 
-/// The row's read list out of the body's scratch into the request's arena (`alloc`): one block
-/// of exactly its length, counted by kind into `mem` (the only copy of a body's reads that
-/// outlives it; rule 11). Under the plant ([`PLANT_ROW_AT_RECORDED`]) at the capacity of the
-/// list before widening (`before`), as `widen` made the row before lane BD3. `data`, the
-/// included data files' cells the body read (run_stretch), joins `wide` first (in the scratch),
-/// the whole sorted and each cell once.
-fn row_of<'a, 'w>(wide: &mut blaze_own::AVec<'w, (CellId, ContentId)>, data: &[(CellId, ContentId)], before: usize, plants: RowPlants, mem: &mut BodyMem, alloc: SharedAlloc<'a>) -> SVec<'a, (CellId, ContentId)> {
-    if !data.is_empty() {
-        wide.extend_from_slice(data);
-        wide.sort_unstable_by_key(|(id, _)| *id);
-        wide.dedup_by_key(|(id, _)| *id);
-    }
-    let room = if plants.row_at_recorded { before.max(wide.len()) } else { wide.len() };
-    let mut row: SVec<'a, (CellId, ContentId)> = SVec::with_capacity_in(room, alloc);
-    row.extend_from_slice(wide);
+fn row_of<'a>(mut wide: DistinctIds<'_>, held: &[CellId], data: &[CellId], shared: &Shared<'_, '_, '_, '_>, mem: &mut BodyMem, alloc: SharedAlloc<'a>) -> SVec<'a, (CellId, ContentId)> {
+    wide.extend(held.iter().chain(data).copied());
+    let mut ids = Vec::with_capacity_in(wide.len(), *wide.allocator());
+    mem.work.cells += (wide.capacity() * (core::mem::size_of::<CellId>() + 1) + ids.capacity() * core::mem::size_of::<CellId>()) as u64;
+    ids.extend(wide);
+    ids.sort_unstable();
+    let room = if shared.plants.row_at_recorded { (mem.before as usize).max(ids.len()) } else { ids.len() };
+    let mut row = SVec::with_capacity_in(room, alloc);
+    row.extend(ids.iter().map(|id| (*id, shared.view.cell(id))));
     mem.count_row(&row);
     row
 }

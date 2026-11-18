@@ -26,33 +26,16 @@
 //! 5. When a row moved (a run, an unsettled pass), the new head and postings are written
 //!    ([`Effect::WriteHead`], [`Effect::WritePostings`]) after every [`Effect::File`] before them.
 //!
-//! Each failure is printed as it ends (report.rs `failure`); after the last suite AND the
-//! program's check ([`Event::Checked`]: "a run is a check too", bottom.md section 11) the
-//! summary is printed (report.rs `summary_with`) and [`Effect::Done`] says the status: failed
-//! when a test failed, when the check found an error, or when a test the plan wanted could not
-//! be run. A test that could not be run is NEVER a pass: until the code builder builds test
-//! bodies (test.md piece 8), every [`Effect::Run`] is answered "cannot be run yet", and today a
-//! workspace's `blaze test` prints, for a library with tests `tests::a` and `tests::b`:
-//!
-//! ```text
-//! NOT RUN tests::a: cannot be run yet: the code builder cannot build test bodies yet (test.md, piece 8)
-//! NOT RUN tests::b: cannot be run yet: the code builder cannot build test bodies yet (test.md, piece 8)
-//! test result: FAILED. ran 0: 0 passed, 0 failed; 0 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky; 2 could not be run yet
-//! ```
-//!
-//! and fails. `--list` prints `tests::a: test` per test the filters let through, then `2 tests,
-//! 0 benchmarks`, and runs nothing.
-//!
-//! Suites run one after another, each at the request's full width. Floor gap, stated (rule
-//! 67): one plan over every suite would keep all cores busy across suites' tails; it needs
-//! `Plan::decide` to take one postings record per suite. The head and postings are rewritten
-//! whole when any row moved: O(the suite's asks), not O(what moved).
+//! The live driver supplies all selected rows to one bounded plan with [`TestLoop::begin_inventory`].
+//! Each row keeps its suite and its position for reporting. A first-call code refusal clears
+//! that row's previous pass and leaves the rest eligible. Reports are printed in inventory
+//! order. [`Effect::Done`] includes test failures, tests that could not run and check errors.
 
 #![cfg_attr(not(test), allow(dead_code, reason = "wired by the driver's lane: main.rs `command`'s test arm builds a `TestLoop` and performs its effects"))]
 
-use core::fmt;
+use core::fmt::{self, Write as _};
 
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AString, AVec, Alloc, String, Vec};
 use blaze_run::head::{self, Head, HeadError, HeadRow, ReadDigest};
 use blaze_run::plan::{self, Address, Asked, Config, Exit, Failure, Kept, Last, Outcome, Plan, PlanError, Ran};
 use blaze_run::postings::{self, Ask, Postings, PostingsError, ReadName};
@@ -164,6 +147,8 @@ pub(crate) enum Event<'r, 'e> {
     Ended(TestEnded<'e>),
     /// [`Effect::Run`]'s answer: the run could not be started.
     CannotRun { test: TestId, why: CannotRun },
+    /// A first call could not be built. The process has been killed and reaped.
+    CannotBuild { suite: SuiteId, test: TestId, why: &'e crate::test_drive::InstanceRefusal },
     /// The driver's clock reached a deadline [`TestLoop::next_deadline`] named.
     Tick,
     /// The program's check ended with this many error findings (zero: it passed). Once.
@@ -234,6 +219,8 @@ pub(crate) enum LoopError {
     Postings { suite: SuiteId, error: PostingsError },
     Plan(PlanError),
     Report(ReportError),
+    /// The shared report did not write its documented closing counts line.
+    SummaryShape,
     Result { test: TestId, error: ResultError },
     /// An event names a test the current suite does not hold.
     UnknownTest { test: TestId },
@@ -270,6 +257,7 @@ impl fmt::Display for LoopError {
             LoopError::Postings { suite, error } => write!(f, "test suite {}: its postings record: {error}", suite.0),
             LoopError::Plan(error) => write!(f, "blaze test's plan: {error}"),
             LoopError::Report(error) => write!(f, "blaze test's report: {error}"),
+            LoopError::SummaryShape => f.write_str("blaze test: the report is missing its closing test-result counts"),
             LoopError::Result { test, error } => write!(f, "test {}'s result record: {error}", Short(&test.0)),
             LoopError::UnknownTest { test } => write!(f, "an answer names test {}, which the current suite does not hold", Short(&test.0)),
             LoopError::NoAddress { test } => write!(f, "test {} passed and is kept, but its end gave no address to file it at", Short(&test.0)),
@@ -308,7 +296,9 @@ pub(crate) enum Plant {
 #[derive(Clone, Copy, Debug)]
 struct Change {
     test: TestId,
-    last: Last,
+    /// None removes a row whose code did not build. Its former pass and asks cannot
+    /// validate another run, even if an older pass still occupies the same address.
+    last: Option<Last>,
     micros: u64,
     /// Its asks' range in the pool; `None`: the old row's asks stand.
     asks: Option<(usize, usize)>,
@@ -317,6 +307,9 @@ struct Change {
 /// The suite being run.
 struct Current<'a, 'r> {
     suite: SuiteId,
+    /// A live request shares one pool across all suites. Its flat dispatch rows
+    /// retain their actual suite for filing results and writing suite heads.
+    owners: Option<&'r [SuiteId]>,
     /// The tests record's rows, in row (path) order.
     asked: AVec<'a, Asked<'r>>,
     /// (test id, row), sorted by id.
@@ -339,6 +332,13 @@ impl<'r> Current<'_, 'r> {
 
     fn path_of(&self, test: TestId) -> Result<&'r str, LoopError> {
         Ok(self.asked[self.row_of(test)? as usize].path)
+    }
+
+    fn owner(&self, test: TestId) -> Result<SuiteId, LoopError> {
+        match self.owners {
+            Some(owners) => Ok(owners[self.row_of(test)? as usize]),
+            None => Ok(self.suite),
+        }
     }
 
     /// The run's asks and reads, kept for the new head.
@@ -383,6 +383,7 @@ impl Event<'_, '_> {
             Event::Looked { .. } => "`Looked`",
             Event::Ended(_) => "`Ended`",
             Event::CannotRun { .. } => "`CannotRun`",
+            Event::CannotBuild { .. } => "`CannotBuild`",
             Event::Tick => "`Tick`",
             Event::Checked { .. } => "`Checked`",
         }
@@ -391,6 +392,11 @@ impl Event<'_, '_> {
 
 /// Text into bytes in the loop's allocator.
 struct Text<'v, 'a>(&'v mut AVec<'a, u8>);
+
+enum RefusalReason<'e> {
+    BeforeStart(CannotRun),
+    FirstCall(&'e crate::test_drive::InstanceRefusal),
+}
 
 impl fmt::Write for Text<'_, '_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
@@ -405,8 +411,15 @@ pub(crate) struct TestLoop<'a, 'r> {
     alloc: Alloc<'a>,
     phase: Phase,
     current: Option<Current<'a, 'r>>,
+    /// The finished live plan's (test, inventory ordinal) index. The ordinal orders package,
+    /// target and path independently, including when one package name prefixes another.
+    inventory_rows: Option<AVec<'a, (TestId, u32)>>,
     entries: AVec<'a, Entry<'r>>,
+    details: AVec<'a, (u32, AVec<'a, u8>)>,
     not_run: AVec<'a, NotRun<'r>>,
+    /// The reason borrows the stopped child's instance only while it is printed into this
+    /// request's frame. The report can then outlive every child, even when they finish early.
+    not_built: AVec<'a, (SuiteId, TestId, &'r str, AString<'a>)>,
     flaky: AVec<'a, Finding>,
     filtered: u32,
     failed: u32,
@@ -428,8 +441,11 @@ impl<'a, 'r> TestLoop<'a, 'r> {
             alloc,
             phase: Phase::Idle,
             current: None,
+            inventory_rows: None,
             entries: Vec::new_in(alloc),
+            details: Vec::new_in(alloc),
             not_run: Vec::new_in(alloc),
+            not_built: Vec::new_in(alloc),
             flaky: Vec::new_in(alloc),
             filtered: 0,
             failed: 0,
@@ -446,6 +462,50 @@ impl<'a, 'r> TestLoop<'a, 'r> {
             return Err(LoopError::OutOfTurn { got: "`begin`", waiting: self.phase.says() });
         }
         self.open(SuiteId(0), out)
+    }
+
+    /// The live inventory has no saved heads. Select each raw test path before
+    /// qualifying its display name, then schedule all selected rows at one width.
+    pub(crate) fn begin_inventory(
+        &mut self,
+        asked: AVec<'a, Asked<'r>>,
+        owners: &'r [SuiteId],
+        filtered: u32,
+        now: Nanos,
+        out: &mut AVec<'_, Effect<'a>>,
+    ) -> Result<(), LoopError> {
+        let pool = SuiteId(u32::MAX);
+        if asked.len() != owners.len() {
+            return Err(LoopError::Ids { suite: pool, ids: owners.len(), rows: asked.len() });
+        }
+        let mut by_id = Vec::with_capacity_in(asked.len(), self.alloc);
+        for (row, one) in asked.iter().enumerate() {
+            let row = u32::try_from(row).map_err(|_| ReportError::TooMany { count: asked.len() })?;
+            by_id.push((one.test, row));
+        }
+        by_id.sort_unstable();
+        for pair in by_id.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                return Err(LoopError::TwoIds { suite: owners[pair[0].1 as usize], test: pair[0].0 });
+            }
+        }
+        let mut config = self.config.plan;
+        config.filter = plan::Filter::All;
+        config.skip = &[];
+        if config.ignored == plan::Ignored::Only {
+            config.ignored = plan::Ignored::Include;
+        }
+        self.filtered = filtered;
+        self.current = Some(Current {
+            suite: pool, owners: Some(owners), asked, by_id,
+            plan: Plan::new(config, self.alloc)?, head: Head::EMPTY, postings: Postings::EMPTY,
+            changes: Vec::new_in(self.alloc), pool: Vec::new_in(self.alloc), reads: Vec::new_in(self.alloc),
+        });
+        self.decide(&[], now, out)
+    }
+
+    pub(crate) fn row_detail(&mut self, row: u32, text: AVec<'a, u8>) {
+        self.details.push((row, text));
     }
 
     /// When the driver must step [`Event::Tick`]: the earliest deadline of a run not yet killed.
@@ -488,7 +548,11 @@ impl<'a, 'r> TestLoop<'a, 'r> {
                 self.after_run_step(out)
             }
             (Event::CannotRun { test, why }, Phase::Running(_)) => {
-                self.cannot_run(test, why, now, out)?;
+                self.cannot_run(test, RefusalReason::BeforeStart(why), now, out)?;
+                self.after_run_step(out)
+            }
+            (Event::CannotBuild { suite, test, why }, Phase::Running(want)) if suite == want => {
+                self.cannot_run(test, RefusalReason::FirstCall(why), now, out)?;
                 self.after_run_step(out)
             }
             (Event::Tick, Phase::Running(_)) => {
@@ -562,6 +626,7 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         let has_head = !head.is_empty();
         self.current = Some(Current {
             suite,
+            owners: None,
             asked,
             by_id,
             head,
@@ -629,20 +694,30 @@ impl<'a, 'r> TestLoop<'a, 'r> {
 
     /// A run that could not be started: reported as not run, never as a pass; its kept pass,
     /// if any, is unsettled (its asks moved and no pass stands at their new answers).
-    fn cannot_run(&mut self, test: TestId, why: CannotRun, now: Nanos, out: &mut AVec<'_, Effect<'a>>) -> Result<(), LoopError> {
+    fn cannot_run(&mut self, test: TestId, why: RefusalReason<'_>, now: Nanos, out: &mut AVec<'_, Effect<'a>>) -> Result<(), LoopError> {
         let plant = self.plant;
         let current = current_of(&mut self.current, self.phase)?;
         let path = current.path_of(test)?;
         current.plan.not_run(test, now, &mut self.scratch)?;
         if let Some(row) = current.head.row(test) {
-            let last = head::unsettle(row.kept.last);
-            if last != row.kept.last {
+            let last = match why {
+                RefusalReason::BeforeStart(_) => Some(head::unsettle(row.kept.last)),
+                RefusalReason::FirstCall(_) => None,
+            };
+            if last != Some(row.kept.last) {
                 current.changes.push(Change { test, last, micros: row.kept.micros, asks: None });
             }
         }
         match plant {
             Plant::NotRunAsPass => self.entries.push(Entry { test, path, outcome: Outcome::Passed { ran: plan::Missed::NoRecord, kept: Ok(()) } }),
-            Plant::None | Plant::KeepFailures => self.not_run.push(NotRun { test, path, why: why.words() }),
+            Plant::None | Plant::KeepFailures => match why {
+                RefusalReason::BeforeStart(why) => self.not_run.push(NotRun { test, path, why: why.words() }),
+                RefusalReason::FirstCall(cause) => {
+                    let mut words = String::new_in(self.alloc);
+                    write!(words, "{cause}").map_err(|_| LoopError::Report(ReportError::Write))?;
+                    self.not_built.push((current.owner(test)?, test, path, words));
+                }
+            },
         }
         self.apply(None, out)
     }
@@ -680,7 +755,7 @@ impl<'a, 'r> TestLoop<'a, 'r> {
             plan::Effect::Kill { test } => out.push(Effect::Kill { suite, test }),
             plan::Effect::Unsettle { test } => {
                 if let Some(row) = current.head.row(test) {
-                    current.changes.push(Change { test, last: head::unsettle(row.kept.last), micros: row.kept.micros, asks: None });
+                    current.changes.push(Change { test, last: Some(head::unsettle(row.kept.last)), micros: row.kept.micros, asks: None });
                 }
             }
             plan::Effect::File { test } => {
@@ -689,8 +764,8 @@ impl<'a, 'r> TestLoop<'a, 'r> {
                 let Some(address) = ended.address else { return Err(LoopError::NoAddress { test }) };
                 let pass = Verdict::Pass(Passed { run, micros: ended.ran.micros, kept: Ok(()) });
                 let asks = current.keep_asks(ended);
-                current.changes.push(Change { test, last: Last::Passed { address }, micros: ended.ran.micros, asks: Some(asks) });
-                file(suite, test, address, &ended.held, &pass, alloc, out, &mut self.flaky)?;
+                current.changes.push(Change { test, last: Some(Last::Passed { address }), micros: ended.ran.micros, asks: Some(asks) });
+                file(current.owner(test)?, test, address, &ended.held, &pass, alloc, out, &mut self.flaky)?;
             }
             plan::Effect::Report { test, outcome } => {
                 let path = current.path_of(test)?;
@@ -699,20 +774,24 @@ impl<'a, 'r> TestLoop<'a, 'r> {
                         let failed = failed_of(ended, why, run)?;
                         let mut text = Vec::new_in(alloc);
                         report::failure(&mut Text(&mut text), style, &Ending { test, path, failed, at: ended.detail.at })?;
-                        out.push(Effect::Print { text });
+                        if current.owners.is_some() {
+                            self.details.push((current.row_of(test)?, text));
+                        } else {
+                            out.push(Effect::Print { text });
+                        }
                         let asks = current.keep_asks(ended);
-                        current.changes.push(Change { test, last: Last::Failed, micros: ended.ran.micros, asks: Some(asks) });
+                        current.changes.push(Change { test, last: Some(Last::Failed), micros: ended.ran.micros, asks: Some(asks) });
                         // Filed BESIDE any pass at its address; a kill before the marks were read
                         // has no address and is reported only.
                         if let Some(address) = ended.address {
-                            file(suite, test, address, &ended.held, &Verdict::Fail(failed), alloc, out, &mut self.flaky)?;
+                            file(current.owner(test)?, test, address, &ended.held, &Verdict::Fail(failed), alloc, out, &mut self.flaky)?;
                         }
                         self.failed += 1;
                     }
                     (Outcome::Failed { .. }, None) => return Err(LoopError::Verdict { test }),
                     (Outcome::Passed { kept: Err(why), .. }, Some(ended)) => {
                         let asks = current.keep_asks(ended);
-                        current.changes.push(Change { test, last: Last::NotKept(why), micros: ended.ran.micros, asks: Some(asks) });
+                        current.changes.push(Change { test, last: Some(Last::NotKept(why)), micros: ended.ran.micros, asks: Some(asks) });
                     }
                     (Outcome::Passed { .. }, _) | (Outcome::Cached(_) | Outcome::Ignored | Outcome::Bench, _) => {}
                 }
@@ -731,10 +810,117 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         }
         let Some(mut current) = self.current.take() else { return Ok(()) };
         self.filtered += current.plan.filtered_out();
-        if !current.changes.is_empty() {
+        if current.owners.is_some() {
+            let mut changes = Vec::with_capacity_in(current.changes.len(), self.alloc);
+            for change in &current.changes {
+                changes.push((current.owner(change.test)?, *change));
+            }
+            changes.sort_unstable_by_key(|(suite, change)| (*suite, change.test));
+            for group in changes.chunk_by(|a, b| a.0 == b.0) {
+                current.suite = group[0].0;
+                current.changes.clear();
+                current.changes.extend(group.iter().map(|(_, change)| *change));
+                write_records(&mut current, self.alloc, out)?;
+            }
+            self.details.sort_unstable_by_key(|(row, _)| *row);
+            for (_, text) in self.details.drain(..) {
+                out.push(Effect::Print { text });
+            }
+            self.inventory_rows = Some(current.by_id);
+            self.phase = Phase::Suites;
+            return self.try_finish(out);
+        } else if !current.changes.is_empty() {
             write_records(&mut current, self.alloc, out)?;
         }
         self.open(SuiteId(current.suite.0 + 1), out)
+    }
+
+    /// Interleave the shared reporter's ordinary results with first-call refusals in
+    /// identity order. The ordinary result lines and accounting fields stay verbatim.
+    fn ordered_summary(&self, out: &mut AVec<'_, u8>) -> Result<(), LoopError> {
+        let style = self.config.style;
+        let json = style.format == Format::Json;
+        let mut refused = Vec::with_capacity_in(self.not_run.len() + self.not_built.len(), self.alloc);
+        let mut order = Vec::with_capacity_in(refused.capacity() + self.entries.len(), self.alloc);
+        for &row in &self.not_run {
+            refused.push(row);
+            order.push((row.path, row.test, Some(false), ""));
+        }
+        for (_, test, path, why) in &self.not_built {
+            // In the text form the driver prints this typed cause itself, which may contain
+            // several lines. In JSON the report escapes it into one event.
+            refused.push(NotRun { test: *test, path, why: if json { why.as_str() } else { "" } });
+            order.push((*path, *test, Some(true), why.as_str()));
+        }
+        for entry in &self.entries {
+            if json || matches!(entry.outcome, Outcome::Failed { .. } | Outcome::Passed { kept: Err(_), .. }) {
+                order.push((entry.path, entry.test, None, ""));
+            }
+        }
+        let mut rendered = String::new_in(self.alloc);
+        report::summary_with(&mut rendered, style, &self.entries, self.filtered, &self.flaky, &refused, self.alloc)?;
+        // summary_with emits the refusals first and the ordinary rows second, each sorted
+        // by (path, test), then flaky findings and one closing line. Both iterators borrow
+        // the same buffer. Consume one line per typed row without inspecting child output.
+        let mut refusals = rendered.as_str().split_inclusive('\n');
+        let mut ordinary = refusals.clone().skip(refused.len());
+        order.sort_unstable_by_key(|&(path, test, _, _)| (path, test));
+        let mut lines = Vec::with_capacity_in(order.len(), self.alloc);
+        for (path, test, refusal, why) in order {
+            let line = match refusal {
+                Some(_) => refusals.next(),
+                None => ordinary.next(),
+            }.ok_or(LoopError::SummaryShape)?;
+            lines.push((self.ordinal(test)?, path, test, line, if !json && refusal == Some(true) { Some(why) } else { None }));
+        }
+        lines.sort_unstable_by_key(|&(ordinal, path, test, _, _)| (ordinal, path, test));
+        for (_, path, _, line, why) in lines {
+            if let Some(why) = why {
+                let label = if style.colour { "\x1b[1;31mNOT RUN\x1b[0m" } else { "NOT RUN" };
+                writeln!(Text(out), "{label} {path}: {why}").map_err(ReportError::from)?;
+            } else {
+                out.extend_from_slice(line.as_bytes());
+            }
+        }
+        let mut findings = Vec::with_capacity_in(self.flaky.len(), self.alloc);
+        findings.extend(self.flaky.iter().map(|finding| finding.flaky.test));
+        findings.sort_unstable();
+        let mut flaky_lines = Vec::with_capacity_in(findings.len(), self.alloc);
+        for test in findings {
+            let line = ordinary.next().ok_or(LoopError::SummaryShape)?;
+            flaky_lines.push((self.ordinal(test)?, test, line));
+        }
+        flaky_lines.sort_by_key(|&(ordinal, test, _)| (ordinal, test));
+        for (_, _, line) in flaky_lines {
+            out.extend_from_slice(line.as_bytes());
+        }
+        let counts = ordinary.next().ok_or(LoopError::SummaryShape)?;
+        let count = self.not_built.len();
+        if count == 0 {
+            out.extend_from_slice(counts.as_bytes());
+        } else if json {
+            let counts = counts.strip_suffix("}\n").ok_or(LoopError::SummaryShape)?;
+            writeln!(Text(out), "{counts},\"not_built\":{count}}}").map_err(ReportError::from)?;
+        } else {
+            let (ran, accounting) = counts.split_once("; ").ok_or(LoopError::SummaryShape)?;
+            let (accounting, _) = accounting.rsplit_once("; ").ok_or(LoopError::SummaryShape)?;
+            write!(Text(out), "{ran}, {count} not run (code not built); {accounting}").map_err(ReportError::from)?;
+            if !self.not_run.is_empty() {
+                write!(Text(out), "; {} could not be run yet", self.not_run.len()).map_err(ReportError::from)?;
+            }
+            out.push(b'\n');
+        }
+        if ordinary.next().is_some() {
+            return Err(LoopError::SummaryShape);
+        }
+        Ok(())
+    }
+
+    fn ordinal(&self, test: TestId) -> Result<u32, LoopError> {
+        let Some(rows) = &self.inventory_rows else { return Ok(0) };
+        rows.binary_search_by_key(&test, |&(id, _)| id)
+            .map(|index| rows[index].1)
+            .map_err(|_| LoopError::UnknownTest { test })
     }
 
     /// After the last suite and the check: the summary and the status.
@@ -748,11 +934,14 @@ impl<'a, 'r> TestLoop<'a, 'r> {
                 Format::Json => fmt::write(&mut Text(&mut text), format_args!("{{\"event\":\"listed_summary\",\"tests\":{tests},\"benches\":{benches}}}\n")),
             };
             written.map_err(|_| LoopError::Report(ReportError::Write))?;
-        } else {
+        } else if self.inventory_rows.is_none() && self.not_built.is_empty() {
             report::summary_with(&mut Text(&mut text), self.config.style, &self.entries, self.filtered, &self.flaky, &self.not_run, self.alloc)?;
+        } else {
+            self.ordered_summary(&mut text)?;
         }
         out.push(Effect::Print { text });
-        let status = Status { failed: self.failed, not_run: u32::try_from(self.not_run.len()).unwrap_or(u32::MAX), check_errors };
+        let not_run = self.not_run.len() + self.not_built.len();
+        let status = Status { failed: self.failed, not_run: u32::try_from(not_run).map_err(|_| ReportError::TooMany { count: not_run })?, check_errors };
         self.phase = Phase::Finished;
         out.push(Effect::Done { status });
         Ok(())
@@ -846,7 +1035,8 @@ fn write_records<'a>(current: &mut Current<'_, '_>, alloc: Alloc<'a>, out: &mut 
         };
         let start = all.len();
         let (test, last, micros) = match (row, change) {
-            (_, Some(change)) => (change.test, change.last, change.micros),
+            (_, Some(Change { last: None, .. })) => continue,
+            (_, Some(Change { test, last: Some(last), micros, .. })) => (test, last, micros),
             (Some(row), None) => (row.kept.test, row.kept.last, row.kept.micros),
             (None, None) => break,
         };

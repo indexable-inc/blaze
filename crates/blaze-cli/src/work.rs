@@ -2065,7 +2065,7 @@ pub(crate) fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, 
                 if crate::signature::is_signature_entry(&outline, item) {
                     let at = blaze_surface::ItemIndex(index as u32);
                     let name = crate::signature::signature_name(subject, &outline, item, text);
-                    parts.push(Part { name, locate: Locate::Source(crate::engine_heads::outline_head_source(&outline, at, text, edition, crate::engine_heads::FnHeadBodies::Rule)), place: item.range.start });
+                    parts.push(Part { name, locate: Locate::Source(crate::engine_heads::outline_head_source(&outline, at, text)), place: item.range.start });
                 }
             }
             // Each lint unit its own part (lints.rs), when the step runs a rule: keyed by its

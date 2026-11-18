@@ -907,69 +907,28 @@ pub(crate) fn in_split_order<'a, T>(arrived: SVec<'a, (u32, T)>, splits: usize, 
     Ok(out)
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum FnHeadBodies {
-    Rule,
-    #[cfg(test)]
-    DropAll,
-}
-
-/// The body inputs of a signature part, selected while the outline still has the signature
-/// text. Restoring the part then needs neither a file read nor another scan of the signature.
-/// Under the Reference's “Items”, a block can declare items. The outer entry freezes the
-/// heads covered by that block. Under “Impl trait” and “Async functions”, the defining body
-/// determines the opaque return type's hidden type, including an async function's future.
-/// The outline has no resolved opaque-type or const-use information. Conservatively keep
-/// any `impl` in the signature and any async or const fn (a const call can occur in a type).
-/// A type macro can also expand to an opaque return type (`front2::type_expand`).
-pub(crate) fn outline_head_source(outline: &blaze_file_items::Outline<'_>, at: ItemIndex, text: &str, edition: blaze_surface::Edition, bodies: FnHeadBodies) -> ContentId {
+/// A fn head records its signature and whether it has a definition. A block that supplies
+/// other heads is tracked through the names and expansion cells the entry reads.
+pub(crate) fn outline_head_source(outline: &blaze_file_items::Outline<'_>, at: ItemIndex, text: &str) -> ContentId {
     use blaze_surface::{ItemDetail, ItemKind};
 
     let item = outline.item(at);
-    let needs_fn_body = |entry: &blaze_surface::Item, body_holds_items: bool| {
-        match bodies {
-            FnHeadBodies::Rule => (),
-            #[cfg(test)]
-            FnHeadBodies::DropAll => return false,
-        }
-        body_holds_items || blaze_ladder::front2::heads::signature_needs_fn_body(
-            entry.text(text, entry.signature),
-            entry.name.map(|name| name.start - entry.signature.start),
-            edition,
-        )
-    };
     let mut h = blaze_ids::Hasher::new(HEAD_SOURCE_DOMAIN);
     h.update(&crate::signature::signature_source(outline, at, text).0);
-    let whole = match item.detail {
-        ItemDetail::Fn { body_holds_items } => {
-            h.update(&[u8::from(item.body.is_some())]);
-            item.body.is_some() && needs_fn_body(item, body_holds_items)
-        }
-        _ => work::checked_body(outline, item).is_some() || work::expansion_entry(outline, item, text),
-    };
-    if whole {
+    if let ItemDetail::Fn { .. } = item.detail {
+        h.update(&[u8::from(item.body.is_some())]);
+    } else if work::checked_body(outline, item).is_some() || work::expansion_entry(outline, item, text) {
         h.update(&item.hash.0);
     }
-    // A default method has no separate signature task. Its trait owns the body's input.
+    // A trait owns its methods' signatures, including whether each has a default.
     if item.kind() == ItemKind::Trait {
         for (_, member) in outline.children(Some(at)) {
-            if let ItemDetail::Fn { body_holds_items } = member.detail {
+            if let ItemDetail::Fn { .. } = member.detail {
                 h.update(&[u8::from(member.body.is_some())]);
-                if member.body.is_some() && needs_fn_body(member, body_holds_items) {
-                    h.update(&member.hash.0);
-                }
             }
         }
     }
     h.finish()
-}
-
-// The control supplies the same outline producer's parts under DropAll for its one edited
-// file. Only the planning thread reads them, so concurrently running fixtures are isolated.
-#[cfg(test)]
-std::thread_local! {
-    pub(crate) static PLANTED_HEAD_SOURCES: core::cell::RefCell<std::collections::BTreeMap<Name, ContentId>> =
-        const { core::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
 
 /// One `Signature` task an outline entry that has a head (signature.rs `is_signature_entry`), in
@@ -983,8 +942,6 @@ pub(crate) fn plan_items<'h>(outlined: &[Outlined<'_>], alloc: SharedAlloc<'h>) 
         let Ok(record) = &one.made else { continue };
         for part in record.parts.iter() {
             let (Kind::Signature, Locate::Source(head)) = (part.name.kind, part.locate) else { continue };
-            #[cfg(test)]
-            let head = PLANTED_HEAD_SOURCES.with_borrow(|parts| parts.get(&part.name).copied().unwrap_or(head));
             let source = crate::engine_tasks::edition_source(head, one.edition);
             planned.push(Planned { name: part.name, phase: Phase::new(Stage::Heads, 0), source, file: one.name });
         }
@@ -1049,9 +1006,9 @@ impl<'s> Owners<'s> {
     where
         's: 'n,
     {
-        let mut prefix = [0u8; 8];
-        prefix.copy_from_slice(&id.of.subject.0[..8]);
-        let (k, key) = (0..NamesSource::crate_count(records)).find_map(|k| NamesSource::crate_key(records, k).filter(|key| key.prefix() == prefix).map(|key| (k, key)))?;
+        let k = NamesSource::crate_of(records, blaze_id::ItemKey(id.of.subject))?;
+        let key = NamesSource::crate_key(records, k)?;
+        let prefix = key.prefix();
         let scope = blaze_drive::key::crate_scope_name(&key);
         // A crate with no file among the members' outlines (a dependency) has no head tasks.
         // Judged by the files, not by the `CELLS` mark of the scope named here: by that mark,
@@ -1586,8 +1543,8 @@ fn heads_of_crate<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>, k: u
             // An entry no outline entry covers stands inside a body (an impl in a fn's body, a
             // body's block a call or `const _` wrote): a body's items have no `Signature` of their
             // own (D114 FACTS (iii)), so the head task of the entry whose body holds it freezes it
-            // (`holding_entry`), under a cell of its place in that entry; that task's source holds
-            // the entry's whole text (`plan_items`), so its key covers the item's.
+            // (`holding_entry`), under a cell of its place in that entry. The freeze records
+            // its reads of the block's expansion, items and members.
             let placed = match entry_of(top) {
                 Some((cover, entry)) => Some((cover, entry, walk.map(|(steps, _)| Written { steps, from_entry: top - cover.0 }))),
                 None => holding_entry(&outline, ItemIndex(top)).and_then(|holder| entry_of(holder.0)).map(|(cover, entry)| {
@@ -2515,8 +2472,6 @@ fn heads_of(
     let (freeze_names, eval_names) = (owned(), owned());
     let both = blaze_ladder::front2::tables::owned_reads::BothOwners { names: &freeze_names, evals: &eval_names };
     let shared = base.reading_into(&freeze_names);
-    let mut once_consts = crate::engine_heads_once::OnceConsts::new(base.reading_into(&eval_names), &index, g, once, job.prefix);
-    let mut source = SeededHeads::new(SeededHeadsOpts { names: shared, sized, pointers, frame, scratch: g, alloc: g, consts: Some(&mut once_consts as &mut dyn ConstValues<'_>), known: Some(once), owners: Some(&both) });
     // An entry of the crate (any split's): the whole crate's listing, not this split's tasks.
     let same_crate = |of: Name| listing.holds_entry(of);
     let job_cx = crate::engine_heads_once::JobCx {
@@ -2537,9 +2492,14 @@ fn heads_of(
         once,
         names: &freeze_names,
         evals: &eval_names,
+        attempt_reads: core::cell::RefCell::new(blaze_hash::HashMap::new_in(g)),
+        engine_refusal: core::cell::Cell::new(None),
         same_crate: &same_crate,
         members,
     };
+    let mut once_consts = crate::engine_heads_once::OnceConsts { cx, job: &job_cx };
+    let job_heads = crate::engine_heads_once::JobHeads { cx, job: &job_cx };
+    let mut source = SeededHeads::new(SeededHeadsOpts { names: shared, sized, pointers, frame, scratch: g, alloc: g, consts: Some(&mut once_consts as &mut dyn ConstValues<'_>), known: Some(&job_heads), owners: Some(&both) });
     let mut done = std::vec::Vec::with_capacity_in(tasks.len(), Global);
     for (at_task, task) in tasks.iter().enumerate() {
         let name = task.planned.name;
@@ -2603,6 +2563,9 @@ fn heads_of(
             // Frozen through the split's one source, its reads its cells' own (engine_heads_once.rs
             // `one_head`; a head that does not freeze is frozen again alone, as before).
             let made = crate::engine_heads_once::one_head(&job_cx, &mut source, &mut owners, *want, name, &mut |id| worked.reads.push(id), &mut failed);
+            if let Some(why) = job_cx.engine_refusal.get() {
+                return Err(why);
+            }
             // Each cell once so far, whenever the list has doubled since it last was.
             if worked.reads.len() > settled.saturating_mul(2).max(SETTLE_AT) {
                 once_each(&mut worked.reads);
@@ -2655,7 +2618,7 @@ fn heads_of(
     }
     // Every lowering the source made, its constant evaluator's too (front2 head.rs
     // `Frozen::eval_lowered`): the work the stage did.
-    once.job_done(source.lowered.saturating_add(source.eval_lowered), source.taken);
+    once.job_done(source.total_lowered(), source.taken);
     Ok(done)
 }
 

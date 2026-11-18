@@ -261,11 +261,11 @@ struct Mapped<'s, 'f> {
     /// The subjects of the handed `Fetch` jobs that hold their sources, sorted.
     handed: &'s [ContentId],
     mapped: &'s mut Vec<(ContentId, &'f [u8]), &'f Frame>,
-    /// The records' folder as the machine names it (`fetch::sources_native`).
-    folder: &'s str,
+    /// Maps one record from the sources store (fetch.rs `Lockfile::map_source`).
+    map: &'s mut dyn FnMut(&ContentId) -> Result<blaze_core::Mapping, CliError>,
     frame: &'f Frame,
     /// The first record that could not be mapped: the store's fault.
-    error: &'s mut Option<std::io::Error>,
+    error: &'s mut Option<CliError>,
 }
 
 impl<'f> Records<'f> for Mapped<'_, 'f> {
@@ -276,12 +276,7 @@ impl<'f> Records<'f> for Mapped<'_, 'f> {
             Ok(at) => return Some(self.mapped[at].1),
             Err(at) => at,
         };
-        let hex = crate::fetch::key_hex(&key);
-        let mut path = std::string::String::with_capacity(self.folder.len() + 65);
-        path.push_str(self.folder);
-        path.push('/');
-        path.extend(hex.iter().map(|digit| char::from(*digit)));
-        match blaze_core::Mapping::map_file(std::path::Path::new(&path)) {
+        match (self.map)(&key) {
             Ok(mapping) => {
                 // Kept for the command: the bytes are read in place by every later entry.
                 let mapping: &'f blaze_core::Mapping = std::boxed::Box::leak(std::boxed::Box::new_in(mapping, self.frame));
@@ -316,14 +311,14 @@ pub(crate) fn run<'f, 'b>(cx: &Cx, lockfile: &mut Lockfile<'f>, graph: &mut Grap
     failed.extend(task.failed.iter().filter(|need| need.kind == Kind::Fetch).map(|need| need.subject));
     failed.sort_unstable();
     // The machine's sources store beneath the home (fetch.rs `SOURCES`), where every `Fetch`
-    // task wrote its unit's record: never the checkout.
-    let Some(folder) = crate::fetch::sources_native(env, held) else {
-        return Err(CliError::Text { what: "HOME is not set: the sources store (fetch.rs `SOURCES`) is beneath it" });
-    };
+    // task wrote its unit's record: never the checkout. Mapped through the fetch's own
+    // directory (fetch.rs `Lockfile::map_source`).
+    let lock = lockfile.lock;
+    let mut map = |key: &ContentId| lockfile.map_source(cx, env, key);
     let mut unmapped = None;
-    let records = Mapped { handed: &handed, mapped: &mut graph.mapped, folder: folder.as_str(), frame, error: &mut unmapped };
+    let records = Mapped { handed: &handed, mapped: &mut graph.mapped, map: &mut map, frame, error: &mut unmapped };
     let unheld = Unheld { failed: &failed, refused: &refused };
-    let entry = unit_graph_task::run(&graph.inputs, lockfile.lock, records, PackView::open_source_put, unheld, env.heap.alloc());
+    let entry = unit_graph_task::run(&graph.inputs, lock, records, PackView::open_source_put, unheld, env.heap.alloc());
     if let Some(error) = unmapped {
         let words = bstd::mem::format_in!(held, "a fetched source record could not be mapped: {error}");
         return Ok(Did::Hole(

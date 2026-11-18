@@ -108,7 +108,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let adt = self.adts.location_adt().ok_or(BuildError::NoLangFn { expr: Some(e), name: "panic_location" })?;
                 let loc_ty = self.ground.intern(PNode::Adt(adt, List::EMPTY)).map_err(|_| malformed("the ground table is full"))?;
                 let ret = self.ground.intern(PNode::Ref(Mutbl::Not, loc_ty)).map_err(|_| malformed("the ground table is full"))?;
-                let site = self.site_of(e, callee.item)?;
+                // The call's site is in the CALLER's body (`e` is its expression): a missing site
+                // is named for that body, not for the callee (lane CX18).
+                let site = self.site_of(e, self.body.owner)?;
                 Ok(Some(self.location_row(e, Site::Here(site), loc_ty, ret)?))
             }
         }

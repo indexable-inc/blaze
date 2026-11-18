@@ -140,6 +140,8 @@ struct SimZygote<'t> {
     asks: AVec<'static, u32>,
     /// Results put on the channel.
     sent: usize,
+    /// The second process starts later in the same plan batch (e.g. a cold launch).
+    stagger: bool,
     dead: bool,
     told_end: bool,
     starts: u32,
@@ -168,6 +170,7 @@ impl<'t> SimZygote<'t> {
             heard: Vec::new_in(g),
             asks,
             sent: 0,
+            stagger: false,
             dead: false,
             told_end: false,
             starts: 0,
@@ -270,6 +273,7 @@ impl<'t> SimZygote<'t> {
                         let script = self.scripts[row as usize];
                         let ends = match script {
                             Script::Hang => None,
+                            Script::Pass if self.stagger => Some(t.after(Nanos(BUDGET.0 * 3 / 4))),
                             _ => Some(t.after(Nanos(1_000_000 + self.tape.below(BUDGET.0 / 2, "duration")))),
                         };
                         self.children.push(SimChild { child, row, script, ends, killed: None, gone: false });
@@ -314,6 +318,9 @@ impl Zygotes for SimZygote<'_> {
         self.width = width;
         self.pool = Some(Pool::new(width, Alloc::global()).expect("a width above zero"));
         self.placed_at = Some(self.now.after(Nanos(self.tape.below(3_000_000, "placement"))));
+        if self.stagger {
+            self.placed_at = Some(self.now);
+        }
         if self.dies_after == Some(0) {
             self.dead = true;
             let at = self.now;
@@ -323,6 +330,9 @@ impl Zygotes for SimZygote<'_> {
     }
 
     fn ask(&mut self, row: u32, test: TestId, budget: Nanos) -> Result<(), RunError> {
+        if self.stagger && row == 1 {
+            self.now = self.now.after(Nanos(BUDGET.0 * 3 / 4));
+        }
         self.asks[row as usize] += 1;
         // A dead zygote's socket buffer takes the ask; nothing reads it.
         if let Some(pool) = self.pool.as_mut() {
@@ -576,6 +586,21 @@ fn request(tape: &Tape, plant: RunPlant) -> Result<(), Broke> {
 #[test]
 fn every_test_gets_one_verdict_and_a_hang_blocks_none() {
     check(SimConfig::cases(500), |tape| request(tape, RunPlant::None));
+}
+
+#[test]
+fn a_siblings_timeout_does_not_cut_a_later_childs_allowance() {
+    // Both fly at plan time zero. One hangs from fork time zero; its sibling forks at
+    // 0.75 s and returns at 1.5 s, inside its own one-second allowance.
+    control(SimConfig::cases(16), RunPlant::None, RunPlant::TickBeforeSibling, "the later child lost its own allowance", |tape, plant| {
+        let g = Alloc::global();
+        let mut zygote = SimZygote::new(tape, Vec::from_slice_in(&[Script::Hang, Script::Pass], g), None);
+        zygote.stagger = true;
+        let mut runner = Runner::new(zygote, &config(2).plan, Host::Macos, g);
+        runner.plant = plant;
+        let driven = drive(&mut runner, 2, 2)?;
+        oracle(driven.stopped.is_none() && driven.text.contains("ran 2: 1 passed, 1 failed"), || format!("the later child lost its own allowance: {:?}\n{}", driven.stopped, driven.text))
+    });
 }
 
 #[test]

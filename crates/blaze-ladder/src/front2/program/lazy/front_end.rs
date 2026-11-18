@@ -49,7 +49,7 @@ impl<'n> InternalBindings<'n> {
     }
 }
 
-impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
+impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// `f` over the checker's world of row `i`'s live body: as `Front2Program::in_world`. A ctor
     /// (a row with no body, built as a fn) is asked in its ADT's world (`ctor_world`); any other
     /// row with no live body has no world: the question is the world's own refusal (`Missing`),
@@ -59,7 +59,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             let key = self.rows.key[i];
             return crate::front2::world_items::ctor_world(self.front.names, &self.front.keys, &self.front.index, &self.store, self.buckets.as_ref(), key, f);
         };
-        let body = &live.again;
+        let body = &live.made;
         let view = body.lowered.view();
         // A function of the lowering alone, made once when the body was checked.
         let Ok(spell) = Spelling::of(&view) else {
@@ -117,7 +117,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
     }
 }
 
-impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
+impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     // (1) Rows and bodies.
 
     fn fn_count(&self) -> usize {
@@ -136,7 +136,7 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
             abi: self.rows.abi[i],
             symbol: self.rows.str(self.rows.symbol[i]),
             export: self.rows.export[i].map(|s| self.rows.str(s)),
-            body: self.live_of(i).map(|l| (&l.again.typeck, &l.lits.texts)),
+            body: self.live_of(i).map(|l| (&l.made.typeck, &l.lits.texts)),
             const_fn: false,
             condition: false,
         }
@@ -157,7 +157,11 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
     }
 
     fn types(&self) -> PTys<'_> {
-        self.tys.as_ref().map_or(tc::PTys::EMPTY, |t| t.view())
+        self.head_types()
+    }
+
+    fn body_types(&self, i: usize) -> PTys<'_> {
+        self.types_of_body(i)
     }
 
     fn resolve(&self, i: usize, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ResolveError> {
@@ -258,11 +262,11 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
         super::seam_rules::fn_abi(tabled, self.front.names, &self.store, key)
     }
 
-    /// program/seam_rules.rs `track_caller` over the rows' own attributes, else the heads'
-    /// (fill.rs `own_track_caller`): a trait impl's method that does not say it itself answers
-    /// with its trait's declaration's.
+    /// Read a filed row's attribute, or ask the shared rule for the function's signature.
     fn track_caller(&self, key: ItemKey) -> Option<bool> {
-        super::seam_rules::track_caller(&self.front.keys, &self.store, key, |k| self.own_track_caller(k))
+        super::seam_rules::track_caller_from(self.front.names, &self.front.keys, &self.store, key, |k| {
+            self.rows.track_caller.get(*self.rows.by_key.get(&k)? as usize).copied()
+        })
     }
 
     /// From `owner`'s live body (the build asks while it builds that body) by program/
@@ -270,20 +274,20 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// source (over records, the items record's file row).
     fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Option<blaze_build::CallerSite<'_>> {
         let live = self.live_by_key(owner)?;
-        super::seam_rules::caller_site(self.front.names, &self.front.keys, owner, &live.again, expr)
+        super::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, owner, &live.made, expr)
     }
 
     /// From `owner`'s live body by program/seam_rules.rs `expr_offset`: no file asked, so a
     /// toolchain crate's trap keeps its site.
     fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {
         let live = self.live_by_key(owner)?;
-        super::seam_rules::expr_offset(&live.again, expr)
+        super::seam_rules::expr_offset(&live.made, expr)
     }
 
     /// program/seam_rules.rs `source_position`: the item's first byte today and today's text of
     /// its file, from the names source (over records, item_grain.rs `row_now` and `file_now`).
     fn source_position(&self, item: ItemKey, site: u32) -> Result<(u32, u32), crate::seam::PositionGap> {
-        super::seam_rules::source_position(self.front.names, &self.front.keys, item, site)
+        super::seam_rules::source_position(self.front.names, &self.front.keys, &self.store, item, site)
     }
 
     /// The start [`LazyProgram::decide_start`] decided, when it is a Rust start.

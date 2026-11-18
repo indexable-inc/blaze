@@ -1,10 +1,17 @@
 //! The borrow check (flow.md sections 3 to 5): accesses and conflicts, liveness, two-phase
 //! activation, tier one (location-insensitive) and tier two (the Polonius rules as stated).
 //!
-//! Tier two is the definition. Each rule of the Polonius book (rules/loans) is one marked step of
-//! [`tier_two`]; tier one is the same rules with the point and `loan_killed_at` dropped, so every
+//! Tier two implements the point-sensitive rules of the Polonius book (rules/loans).
+//! Tier one drops the point and `loan_killed_at`, so every
 //! fact of tier two is a fact of tier one, and tier one accepting a body means tier two does.
 #![blaze::sans_io]
+
+mod components;
+mod filter;
+mod points;
+mod solver;
+#[cfg(test)]
+mod solver_tests;
 
 use blaze_own::Vec;
 use core::alloc::Allocator;
@@ -219,7 +226,7 @@ pub fn facts<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>,
     loop {
         passes += 1;
         if passes > limit {
-            return Err(Bound { what: "liveness passes", limit });
+            return Err(Bound::Passes { what: "liveness passes", limit });
         }
         let mut changed = false;
         for s in (0..n).rev() {
@@ -269,7 +276,7 @@ pub fn facts<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>,
     loop {
         passes += 1;
         if passes > limit {
-            return Err(Bound { what: "activation passes", limit });
+            return Err(Bound::Passes { what: "activation passes", limit });
         }
         let mut changed = false;
         for s in 0..n {
@@ -352,7 +359,7 @@ fn close<A: Allocator + Clone>(
     let mut head = 0usize;
     while head < queue.len() {
         if head as u64 >= limit {
-            return Err(Bound { what: "tier one work list pops", limit });
+            return Err(Bound::Passes { what: "tier one work list pops", limit });
         }
         let from = queue[head];
         head += 1;
@@ -449,15 +456,47 @@ pub fn tier_one<A: Allocator + Clone>(
     Ok(TierOne::Accepted)
 }
 
-/// Tier two: the Polonius rules evaluated as stated, over every point, to a fixed point.
-/// `subset` is one bit per (point, origin, origin), `contains` one per (point, origin, loan).
-/// Bound: passes in point order, each but the last adding a fact, so at most
-/// `points * (origins^2 + origins * loans) + 1`.
+/// Location-sensitive loan and placeholder findings, in diagnostic order.
 pub fn tier_two<A: Allocator + Clone>(
     flow: &Flow<A>,
     facts: &Facts<A>,
     plant: Plant,
     alloc: A,
+) -> Result<Vec<BorrowFinding, A>, Bound> {
+    let result = solver::solve((), flow, facts, plant, alloc.clone(), &mut solver::Meter::new(solver::LIMIT));
+    #[cfg(test)]
+    if let Ok(found) = &result {
+        let expected = tier_two_oracle(flow, facts, plant, alloc)?;
+        assert_eq!(found.as_slice(), expected.as_slice(), "tier two disagrees with the pointwise rules");
+    }
+    result
+}
+
+#[cfg(test)]
+fn tier_two_oracle<A: Allocator + Clone>(
+    flow: &Flow<A>, facts: &Facts<A>, plant: Plant, alloc: A,
+) -> Result<Vec<BorrowFinding, A>, Bound> {
+    tier_two_oracle_counted(flow, facts, plant, alloc, &mut 0)
+}
+
+#[cfg(test)]
+pub(crate) fn assert_tiers_equal_for_fixture<A: Allocator + Clone>(flow: &Flow<A>) {
+    let alloc = flow.stmts.allocator();
+    let facts = facts(flow, alloc.clone()).expect("fixture liveness converges");
+    tier_two(flow, &facts, Plant::None, alloc.clone()).expect("fixture loan analysis converges");
+}
+
+/// The original pointwise rules, kept as a test oracle.
+/// `subset` is one bit per (point, origin, origin), `contains` one per (point, origin, loan).
+/// Bound: passes in point order, each but the last adding a fact, so at most
+/// `points * (origins^2 + origins * loans) + 1`.
+#[cfg(test)]
+fn tier_two_oracle_counted<A: Allocator + Clone>(
+    flow: &Flow<A>,
+    facts: &Facts<A>,
+    plant: Plant,
+    alloc: A,
+    cells: &mut u64,
 ) -> Result<Vec<BorrowFinding, A>, Bound> {
     let (n, o, nl) = (flow.stmts.len(), flow.origins as usize, flow.loans.len());
     let points = 2 * n;
@@ -477,7 +516,7 @@ pub fn tier_two<A: Allocator + Clone>(
     loop {
         passes += 1;
         if passes > limit {
-            return Err(Bound { what: "tier two passes", limit });
+            return Err(Bound::Passes { what: "tier two passes", limit });
         }
         let mut changed = false;
         for p in 0..points {
@@ -486,8 +525,10 @@ pub fn tier_two<A: Allocator + Clone>(
             loop {
                 let mut grew = false;
                 for a in 0..o {
+                    *cells += o as u64;
                     for b in 0..o {
                         if subset.get(p, a * o + b) {
+                            *cells += o as u64;
                             for c in 0..o {
                                 if subset.get(p, b * o + c) {
                                     grew |= subset.set(p, a * o + c);
@@ -504,9 +545,11 @@ pub fn tier_two<A: Allocator + Clone>(
             // origin_contains_loan_on_entry(O2, L, P) :- ..(O1, L, P), subset(O1, O2, P).
             // subset is closed at P, so one round suffices.
             for a in 0..o {
+                *cells += o as u64;
                 for b in 0..o {
                     if subset.get(p, a * o + b) {
                         let (from, into) = if plant == Plant::TierTwoReversed { (b, a) } else { (a, b) };
+                        *cells += nl as u64;
                         for l in 0..nl {
                             if contains.get(p, from * nl + l) {
                                 changed |= contains.set(p, into * nl + l);
@@ -521,6 +564,7 @@ pub fn tier_two<A: Allocator + Clone>(
             let mut edge = |q: usize| {
                 // subset(O1, O2, Q) :- subset(O1, O2, P), cfg_edge(P, Q), live(O1, Q), live(O2, Q).
                 for a in 0..o {
+                    *cells += o as u64;
                     for b in 0..o {
                         if subset.get(p, a * o + b) && live(q, a) && live(q, b) {
                             changed |= subset.set(q, a * o + b);
@@ -529,6 +573,7 @@ pub fn tier_two<A: Allocator + Clone>(
                 }
                 // ..(O, L, Q) :- ..(O, L, P), !loan_killed_at(L, P), cfg_edge(P, Q), live(O, Q).
                 for a in 0..o {
+                    *cells += nl as u64;
                     for l in 0..nl {
                         if contains.get(p, a * nl + l)
                             && !(is_start && kills(flow, s, Loan(l as u32)))

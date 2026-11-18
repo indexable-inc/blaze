@@ -23,7 +23,7 @@ use core::fmt;
 
 use crate::a64::{ADD64, ADRP, BLR, LDR64, adrp, add_lo12, expect, ldr_lo12, write32};
 use crate::image::ImageError;
-use crate::record::{CodeView, OWN_CODE, OWN_RELRO, SiteKind, Space, Symbol, Target};
+use crate::record::{CodeView, OWN_CODE, OWN_RELRO, PositionPart, PositionRow, SiteKind, Space, Symbol, Target};
 
 /// What the run's table answers for a record's targets. The control thread implements it over
 /// its slot table; asking it a symbol first seen numbers a new slot whose word names its stub.
@@ -53,6 +53,8 @@ pub enum PlaceError {
     Size { symbol: Symbol, what: &'static str, want: usize, got: usize },
     /// `what` is not on the alignment its instructions or words need.
     Misaligned { symbol: Symbol, what: &'static str, at: u64, align: u64 },
+    /// A parent's answers must give one little-endian u32 per sealed position row.
+    PositionBytes { symbol: Symbol, rows: usize, bytes: usize },
     /// A site is not the instructions it says, cannot reach its word, or names nothing bound
     /// (record-offset positions).
     Site(ImageError),
@@ -66,6 +68,9 @@ impl fmt::Display for PlaceError {
             }
             PlaceError::Misaligned { symbol, what, at, align } => {
                 write!(f, "function {symbol}: {what} at {at:#x} is not {align}-aligned (run.md, \"Slot table\")")
+            }
+            PlaceError::PositionBytes { symbol, rows, bytes } => {
+                write!(f, "function {symbol}: {rows} source position fields need one u32 each, received {bytes} bytes")
             }
             PlaceError::Site(error) => write!(f, "{error} (placing one record; offsets are the record's)"),
         }
@@ -92,6 +97,36 @@ pub fn place(
     code: &mut [u8],
     relro: &mut [u8],
 ) -> Result<(), PlaceError> {
+    place_positions(record, symbol, at, words, code, relro, |_, row| Err(ImageError::UnresolvedPosition { symbol, row }))
+}
+
+/// Places with the parent's transient answers, one little-endian u32 for each sealed row.
+pub fn place_resolved(
+    record: &CodeView<'_>,
+    symbol: Symbol,
+    at: At,
+    words: &mut dyn Words,
+    code: &mut [u8],
+    relro: &mut [u8],
+    values: &[u8],
+) -> Result<(), PlaceError> {
+    if record.positions().checked_mul(4) != Some(values.len()) {
+        return Err(PlaceError::PositionBytes { symbol, rows: record.positions(), bytes: values.len() });
+    }
+    place_positions(record, symbol, at, words, code, relro, |i, _| Ok(crate::a64::read32(values, (i * 4) as u64)))
+}
+
+/// Places a record using this run's source-position answers in sealed row order. Only the
+/// destination bytes receive the answers. A lookup failure prevents publication.
+pub fn place_positions(
+    record: &CodeView<'_>,
+    symbol: Symbol,
+    at: At,
+    words: &mut dyn Words,
+    code: &mut [u8],
+    relro: &mut [u8],
+    value: impl FnMut(usize, PositionRow) -> Result<u32, ImageError>,
+) -> Result<(), PlaceError> {
     let want = record.code().len();
     if code.len() != want {
         return Err(PlaceError::Size { symbol, what: "code", want, got: code.len() });
@@ -113,6 +148,7 @@ pub fn place(
     }
     code.copy_from_slice(record.code());
     relro.copy_from_slice(record.relro());
+    fill_positions(record, symbol, code, relro, value)?;
     for s in 0..record.sites() {
         let site = record.site(s);
         let off = u64::from(site.at);
@@ -153,6 +189,30 @@ pub fn place(
         let filled = value.wrapping_add_signed(word.addend);
         let start = word.at as usize;
         relro[start..start + 8].copy_from_slice(&filled.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// The slices start at this record's part bases. Its seal proves each field lies inside the
+/// corresponding part and overlaps no site, address word or other field.
+pub(crate) fn fill_positions(
+    record: &CodeView<'_>,
+    symbol: Symbol,
+    code: &mut [u8],
+    relro: &mut [u8],
+    mut value: impl FnMut(usize, PositionRow) -> Result<u32, ImageError>,
+) -> Result<(), ImageError> {
+    for i in 0..record.positions() {
+        let row = record.position(i);
+        let dst = match row.part {
+            PositionPart::Code => &mut *code,
+            PositionPart::Relro => &mut *relro,
+        };
+        let resolved = value(i, row)?;
+        if resolved == 0 {
+            return Err(ImageError::ZeroPosition { symbol, row });
+        }
+        write32(dst, u64::from(row.at), resolved);
     }
     Ok(())
 }

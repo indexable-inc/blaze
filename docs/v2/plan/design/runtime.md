@@ -96,9 +96,16 @@ test asserts. Where a row is a target and not yet a derived floor it says so.
    times the memory of a from-scratch run, so blaze uses no delta engine.
 
 3. **The engine enters each task once, and finds work forward from what changed.**
-   - The plan is made from text; stages run in order over shared immutable tables; inside Heads and Bodies a
-     row's wave is one more than the highest same-stage row it read and never goes down, so a head that reads
-     a head and a body that reads a body's fact are ordered and never refused or left stale.
+   - The plan is made from text; a task runs after ITS producers over shared immutable tables, and no stage
+     is a barrier for a crate that does not read it (decision D142, 2026-11-18: on tempo the kernel counted
+     0.5, 1.6, 4.8 and 7.4 busy cores of 16 in Scripts, Names, Heads and Bodies while stages ran in global
+     order, scripts one at a time and names on the coordinator); inside Heads and Bodies a row's wave is one
+     more than the highest same-stage row it read and never goes down, so a head that reads a head and a body
+     that reads a body's fact are ordered and never refused or left stale.
+   - A read list holds a task's DIRECT reads, and every crate the lock fixes is one settled-class proof in
+     it, never a cell a crate; a cell's id is made once a distinct key (decision D140: on tempo 52% of the
+     body stage's CPU was read bookkeeping, and 913 of a body's 1,058 kept cells were whole dependency
+     records).
    - A need found while running is made inline through a claim; a re-made result with equal bytes moves no
      reader. A candidate is entered only if the request still needs it.
    - A read list is kept in read order and checked in that order, stopping at the first that moved.
@@ -131,7 +138,12 @@ test asserts. Where a row is a target and not yet a derived floor it says so.
    Clippy merged their passes); Clippy's lints were 72% of CPU on one project.
 
 5. **Nothing shared and mutable on the path of an item, and no single thread on the path of a stage.** A
-   stage's tables are immutable while it runs; a worker's state is its frame, reset per task; an interned id
+   stage's tables are immutable while it runs; what a task makes for itself (inference variables,
+   diagnostics, its read recorder) is in its frame, reset per task, and what many tasks need (opened records,
+   a scope's lang index, a frozen head, a constant's value, a settled goal's answer) is made ONCE a request
+   through a claim and read in place, each hit still the task's read (decision D141, 2026-11-18: with every
+   task rebuilding these in its own frame, tempo's heads were lowered 5.9 times each and 70% of the head
+   stage's CPU was other items' signatures lowered again); an interned id
    is (worker, index), sized for more than 128 workers; a shared result is a record made once through a claim;
    each worker writes its own sorted run of rows and index entries, so the coordinator merges runs and never
    inserts per read.
@@ -153,8 +165,12 @@ test asserts. Where a row is a target and not yet a derived floor it says so.
    read and the impls your trait questions can reach.
 
 8. **A program is a manifest over code records.** `run` makes a function on its first call and tiers up in
-   the background; `export` writes a file others can run; an edit patches bytes in proportion to it. One code
-   record per shape at the first tier; line tables with the code, full debug info after.
+   the background; a COLD run also prepares a function's direct callees in parallel as it builds the caller,
+   keeping first-call resolution for indirect calls (decision D144, 2026-11-18, not built: hello world's
+   first run made 630 code records one at a time in 12.8 s; its second run took 0.07 s); `export` writes a
+   file others can run; an edit patches bytes in proportion to it. One code record per shape at the first
+   tier; a record holds no line or column, only a row for each source-position field that its placement
+   fills from today's file (decision D143); line tables with the code, full debug info after.
    *Evidence:* nobody surveyed keeps native code per function on disk by content; a faster back end alone
    moves little (the Cranelift back end: 5 to 12% end to end on a large Rust project, with a per-function
    cache as its own next goal); Zig's in-place patching reaches 30 to 70 ms rebuilds.

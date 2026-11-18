@@ -261,8 +261,11 @@ pub fn lay_out<'a, 'r>(
     let n = members.len();
     let page = plan.page;
     let mut by_symbol: AVec<'_, u32> = Vec::with_capacity_in(n, alloc);
-    for i in 0..n as u32 {
-        by_symbol.push(i);
+    for (i, member) in members.iter().enumerate() {
+        if member.record.positions() != 0 {
+            return Err(blaze_code::image::ImageError::UnresolvedPosition { symbol: member.symbol, row: member.record.position(0) }.into());
+        }
+        by_symbol.push(i as u32);
     }
     by_symbol.sort_unstable_by(|&a, &b| members[a as usize].symbol.cmp(&members[b as usize].symbol));
     for pair in by_symbol.windows(2) {

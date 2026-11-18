@@ -1936,21 +1936,26 @@ impl FrontEnd for Front2Program<'_> {
     /// row of its trait's declaration of the method of its name (`None` when that row is not
     /// tabled: never guessed `false`).
     fn track_caller(&self, key: ItemKey) -> Option<bool> {
-        lazy::seam_rules::track_caller(&self.front.keys, &self.store, key, |k| Some(self.fns.get(*self.by_key.get(&k)?)?.track_caller))
+        lazy::seam_rules::track_caller_from(self.front.names, &self.front.keys, &self.store, key, |k| Some(self.fns.get(*self.by_key.get(&k)?)?.track_caller))
     }
 
     /// From `owner`'s lowered body (`View::site`: item-relative, or the outermost macro call's
     /// range) and the solved file the item is written in, by its shown name (seam_rules.rs).
     fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Option<blaze_build::CallerSite<'_>> {
         let row = self.fns.get(*self.by_key.get(&owner)?)?;
-        lazy::seam_rules::caller_site(self.front.names, &self.front.keys, owner, row.body.as_ref()?, expr)
+        lazy::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, owner, row.body.as_ref()?, expr)
+    }
+
+    fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {
+        let row = self.fns.get(*self.by_key.get(&owner)?)?;
+        lazy::seam_rules::expr_offset(row.body.as_ref()?, expr)
     }
 
     /// From the item's present first byte in today's text of its file (`NamesSource::item_start`,
     /// item_grain.rs) and that text's line starts: an edit above the item moves the answer and
     /// no record (seam_rules.rs).
     fn source_position(&self, item: ItemKey, site: u32) -> Result<(u32, u32), crate::seam::PositionGap> {
-        lazy::seam_rules::source_position(self.front.names, &self.front.keys, item, site)
+        lazy::seam_rules::source_position(self.front.names, &self.front.keys, &self.store, item, site)
     }
 
     /// A static the program reaches: its head's mutability and `#[thread_local]` (statics.rs).

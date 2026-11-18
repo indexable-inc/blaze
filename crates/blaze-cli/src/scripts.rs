@@ -623,6 +623,27 @@ pub(crate) fn job<'f: 'j, 'j>(
     frame: &'f Frame,
     jobs: &'j Frame,
 ) -> Result<Prepared<'j>, CliError> {
+    job_from(cx, root, store, scripts, names, env, workers, lock, members, task, frame, jobs, |_| Ok(None))
+}
+
+/// A producer completed by this request can hand its payload directly to a reader before
+/// the producer's logical wave is committed. Standing inputs still come from the store.
+#[expect(clippy::too_many_arguments, reason = "the script job's inputs and its two sources of producer records")]
+pub(crate) fn job_from<'f: 'j, 'j>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    store: &mut dyn Store<'_>,
+    scripts: &mut Option<Result<Scripts<'f>, &'f str>>,
+    names: &mut Option<crate::names::Names<'f>>,
+    env: &FetchEnv<'_>,
+    workers: u32,
+    lock: Option<&'f Lock<'static>>,
+    members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
+    task: &Task<'_>,
+    frame: &'f Frame,
+    jobs: &'j Frame,
+    mut completed: impl FnMut(Name) -> Result<Option<&'j [u8]>, CliError>,
+) -> Result<Prepared<'j>, CliError> {
     let cx = cx.span("script: make the job");
     if let Some(failed) = task.failed.first() {
         return Ok(Prepared::Waited(*failed));
@@ -716,12 +737,15 @@ pub(crate) fn job<'f: 'j, 'j>(
         match task.inputs.iter().find(|handed: &&Input| handed.name == dep) {
             None => wants.push(Want { name: dep, home: Name::unit_graph() }),
             Some(handed) => {
-                let read = crate::work::payload(&cx, store, handed, jobs)?;
+                let bytes = match completed(dep)? {
+                    Some(bytes) => bytes,
+                    None => held_bytes(crate::work::payload(&cx, store, handed, jobs)?.payload(), jobs),
+                };
                 let files = match files_of(&mut scripts.sources, &mut scripts.files, members, lock, &graph.units[input.index()], frame, jobs) {
                     Ok(files) => files,
                     Err(refused) => return Ok(refused),
                 };
-                producers.push(Producer { script: *input, links: crate::work::held_str(links, jobs), name: dep, out: handed.out, bytes: held_bytes(read.payload(), jobs), files, direct: *direct });
+                producers.push(Producer { script: *input, links: crate::work::held_str(links, jobs), name: dep, out: handed.out, bytes, files, direct: *direct });
             }
         }
     }

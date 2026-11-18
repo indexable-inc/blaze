@@ -50,7 +50,7 @@ struct Double {
 }
 
 impl crate::engine_scripts::ScriptRunner for Double {
-    fn run(&self, cx: &Cx, root: &bstd::fs::Dir<bstd::fs::ReadWrite>, name: blaze_drive::Name, kept: Option<ReadsPlant>) -> crate::scripts::PooledScript {
+    fn run(&self, cx: &Cx, root: &bstd::fs::Dir<bstd::fs::ReadWrite>, name: blaze_drive::Name, kept: Option<ReadsPlant>, _: &[(blaze_drive::Input, &[u8])]) -> crate::scripts::PooledScript {
         self.runs.fetch_add(1, Ordering::SeqCst);
         let frame = cx.frame();
         let mut recorded: std::vec::Vec<(std::string::String, Option<blaze_ids::ContentId>)> = std::vec::Vec::new();
@@ -199,4 +199,208 @@ fn control_a_dropped_file_read_keeps_a_stale_answer() {
     let (fresh, ..) = request(&fresh_world, double(Prints::ByBytes, ReadsPlant::None));
     assert_ne!(stale, fresh, "the planted answer differs from a fresh world's");
     assert!(stale.is_empty() && !fresh.is_empty(), "the stale answer keeps `f`; the fresh one refuses the call: {stale:?} against {fresh:?}");
+}
+
+mod parallel {
+    use super::*;
+    use blaze_build_script::env::{DepMetadata, Given, PackageFacts, env};
+    use blaze_core::lock::Lock;
+    use blaze_drive::{Kind, Name};
+    use crate::engine_scripts::{ScriptClock, ScriptRunner};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Event {
+        Start(Name, u64),
+        End(Name, u64),
+    }
+
+    struct Fixture {
+        a: Name,
+        b: Name,
+        omit_edge: bool,
+        events: Lock<std::vec::Vec<Event>>,
+        missing: AtomicU32,
+    }
+
+    fn name(package: &str) -> Name {
+        Name::new(Kind::Script, blaze_world::script_subject(package, "0.1.0", blaze_world::Side::Target, &[], blaze_own::testing::heap().alloc()))
+    }
+
+    impl ScriptClock for Fixture {
+        fn start(&self, name: Name, tick: u64) -> u64 {
+            self.events.lock().push(Event::Start(name, tick));
+            tick + if name == self.a || name == self.b { 1 } else { 10 }
+        }
+
+        fn end(&self, name: Name, tick: u64) {
+            self.events.lock().push(Event::End(name, tick));
+        }
+
+        fn omit_links_edge(&self, producer: Name, reader: Name) -> bool {
+            self.omit_edge && producer == self.a && reader == self.b
+        }
+    }
+
+    impl ScriptRunner for Fixture {
+        fn clock(&self) -> Option<&dyn ScriptClock> { Some(self) }
+
+        fn run(&self, cx: &Cx, root: &bstd::fs::Dir<bstd::fs::ReadWrite>, name: Name, kept: Option<ReadsPlant>, producers: &[(blaze_drive::Input, &[u8])]) -> crate::scripts::PooledScript {
+            let erased = blaze_own::Erased::new(cx.frame());
+            let mut checkout = std::vec::Vec::new();
+            if name == self.a || name == self.b {
+                let (path, subject) = if name == self.a { ("a/input", "file:a/input") } else { ("b/input", "file:b/input") };
+                let (_, _, answer) = reads::now(cx, root, &NoStamps, Plant::None, ReadKind::File, path, None, cx.frame()).unwrap();
+                if name == self.a && answer == blaze_proc_macro::script_sandbox::file_answer(b"fail") {
+                    let failed = crate::scripts::failed("a build script failed", format_args!("fixture producer a refused its input"), true);
+                    return crate::scripts::PooledScript { did: Ok(failed), ns: 0, used: 0, checkout, unkept: None };
+                }
+                checkout = reads::cells_of([(subject, Some(answer))].into_iter(), kept.unwrap()).unwrap();
+            }
+            let printed: &[u8] = if name == self.a {
+                b"cargo::metadata=answer=42\n"
+            } else if name == self.b {
+                let mut deps = std::vec::Vec::new();
+                for (_, bytes) in producers.iter().filter(|(input, _)| input.name == self.a) {
+                    let (_, bytes) = crate::scripts::payload_parts(bytes).expect("a handed its Script record to b");
+                    let record = blaze_build_script::outputs::OutputsRef::open(bytes).unwrap();
+                    deps.extend(record.metadata().map(|(key, value)| DepMetadata { links: "a", key, value }));
+                }
+                let given = Given {
+                    package: PackageFacts { name: "b", version: "0.1.0", ..PackageFacts::default() },
+                    seen: blaze_expand::seen::SeenRoot::Member { dir: "b" },
+                    features: &[], target_cfg: &[], host: crate::graph::TRIPLE, target: crate::graph::TRIPLE, deps: &deps,
+                };
+                if env(&given, erased.handle()).get("DEP_A_ANSWER") == Some("42") {
+                    b"cargo::rustc-cfg=received_42\n"
+                } else {
+                    self.missing.fetch_add(1, Ordering::SeqCst);
+                    b""
+                }
+            } else {
+                b""
+            };
+            let outputs = blaze_build_script::outputs::Outputs::read(printed, "/out", blaze_build_script::instr::OutputLimits::DEFAULT, erased.handle()).unwrap();
+            let mut read_list: std::vec::Vec<_> = checkout.iter().map(|read| (read.name(), read.answer)).collect();
+            read_list.extend(producers.iter().map(|(input, _)| (input.name, input.out)));
+            let did = crate::scripts::outputs_record(name, &read_list, crate::scripts::RanAs::Wasm, &outputs, "fixture");
+            // Two distinguishable notes make their relative printed order observable.
+            let unkept = (name != self.a && name != self.b).then(|| reads::NoCell::Kind { subject: format!("fixture-{name}") });
+            crate::scripts::PooledScript { did: Ok(did), ns: 0, used: 0, checkout, unkept }
+        }
+    }
+
+    fn workspace() -> Io {
+        let mut world = SimWorld::new(35, Limits::USUAL);
+        world.faults.max_latency = core::time::Duration::ZERO;
+        let io = Io::simulated(world);
+        write(&io, "a/input", "first");
+        write(&io, "b/input", "first");
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\", \"c\", \"d\"]\nresolver = \"2\"\n");
+        for package in ["a", "b", "c", "d"] {
+            let mut manifest = format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n");
+            if package == "a" {
+                manifest.push_str("links = \"a\"\n");
+            }
+            if package == "b" {
+                manifest.push_str("[dependencies]\na = { path = \"../a\" }\n");
+            }
+            write(&io, &format!("{package}/Cargo.toml"), &manifest);
+            write(&io, &format!("{package}/src/lib.rs"), "pub fn value() -> u8 { 1 }\n");
+            let script = match package {
+                "a" => "fn main() { println!(\"cargo::metadata=answer=42\"); }\n",
+                "b" => "fn main() { assert_eq!(std::env::var(\"DEP_A_ANSWER\").unwrap(), \"42\"); println!(\"cargo::rustc-cfg=received_42\"); }\n",
+                _ => "fn main() {}\n",
+            };
+            write(&io, &format!("{package}/build.rs"), script);
+        }
+        io
+    }
+
+    fn fixture(omit_edge: bool) -> &'static Fixture {
+        std::boxed::Box::leak(std::boxed::Box::new(Fixture {
+            a: name("a"), b: name("b"), omit_edge, events: Lock::new("script fixture events", std::vec::Vec::new()), missing: AtomicU32::new(0),
+        }))
+    }
+
+    fn check(workers: u32, omit_edge: bool) -> (&'static Fixture, blaze_ids::ContentId, std::string::String) {
+        let io = workspace();
+        let fixture = fixture(omit_edge);
+        let (_, checked) = crate::engine_scripts::with_runner(fixture, || engine_from(&io, workers, false));
+        (fixture, checked.records.digest(), stdout(&io))
+    }
+
+    fn times(events: &[Event], script: Name) -> (u64, u64) {
+        let mut starts = events.iter().filter_map(|event| match *event { Event::Start(n, t) if n == script => Some(t), _ => None });
+        let mut ends = events.iter().filter_map(|event| match *event { Event::End(n, t) if n == script => Some(t), _ => None });
+        let interval = (starts.next().expect("script started"), ends.next().expect("script ended"));
+        assert_eq!((starts.next(), ends.next()), (None, None), "each script runs once");
+        interval
+    }
+
+    #[test]
+    fn ready_scripts_overlap_and_publish_the_serial_records_and_lines() {
+        let (serial, records, lines) = check(1, false);
+        let (parallel, other_records, other_lines) = check(3, false);
+        assert_eq!(serial.missing.load(Ordering::SeqCst), 0);
+        assert_eq!(parallel.missing.load(Ordering::SeqCst), 0, "b received DEP_A_ANSWER=42");
+        let events = parallel.events.lock();
+        assert_eq!(events.len(), 8);
+        assert_eq!(times(&events, name("a")), (0, 1));
+        assert_eq!(times(&events, name("b")), (1, 2), "b starts when a ends while c and d still run");
+        for slow in ["c", "d"] {
+            assert_eq!(times(&events, name(slow)), (0, 10));
+        }
+        let serial_events = serial.events.lock();
+        for pair in serial_events.chunks_exact(2) {
+            assert!(matches!(pair, [Event::Start(x, _), Event::End(y, _)] if x == y));
+        }
+        assert_eq!(records, other_records, "every record put, in put order");
+        assert!(lines.contains(&format!("fixture-{}", name("c"))) && lines.contains(&format!("fixture-{}", name("d"))));
+        assert_eq!(lines, other_lines, "all printed bytes, including both script notes");
+        println!("a,c,d start at 0; b reads DEP_A_ANSWER=42 at 1; records and lines match");
+    }
+
+    #[test]
+    fn control_missing_links_edge_starts_b_before_a_ends() {
+        // Same manifests and dependency. The planted planner drops only its metadata edge.
+        let (fixture, _, _) = check(4, true);
+        let events = fixture.events.lock();
+        assert!(times(&events, fixture.b).0 < times(&events, fixture.a).1);
+        assert_eq!(fixture.missing.load(Ordering::SeqCst), 1);
+        println!("caught b starting before a ended with DEP_A_ANSWER missing");
+    }
+
+    #[test]
+    fn a_links_reader_stands_on_equal_output_and_resumes_after_producer_recovery() {
+        let io = workspace();
+        let fixture = fixture(false);
+        let request = || {
+            fixture.events.lock().clear();
+            let before = stdout(&io).len();
+            crate::engine_scripts::with_runner(fixture, || engine_from(&io, 3, false));
+            (fixture.events.lock().clone(), stdout(&io).split_off(before))
+        };
+        request();
+        write(&io, "b/input", "changed");
+        let (stored, _) = request();
+        assert!(!stored.iter().any(|e| matches!(e, Event::Start(n, _) if *n == fixture.a)), "a's record stands");
+        assert_eq!(times(&stored, fixture.b), (0, 1), "b can read the stored a while c and d run");
+        write(&io, "a/input", "second");
+        let (equal, _) = request();
+        assert_eq!(times(&equal, fixture.a), (0, 1));
+        assert!(!equal.iter().any(|e| matches!(e, Event::Start(n, _) if *n == fixture.b)), "a returned equal metadata");
+        write(&io, "a/input", "fail");
+        let (failed, lines) = request();
+        assert!(lines.contains("fixture producer a refused its input"), "{lines}");
+        assert!(!failed.iter().any(|e| matches!(e, Event::Start(n, _) if *n == fixture.b)), "b cannot run with failed metadata");
+        for slow in ["c", "d"] {
+            assert_eq!(times(&failed, name(slow)), (0, 10), "unrelated work still finishes");
+        }
+        write(&io, "a/input", "recovered");
+        let (recovered, _) = request();
+        assert_eq!(times(&recovered, fixture.a), (0, 1), "a retries its owed failure on the next request");
+        assert_eq!(times(&recovered, fixture.b), (1, 2), "b observed a's transition from absent to present");
+        assert_eq!(fixture.missing.load(Ordering::SeqCst), 0);
+        println!("b read stored a at 0; equal metadata skipped b; failed a blocked b; recovered a released b at 1");
+    }
 }

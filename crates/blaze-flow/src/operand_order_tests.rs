@@ -37,6 +37,7 @@ fn found(call: bool, ops: [Operand; 2], plant: Plant) -> Vec<(Stmt, Place, MoveF
         Ok(f) => f,
         Err(e) => panic!("the case's flow: {e:?}"),
     };
+    crate::loans::assert_tiers_equal_for_fixture(&flow);
     match check_moves_planted(&flow, plant, &heap) {
         Ok(v) => v.iter().map(|f| (f.at.stmt(), f.place, f.kind)).collect(),
         Err(b) => panic!("the move check's bound: {b:?}"),

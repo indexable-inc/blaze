@@ -34,6 +34,7 @@ pub(super) fn frames(bytes: &[u8]) -> std::vec::Vec<std::string::String> {
                 std::format!("Declare {pairs:?}")
             }
             Down::Publish { slot, record, .. } => std::format!("Publish {} {}", slot.0, record.0[0]),
+            Down::Positioned { slot, record, values, .. } => std::format!("Positioned {} {} {values:?}", slot.0, record.0[0]),
             Down::Failed { why, .. } => std::format!("Failed {why:?}"),
             Down::Personality { slot } => std::format!("Personality {}", slot.0),
             Down::Native { library, words } => std::format!("Native {} {}", library.0[0], words.len()),
@@ -456,6 +457,16 @@ pub(super) struct ToyFront<'t> {
     pub(super) clean: bool,
     /// The fn the run starts at: `MAIN`, or `SHOUT` for the statics model.
     pub(super) root: u128,
+}
+
+impl Publication for ToyFront<'_> {
+    fn for_publication(&mut self, symbol: [u8; 32], record: &[u8], no_personality: bool, _values: &mut AVec<'_, u8>) -> Result<bool, ParentError> {
+        if !no_personality {
+            return Ok(false);
+        }
+        let view = blaze_code::record::CodeView::read(record).map_err(|why| ParentError::Decode { symbol, why })?;
+        Ok(blaze_code::unwind::read(view).map_err(|why| ParentError::Unwind { symbol, why })?.lands())
+    }
 }
 
 impl<'t> Front for ToyFront<'t> {
@@ -892,7 +903,7 @@ pub(super) fn statics_before_publish(bytes: &[u8], folder: &ToyFolder) -> Result
                     return Err(std::format!("the thread-local descriptor {:02x?} told twice", &descriptor.0[..6]));
                 }
             }
-            Down::Publish { record, .. } => {
+            Down::Publish { record, .. } | Down::Positioned { record, .. } => {
                 let entry = folder.bytes.get(&record.0).ok_or_else(|| std::format!("record {:02x?} published and never filed", &record.0[..6]))?;
                 for static_ in toy_named(entry) {
                     if !sent.contains(&static_.0) {
@@ -1122,6 +1133,12 @@ struct Landing<'t> {
     routine: bool,
 }
 
+impl Publication for Landing<'_> {
+    fn for_publication(&mut self, _symbol: [u8; 32], record: &[u8], no_personality: bool, _values: &mut AVec<'_, u8>) -> Result<bool, ParentError> {
+        Ok(no_personality && record.ends_with(&A.to_le_bytes()))
+    }
+}
+
 impl<'t> Front for Landing<'t> {
     type Start = Headed;
     type Ids = ToyIds;
@@ -1153,10 +1170,6 @@ impl<'t> Front for Landing<'t> {
 
     fn each_vtable(&self, symbol: [u8; 32], entry: &[u8], each: &mut dyn FnMut(Symbol, &[u8]) -> Result<(), ParentError>) -> Result<(), ParentError> {
         self.toy.each_vtable(symbol, entry, each)
-    }
-
-    fn lands(&self, _symbol: [u8; 32], record: &[u8]) -> Result<bool, ParentError> {
-        Ok(record.ends_with(&A.to_le_bytes()))
     }
 
     fn path_of(&mut self, item: ItemKey) -> Option<Box<str>> {
@@ -1234,6 +1247,12 @@ struct Watched<'t> {
 
 fn toy_path(item: u128) -> std::string::String {
     std::format!("toy::{item:#x}")
+}
+
+impl Publication for Watched<'_> {
+    fn for_publication(&mut self, symbol: [u8; 32], record: &[u8], no_personality: bool, values: &mut AVec<'_, u8>) -> Result<bool, ParentError> {
+        self.toy.for_publication(symbol, record, no_personality, values)
+    }
 }
 
 impl<'t> Front for Watched<'t> {

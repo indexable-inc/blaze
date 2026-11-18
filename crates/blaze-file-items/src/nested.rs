@@ -262,6 +262,12 @@ fn offset(at: usize) -> u32 {
     u32::try_from(at).expect("an item's text is counted in u32")
 }
 
+/// Whether the text can write a block module or contain a statement macro call.
+pub fn may_write_block(text: &str) -> bool {
+    const WORDS: [&str; 8] = ["impl", "struct", "enum", "union", "type", "trait", "mod", "extern"];
+    text.contains('!') || WORDS.into_iter().any(|word| text.contains(word))
+}
+
 /// The blocks of `text` (one item's whole text) and the item statements in them.
 pub fn scan<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
     scan_at(text, 0, alloc)

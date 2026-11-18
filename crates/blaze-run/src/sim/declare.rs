@@ -249,6 +249,9 @@ impl Sim {
         let got = match down {
             Down::Declare { pairs } => Got::Declare(pairs.iter().collect()),
             Down::Publish { slot, record, .. } => Got::Publish(SlotId(slot.0), CodeRef(record.0)),
+            Down::Positioned { slot, .. } => {
+                return Err(Broke::Oracle(format!("the parent sent source positions for slot {}: this model's records have no position rows", slot.0)));
+            }
             Down::Failed { need, why } => Got::Failed(need, why == Failure::Unresolved),
             Down::Personality { slot } => {
                 return Err(Broke::Oracle(format!(

@@ -72,7 +72,7 @@ use blaze_code::unwind::UnwindError;
 use blaze_launch::wire::run::{Declared, Down, Failure, Needed, Symbol as WireSymbol, Up};
 use blaze_launch::wire::{RecordId, WireError, split};
 use blaze_launch::{Slot, Thread, Tier};
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{ADeque, AVec, Alloc, Vec, VecDeque};
 use blaze_run::first_call::{self, Do, FirstCall, Woken};
 use blaze_run::{CodeRef, FindingsRef, Nanos, SlotId, ThreadId, Why};
 
@@ -293,6 +293,8 @@ pub enum RunModeError {
     Wire(WireError),
     /// The first-call machine refused an answer: the wire is out of step.
     FirstCall(first_call::Error),
+    /// A placement was carried out of order with the inputs supplied by its publication.
+    PositionOrder { placement: Act, queued: Option<Act> },
     /// The parent named a slot it never declared.
     Undeclared { slot: Slot },
     /// The parent declared `slot` for `symbol`, which runs through another slot already, or
@@ -400,6 +402,9 @@ impl fmt::Display for RunModeError {
         match *self {
             RunModeError::Wire(why) => write!(f, "the parent's message does not read: {why}"),
             RunModeError::FirstCall(why) => write!(f, "{why}"),
+            RunModeError::PositionOrder { placement, queued } => write!(
+                f, "source positions for {placement:?} were requested with {queued:?} next in publication order"
+            ),
             RunModeError::Undeclared { slot } => {
                 write!(f, "the parent named slot {}, which it never declared (run wire, `Declare`)", slot.0)
             }
@@ -547,6 +552,9 @@ pub struct RunMode<'a> {
     slots: Numbering<'a>,
     /// The parent's bytes not yet a whole frame.
     inbox: AVec<'a, u8>,
+    /// One input per emitted placement, including ordinary publications with zero rows.
+    /// A repeated answer that FirstCall coalesces has no placement and takes no entry.
+    position_inputs: ADeque<'a, (Act, AVec<'a, u8>)>,
     /// Frames for the parent, written by the driver ([`RunMode::outbox`]). The wire's encoder
     /// writes onto `alloc`'s vector, so this one is that type, in the run's allocator.
     outbox: std::vec::Vec<u8, Alloc<'a>>,
@@ -593,6 +601,7 @@ impl<'a> RunMode<'a> {
                 alloc,
             },
             inbox: Vec::new_in(alloc),
+            position_inputs: VecDeque::new_in(alloc),
             outbox: std::vec::Vec::new_in(alloc),
             said: Vec::new_in(alloc),
             next_id: 1,
@@ -643,12 +652,12 @@ impl<'a> RunMode<'a> {
                 self.now = now;
                 let mut dos: AVec<'_, Do> = Vec::new_in(self.alloc);
                 self.slots.first.tick(now, &mut dos);
-                self.carry_dos(&dos, None, out)
+                self.carry_dos(&dos, None, &[], out)
             }
             Event::Fired { thread, slot } => {
                 let mut dos: AVec<'_, Do> = Vec::new_in(self.alloc);
                 self.slots.first.fired(ThreadId(thread.0), slot, self.now, &mut dos)?;
-                self.carry_dos(&dos, Some(thread), out)
+                self.carry_dos(&dos, Some(thread), &[], out)
             }
             Event::Closed => {
                 self.closed = true;
@@ -696,36 +705,8 @@ impl<'a> RunMode<'a> {
                 Ok(())
             }
             Down::Native { library, words } => self.on_native(library, words, out),
-            Down::Publish { slot, tier, record } => {
-                if tier != Tier::Zero {
-                    // A promotion (D100 point 13): the slot's fast code is bound, the optimized
-                    // record goes to the hot region and one store of the slot word publishes it.
-                    // The first-call machine's state stays `Bound`: no thread waits on it.
-                    let local = self.slots.local(slot)?;
-                    return match self.slots.first.state(local)? {
-                        first_call::State::Bound(_) => {
-                            out.push(Act::Promote { slot: local, record: RecordId(record.0) });
-                            Ok(())
-                        }
-                        _ => Err(RunModeError::NotBuilt {
-                            what: "a record at the optimized tier for a slot whose fast code is not bound yet",
-                        }),
-                    };
-                }
-                let local = self.slots.local(slot)?;
-                let code = CodeRef(record.0);
-                let mut dos: AVec<'_, Do> = Vec::new_in(self.alloc);
-                match self.slots.first.state(local)? {
-                    first_call::State::Asked { .. } => self.slots.first.answered(local, Ok(code), &mut dos)?,
-                    // An offer the parent sent unasked: placed at once (run.md, "Compiled
-                    // behind"); FirstCall decides what a publishing or bound slot does with it.
-                    _ => {
-                        let symbol = first_call::Symbol(self.slots.symbol(local).0);
-                        self.slots.first.know(symbol, code, true, &mut dos)?;
-                    }
-                }
-                self.carry_dos(&dos, None, out)
-            }
+            Down::Publish { slot, tier, record } => self.publication(slot, tier, record, &[], out),
+            Down::Positioned { slot, tier, record, values } => self.publication(slot, tier, record, values, out),
             Down::Personality { slot } => self.bind_personality(slot),
             Down::Data { data } => {
                 for told in data.iter() {
@@ -768,9 +749,41 @@ impl<'a> RunMode<'a> {
                 };
                 let mut dos: AVec<'_, Do> = Vec::new_in(self.alloc);
                 self.slots.first.answered(local, Err(why), &mut dos)?;
-                self.carry_dos(&dos, None, out)
+                self.carry_dos(&dos, None, &[], out)
             }
         }
+    }
+
+    fn publication(&mut self, slot: Slot, tier: Tier, record: RecordId, values: &[u8], out: &mut AVec<'_, Act>) -> Result<(), RunModeError> {
+        let local = self.slots.local(slot)?;
+        let state = self.slots.first.state(local)?;
+        if tier == Tier::Optimized {
+            return match state {
+                first_call::State::Bound(_) => {
+                    self.queue_placement(Act::Promote { slot: local, record }, values, out);
+                    Ok(())
+                }
+                _ => Err(RunModeError::NotBuilt {
+                    what: "a record at the optimized tier for a slot whose fast code is not bound yet",
+                }),
+            };
+        }
+        let code = CodeRef(record.0);
+        let mut dos = Vec::new_in(self.alloc);
+        match state {
+            first_call::State::Asked { .. } => self.slots.first.answered(local, Ok(code), &mut dos)?,
+            _ => {
+                // An unasked offer or a repeat. FirstCall emits a placement only for new work.
+                let symbol = first_call::Symbol(self.slots.symbol(local).0);
+                self.slots.first.know(symbol, code, true, &mut dos)?;
+            }
+        }
+        self.carry_dos(&dos, None, values, out)
+    }
+
+    fn queue_placement(&mut self, act: Act, values: &[u8], out: &mut AVec<'_, Act>) {
+        self.position_inputs.push_back((act, Vec::from_slice_in(values, self.alloc)));
+        out.push(act);
     }
 
     /// One pair the parent declared (in `Declare` or `Native`): `symbol` runs through the
@@ -800,7 +813,7 @@ impl<'a> RunMode<'a> {
 
     /// The first-call machine's effects as acts and wire frames. `asker` is the thread whose
     /// stub made them (an ask comes only from a fired stub).
-    fn carry_dos(&mut self, dos: &[Do], asker: Option<Thread>, out: &mut AVec<'_, Act>) -> Result<(), RunModeError> {
+    fn carry_dos(&mut self, dos: &[Do], asker: Option<Thread>, values: &[u8], out: &mut AVec<'_, Act>) -> Result<(), RunModeError> {
         for &step in dos {
             match step {
                 Do::Stub { slot } => out.push(Act::Stub { slot }),
@@ -819,7 +832,7 @@ impl<'a> RunMode<'a> {
                     Up::Need { need, thread }.encode(self.next_id, &mut self.outbox)?;
                     self.next_id += 1;
                 }
-                Do::Publish { slot, code } => out.push(Act::Place { slot, record: RecordId(code.0) }),
+                Do::Publish { slot, code } => self.queue_placement(Act::Place { slot, record: RecordId(code.0) }, values, out),
                 Do::Wake { thread, slot, woken: Woken::Again } => out.push(Act::Wake { thread: Thread(thread.0), slot }),
                 Do::Wake { slot, woken: Woken::Fail(why), .. } => {
                     let symbol = self.slots.symbol(slot);
@@ -855,7 +868,7 @@ impl<'a> RunMode<'a> {
         self.lay(slot, record, source, memory, plant, Region::Area)?;
         let mut dos: AVec<'_, Do> = Vec::new_in(self.alloc);
         self.slots.first.published(slot, &mut dos)?;
-        self.carry_dos(&dos, None, out)
+        self.carry_dos(&dos, None, &[], out)
     }
 
     /// Carries [`Act::Promote`]: places `record` in the hot region and publishes it in
@@ -937,6 +950,15 @@ impl<'a> RunMode<'a> {
         plant: Plant,
         region: Region,
     ) -> Result<(), RunModeError> {
+        let placement = match region {
+            Region::Area => Act::Place { slot, record },
+            Region::Hot => Act::Promote { slot, record },
+        };
+        let queued = self.position_inputs.front().map(|(act, _)| *act);
+        if queued != Some(placement) {
+            return Err(RunModeError::PositionOrder { placement, queued });
+        }
+        let (_, values) = self.position_inputs.pop_front().expect("the placement at the front was just checked");
         let bytes = source.bytes(record)?;
         let view = CodeView::read(bytes).map_err(|why| RunModeError::Decode { record, why })?;
         let unwind = blaze_code::unwind::read(view).map_err(|why| RunModeError::Unwind { record, why })?;
@@ -960,7 +982,7 @@ impl<'a> RunMode<'a> {
                 record,
                 refused: None,
             };
-            let placed = blaze_code::place::place(&view, symbol, At { code: code_at, relro: relro_at }, &mut binder, &mut code, &mut relro);
+            let placed = blaze_code::place::place_resolved(&view, symbol, At { code: code_at, relro: relro_at }, &mut binder, &mut code, &mut relro, &values);
             if let Some(why) = binder.refused {
                 return Err(why);
             }
@@ -1953,3 +1975,133 @@ mod personality_tests;
 mod statics_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+    use blaze_code::record::{CodeRecord, PositionField, PositionPart, PositionRow};
+    use blaze_launch::wire::List;
+
+    struct Source<'a> {
+        record: RecordId,
+        bytes: &'a [u8],
+    }
+
+    impl RecordSource for Source<'_> {
+        fn bytes(&self, id: RecordId) -> Result<&[u8], RunModeError> {
+            assert_eq!(id, self.record, "both slots name the same content-addressed record");
+            Ok(self.bytes)
+        }
+    }
+
+    /// A reader observes the resolved relro word when the slot is stored.
+    #[derive(Default)]
+    struct MemorySeen {
+        next: u64,
+        stored: std::vec::Vec<(SlotId, u32)>,
+    }
+
+    impl Memory for MemorySeen {
+        fn stub(&mut self, _: SlotId) -> Result<(), RunModeError> { Ok(()) }
+        fn word(&self, _: SlotId) -> u64 { unreachable!("no calls") }
+        fn address_word(&self, _: SlotId) -> u64 { unreachable!("no function address loads") }
+        fn thunk(&self, _: SlotId) -> u64 { unreachable!("no function addresses") }
+        fn outside(&mut self, _: CodeSymbol, _: &str) -> Result<Outside, RunModeError> { unreachable!("no C names") }
+        fn reserve(&mut self, len: usize, align: usize) -> Result<u64, RunModeError> {
+            let at = self.next.next_multiple_of(align as u64);
+            self.next = at + len as u64;
+            Ok(at)
+        }
+        fn reserve_hot(&mut self, len: usize, align: usize) -> Result<u64, RunModeError> { self.reserve(len, align) }
+        fn carry(&mut self, step: Step, placing: &Placing<'_>) -> Result<(), RunModeError> {
+            if step == Step::Store {
+                let word = placing.relro.try_into().expect("one source line in relro");
+                self.stored.push((placing.slot, u32::from_le_bytes(word)));
+            }
+            Ok(())
+        }
+        fn reserve_data(&mut self, _: usize, _: usize) -> Result<u64, RunModeError> { unreachable!("no writable data") }
+        fn static_word(&self, _: u32) -> u64 { unreachable!("no static") }
+        fn publish_static(&mut self, _: u32, _: u64, _: &[u8], _: Room) -> Result<(), RunModeError> { unreachable!("no static") }
+        fn thread_key(&mut self, _: u64) -> Result<ThreadKey, RunModeError> { unreachable!("no thread local") }
+        fn write(&mut self, _: u64, _: &[u8]) -> Result<(), RunModeError> { unreachable!("no thread local") }
+    }
+
+    #[test]
+    fn coalesced_positioned_publications_follow_their_placements() {
+        let alloc = Alloc::global();
+        let mut code = CodeRecord::new_in(alloc);
+        code.code.extend_from_slice(&0xd65f03c0u32.to_le_bytes());
+        code.relro.extend_from_slice(&[0; 4]);
+        code.positions.push(PositionRow { part: PositionPart::Relro, at: 0, item: 91, site: 17, field: PositionField::Line });
+        let mut encoded = Vec::new_in(alloc);
+        code.seal().unwrap().encode(&mut encoded);
+        let record = RecordId(blaze_blake3::hash(&encoded));
+        let source = Source { record, bytes: &encoded };
+
+        let mut mode = RunMode::new(alloc);
+        let mut acts = Vec::new_in(alloc);
+        let mut memory = MemorySeen::default();
+        let pairs = [
+            Declared { symbol: WireSymbol([1; 32]), slot: Slot(7) },
+            Declared { symbol: WireSymbol([2; 32]), slot: Slot(5) },
+        ];
+        let mut down = std::vec::Vec::new();
+        Down::Declare { pairs: List::of(&pairs) }.encode(1, &mut down).unwrap();
+        mode.on(Event::Frame(&down), &mut acts).unwrap();
+        for &act in &acts[..] {
+            let Act::Stub { slot } = act else { panic!("unexpected declaration action {act:?}") };
+            memory.stub(slot).unwrap();
+        }
+        acts.clear();
+
+        let (a, b) = (SlotId(0), SlotId(1));
+        for (slot, thread) in [(a, Thread(1)), (b, Thread(2)), (a, Thread(3))] {
+            mode.on(Event::Fired { slot, thread }, &mut acts).unwrap();
+        }
+        let mut up = mode.outbox();
+        for (slot, who) in [(Slot(7), Thread(1)), (Slot(5), Thread(2))] {
+            let (frame, took) = split(up).unwrap().unwrap();
+            assert!(matches!(Up::decode(frame).unwrap().1, Up::Need { need: Needed::Slot(sent), thread } if sent == slot && thread == who));
+            up = &up[took..];
+        }
+        assert!(up.is_empty(), "a repeat firing shares the outstanding need");
+        mode.sent();
+
+        down.clear();
+        // A prepublication and the reply to the need it crossed both arrive for slot 7.
+        // Slot 5's publication is in the same read, before either placement is carried.
+        for (id, slot, line) in [(2, Slot(7), 13u32), (3, Slot(7), 13), (4, Slot(5), 29)] {
+            Down::Positioned { slot, tier: Tier::Zero, record, values: &line.to_le_bytes() }.encode(id, &mut down).unwrap();
+        }
+        mode.on(Event::Frame(&down), &mut acts).unwrap();
+        let first = Act::Place { slot: a, record };
+        let second = Act::Place { slot: b, record };
+        assert_eq!(acts.as_slice(), &[first, second]);
+
+        // Plant the one-off pairing, the second action against the first answer. Even with an
+        // identical record id it is refused before either word is published or input consumed.
+        assert_eq!(mode.place(b, record, &source, &mut memory, Plant::None, &mut acts),
+            Err(RunModeError::PositionOrder { placement: second, queued: Some(first) }));
+        assert!(memory.stored.is_empty());
+        for index in 0..2 {
+            let Act::Place { slot, record } = acts[index] else { unreachable!() };
+            mode.place(slot, record, &source, &mut memory, Plant::None, &mut acts).unwrap();
+        }
+        assert_eq!(memory.stored, [(a, 13), (b, 29)]);
+        assert_eq!(&acts[2..], &[
+            Act::Wake { thread: Thread(1), slot: a },
+            Act::Wake { thread: Thread(3), slot: a },
+            Act::Wake { thread: Thread(2), slot: b },
+        ]);
+        assert!(mode.position_inputs.is_empty());
+
+        acts.clear();
+        down.clear();
+        Down::Positioned { slot: Slot(7), tier: Tier::Zero, record, values: &13u32.to_le_bytes() }.encode(5, &mut down).unwrap();
+        mode.on(Event::Frame(&down), &mut acts).unwrap();
+        assert!(acts.is_empty(), "a bound slot needs no second placement");
+        assert!(mode.position_inputs.is_empty(), "the repeated answer leaves no input");
+        println!("run_mode: slots received lines 13 and 29 once; PositionOrder caught the one-off pairing");
+    }
+}

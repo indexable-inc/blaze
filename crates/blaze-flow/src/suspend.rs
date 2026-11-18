@@ -187,7 +187,7 @@ fn forward<A: Allocator + Clone>(
     loop {
         passes += 1;
         if passes > limit {
-            return Err(Bound { what, limit });
+            return Err(Bound::Passes { what, limit });
         }
         let mut changed = false;
         for b in 0..blocks {
@@ -273,7 +273,7 @@ fn live_by_use<A: Allocator + Clone>(
     loop {
         passes += 1;
         if passes > limit {
-            return Err(Bound { what: "live-by-use passes", limit });
+            return Err(Bound::Passes { what: "live-by-use passes", limit });
         }
         let mut changed = false;
         for b in (0..blocks).rev() {

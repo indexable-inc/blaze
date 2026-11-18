@@ -54,12 +54,11 @@ impl CoroutineTable {
     pub(crate) fn of<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>], alloc: Alloc<'static>) -> CoroutineTable {
         let mut tys = PortableTys::new_in(alloc);
         let mut rows = Vec::new_in(alloc);
-        let types = program.types();
         for (i, done) in checked.iter().enumerate() {
             let Some(done) = done else { continue };
             let function = program.function(i);
             let Some((body, _)) = function.body else { continue };
-            let view = body.view(types);
+            let view = body.view(program.body_types(i));
             let sig = program.sig(i);
             let generics = sig.parent_count + sig.own_count;
             for (ordinal, _) in blaze_build::coroutines_in(&view) {

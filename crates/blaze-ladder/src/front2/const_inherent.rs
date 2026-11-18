@@ -126,7 +126,10 @@ impl Table {
         self.entries[..self.len].iter().flatten().find(|e| e.need == need)
     }
 
-    fn set(&mut self, need: LibKey, state: State) {
+    /// Sets the state of the asked leaf `need` (nothing when it was never asked here): its own
+    /// evaluation's, or the state another task of the request reached for it (blaze-cli
+    /// engine_heads_once.rs, lane CX27).
+    pub fn set(&mut self, need: LibKey, state: State) {
         if let Some(e) = self.entries[..self.len].iter_mut().flatten().find(|e| e.need == need) {
             e.state = state;
         }

@@ -15,17 +15,15 @@
 //! - **Run**: each task wraps today's function, unchanged: a lookup scripts.rs's sibling
 //!   (`script_modules::run`, `macros::run`) on the coordinator's thread; a run's job made there
 //!   (`scripts::job`, which opens the command's scripts once: the runtime, the sandbox's
-//!   setting and the native runner's jobserver, rule 9) and the wave's runs at once on the
-//!   workers (`scripts::pooled`), as the old loop runs them (work.rs `run_batches`).
+//!   setting and the native runner's jobserver, rule 9). Workers start each ready run as soon
+//!   as its inputs are available. The engine still commits records and diagnostics by wave.
 //! - **Read**: a run's record is marked in the names stage, whose crate task hands it to
 //!   names/scope.rs `prepare` by its key (the store holds it after the phase's put).
-
-use core::convert::Infallible;
 
 use blaze_drive::{Input, Key, Kind, Locate, Name, TaskFailure, Why};
 use blaze_engine::{Buffer, CellId, Done, Phase, Planned, SVec, Stage, Task as EngineTask, Tools};
 use blaze_ids::ContentId;
-use blaze_own::{SharedAlloc, Vec};
+use blaze_own::{BTreeMap, SharedAlloc, Vec};
 use blaze_unit_graph::UnitId;
 use blaze_world::Side;
 use bstd::cx::Cx;
@@ -44,6 +42,123 @@ use crate::work::{self, Did};
 /// Where the rule that refuses a task on this path is.
 const RULE: &str = "engine_scripts.rs";
 
+struct RunPlan<'f> {
+    task: EngineTask,
+    inputs: usize,
+    readers: Vec<usize, &'f Frame>,
+}
+
+/// Only actual completions release edges. The same frontier computes the publication depths.
+struct Ready<'a> {
+    left: Vec<usize, &'a Frame>,
+    queue: Vec<usize, &'a Frame>,
+}
+
+impl<'a> Ready<'a> {
+    fn new(runs: &[RunPlan<'_>], frame: &'a Frame) -> Self {
+        let mut left = Vec::with_capacity_in(runs.len(), frame);
+        let mut queue = Vec::with_capacity_in(runs.len(), frame);
+        for (i, run) in runs.iter().enumerate() {
+            left.push(run.inputs);
+            if run.inputs == 0 {
+                queue.push(i);
+            }
+        }
+        Self { left, queue }
+    }
+
+    fn finish(&mut self, readers: &[usize]) {
+        for &reader in readers {
+            self.left[reader] -= 1;
+            if self.left[reader] == 0 {
+                self.queue.push(reader);
+            }
+        }
+    }
+}
+
+struct Previous<'f> {
+    key: Key,
+    owed: bool,
+    reads: &'f [(CellId, ContentId)],
+}
+
+struct Completed<'f> {
+    drive: blaze_drive::Task<'static>,
+    made: Result<work::Made<'f>, Failure<'f>>,
+    owed: bool,
+    worker: Option<WorkerResult>,
+}
+
+struct WorkerResult {
+    ns: u64,
+    checkout: std::vec::Vec<crate::engine_script_reads::CheckoutRead>,
+    unkept: Option<crate::engine_script_reads::NoCell>,
+    produced: bool,
+    hole: bool,
+}
+
+enum ScriptWork<'f> {
+    Script(crate::scripts::ScriptJob<'f>),
+    #[cfg(test)]
+    Double(&'static dyn ScriptRunner, Name, Option<crate::engine_script_reads::ReadsPlant>, &'f [(Input, &'f [u8])]),
+}
+
+enum Dispatch<'f, 'j> {
+    Run(ScriptWork<'j>, blaze_drive::Task<'static>),
+    Answered(Completed<'f>),
+}
+
+/// Also signals when the pool rejects a job before calling its closure. Joining the handle
+/// then gives the original task error. Each flag is set once. The park token covers a
+/// completion racing the coordinator's scan, including when several wakes coalesce.
+struct Notice<'a> {
+    finished: &'a bstd::sync::Flag,
+    waiter: &'a blaze_core::wait::Parker,
+}
+
+impl Drop for Notice<'_> {
+    fn drop(&mut self) {
+        self.finished.set();
+        self.waiter.unpark();
+    }
+}
+
+struct WaitClock<'a>(&'a bstd::clock::Clock);
+
+impl blaze_core::wait::Clock for WaitClock<'_> {
+    fn now(&self) -> core::time::Duration {
+        self.0.now().since_start()
+    }
+}
+
+impl<'f> Completed<'f> {
+    fn answer(drive: blaze_drive::Task<'static>, did: Did<'f>) -> Result<Self, CliError> {
+        let owed = !stands_on_reads(&did);
+        let made = published(drive.name, did)?;
+        Ok(Self { drive, made, owed, worker: None })
+    }
+
+    fn pooled(drive: blaze_drive::Task<'static>, pooled: crate::scripts::PooledScript, frame: &'f Frame) -> Result<Self, CliError> {
+        let name = drive.name;
+        let did = match pooled.did {
+            Err(why) => Did::Failed(TaskFailure { name, why }),
+            Ok(Ran::Made(record)) => record.into_held(frame).map_or_else(|_| work::held_refused(name), Did::Done),
+            Ok(Ran::Failed { what, words, hole }) => {
+                let failure = TaskFailure { name, why: Why::Refused { what, rule: crate::scripts::RULE } };
+                let said = core::str::from_utf8(&words).map_err(|_| CliError::Text { what: "a build script's failure words are not UTF-8" })?;
+                let words = work::held_str(said, frame);
+                if hole { Did::Hole(failure, words) } else { Did::FailedSaying(failure, words) }
+            }
+        };
+        let produced = matches!(did, Did::Done(_));
+        let hole = matches!(did, Did::Hole(..));
+        let mut answer = Self::answer(drive, did)?;
+        answer.worker = Some(WorkerResult { ns: pooled.ns, checkout: pooled.checkout, unkept: pooled.unkept, produced, hole });
+        Ok(answer)
+    }
+}
+
 /// The stage over one command's scripts and module lookups.
 pub(crate) struct ScriptsStage<'f> {
     /// The command's scripts, opened by the first `Script` job (scripts.rs `Scripts::open`);
@@ -53,6 +168,10 @@ pub(crate) struct ScriptsStage<'f> {
     macros: Option<crate::macros::MacroCrates>,
     /// Each planned task's reads, by name, sorted: what its plan hands it.
     reads: Vec<(Name, Vec<Name, &'f Frame>), &'f Frame>,
+    runs: Vec<RunPlan<'f>, &'f Frame>,
+    /// Work finished ahead of the engine's publication wave. A reader can use its record now.
+    completed: BTreeMap<Name, Completed<'f>, &'f Frame>,
+    previous: BTreeMap<Name, Previous<'f>, &'f Frame>,
     /// Each record entered or handed so far (the graph, then this stage's), by name: its key and
     /// out, `None` when it failed.
     made: Vec<(Name, Option<(Key, ContentId)>), &'f Frame>,
@@ -74,6 +193,8 @@ pub(crate) struct ScriptsStage<'f> {
     /// A test's runner in place of each `Script` task's job and run ([`ScriptRunner`]).
     #[cfg(test)]
     runner: Option<&'static dyn ScriptRunner>,
+    #[cfg(test)]
+    tick: u64,
     /// Runs this request whose record was kept with their reads as cells.
     kept_runs: u32,
     /// Runs this request that were holes, and the first one's words (its package, why).
@@ -93,13 +214,24 @@ impl core::fmt::Display for UnkeptWords<'_> {
 }
 
 /// What runs a `Script` task in a test: in place of its job (which opens the wasm runtime and
-/// the real checkout) and its run, on the stage's thread. The production stage has no runner
+/// the real checkout) and its run, on the same workers as a production job. The production stage has no runner
 /// and no such field; a test sets one for its thread with [`with_runner`].
 #[cfg(test)]
 pub(crate) trait ScriptRunner: Sync {
     /// The run of `name` over the checkout `root`; `kept`: its reads are cells, with the plant
     /// (`None`: they are a hole, as on the old path).
-    fn run(&self, cx: &Cx, root: &bstd::fs::Dir<bstd::fs::ReadWrite>, name: Name, kept: Option<crate::engine_script_reads::ReadsPlant>) -> crate::scripts::PooledScript;
+    fn run(&self, cx: &Cx, root: &bstd::fs::Dir<bstd::fs::ReadWrite>, name: Name, kept: Option<crate::engine_script_reads::ReadsPlant>, producers: &[(Input, &[u8])]) -> crate::scripts::PooledScript;
+
+    fn clock(&self) -> Option<&dyn ScriptClock> { None }
+}
+
+/// A simulated worker holds its slot and result until its finish tick. Admission, producer
+/// handoff and publication use the real driver. Ties are broken by the run's plan index.
+#[cfg(test)]
+pub(crate) trait ScriptClock {
+    fn start(&self, name: Name, tick: u64) -> u64;
+    fn end(&self, name: Name, tick: u64);
+    fn omit_links_edge(&self, _producer: Name, _reader: Name) -> bool { false }
 }
 
 #[cfg(test)]
@@ -110,10 +242,14 @@ std::thread_local! {
 /// `work` with `runner` in place of every `Script` task's run of the stages made on this thread.
 #[cfg(test)]
 pub(crate) fn with_runner<R>(runner: &'static dyn ScriptRunner, work: impl FnOnce() -> R) -> R {
-    RUNNER.with(|cell| cell.set(Some(runner)));
-    let out = work();
-    RUNNER.with(|cell| cell.set(None));
-    out
+    struct Restore(Option<&'static dyn ScriptRunner>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RUNNER.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(RUNNER.with(|cell| cell.replace(Some(runner))));
+    work()
 }
 
 impl<'f> ScriptsStage<'f> {
@@ -122,6 +258,9 @@ impl<'f> ScriptsStage<'f> {
             scripts: None,
             macros: None,
             reads: Vec::new_in(frame),
+            runs: Vec::new_in(frame),
+            completed: BTreeMap::new_in(frame),
+            previous: BTreeMap::new_in(frame),
             made: Vec::new_in(frame),
             results: Vec::new_in(frame),
             given: Vec::new_in(frame),
@@ -131,6 +270,8 @@ impl<'f> ScriptsStage<'f> {
             reads_planned: false,
             #[cfg(test)]
             runner: RUNNER.with(|cell| cell.get()),
+            #[cfg(test)]
+            tick: 0,
             kept_runs: 0,
             holes: (0, None),
             unkept: Vec::new_in(frame),
@@ -237,11 +378,8 @@ impl<'f> ScriptsStage<'f> {
         }
         runs.sort_unstable_by_key(|(subject, script, _)| (*subject, *script));
         runs.dedup_by_key(|(subject, _, _)| *subject);
-        // (name, source, wave, producers among the planned runs).
-        let mut scripts: Vec<(Name, ContentId, u16, Vec<Name, &Frame>), &Frame> = Vec::new_in(frame);
         for (name, source) in crate::scripts::parts(names.script_keys(), crate::scripts::sdk_identity(env)) {
             let mut reads = reads_only(&[unit_graph]);
-            let mut producers = Vec::new_in(frame);
             if let Ok(at) = runs.binary_search_by_key(&name.subject, |(subject, _, _)| *subject) {
                 let (_, script, side) = runs[at];
                 // Its module's lookup: the one its reading crate names (scripts.rs `job`).
@@ -250,8 +388,11 @@ impl<'f> ScriptsStage<'f> {
                 }
                 for (input, _, _) in blaze_proc_macro::script_unit::links_closure(units, script).iter() {
                     if let Some(producer) = crate::scripts::name_of(units, *input, side, heap.clone()) {
+                        #[cfg(test)]
+                        if self.runner.and_then(|runner| runner.clock()).is_some_and(|clock| clock.omit_links_edge(producer, name)) {
+                            continue;
+                        }
                         reads.push(producer);
-                        producers.push(producer);
                     }
                 }
             }
@@ -259,36 +400,316 @@ impl<'f> ScriptsStage<'f> {
             reads.sort_unstable();
             reads.dedup();
             self.reads.push((name, reads));
-            scripts.push((name, source, 1, producers));
-        }
-        // Each run one wave after its deepest producer: relaxed to the longest path; a walk still
-        // moving after as many rounds as runs is a `links` cycle (rule 18).
-        let mut rounds = 0usize;
-        loop {
-            let mut moved = false;
-            for at in 0..scripts.len() {
-                let deepest = scripts[at].3.iter().filter_map(|producer| scripts.iter().find(|one| one.0 == *producer)).map(|one| one.2.saturating_add(1)).max().unwrap_or(1);
-                if deepest > scripts[at].2 {
-                    scripts[at].2 = deepest;
-                    moved = true;
-                }
-            }
-            if !moved {
-                break;
-            }
-            rounds += 1;
-            if rounds > scripts.len() {
-                return Err(EngineCheckError::Cycle { krate: scripts[0].0 }.into());
-            }
-        }
-        for (name, source, wave, _) in scripts.iter() {
-            planned.push(Planned { name: *name, phase: Phase::new(Stage::Scripts, *wave), source: *source, file: *name });
+            planned.push(Planned { name, phase: Phase::new(Stage::Scripts, 1), source, file: name });
         }
         planned.sort_unstable_by_key(|one| one.name);
         planned.dedup_by_key(|one| one.name);
         self.reads.sort_unstable_by_key(|(name, _)| *name);
         self.reads.dedup_by_key(|(name, _)| *name);
+        for &one in &planned {
+            self.runs.push(RunPlan { task: EngineTask { planned: one, key: tools.key(one.name, &one.source) }, inputs: 0, readers: Vec::new_in(frame) });
+        }
+        // Every run waits for its own lookup and the scripts whose bytes it receives.
+        // The unit graph has already been committed by the Units stage.
+        for (reader, (_, reads)) in self.reads.iter().enumerate() {
+            for producer in reads {
+                if *producer == unit_graph {
+                    continue;
+                }
+                let at = self.runs.binary_search_by_key(producer, |run| run.task.planned.name)
+                    .map_err(|_| EngineCheckError::Unseen { task: self.runs[reader].task.planned.name, read: *producer })?;
+                self.runs[at].readers.push(reader);
+                self.runs[reader].inputs += 1;
+            }
+        }
+        let mut ready = Ready::new(&self.runs, frame);
+        while let Some(at) = ready.queue.pop() {
+            let task = self.runs[at].task.planned;
+            planned[at] = task;
+            for i in 0..self.runs[at].readers.len() {
+                let reader = self.runs[at].readers[i];
+                let depth = task.phase.wave.checked_add(1).ok_or(CliError::Text { what: "build script links depth exceeds the engine wave limit (engine_scripts.rs)" })?;
+                let wave = &mut self.runs[reader].task.planned.phase.wave;
+                *wave = (*wave).max(depth);
+            }
+            ready.finish(&self.runs[at].readers);
+        }
+        if let Some(stuck) = ready.left.iter().position(|left| *left != 0) {
+            return Err(EngineCheckError::Cycle { krate: self.runs[stuck].task.planned.name }.into());
+        }
         Ok(planned)
+    }
+
+    /// The old script rows are the evidence for running a later wave early on an incremental
+    /// request. The engine still decides which results to publish at each wave.
+    pub(crate) fn restore(&mut self, name: Name, made: Option<(Key, ContentId)>, row: &blaze_engine::Row<'_>, owed: bool, frame: &'f Frame) {
+        self.mark(name, made);
+        if name.kind == Kind::Script {
+            self.previous.insert(name, Previous { key: row.key, owed, reads: Vec::from_slice_in(&row.reads, frame).leak() });
+        }
+    }
+
+    fn output(&self, name: Name) -> Option<Option<(Key, ContentId)>> {
+        if let Some(done) = self.completed.get(&name) {
+            return Some(done.made.as_ref().ok().map(|record| (done.drive.key, record.out)));
+        }
+        self.made.binary_search_by_key(&name, |(name, _)| *name).ok().map(|at| self.made[at].1)
+    }
+
+    fn drive(&self, task: &EngineTask, heap: blaze_own::Alloc<'static>) -> Result<blaze_drive::Task<'static>, CliError> {
+        let name = task.planned.name;
+        let at = self.reads.binary_search_by_key(&name, |(name, _)| *name).map_err(|_| EngineCheckError::Unseen { task: name, read: name })?;
+        let mut inputs = Vec::new_in(heap);
+        let mut failed = Vec::new_in(heap);
+        for &read in &self.reads[at].1 {
+            match self.output(read).ok_or(EngineCheckError::Unseen { task: name, read })? {
+                Some((key, out)) => inputs.push(Input { name: read, at: key, out }),
+                None => failed.push(read),
+            }
+        }
+        Ok(drive_task(name, task.key, task.planned.source, inputs, failed, heap))
+    }
+
+    /// At this point every producer has finished or stands. The remaining reads are wave 0
+    /// checkout cells, module lookups and the unit graph. None of these comes from a later wave.
+    fn needs_run(&self, task: EngineTask) -> Option<bool> {
+        let name = task.planned.name;
+        let Some(previous) = self.previous.get(&name) else {
+            // No stored row is a new entry. A restored mark without its read list can only
+            // be decided when the engine opens its wave.
+            return self.output(name).is_none().then_some(true);
+        };
+        if previous.key != task.key || previous.owed {
+            return Some(true);
+        }
+        let planned = self.reads.binary_search_by_key(&name, |(name, _)| *name).ok()?;
+        for &(cell, seen) in previous.reads {
+            if cell.cell != WHOLE {
+                return None;
+            }
+            let now = match cell.of.kind {
+                // A cell outside today's plan might be defined inline by an earlier run.
+                Kind::Given => {
+                    let at = self.given.binary_search_by_key(&cell.of, |(name, _, _)| *name).ok()?;
+                    self.given[at].1
+                }
+                // Only these producers were settled before this task was released.
+                _ if self.reads[planned].1.binary_search(&cell.of).is_ok() => self.output(cell.of)?.map_or(blaze_drive::key::ABSENT, |(_, out)| out),
+                _ => return None,
+            };
+            if now != seen {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
+    /// Prepare one job on the coordinator, then immediately give it to a worker. A freshly
+    /// completed producer's record is available here even before the engine puts its wave.
+    fn prepare_run<'j>(
+        &mut self, cx: &Cx, store: &mut dyn crate::store::Store<'_>, handles: &Handles<'_, 'f>,
+        names: &mut NamesStage<'f>, task: EngineTask, frame: &'f Frame, jobs: &'j Frame,
+        payloads: &mut BTreeMap<Name, &'j [u8], &'j Frame>,
+    ) -> Result<Dispatch<'f, 'j>, CliError>
+    where
+        'f: 'j,
+    {
+        let name = task.planned.name;
+        let drive = self.drive(&task, handles.env.heap.alloc())?;
+        if let Some(&on) = drive.failed.first() {
+            return Ok(Dispatch::Answered(Completed::answer(drive, Did::Failed(TaskFailure { name, why: Why::Waited { on } }))?));
+        }
+        let completed = &self.completed;
+        // Borrowing the map of completions would prevent inserting the next result until all
+        // its readers join. Share one stable slice per producer across these jobs instead.
+        let mut bytes = |name| -> Result<Option<&'j [u8]>, CliError> {
+            if let Some(&payload) = payloads.get(&name) {
+                return Ok(Some(payload));
+            }
+            let Some(done) = completed.get(&name) else { return Ok(None) };
+            let record = done.made.as_ref().map_err(|_| EngineCheckError::Unseen { task: drive.name, read: name })?;
+            let payload: &'j [u8] = Vec::from_slice_in(record.payload_bytes()?, jobs).leak();
+            payloads.insert(name, payload);
+            Ok(Some(payload))
+        };
+        #[cfg(test)]
+        if let Some(runner) = self.runner {
+            let mut given = Vec::new_in(jobs);
+            for input in drive.inputs.iter().filter(|input| input.name.kind == Kind::Script) {
+                let payload = match bytes(input.name)? {
+                    Some(payload) => payload,
+                    None => Vec::from_slice_in(work::payload(cx, store, input, jobs)?.payload(), jobs).leak(),
+                };
+                given.push((*input, payload));
+            }
+            return Ok(Dispatch::Run(ScriptWork::Double(runner, name, self.reads_planned.then_some(self.plant), given.leak()), drive));
+        }
+        let made = work::unwinding(|| crate::scripts::job_from(cx, handles.root, store, &mut self.scripts, &mut names.names, handles.env, handles.workers.get(), handles.lock, handles.members, &drive, frame, jobs, &mut bytes));
+        let did = match made {
+            Err(work::Panicked) => {
+                let mut done = Completed::answer(drive, Did::Failed(refusal(name, "a build script's job panicked while it was made (its words are on the error stream)").failure))?;
+                done.owed = true;
+                return Ok(Dispatch::Answered(done));
+            }
+            Ok(made) => match made? {
+                Prepared::Ready(mut job) => {
+                    if self.reads_planned {
+                        job.checkout = crate::scripts::CheckoutReads::Kept(self.plant);
+                    }
+                    return Ok(Dispatch::Run(ScriptWork::Script(job), drive));
+                }
+                Prepared::Need(wants) => return Err(EngineCheckError::Unseen { task: name, read: wants.first().map_or(name, |want| want.name) }.into()),
+                Prepared::Waited(on) => Did::Failed(TaskFailure { name, why: Why::Waited { on } }),
+                Prepared::Said { what, words, hole } => {
+                    let failure = TaskFailure { name, why: Why::Refused { what, rule: crate::scripts::RULE } };
+                    let words = work::held_str(words, frame);
+                    if hole { Did::Hole(failure, words) } else { Did::FailedSaying(failure, words) }
+                }
+            },
+        };
+        Ok(Dispatch::Answered(Completed::answer(drive, did)?))
+    }
+
+    /// Consume completions in worker order to unblock readers. Only the engine's task order
+    /// is used to publish completed records, notes and checkout reads in `run_phase`.
+    #[expect(clippy::too_many_arguments, reason = "the script workers and the coordinator's phase inputs")]
+    fn execute(
+        &mut self, cx: &Cx, store: &mut dyn crate::store::Store<'_>, handles: &Handles<'_, 'f>,
+        names: &mut NamesStage<'f>, tasks: &[EngineTask], frame: &'f Frame,
+    ) -> Result<(), CliError> {
+        let Some(first) = tasks.iter().find(|task| !self.completed.contains_key(&task.planned.name)) else { return Ok(()) };
+        let wave = first.planned.phase.wave;
+        let job_frame = Frame::with_reserve(frame.reserved(), bstd::mem::Tag::Other)
+            .map_err(|_| CliError::Text { what: "reserving the frame for build-script jobs and producer records (engine_scripts.rs)" })?;
+        let jobs = &job_frame;
+        let mut payloads = BTreeMap::new_in(jobs);
+        let mut ready = Ready::new(&self.runs, jobs);
+        let mut deferred = Vec::with_capacity_in(self.runs.len(), jobs);
+        deferred.resize(self.runs.len(), false);
+        let mut finished = Vec::with_capacity_in(self.runs.len(), jobs);
+        finished.resize_with(self.runs.len(), bstd::sync::Flag::new);
+        let waiter = blaze_core::wait::Parker::new();
+        let scope = cx.scope();
+        scope.narrow_workers(handles.workers, Class::Foreground);
+        let width = scope.workers();
+        #[cfg(test)]
+        let sim = self.runner.and_then(|runner| runner.clock());
+        #[cfg(test)]
+        let width = if sim.is_some() { handles.workers.get() } else { width };
+        #[cfg(test)]
+        let (mut tick, mut calendar) = (self.tick, BTreeMap::new_in(jobs));
+        let width = width as usize;
+        let mut running = BTreeMap::new_in(handles.env.heap.alloc());
+        let result = (|| -> Result<(), CliError> {
+            loop {
+                while running.len() < width && let Some(at) = ready.queue.pop() {
+                    let task = self.runs[at].task;
+                    let name = task.planned.name;
+                    let run = if task.planned.phase.wave < wave || self.completed.contains_key(&name) {
+                        Some(false)
+                    } else if task.planned.phase.wave == wave {
+                        Some(tasks.binary_search_by_key(&name, |task| task.planned.name).is_ok())
+                    } else if deferred[at] {
+                        None
+                    } else {
+                        self.needs_run(task)
+                    };
+                    if run == Some(true) {
+                        if name.kind == Kind::MacroModule {
+                            let drive = self.drive(&task, handles.env.heap.alloc())?;
+                            let did = self.lookup(cx, store, handles, names, &drive, frame)?;
+                            self.completed.insert(name, Completed::answer(drive, did)?);
+                            ready.finish(&self.runs[at].readers);
+                            continue;
+                        }
+                        match self.prepare_run(cx, store, handles, names, task, frame, jobs, &mut payloads)? {
+                            Dispatch::Run(job, drive) => {
+                                let notice = || Notice { finished: &finished[at], waiter: &waiter };
+                                #[cfg(test)]
+                                let notice = match sim {
+                                    Some(clock) => {
+                                        calendar.insert((clock.start(name, tick), at), ());
+                                        None
+                                    }
+                                    None => Some(notice()),
+                                };
+                                #[cfg(not(test))]
+                                let notice = notice();
+                                let clock = &handles.env.clock;
+                                #[cfg(test)]
+                                let root = handles.root;
+                                let handle = scope.may_overlap("build script", crate::scripts::SCRIPT_FRAME, move |cx| {
+                                    let _notice = notice;
+                                    let pooled = match job {
+                                        ScriptWork::Script(job) => crate::scripts::pooled(cx, &job, clock),
+                                        #[cfg(test)]
+                                        ScriptWork::Double(runner, name, plant, producers) => runner.run(cx, root, name, plant, producers),
+                                    };
+                                    Ok::<_, core::convert::Infallible>(pooled)
+                                });
+                                running.insert(at, (handle, drive));
+                                continue;
+                            }
+                            Dispatch::Answered(done) => {
+                                self.completed.insert(name, done);
+                            }
+                        }
+                    } else if run.is_none() {
+                        for &reader in &self.runs[at].readers {
+                            deferred[reader] = true;
+                        }
+                    }
+                    ready.finish(&self.runs[at].readers);
+                }
+                if running.is_empty() {
+                    return Ok(());
+                }
+                let next = || loop {
+                    if let Some(at) = running.keys().copied().find(|&at| finished[at].is_set()) {
+                        break Ok(at);
+                    }
+                    let task = "a ready build script to finish";
+                    let clock = WaitClock(&handles.env.clock);
+                    let why = match waiter.park(task, cx.deadline().finite(), &clock) {
+                        Ok(blaze_core::wait::Waited::Ready(())) => continue,
+                        Ok(blaze_core::wait::Waited::Deadline) => bstd::task::TaskWhy::Unended {
+                            running: running.len(),
+                            stopped: bstd::Stopped::Deadline { span: task, at: cx.deadline().get() },
+                        },
+                        Err(error) => bstd::task::TaskWhy::Failed(error.to_string()),
+                    };
+                    break Err(CliError::Pool(bstd::task::TaskError { scope: cx.name(), task, why }));
+                };
+                #[cfg(test)]
+                let at = match sim {
+                    Some(clock) => {
+                        let ((end, at), ()) = calendar.pop_first().expect("an occupied simulated worker has a finish tick");
+                        tick = end;
+                        clock.end(self.runs[at].task.planned.name, tick);
+                        at
+                    }
+                    None => next()?,
+                };
+                #[cfg(not(test))]
+                let at = next()?;
+                let (handle, drive) = running.remove(&at).ok_or(CliError::Text { what: "a completion names no running build script (engine_scripts.rs)" })?;
+                let pooled = handle.join(cx).map_err(CliError::Pool)?;
+                self.completed.insert(drive.name, Completed::pooled(drive, pooled, frame)?);
+                ready.finish(&self.runs[at].readers);
+            }
+        })();
+        // Even a preparation refusal or pool failure must join all submitted work.
+        let mut joined = Ok(());
+        while let Some((_, (handle, _))) = running.pop_first() {
+            if let Err(error) = handle.join(cx) {
+                joined = Err(CliError::Pool(error));
+            }
+        }
+        drop(running);
+        #[cfg(test)]
+        { self.tick = tick; }
+        let settled = scope.join(cx).map_err(CliError::Pool);
+        result.and(joined).and(settled)
     }
 
     /// One scripts phase: every task entered once, its result in `buffer`, each run marked in
@@ -307,7 +728,6 @@ impl<'f> ScriptsStage<'f> {
         frame: &'f Frame,
     ) -> Result<(), CliError> {
         let cx = cx.span("engine: one scripts phase");
-        let heap = handles.env.heap.alloc();
         // Each `Given` cell of a script's read defines today's answer, the sweep's
         // (engine_script_reads.rs); the rest run below.
         let mut rest: Vec<EngineTask, &Frame> = Vec::with_capacity_in(tasks.len(), frame);
@@ -320,183 +740,32 @@ impl<'f> ScriptsStage<'f> {
             buffer.done.push(crate::engine_script_reads::given_done(task, self.given[at].1, alloc));
         }
         let tasks: &[EngineTask] = &rest;
-        // Each task's drive task, its reads handed whole.
-        let mut drives = Vec::with_capacity_in(tasks.len(), frame);
-        for task in tasks.iter() {
+        self.execute(&cx, store, handles, names, tasks, frame)?;
+        for task in tasks {
             let name = task.planned.name;
-            let reads = self.reads.binary_search_by_key(&name, |(name, _)| *name).map(|at| &self.reads[at].1).map_err(|_| EngineCheckError::Unseen { task: name, read: name })?;
-            let mut inputs = blaze_own::Vec::new_in(heap.clone());
-            let mut failed = blaze_own::Vec::new_in(heap.clone());
-            for read in reads.iter() {
-                match self.made.binary_search_by_key(read, |(name, _)| *name) {
-                    Ok(at) => match self.made[at].1 {
-                        Some((key, out)) => inputs.push(Input { name: *read, at: key, out }),
-                        None => failed.push(*read),
-                    },
-                    Err(_) => return Err(EngineCheckError::Unseen { task: name, read: *read }.into()),
-                }
-            }
-            failed.sort_unstable();
-            drives.push(drive_task(name, task.key, task.planned.source, inputs, failed, heap.clone()));
-        }
-        // 1. Each lookup answered and each run's job made, on this thread.
-        let mut answered: Vec<(usize, Result<work::Made<'f>, Failure<'f>>), &Frame> = Vec::new_in(frame);
-        let mut ready: Vec<(usize, crate::scripts::ScriptJob<'f>), &Frame> = Vec::new_in(frame);
-        #[cfg(test)]
-        let mut doubled: Vec<(usize, crate::scripts::PooledScript), &Frame> = Vec::new_in(frame);
-        // The tasks (by index) whose failure is not a function of their key and their reads (a
-        // panic, a hole: work.rs `filed`, `Did::Hole`): owed, entered again each request. Every
-        // other failure stands on what it was handed (plan row A8).
-        let mut owed: Vec<usize, &Frame> = Vec::new_in(frame);
-        for (i, drive) in drives.iter().enumerate() {
-            let name = drive.name;
-            match name.kind {
-                Kind::MacroModule => {
-                    let did = self.lookup(&cx, store, handles, names, drive, frame)?;
-                    if !stands_on_reads(&did) {
-                        owed.push(i);
-                    }
-                    answered.push((i, published(name, did)?));
-                }
-                // A test's runner in place of the job and its run (`ScriptRunner`).
-                #[cfg(test)]
-                Kind::Script if self.runner.is_some() => {
-                    let plant = self.reads_planned.then_some(self.plant);
-                    if let Some(runner) = self.runner {
-                        doubled.push((i, runner.run(&cx, handles.root, name, plant)));
+            let done = self.completed.remove(&name).ok_or(EngineCheckError::Unseen { task: name, read: name })?;
+            let Completed { drive, made, owed, worker } = done;
+            let used_unkept = worker.as_ref().is_some_and(|run| run.unkept.is_some());
+            if let Some(run) = worker {
+                times.push(name, run.ns);
+                if run.produced {
+                    if let Some(why) = run.unkept {
+                        self.unkept.push((name, why));
+                    } else {
+                        self.fresh.extend(run.checkout.into_iter().map(|read| (name, read)));
+                        self.kept_runs += u32::from(self.reads_planned);
                     }
                 }
-                Kind::Script => {
-                    // A panic while its job is made fails this run alone (rule 20), as work.rs's.
-                    let made = work::unwinding(|| crate::scripts::job(&cx, handles.root, store, &mut self.scripts, &mut names.names, handles.env, handles.workers.get(), handles.lock, handles.members, drive, frame, frame));
-                    match made {
-                        // A panic is not a function of reads: owed.
-                        Err(work::Panicked) => {
-                            owed.push(i);
-                            answered.push((i, Err(refusal(name, "a build script's job panicked while it was made (its words are on the error stream)"))));
-                        }
-                        Ok(made) => match made? {
-                            // Its reads of the checkout are cells here, its outputs kept
-                            // (scripts.rs `CheckoutReads`).
-                            Prepared::Ready(mut job) => {
-                                // Only once the request plans the reads' cells (hook H1 calls
-                                // `plan_reads`): else a read's record would stand on no task.
-                                if self.reads_planned {
-                                    job.checkout = crate::scripts::CheckoutReads::Kept(self.plant);
-                                }
-                                ready.push((i, job));
-                            }
-                            Prepared::Need(wants) => return Err(EngineCheckError::Unseen { task: name, read: wants.first().map_or(name, |want| want.name) }.into()),
-                            // Its failed need is read ABSENT: that task's fix moves this row.
-                            Prepared::Waited(on) => answered.push((i, Err(Failure { failure: TaskFailure { name, why: Why::Waited { on } }, words: None }))),
-                            Prepared::Said { what, words, hole } => {
-                                // `hole`: the cause is outside its key (scripts.rs `Prepared::Said`:
-                                // the command's scripts not set up, a package's sources not
-                                // fetched), so no read makes it stand: owed.
-                                if hole {
-                                    owed.push(i);
-                                }
-                                answered.push((i, Err(Failure { failure: TaskFailure { name, why: Why::Refused { what, rule: crate::scripts::RULE } }, words: Some(words) })));
-                            }
-                        },
-                    }
-                }
-                // A plan fault, not a function of a cell: owed.
-                _ => {
-                    owed.push(i);
-                    answered.push((i, Err(refusal(name, "a task of a kind the scripts stage does not run"))));
+                if run.hole && let Err(Failure { words: Some(said), .. }) = &made {
+                    self.holes.0 += 1;
+                    self.holes.1.get_or_insert_with(|| std::string::String::from(*said));
                 }
             }
-        }
-        // 2. The wave's runs at once, on the workers, each in its own sandbox; a native run's
-        // children share the command's jobserver (scripts.rs `Scripts::open`).
-        let mut finished: Vec<(usize, crate::scripts::PooledScript), &Frame> = Vec::new_in(frame);
-        #[cfg(test)]
-        finished.extend(doubled.drain(..));
-        // The tasks (by index) whose record is right for this command only: used, and owed.
-        let mut unkept: Vec<usize, &Frame> = Vec::new_in(frame);
-        if !ready.is_empty() {
-            let scope = cx.scope();
-            scope.narrow_workers(handles.workers, Class::Foreground);
-            let clock = &handles.env.clock;
-            let mut running = Vec::new_in(frame);
-            for (_, job) in ready.iter() {
-                running.push(scope.may_overlap("build script", crate::scripts::SCRIPT_FRAME, move |cx: &Cx| Ok::<_, Infallible>(crate::scripts::pooled(cx, job, clock))));
-            }
-            let mut joined = Vec::new_in(frame);
-            let mut stopped = None;
-            for handle in running.into_iter() {
-                match handle.join(&cx) {
-                    Ok(one) => joined.push(one),
-                    Err(error) => {
-                        stopped.get_or_insert(error);
-                    }
-                }
-            }
-            scope.join(&cx).map_err(CliError::Pool)?;
-            if let Some(error) = stopped {
-                return Err(CliError::Pool(error));
-            }
-            finished.extend(ready.iter().map(|(i, _)| *i).zip(joined));
-        }
-        {
-            for (i, mut pooled) in finished.into_iter() {
-                let i = &i;
-                let name = drives[*i].name;
-                times.push(name, pooled.ns);
-                // A kept record's reads of the checkout (empty for anything else: scripts.rs
-                // `pooled`), each with its reader; an unkept record's none, so no leaf row or
-                // `Given` cell stands on a run that is not kept.
-                let why_unkept = pooled.unkept.take();
-                if why_unkept.is_none() {
-                    self.fresh.extend(core::mem::take(&mut pooled.checkout).into_iter().map(|read| (name, read)));
-                }
-                let did = match pooled.did {
-                    Err(why) => Did::Failed(TaskFailure { name, why }),
-                    Ok(Ran::Made(record)) => {
-                        match why_unkept {
-                            // Right for this command: its dependents read it now (a read no cell
-                            // names fails no one), and it runs again next command.
-                            Some(why) => {
-                                unkept.push(*i);
-                                self.unkept.push((name, why));
-                            }
-                            None => self.kept_runs += u32::from(self.reads_planned),
-                        }
-                        record.into_held(frame).map_or_else(|_| work::held_refused(name), Did::Done)
-                    }
-                    Ok(Ran::Failed { what, words, hole }) => {
-                        let failure = TaskFailure { name, why: Why::Refused { what, rule: crate::scripts::RULE } };
-                        let said = core::str::from_utf8(&words).map_err(|_| CliError::Text { what: "a build script's failure words are not UTF-8" })?;
-                        if hole {
-                            self.holes.0 += 1;
-                            self.holes.1.get_or_insert_with(|| std::string::String::from(said));
-                        }
-                        let words = work::held_str(said, frame);
-                        match hole {
-                            true => Did::Hole(failure, words),
-                            false => Did::FailedSaying(failure, words),
-                        }
-                    }
-                };
-                // A panic on its worker, its record not held, a hole: owed.
-                if !stands_on_reads(&did) {
-                    owed.push(*i);
-                }
-                answered.push((*i, published(name, did)?));
-            }
-        }
-        // Each result as the engine's row and this stage's record, in task order. Its reads: the
-        // record's own and what its plan handed it, each a whole cell of an earlier phase.
-        answered.sort_unstable_by_key(|(i, _)| *i);
-        for (i, made) in answered.into_iter() {
-            let task = &tasks[i];
-            let name = task.planned.name;
             let done = match &made {
                 Ok(record) => {
                     let mut reads: SVec<'a, (CellId, ContentId)> = SVec::new_in(alloc);
                     reads.extend(record.reads.iter().map(|(read, digest)| (CellId { of: *read, cell: WHOLE }, *digest)));
-                    reads.extend(drives[i].inputs.iter().map(|input| (CellId { of: input.name, cell: WHOLE }, input.out)));
+                    reads.extend(drive.inputs.iter().map(|input| (CellId { of: input.name, cell: WHOLE }, input.out)));
                     reads.sort_unstable_by_key(|(id, _)| *id);
                     reads.dedup_by_key(|(id, _)| *id);
                     let mut defines = SVec::new_in(alloc);
@@ -519,7 +788,7 @@ impl<'f> ScriptsStage<'f> {
                     // command under its bytes' key (engine_store.rs `record_key`), which a reader
                     // finds only by this row's out: no later command reads it but through a
                     // rerun that made the same bytes.
-                    if unkept.contains(&i) {
+                    if used_unkept {
                         buffer.owed.push(name);
                     }
                     Done { name, key: task.key, out: record.out, defines, reads, findings: u32::try_from(record.findings.len()).unwrap_or(u32::MAX), failed: false }
@@ -529,7 +798,8 @@ impl<'f> ScriptsStage<'f> {
                     if name.kind == Kind::Script {
                         names.mark(name, None);
                     }
-                    if owed.contains(&i) {
+                    if owed {
+                        buffer.owed.push(name);
                         crate::engine_tasks::failed(task, alloc)
                     } else {
                         // What its failure saw (plan row A8): every record its plan handed it,
@@ -540,7 +810,6 @@ impl<'f> ScriptsStage<'f> {
                         // the run's mode); its environment is the world row's cfg, the graph's
                         // record, which every run reads; a module the store lacks is in its
                         // lookup's key (the store's listing) and read here as that lookup's cell.
-                        let drive = &drives[i];
                         let mut reads: SVec<'a, (CellId, ContentId)> = SVec::with_capacity_in(drive.inputs.len() + drive.failed.len(), alloc);
                         reads.extend(drive.inputs.iter().map(|input| (CellId { of: input.name, cell: WHOLE }, input.out)));
                         reads.extend(drive.failed.iter().map(|read| (CellId { of: *read, cell: WHOLE }, blaze_drive::key::ABSENT)));
@@ -559,6 +828,14 @@ impl<'f> ScriptsStage<'f> {
     fn lookup(&mut self, cx: &Cx, store: &mut dyn crate::store::Store<'_>, handles: &Handles<'_, 'f>, names: &NamesStage<'f>, drive: &blaze_drive::Task<'_>, frame: &'f Frame) -> Result<Did<'f>, CliError> {
         let world = names.names.as_ref().ok_or(CliError::Text { what: "the names world, made by the planner, is gone (engine_scripts.rs `lookup`)" })?;
         if let Some(module) = world.script_module(drive.name.subject) {
+            // A fixture supplies the executable in place of the module on disk. Its
+            // lookup succeeds so failed links producers go through the real Waited path.
+            #[cfg(test)]
+            if self.runner.is_some() {
+                let mut module = work::Made::new_in(drive.name, frame);
+                module.out = drive.name.subject;
+                return Ok(Did::Done(module));
+            }
             let wanted = crate::script_modules::Wanted { ran_as: module.ran_as, package: module.package, version: module.version, features: &module.features[..] };
             return crate::script_modules::run(cx, handles.env.home, wanted, drive, frame);
         }

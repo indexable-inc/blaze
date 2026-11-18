@@ -1146,6 +1146,46 @@
    "recommended": "blaze-cli store.rs `TRUSTED_BUILDER = cfg!(feature = \"publish\")`, read in `open_for_command` and `CommandStore::new`; one constant, one place.",
    "why": "Only a trusted builder may make records that leave the machine (the Trust rule); the choice is the build's, not a flag or an environment variable a developer could set by accident, and a developer's home never holds a PUBLIC record.",
    "state": "proposed by RH5 2026-11-18 for the coordinator's word; written by RH5."
+  },
+  {
+   "id": "D140",
+   "date": "2026-11-18",
+   "decision": "A task's read list holds its DIRECT reads only, and every crate whose content the lock fixes (a registry or toolchain crate, never a path, git or patched one without a checksum) is ONE settled-class proof in it, not a cell a crate. A cell's id is made once for each distinct read key (never a hash a read), and the request's view of cells is a flat table, not a tree.",
+   "recommended": "engine_bodies.rs `widen`/`row_of`, front2 tables/{task,recorder,owned_reads}.rs, blaze-engine `View` (lanes BD4 and CX22, 2026-11-18). Judge: the `bodies memory:` line on tempo (row kept a body from 85,932 bytes; cells after widening from 1,058, of which 913 were whole dependency records) and the bodies stage's stack sample (read bookkeeping from 52% of on-CPU samples to a few percent).",
+   "why": "Measured, the tempo run of 2026-11-18 04:51 on tree 9c57f43a88 (release g044534, 16 workers; kept in the notes' reports/tempo-0451/: the kernel's cpu time each 5 s and one 5 s stack sample a stage) and two independent reviews of that night (briefs/RV1-astra-review.md, briefs/RV2-advise-review.raw): 52% of the bodies stage's CPU was `cell_id` -> blake3, the view's BTreeMap get and sorts; type inference, trait solving and the borrow check together were 8%. The design's own floor for a body's reads is its member reads.",
+   "state": "decided by the coordinator 2026-11-18 05:15; the two lanes are writing; not on the green tree yet."
+  },
+  {
+   "id": "D141",
+   "date": "2026-11-18",
+   "decision": "A request has an immutable context shared by its tasks (opened records, the lang index of a scope, frozen heads read in place, constants' values, settled goal answers), made once through the table's claim, and a frame a task for what is the task's own (inference variables, diagnostics, the read recorder). This AMENDS runtime.md's principle 5 (\"a worker's state is its frame, reset per task\"): the frame stays, the rebuild of shared facts in it goes. Every hit of the shared context is still recorded as the task's read.",
+   "recommended": "Heads first (lane CX27: a head made once a request and read in place; `lowered` == distinct heads), then bodies (a warm context per (worker, scope) and the goal table: `goals: None` at engine_bodies.rs), after the reads lane lands in the same files.",
+   "why": "Measured, the tempo run of 2026-11-18 04:51 on tree 9c57f43a88 (release g044534, 16 workers; kept in the notes' reports/tempo-0451/: the kernel's cpu time each 5 s and one 5 s stack sample a stage) and two independent reviews of that night (briefs/RV1-astra-review.md, briefs/RV2-advise-review.raw): the heads stage's on-CPU samples were 70% under `front2::heads::Store::ensure` (signatures of OTHER items lowered again in the task's private store: 968,591 lowerings for 165,246 cells on an earlier run), 28% array-length constants type-checked inside head tasks, 4% type work; each body builds a new lang index, world and store.",
+   "state": "decided by the coordinator 2026-11-18 05:15; the heads lane is writing; bodies' part not started."
+  },
+  {
+   "id": "D142",
+   "date": "2026-11-18",
+   "decision": "A stage is not a global barrier, and no stage's work runs on the coordinator: a task is released when ITS producers are done (a pipeline a crate), build scripts run side by side bounded by the workers and their `links` order, a crate's names work runs on a worker, and splits are cut by cost not count. This AMENDS runtime.md's principle 3 (\"stages run in order\"): the order that stays is producer before consumer. Results are still merged in task order (rule 25).",
+   "recommended": "Now, inside the stages (lanes CX25 scripts, CX26 names). Then the engine's scheduler as a simulated sans-IO state machine in blaze-engine (rules 43, 79) before any stage driver adopts it.",
+   "why": "Measured, the tempo run of 2026-11-18 04:51 on tree 9c57f43a88 (release g044534, 16 workers; kept in the notes' reports/tempo-0451/: the kernel's cpu time each 5 s and one 5 s stack sample a stage) and two independent reviews of that night (briefs/RV1-astra-review.md, briefs/RV2-advise-review.raw): the kernel's CPU over wall was about 0.5 core in Scripts (one script at a time: 276 runs of about 100 ms, 29 s), 1.6 in Names (23 s), 4.8 in Heads, 7.4 in Bodies, on 16 workers.",
+   "state": "decided by the coordinator 2026-11-18 05:15; the two stage lanes are writing; the scheduler is not started."
+  },
+  {
+   "id": "D143",
+   "date": "2026-11-18",
+   "decision": "A code record holds no line or column: it holds a ROW for each source-position field (part, offset, item, item-relative site, line or column) with the field's bytes zero, and whoever places the record fills them from today's file. With that, the builder is told which fns are `#[track_caller]` (it was held at \"not said\" because a record could not carry a position), so a panic's `Location` is built. A placement with no way to resolve a position leaves the record out by name, never zeros.",
+   "recommended": "blaze-code record.rs (`bzcode07`), blaze-emit pass/sites.rs, blaze-code place.rs/image.rs, the run wire's `Down::Positioned`, the child's `place_resolved` (lane CX18, three passes, 2026-11-18). Judge: `blaze test` on `assert_eq!(1, 2)` prints the failure with its file and line and counts one failed test.",
+   "why": "Rule 71 (records hold item-relative positions): the same record must serve when lines are added above its item. Found by a real run: a failing `assert_eq!` could not be BUILT (`Location::caller`: \"this fn's own `#[track_caller]` is not said\").",
+   "state": "decided by the coordinator 2026-11-18 05:15; written by the lane, not compiled whole yet."
+  },
+  {
+   "id": "D144",
+   "date": "2026-11-18",
+   "decision": "A cold `run` or `test` prepares the code of a fn's DIRECT callees in parallel as it builds the caller (bounded, deduplicated in flight, misses first) and keeps first-call resolution for indirect calls; the warm start list stays as it is. This amends runtime.md's principle 8 (\"`run` makes a function on its first call\") for the cold case only.",
+   "recommended": "After the check's stages are at their floors: `run`/`test` start from the engine's answer with code as engine tasks (plan row F2). Judge: hello world's first run (12.84 s for 630 code records made one at a time on 2026-11-18; the second run 0.07 s must not move) and unused code records made.",
+   "why": "Both reviews named it the one design limit of the cold run; the hello-world first run builds 630 fns serially on one thread.",
+   "state": "decided by the coordinator 2026-11-18 05:15; NOT started."
   }
  ]
 }

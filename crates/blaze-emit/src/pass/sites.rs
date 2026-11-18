@@ -13,6 +13,7 @@
 //! | `data_addr` of own data holding no address | `adr x9, <row>` | the same: the row follows the instructions |
 //! | `data_addr` of own data holding an address | `adr x9, <row>`, the row's words filled in place | `adrp x9, 0; add x9, x9, #0`: a relro site; the row is in the relro part |
 //! | an address in a data row | a word of the code placement fills | a word of the relro part, naming its target or the record's own code or relro byte |
+//! | a source position in a data row | a zero field and a fixup in code | a zero field and its item-relative position row in code or relro |
 //!
 //! Every `adrp` is emitted with a zero page and every `ldr`/`add` with a zero offset: the
 //! reach (`adrp`'s 4 GiB, the page offset scaled by 8) is checked where the address is known,
@@ -23,6 +24,7 @@
 
 use core::alloc::Allocator;
 
+use blaze_code::record::{PositionField, PositionPart, PositionRow};
 use blaze_lir::func::{DataId, RefId, RefKind};
 use blaze_own::Vec;
 
@@ -86,6 +88,7 @@ pub(crate) struct Form<A: Allocator> {
     /// its rows, at least 8 bytes.
     pub(crate) relro_align: u8,
     pub(crate) words: Vec<WordRow, A>,
+    pub(crate) positions: Vec<PositionRow, A>,
     /// Per placed data row, where it starts: in the code for a row holding no address, in the
     /// relro part for one that does.
     pub(crate) data_at: Vec<u32, A>,
@@ -111,6 +114,7 @@ impl<A: Allocator + Clone> Form<A> {
             code_align: blaze_code::record::LEAST_CODE_ALIGN,
             relro_align: blaze_code::record::LEAST_RELRO_ALIGN,
             words: Vec::new_in(alloc.clone()),
+            positions: Vec::new_in(alloc.clone()),
             data_at: Vec::new_in(alloc.clone()),
             inner: Vec::new_in(alloc.clone()),
             insts: 0,
@@ -123,12 +127,6 @@ impl<A: Allocator + Clone> Form<A> {
 /// Why the record form refuses a data row whose address is not on a word of the relro part.
 pub(crate) const UNALIGNED_ADDRESS: &str =
     "an address at an offset that is not 8-aligned in its row (the image binds whole aligned words of the relro part)";
-
-/// Why the record form refuses a data row holding a source position (a `Location`'s line or
-/// column): a `blaze_code` record has no position field yet, and writing the line in would put
-/// an absolute position in a code record (rule 71).
-pub(crate) const RECORD_POSITION: &str =
-    "a source position (a `#[track_caller]` `Location`'s line or column) in the code record form, which has no position field";
 
 impl<A: Allocator> Pass<'_, '_, A> {
     /// Whether the pass emits the record form.
@@ -212,26 +210,40 @@ impl<A: Allocator> Pass<'_, '_, A> {
             // The row's part asks its placement for the row's alignment (record.rs
             // `code_align`, `relro_align`): its offset there is a multiple of it.
             let log2 = rec.align as u8;
-            if !view.data_positions_of(DataId(row)).is_empty() {
-                return Err(EmitError::Data { row, why: RECORD_POSITION });
-            }
             let relocs = view.data_relocs_of(DataId(row));
             let bytes = view.data_bytes_of(DataId(row));
-            if relocs.is_empty() {
+            let (part, start, placed) = if relocs.is_empty() {
                 form.code_align = form.code_align.max(log2);
                 self.pad_to(align);
-                form.data_at.push(self.here());
+                let start = self.code.len();
                 self.code.extend_from_slice(bytes);
-                at += 1;
-                continue;
-            }
-            form.relro_align = form.relro_align.max(log2);
-            while form.relro.len() % align != 0 {
-                form.relro.push(0);
-            }
-            let start = u32::try_from(form.relro.len()).map_err(|_| too_large)?;
+                (PositionPart::Code, start, &mut self.code[start..])
+            } else {
+                form.relro_align = form.relro_align.max(log2);
+                while form.relro.len() % align != 0 {
+                    form.relro.push(0);
+                }
+                let start = form.relro.len();
+                form.relro.extend_from_slice(bytes);
+                (PositionPart::Relro, start, &mut form.relro[start..])
+            };
+            let start = u32::try_from(start)
+                .map_err(|_| EmitError::TooLarge { what: "a data row's offset in its record part (4 GiB)" })?;
             form.data_at.push(start);
-            form.relro.extend_from_slice(bytes);
+            for p in view.data_positions_of(DataId(row)) {
+                let field = match blaze_lir::PositionField::from_word(p.field) {
+                    Some(blaze_lir::PositionField::Line) => PositionField::Line,
+                    Some(blaze_lir::PositionField::Col) => PositionField::Col,
+                    None => return Err(EmitError::Data { row, why: "a source position of no known field" }),
+                };
+                let offset = p.offset as usize;
+                let slot = placed.get_mut(offset..).and_then(|tail| tail.get_mut(..4))
+                    .ok_or(EmitError::Data { row, why: "a source position past its row's end" })?;
+                slot.fill(0);
+                let at = start.checked_add(p.offset)
+                    .ok_or(EmitError::TooLarge { what: "a source position's offset in its record part (4 GiB)" })?;
+                form.positions.push(PositionRow { part, at, item: p.item_key(), site: p.site, field });
+            }
             for r in relocs {
                 if u64::from(r.offset) + 8 > u64::from(rec.bytes_len) {
                     return Err(EmitError::Data { row, why: "a relocation past its row's end" });

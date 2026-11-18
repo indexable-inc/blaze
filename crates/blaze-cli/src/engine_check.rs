@@ -735,7 +735,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         };
         match row.phase.stage {
             Stage::Scripts => {
-                scripts.mark(*name, made);
+                scripts.restore(*name, made, row, start.owed_tasks.contains_key(name), frame);
                 if let Some(stage) = names.as_mut() {
                     stage.mark(*name, made);
                 }

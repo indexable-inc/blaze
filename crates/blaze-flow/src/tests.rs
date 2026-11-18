@@ -254,6 +254,7 @@ fn oracle_moves(flow: &Flow<Global>) -> Result<Found, Broke> {
 
 fn moves_case(t: &Tape, plant: Plant) -> Result<(), Broke> {
     let flow = random_flow(t);
+    crate::loans::assert_tiers_equal_for_fixture(&flow);
     let got: Found = match check_moves_planted(&flow, plant, Global) {
         Ok(v) => v.iter().map(|f| (f.at, f.place, f.kind)).collect(),
         Err(b) => return Err(Broke::Harness(format!("{b:?}"))),
@@ -328,6 +329,7 @@ fn finish(b: FlowBuilder<Global>) -> Flow<Global> {
 }
 
 fn kinds(flow: &Flow<Global>) -> Vec<(Stmt, Place, MoveFindingKind)> {
+    crate::loans::assert_tiers_equal_for_fixture(flow);
     match check_moves(flow, Global) {
         Ok(v) => v.iter().map(|f| (f.at.stmt(), f.place, f.kind)).collect(),
         Err(b) => panic!("{b:?}"),
@@ -417,6 +419,7 @@ fn drop_kinds_from_the_same_result() {
     let e = b.stmt(StmtKind::Drop(Place(2)), S);
     b.ret(S);
     let flow = finish(b);
+    crate::loans::assert_tiers_equal_for_fixture(&flow);
     let st = match inits(&flow, Plant::None, Global) {
         Ok(st) => st,
         Err(e) => panic!("{e:?}"),

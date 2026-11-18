@@ -44,7 +44,7 @@ fn held_values_and_subjects_read_back_in_one_form() {
     let one = sealed(&[arm, small, copy], alloc).unwrap();
     let other = sealed(&[copy, arm, small], alloc).unwrap();
     assert_eq!(one[..], other[..], "the order rows were added in leaves no trace (rule 25)");
-    assert_eq!(&one[..8], b"bzcode06");
+    assert_eq!(&one[..8], b"bzcode07");
     let view = CodeView::read(&one).unwrap();
     assert_eq!(view.traps(), 3);
     assert_eq!(view.trap_at(4), Some(copy));
@@ -66,9 +66,9 @@ fn a_bad_held_value_or_subject_is_refused() {
 
     let row = TrapRow { at: 4, kind: TrapKind::Discriminant, site: None, held: Held::Reg(9), subject: Some(alignment_enum()) };
     let mut bytes = sealed(&[row], alloc).unwrap();
-    // The trap row follows the head (56) and the code (20, padded to 24); its held tag is its
+    // The trap row follows the head (64) and the code (20, padded to 24); its held tag is its
     // byte 5, and the subject row follows it (32 bytes).
-    let trap = 56 + 24;
+    let trap = 64 + 24;
     assert_eq!(bytes[trap + 5], 1);
     assert_eq!(bytes[trap + 6], 9);
     bytes[trap + 5] = 3;

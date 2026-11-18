@@ -6,19 +6,20 @@
 //! [`holds`] is also called by `tests::emitted_for` for every function the crate's tests emit
 //! in the literal-word form, so each of them is checked in the record form too.
 //!
-//! The lines the three tests print:
+//! The lines the tests print:
 //!
 //! ```text
 //! record form: 7 functions, 5 sites, 1 relro word, 0 literal words; each round-trips and builds to equal bytes twice
 //! both forms run equal: a loop 5050, a static and data 147 then 149, 4 calls, a function's address, a memcpy of 200 bytes
 //! record form refusals: no symbol, a C name for a vtable, an unaligned address; a C function keeps its name
+//! tracked call: equal record bytes, caller placed at 2:5 then 5:5
 //! ```
 
-use blaze_code::record::{CodeView, OWN_CODE, Sealed, SiteKind, Space, Symbol, Target};
+use blaze_code::record::{CodeView, OWN_CODE, PositionField, PositionPart, PositionRow, Sealed, SiteKind, Space, Symbol, Target};
 use blaze_lir::{
     Flags, Op, Ty, View,
-    builder::{DataReloc, MemAttrs},
-    func::{DataId, RefKind},
+    builder::{DataPosition, DataReloc, MemAttrs, Param, Variadic},
+    func::{Conv, DataId, RefKind},
 };
 use blaze_own::{Alloc, Vec};
 
@@ -174,10 +175,92 @@ pub(crate) fn holds(func: View<'_>, isa: Isa) -> Option<(usize, usize)> {
     assert!((0..view.sites()).all(|i| view.site(i) == record.sites[i]), "the sites round-trip");
     assert_eq!(view.words(), record.words.len());
     assert!((0..view.words()).all(|i| view.word(i) == record.words[i]), "the words round-trip");
+    assert_eq!(view.positions(), record.positions.len());
+    assert!((0..view.positions()).all(|i| view.position(i) == record.positions[i]), "the source position fields round-trip");
 
     let (again, _) = sealed_of(func, &ByPlace, isa).expect("the second build emits as the first did");
     assert_eq!(&bytes[..], &encode(&again)[..], "two builds give equal bytes\n{}", text());
     Some((view.sites(), view.words()))
+}
+
+/// At the emitter boundary the hidden last argument of a tracked call is a pointer to a
+/// `Location` (blaze-build intrinsics.rs `location`). Plant the current coordinates in
+/// the input bytes: copying those numbers would make the two builds below differ.
+#[test]
+fn moving_the_untracked_caller_preserves_the_record() {
+    use blaze_code::{
+        image::ImageError,
+        place::{At, Words, place_positions},
+    };
+
+    const ITEM: u128 = 0x1234_5678_9abc_def0_ffe0_ddc0_bba0_9988;
+    const CALLER: &str = "fn caller() -> u32 {\n    tracked()\n}\n";
+    let coordinates = |source: &str, at: usize| {
+        let before = &source[..at];
+        let line = 1 + before.bytes().filter(|&b| b == b'\n').count() as u32;
+        let col = 1 + before.rsplit('\n').next().unwrap().chars().count() as u32;
+        (line, col)
+    };
+    let build = |source: &str| {
+        let start = source.find("fn caller").unwrap();
+        let call = source.find("tracked()").unwrap();
+        let site = (call - start) as u32;
+        let (line, col) = coordinates(source, call);
+        let func = one(&[], Ty::I32, |b, _| {
+            let filename = b"src/main.rs\0";
+            let path = b.data(filename, 0, &[]);
+            let mut bytes = [0u8; 24];
+            bytes[8..16].copy_from_slice(&((filename.len() - 1) as u64).to_le_bytes());
+            bytes[16..20].copy_from_slice(&line.to_le_bytes());
+            bytes[20..24].copy_from_slice(&col.to_le_bytes());
+            let fields = [
+                DataPosition { offset: 16, item: ITEM, site, field: blaze_lir::PositionField::Line },
+                DataPosition { offset: 20, item: ITEM, site, field: blaze_lir::PositionField::Col },
+            ];
+            let location = b.data_with_positions(&bytes, 3, &[DataReloc { offset: 0, target: path, addend: 0 }], &fields);
+            let ptr = b.data_addr(location);
+            let tracked = b.reference(RefKind::Func, 0);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[Param::of(Ty::I32)]);
+            b.call(Flags::NONE, tracked, sig, &[ptr])
+        });
+        let (sealed, _) = sealed_of(func.view(), &ByPlace, ISA).expect("the untracked caller emits a record");
+        encode(&sealed)
+    };
+    let moved = format!("\n\n\n{CALLER}");
+    let bytes = build(CALLER);
+    assert_eq!(&bytes[..], &build(&moved)[..], "adding three lines above the caller preserves every stored byte");
+    let view = CodeView::read(&bytes).expect("the stored caller reads");
+    let site = CALLER.find("tracked()").unwrap() as u32;
+    assert_eq!(view.positions(), 2);
+    assert_eq!(view.position(0), PositionRow { part: PositionPart::Relro, at: 16, item: ITEM, site, field: PositionField::Line });
+    assert_eq!(view.position(1), PositionRow { part: PositionPart::Relro, at: 20, item: ITEM, site, field: PositionField::Col });
+    assert_eq!(&view.relro()[16..24], &[0; 8], "the record excludes the planted coordinates");
+
+    struct Tracked;
+    impl Words for Tracked {
+        fn word(&mut self, target: Target, call: bool) -> Result<u64, ImageError> {
+            assert!(call);
+            assert_eq!(target, Target { space: Space::Func, symbol: symbol(Outside::Func(0)) });
+            Ok(0x3000)
+        }
+        fn value(&mut self, target: Target) -> Result<u64, ImageError> {
+            panic!("the filename belongs to the caller's code, unexpected import {target:?}")
+        }
+    }
+    let placed = |source: &str| {
+        let mut code = vec![0; view.code().len()];
+        let mut relro = vec![0; view.relro().len()];
+        let at = At { code: 0x1000, relro: 0x2000 };
+        place_positions(&view, Symbol::of_name("caller"), at, &mut Tracked, &mut code, &mut relro, |_, row| {
+            assert_eq!(row.item, ITEM);
+            let call = source.find("fn caller").unwrap() + row.site as usize;
+            Ok(row.field.value(coordinates(source, call)))
+        }).expect("the caller places against the current text");
+        (inst(&relro, 16), inst(&relro, 20))
+    };
+    assert_eq!(placed(CALLER), (2, 5));
+    assert_eq!(placed(&moved), (5, 5));
+    println!("tracked call: equal record bytes, caller placed at 2:5 then 5:5");
 }
 
 /// The piece's test (run.md, "Pieces", 5): prints
@@ -302,6 +385,7 @@ mod runs {
         let (sealed, _) = sealed_of(func, &ByPlace, ISA).expect("the record form emits");
         let bytes = encode(&sealed);
         let view = CodeView::read(&bytes).expect("the record reads");
+        assert_eq!(view.positions(), 0, "this test binder has no source-position resolver");
         let targets = view.targets();
         let relro_at = (8 * targets).next_multiple_of(16);
         Executable::written(view.code().len(), relro_at + view.relro().len(), |code, data| {

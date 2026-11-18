@@ -620,6 +620,14 @@ fn unit_crate_key<'w>(
         put(&mut bytes, b"\0corrected");
         put(&mut bytes, &row.digest());
     }
+    // A registry crate's archive checksum, as the lock writes it (rule 21: a key covers every
+    // input): name, version and registry do not say WHICH bytes; an archive replaced under one
+    // version must not find the old names record (lane BD4, found by its archive control).
+    let package = lock.package(unit.package);
+    if let (blaze_manifest::lock::LockSource::Registry { .. }, blaze_manifest::lock::Checksum::Sha256(sum)) = (&package.source, &package.checksum) {
+        put(&mut bytes, b"\0registry archive sha256");
+        put(&mut bytes, sum.as_bytes());
+    }
     CrateItemKey(ContentId::of("blaze world crate 3", &bytes))
 }
 

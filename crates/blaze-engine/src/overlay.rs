@@ -88,6 +88,7 @@ use blaze_drive::key::{ABSENT, Key, Name};
 use blaze_id::ContentId;
 use blaze_own::{Alloc, BTreeMap, BTreeSet, SharedAlloc, Vec};
 
+use crate::cell_table::CellTable;
 use crate::engine::{Answer, Cause, CellId, EngineError, Gen, Phase, Plant, Planned, Row, SMap, SSet, SVec};
 use crate::last::{Found, LastAnswer, LastRow, Touched};
 use crate::readers::ReaderEdits;
@@ -170,7 +171,7 @@ pub struct Work<'a> {
     /// The rows this request put (`Some`) or took out (`None`), by name.
     pub rows: SMap<'a, Name, Option<Row<'a>>>,
     /// The cells this request moved: their digest and this request's serial, or `None`: absent.
-    pub cells: SMap<'a, CellId, Option<(ContentId, Gen)>>,
+    pub cells: CellTable<'a, Option<(ContentId, Gen)>>,
     /// Each cell's readers this request added (`true`) or dropped (`false`), sorted by cell then
     /// reader: put by the engine's finish (readers.rs `ReaderIndex::finish`), empty before.
     pub readers: ReaderEdits<'a>,
@@ -278,7 +279,7 @@ impl<'a> Work<'a> {
                 }
             }
         }
-        for (id, cell) in self.cells.into_iter() {
+        for (&id, &cell) in self.cells.iter() {
             match cell {
                 Some(cell) => {
                     answer.cells.insert(id, cell);
@@ -288,6 +289,7 @@ impl<'a> Work<'a> {
                 }
             }
         }
+        drop(self.cells);
         for (id, delta) in self.readers.iter() {
             let readers = answer.readers.entry(*id).or_insert_with(|| BTreeSet::new_in(alloc));
             for (reader, added) in delta.iter() {
@@ -392,7 +394,7 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
             serial,
             plant,
             rows: BTreeMap::new_in(alloc),
-            cells: BTreeMap::new_in(alloc),
+            cells: CellTable::new_in(alloc),
             readers: ReaderEdits::new_in(alloc),
             by_file: BTreeMap::new_in(alloc),
             findings: BTreeMap::new_in(alloc),
@@ -403,7 +405,8 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
     }
 
     /// The last answer and this request's writes, for the form's [`Fold`].
-    pub fn into_parts(self) -> (L, Work<'a>) {
+    pub fn into_parts(mut self) -> (L, Work<'a>) {
+        self.work.cells.finish_order();
         (self.last, self.work)
     }
 

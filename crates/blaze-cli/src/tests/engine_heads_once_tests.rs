@@ -5,8 +5,8 @@
 //! check's and the one a source a head gives (`Sources::Head`, the measure before the table),
 //! every cell is frozen once (`frozen` = `cells` + the races' `twice`), and the cold read sets
 //! differ only at witnessed same-crate head cutoffs. Then each edit row is compared with a fresh check:
-//! a body-only edit of `a` (EARLY CUTOFF: `a`'s task reruns, `b`'s are not entered), and `a`'s
-//! struct gaining a field (`b`'s readers are entered).
+//! a body-only edit of `a`, a spelling change to an alias in `b` (equal frozen bytes stop
+//! its readers), a width change to that alias, and a field added to `a`'s struct.
 //!
 //! THE RACE (rule 43, `blaze_sim`): two workers that both miss a cell and freeze it, interleaved
 //! every way the tape draws (each a look, then a put on a miss): one entry, the first's bytes, an
@@ -24,6 +24,7 @@ use crate::engine_heads_once::{Entry, HeadsOnce, OnceCounts, OnceError, OncePlan
 use blaze_drive::{Kind, Name};
 use blaze_engine::{CellId, Stage};
 use blaze_ladder::front2::heads::Want;
+use blaze_ladder::front2::tables::head::{FrozenHead, WANT_BYTES, want_bytes};
 use blaze_sim::{Broke, Config, Tape, check as sim_check, control};
 
 /// The ids a request listed, by the helpers' own form.
@@ -37,7 +38,7 @@ const A_LIB: &str = "pub struct Point {\n    pub x: u32,\n}\n\npub fn make(p: Po
 const A_LIB_BODY: &str = "pub struct Point {\n    pub x: u32,\n}\n\npub fn make(p: Point) -> Point {\n    let q = p;\n    q\n}\n\npub fn twice(p: Point, q: Point) -> u32 {\n    p.x + q.x\n}\n";
 /// `Point` gains a field.
 const A_LIB_FIELD: &str = "pub struct Point {\n    pub x: u32,\n    pub y: u32,\n}\n\npub fn make(p: Point) -> Point {\n    p\n}\n\npub fn twice(p: Point, q: Point) -> u32 {\n    p.x + q.x\n}\n";
-const B_LIB: &str = "pub struct Holder {\n    pub p: a::Point,\n}\n\npub fn wrap(p: a::Point) -> Holder {\n    Holder { p }\n}\n\npub fn first(h: &Holder) -> u32 {\n    h.p.x\n}\n\npub fn again(p: a::Point) -> a::Point {\n    a::make(p)\n}\n";
+const B_LIB: &str = "pub type Num = u32;\npub type Word = u32;\npub struct Holder {\n    pub p: a::Point,\n}\n\npub fn wrap(p: a::Point) -> Holder {\n    Holder { p }\n}\n\npub fn first(h: &Holder) -> Word {\n    h.p.x\n}\n\npub fn again(p: a::Point) -> a::Point {\n    a::make(p)\n}\n";
 
 fn two_members(seed: u64) -> Io {
     let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
@@ -46,6 +47,41 @@ fn two_members(seed: u64) -> Io {
     write(&io, "a/src/lib.rs", A_LIB);
     write(&io, "b/Cargo.toml", B_MANIFEST);
     write(&io, "b/src/lib.rs", B_LIB);
+    io
+}
+
+/// Each of the eight signatures lives in its own file, so the head splitter can assign them
+/// to different jobs. Both downstream crates name the same normal library unit's constant.
+fn chain_with_shared_length(seed: u64) -> Io {
+    let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+    write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n");
+    write(&io, "a/Cargo.toml", A_MANIFEST);
+    write(&io, "a/src/lib.rs", "pub const N: usize = 2 + 2;\npub struct A { pub n: u8 }\npub trait HasA { fn get(&self) -> &A; }\n");
+    write(&io, "b/Cargo.toml", B_MANIFEST);
+    write(&io, "c/Cargo.toml", "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nb = { path = \"../b\" }\na = { path = \"../a\" }\n");
+    for (krate, base, sigs) in [
+        ("b", "pub struct B { pub a: a::A }\nimpl a::HasA for B { fn get(&self) -> &a::A { &self.a } }\n", 0..4),
+        ("c", "pub struct C { pub b: b::B }\n", 4..8),
+    ] {
+        let mut lib = Label::from(base);
+        for i in sigs {
+            lib.push_str(&format!("pub mod sig{i};\n"));
+            // N must normalize to 4 for the body to type-check.
+            write(&io, &format!("{krate}/src/sig{i}.rs"), "pub fn take(bytes: [u8; a::N]) -> [u8; 4] { bytes }\n");
+        }
+        write(&io, &format!("{krate}/src/lib.rs"), &lib);
+    }
+    io
+}
+
+/// References give the recursive structs a finite layout. West's method reads Base::X through
+/// East's supertrait while East's method requires West. Neither method adds a supertrait edge.
+fn mutually_naming_heads(seed: u64) -> Io {
+    let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+    write(&io, "Cargo.toml", A_MANIFEST);
+    write(&io, "src/lib.rs", "pub mod left;\npub mod right;\npub trait Base { type X; }\n");
+    write(&io, "src/left.rs", "pub struct Left<'a, T> { pub value: T, pub right: &'a crate::right::Right<'a, T> }\npub trait East: crate::Base { fn east(&self) where Self: crate::right::West; }\n");
+    write(&io, "src/right.rs", "pub struct Right<'a, T> { pub value: T, pub left: &'a crate::left::Left<'a, T> }\npub trait West { fn west<T: crate::left::East>(&self, x: T::X); }\n");
     io
 }
 
@@ -73,7 +109,11 @@ impl Said {
 
 /// One request on 2 workers, its head tasks over `sources`.
 fn request(io: &Io, fresh: bool, sources: Sources, units: HeadUnits) -> Said {
-    let mut o = opts(io, 2, fresh);
+    request_with_workers(io, fresh, sources, units, 2)
+}
+
+fn request_with_workers(io: &Io, fresh: bool, sources: Sources, units: HeadUnits, workers: u32) -> Said {
+    let mut o = opts(io, workers, fresh);
     o.head_sources = sources;
     o.head_units = units;
     let before = stdout(io).len();
@@ -105,10 +145,118 @@ impl OnceCounts {
     }
 }
 
-fn cold_request(io: &Io, sources: Sources, units: HeadUnits) -> (Said, UnitReads) {
+fn observed_request(io: &Io, sources: Sources, units: HeadUnits) -> (Said, UnitReads) {
     UNIT_READS.set(Some(UnitReads::new()));
     let said = request(io, false, sources, units);
-    (said, UNIT_READS.take().expect("observing this cold request"))
+    (said, UNIT_READS.take().expect("observing this request"))
+}
+
+/// The records readers consume. A task's dependency list can stop at another head in the
+/// shared schedule, so compare the frozen payload, cell definitions and task output.
+#[derive(Debug, PartialEq, Eq)]
+struct HeadOutput {
+    payload: std::vec::Vec<u8>,
+    defines: std::vec::Vec<(blaze_drive::cells::Cell, blaze_ids::ContentId)>,
+    out: blaze_ids::ContentId,
+}
+
+fn head_outputs(io: &Io, array_bodies: Option<&Said>) -> BTreeMap<Name, HeadOutput> {
+    use crate::store::Store as _;
+    super::engine_answer_rows_tests::with_store(io, |cx, store, opts| {
+        let root = crate::engine_answer::root_name(opts.place.checkout, &opts.tools, cx.frame());
+        let pointer = crate::engine_answer::load_pointer(cx, store, &root).expect("read the cold pointer").expect("a cold answer").expect("a valid pointer");
+        let (kept, _) = crate::engine_answer::load_answer(cx, store, pointer.root, opts.heap.shared()).expect("open the cold answer").expect("read the cold rows");
+        if let Some(said) = array_bodies {
+            for i in 0..8 {
+                let krate = if i < 4 { "b" } else { "c" };
+                let path = format!("{krate}/src/sig{i}.rs");
+                let file = Name::file(path.as_bytes());
+                let mut bodies = kept.answer.rows.iter().filter(|(name, row)| name.kind == Kind::BodyCheck && row.file == file);
+                let (_, take) = bodies.next().unwrap_or_else(|| panic!("missing body that returns its [u8; a::N] as [u8; 4] in {path}"));
+                assert!(bodies.next().is_none(), "{path} declares just the one body");
+                assert!(!take.failed && take.findings == 0, "array lengths in {path} must unify at four");
+                assert!(said.checked.bodies.0.iter().all(|note| !note.contains(path.as_str())), "the body in {path} must check clean: {:?}", said.checked.bodies.0);
+            }
+            assert!(said.checked.bodies.1 >= 8, "the eight array consumers must all be checked clean");
+        }
+        kept.answer.rows.iter().filter(|(name, _)| name.kind == Kind::Signature).map(|(name, row)| {
+            assert!(!row.failed && row.findings == 0, "all fixture signatures must freeze, including {name:?}");
+            let held = store.get(cx, kept.records[name]).expect("read the signature record").expect("the signature record exists");
+            let blaze_drive::record::Stored::Whole(record) = blaze_drive::record::open(held.bytes).expect("a valid signature record") else {
+                panic!("missing frozen payload for {name:?}");
+            };
+            assert!(!record.payload.is_empty(), "fixture task {name:?} must freeze at least one head");
+            (*name, HeadOutput { payload: record.payload.to_vec(), defines: row.defines.to_vec(), out: row.out })
+        }).collect()
+    })
+}
+
+/// Count the distinct wants needed by the fixture from the oracle's stored output, independent
+/// of the lowering counter. An ADT or trait record contains both its generic head and its
+/// definition or members (front2/tables/head.rs `cell_of`).
+fn distinct_heads(outputs: &BTreeMap<Name, HeadOutput>) -> (usize, usize) {
+    let mut cells = BTreeSet::<[u8; WANT_BYTES]>::new();
+    let mut wants = BTreeSet::<[u8; WANT_BYTES]>::new();
+    for row in outputs.values() {
+        crate::engine_seeds::each_run(&row.payload, &mut |tag, _, at, len| {
+            let want = FrozenHead::read(&row.payload[at..at + len]).expect("the oracle's frozen bytes").want();
+            let id = want_bytes(want);
+            assert_eq!(tag, id.as_slice(), "the frozen bytes belong to the stored cell");
+            cells.insert(id);
+            wants.insert(id);
+            if let Want::Adt(key) | Want::Members(key) = want {
+                wants.insert(want_bytes(Want::Head(key)));
+            }
+        }).expect("whole frozen runs in a head task's payload");
+    }
+    (cells.len(), wants.len())
+}
+
+/// The same predicate judges the request table and the deliberately private lowering schedule.
+fn lowered_once(counts: OnceCounts, distinct: usize) -> bool {
+    counts.lowered == distinct as u64
+}
+
+#[test]
+fn each_distinct_head_is_lowered_once_across_jobs_and_crates() {
+    // One signature per outline entry. A trait covers its members, while an impl
+    // method has its own entry. Each source entry has a library and a test unit.
+    for (name, fixture, tasks, declarations, constants) in [
+        ("two members", two_members as fn(u64) -> Io, 9, 2, 0),
+        ("three crates and eight lengths", chain_with_shared_length, 15, 4, 1),
+        ("mutually naming ADTs and traits", mutually_naming_heads, 5, 5, 0),
+    ] {
+        let mut serial = None;
+        for workers in [1, 8] {
+            let oracle_io = fixture(23);
+            let oracle = request_with_workers(&oracle_io, false, Sources::Head, HeadUnits::Each, workers);
+            let expected = head_outputs(&oracle_io, (constants > 0).then_some(&oracle));
+            assert_eq!(expected.len(), tasks, "{name}: one task for every fixture signature");
+            let (cells, distinct) = distinct_heads(&expected);
+            assert_eq!((cells, distinct), (2 * tasks, 2 * (tasks + declarations)), "{name}: full cells and their distinct lowering wants across both units");
+            let io = fixture(23);
+            let shared = request_with_workers(&io, false, Sources::Job, HeadUnits::Each, workers);
+            let outputs = head_outputs(&io, (constants > 0).then_some(&shared));
+            assert!(shared.same_answer(&oracle), "{name}, {workers} workers: findings differ: {:?} vs {:?}", shared.lines, oracle.lines);
+            assert_eq!(shared.checked.bodies, oracle.checked.bodies, "{name}, {workers} workers: body notes and clean count");
+            assert_eq!(outputs, expected, "{name}, {workers} workers: frozen records");
+            if let Some(first) = &serial {
+                assert_eq!(&outputs, first, "{name}: one and eight workers must freeze identical records");
+            }
+            serial = Some(outputs);
+            let o = shared.once();
+            assert_eq!(o.cells as usize, cells, "{name}, {workers} workers: table covers the oracle's distinct cells");
+            assert!(lowered_once(o, distinct), "{name}, {workers} workers: lowered {} for {distinct} distinct heads", o.lowered);
+            assert_eq!((o.frozen, o.twice), (o.cells, 0), "{name}, {workers} workers: concurrent readers must share the first freeze");
+            assert_eq!((o.consts, o.evaluated), (constants, constants), "{name}, {workers} workers: evaluations of the constant's own key");
+            let private = oracle.once();
+            assert!(!lowered_once(private, distinct) && private.lowered > distinct as u64, "CONTROL: private re-lowering escaped the same counter oracle: {private:?}");
+            if constants > 0 {
+                assert!(private.evaluated >= 8, "CONTROL: eight signature tasks must independently demand N: {private:?}");
+            }
+            println!("{name}, {workers} workers: {cells} cells, {} lowerings for {distinct} distinct heads, {} constants evaluated; private control {}, findings and frozen records equal", o.lowered, o.evaluated, private.lowered);
+        }
+    }
 }
 
 /// The cold Job answer supplies the row size and labels. The task/unit pairs come from the
@@ -208,6 +356,7 @@ impl HeadRows {
             let want = match item.kind() {
                 blaze_surface::ItemKind::Struct => Want::Adt(key),
                 blaze_surface::ItemKind::Function => Want::Fn(key),
+                blaze_surface::ItemKind::TypeAlias => Want::Head(key),
                 blaze_surface::ItemKind::MacroCall => {
                     let expansion = NameCell::Expansion { call: key };
                     self.expansions.insert((name, krate), CellId { of: scope, cell: blaze_drive::cells::Cell(expansion.key()) });
@@ -340,8 +489,7 @@ fn compare_unit_reads(rows: &HeadRows, head: &UnitReads, job: &UnitReads, head_m
 
 /// The row after an edit: the incremental answer against a fresh check's (rule 21: no row is
 /// fast by being stale), printed with its counts.
-fn row(io: &Io, name: &str) -> Said {
-    let now = request(io, false, Sources::Job, HeadUnits::Each);
+fn row(io: &Io, name: &str, now: &Said) {
     let fresh = request(io, true, Sources::Job, HeadUnits::Each);
     let o = now.once();
     println!(
@@ -357,7 +505,26 @@ fn row(io: &Io, name: &str) -> Said {
         entries(&now.checked)
     );
     assert!(now.same_answer(&fresh), "row {name}: the answer after the edit is not a fresh check's: ids {:?} against {:?}, lines {:?} against {:?}", now.ids, fresh.ids, now.lines, fresh.lines);
-    now
+}
+
+/// The actual frozen runs, including each unit's record bytes. The row key and the
+/// envelope's read list can change when a spelling resolves through an extra alias.
+pub(super) fn frozen_runs(io: &Io, task: Name) -> (blaze_drive::Key, std::vec::Vec<u8>) {
+    use crate::store::Store as _;
+
+    super::engine_answer_rows_tests::with_store(io, |cx, store, opts| {
+        let root = crate::engine_answer::root_name(opts.place.checkout, &opts.tools, cx.frame());
+        let pointer = crate::engine_answer::load_pointer(cx, store, &root).expect("open pointer").expect("stored answer").expect("read pointer");
+        let (kept, _) = crate::engine_answer::load_answer(cx, store, pointer.root, opts.heap.shared()).expect("open pages").expect("read rows");
+        let row = &kept.answer.rows[&task];
+        assert!(!row.failed && row.findings == 0 && !row.defines.is_empty(), "the signature task produced its cells");
+        let held = store.get(cx, kept.records[&task]).expect("open signature record").expect("stored signature");
+        let blaze_drive::record::Stored::Whole(view) = blaze_drive::record::open(held.bytes).expect("read signature record") else {
+            panic!("expected a whole Signature record");
+        };
+        assert!(!view.payload.is_empty(), "the signature has frozen runs");
+        (row.key, view.payload.to_vec())
+    })
 }
 
 /// For every cold task, unit and entry, each Job-only read must be a same-crate head cutoff,
@@ -371,18 +538,16 @@ fn row(io: &Io, name: &str) -> Said {
 fn each_head_is_frozen_once_and_its_readers_follow_its_meaning() {
     // Before: a source a head (the measure's baseline), on a world of its own.
     let before_io = two_members(23);
-    let (before, head_units) = cold_request(&before_io, Sources::Head, HeadUnits::Each);
+    let (before, head_units) = observed_request(&before_io, Sources::Head, HeadUnits::Each);
     let io = two_members(23);
-    let (cold, job_units) = cold_request(&io, Sources::Job, HeadUnits::Each);
+    let (cold, job_units) = observed_request(&io, Sources::Job, HeadUnits::Each);
     let rows = HeadRows::cold(&io, &[("a/src/lib.rs", A_LIB), ("b/src/lib.rs", B_LIB)]);
     let fresh = request(&io, true, Sources::Job, HeadUnits::Each);
     assert!(cold.same_answer(&fresh), "cold: the table's answer is not a fresh check's: {:?} against {:?}", cold.lines, fresh.lines);
     assert!(cold.same_answer(&before), "cold: the table's answer is not a source a head's: {:?} against {:?}", cold.lines, before.lines);
     let o = cold.once();
     assert!(o.cells > 0, "cold: the table holds no cell: {o:?}");
-    // The floor: each cell frozen once; a race between two jobs that both missed a cell is the
-    // only second freeze, and it is counted.
-    assert_eq!(o.frozen, o.cells + o.twice, "ORACLE: a cell was frozen more than once outside a race: {o:?}");
+    assert_eq!((o.frozen, o.twice), (o.cells, 0), "ORACLE: two jobs that miss the same cell must share its maker: {o:?}");
     assert_eq!(o.reads_unequal, 0, "two freezes of one cell kept other reads: {o:?}");
     // (`Checked` holds no profile text: the table's profile line is read on the real run.)
     let b = before.once();
@@ -405,17 +570,51 @@ fn each_head_is_frozen_once_and_its_readers_follow_its_meaning() {
     assert!(o.lowered <= b.lowered, "ORACLE: the table lowered more than a source a head: {o:?} against {b:?}");
     println!("heads once cold: {o:?}; {}", entries(&cold.checked));
 
-    // A body-only edit in `a`: NO head task is entered, `make`'s own neither (lane CX17: a
-    // fn's head key holds its signature's text, not its body's; before it the head reran and
-    // froze equal bytes, the EARLY CUTOFF this row used to show. OPEN, lane CX19: an edit that
-    // moves a head's key and not its meaning, to show the cutoff again).
+    // A body-only edit in `a` leaves every head key alone.
     write(&io, "a/src/lib.rs", A_LIB_BODY);
-    let body = row(&io, "a body-only edit in a");
+    let body = request(&io, false, Sources::Job, HeadUnits::Each);
+    row(&io, "a body-only edit in a", &body);
     assert_eq!(body.heads(), 0, "ORACLE: a body-only edit entered a head task");
+
+    // Both edits replace the same three-byte type token. Word's reader is in its own
+    // crate, where reads_from records the frozen head cell. Check that edge on the cold row.
+    let task = |path: &str| *rows.owners.iter().find(|(_, label)| label.as_str() == path).expect("fixture signature").0;
+    let word = task("b/src/lib.rs::Word");
+    let first = task("b/src/lib.rs::first");
+    assert!(job_units.iter().any(|(&(owner, _), lists)| owner == first && lists.iter().flatten().any(|id| id.of == word && rows.head_units.contains_key(id))));
+    let (original_key, original_bytes) = frozen_runs(&io, word);
+    write(&io, "b/src/lib.rs", &B_LIB.replace("Word = u32", "Word = Num"));
+    let (same, entered) = observed_request(&io, Sources::Job, HeadUnits::Each);
+    let (same_key, same_bytes) = frozen_runs(&io, word);
+    assert_ne!(original_key, same_key, "spelling the type through Num moves Word's key");
+    assert_eq!(same_bytes, original_bytes, "Word must freeze byte-for-byte as u32");
+    assert_eq!(same.heads(), 1);
+    assert_eq!(same.checked.stages[Stage::Heads.index()].identical, 1);
+    assert_eq!(entered.keys().map(|&(name, _)| name).collect::<BTreeSet<_>>(), BTreeSet::from([word]));
+    assert_eq!(same.checked.stages[Stage::Bodies.index()].entered, 0);
+    assert!(!same.lines.iter().any(|line| line.contains("error[types]")), "{:?}", same.lines);
+    row(&io, "Word = Num (u32)", &same);
+    println!("Word = Num: one head entered, identical frozen bytes, no reader entered");
+
+    write(&io, "b/src/lib.rs", &B_LIB.replace("Word = u32", "Word = u16"));
+    let (changed, entered) = observed_request(&io, Sources::Job, HeadUnits::Each);
+    let (changed_key, changed_bytes) = frozen_runs(&io, word);
+    assert_ne!(same_key, changed_key);
+    assert_ne!(same_bytes, changed_bytes);
+    assert!(entered.keys().any(|&(name, _)| name == first), "first's head reads Word");
+    assert!(changed.checked.because.iter().any(|(g, _)| g.stage == Stage::Heads && g.cause == "read moved" && g.definer == Some(word)));
+    assert!(changed.checked.stages[Stage::Bodies.index()].entered > 0);
+    assert!(
+        changed.lines.iter().any(|line| line.contains("b/src/lib.rs:") && line.contains("error[types]") && line.contains("found `u32`, expected `u16`")),
+        "first returns a u32 field where u16 is required: {:?}", changed.lines
+    );
+    row(&io, "Word = u16", &changed);
+    println!("Word = u16: frozen bytes changed, first entered and reported E0308");
 
     // `Point` gains a field: its head moves, and `b`'s heads that read it are entered.
     write(&io, "a/src/lib.rs", A_LIB_FIELD);
-    let field = row(&io, "a's struct gains a field");
+    let field = request(&io, false, Sources::Job, HeadUnits::Each);
+    row(&io, "a's struct gains a field", &field);
     assert!(field.heads() >= 2, "ORACLE: `Point` gained a field and no head task of `b` that reads it was entered ({} entered)", field.heads());
 }
 
@@ -430,10 +629,10 @@ fn the_cutoff_oracle_catches_a_dropped_expansion_read() {
         write(&io, "src/lib.rs", LIB);
         io
     };
-    let (baseline, head) = cold_request(&fixture(), Sources::Head, HeadUnits::Each);
+    let (baseline, head) = observed_request(&fixture(), Sources::Head, HeadUnits::Each);
     for units in [HeadUnits::Each, HeadUnits::NoExpansionReads] {
         let io = fixture();
-        let (answer, job) = cold_request(&io, Sources::Job, units);
+        let (answer, job) = observed_request(&io, Sources::Job, units);
         let rows = HeadRows::cold(&io, &[("src/lib.rs", LIB)]);
         check_counts(&rows, Sources::Head, &head, baseline.once());
         check_counts(&rows, Sources::Job, &job, answer.once());

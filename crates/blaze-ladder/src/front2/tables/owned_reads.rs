@@ -179,8 +179,6 @@ impl<'a> OwnedRecorder<'a> {
         let mut sorted: AVec<'a, TableRead> = AVec::with_capacity_in(slot.reads.len(), self.alloc);
         sorted.extend_from_slice(&slot.reads);
         sorted.sort_unstable();
-        // Each once by `seen`; kept as the guard of the list's form (rule 25), a no-op.
-        sorted.dedup();
         for one in sorted.iter() {
             each(*one);
         }
@@ -255,17 +253,17 @@ impl ReadSink for OwnedRecorder<'_> {
         }
         self.last.set(Some(one));
         let mut seen = self.seen.borrow_mut();
-        if seen.contains(&one) {
-            return;
-        }
         let mut slots = self.slots.borrow_mut();
         let slot = &mut slots[owner as usize];
-        if slot.reads.len() >= MOST_READS {
-            slot.full = true;
+        if slot.reads.len() == MOST_READS {
+            if !seen.contains(&one) {
+                slot.full = true;
+            }
             return;
         }
-        seen.insert(one);
-        slot.reads.push(read);
+        if seen.insert(one) {
+            slot.reads.push(read);
+        }
     }
 
     fn binding(&self, module: ItemKey, ns: Namespace, name: &str) {

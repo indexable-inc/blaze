@@ -70,7 +70,7 @@ struct Searched<'n> {
     name: &'n str,
 }
 
-impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
+impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// Files `key` in the key map from the records (module docs), or refuses naming what was
     /// searched. `Ok` when the key map already knows it or the names source finds its row.
     pub(super) fn locate(&mut self, key: ItemKey) -> Result<(), LazyRefusal> {

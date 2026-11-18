@@ -229,20 +229,20 @@ impl<'f> Holders<'f> {
         self.bodies[from..].iter().take_while(|one| one.name == name).filter(|one| one.is == BodyIs::Held).nth(1).is_some()
     }
 
-    /// The cell that says unit `unit` does not hold a file or an entry ([`not_held_cell`]).
-    pub(crate) fn not_held_cell(&self, view: View<'_, '_>, unit: u32) -> Option<CellId> {
-        self.units.get(unit as usize).map(|one| not_held_cell(view, one.name, one.prefix))
+    /// The not-held proof for each unit, shared by every decision in this phase.
+    pub(crate) fn unit_cells(&self, grains: &crate::engine_scope_reads::ReadGrains<'_>, g: blaze_own::Alloc<'static>) -> blaze_own::AVec<'static, CellId> {
+        let mut ids = Vec::with_capacity_in(self.units.len(), g);
+        ids.extend(self.units.iter().map(|one| grains.place(items_cell(one.name, one.prefix), false)));
+        ids
     }
 
     /// What a decision is a function of: each `passed` unit's not-held cell and the refusals'
-    /// `reads`, sorted, each once, in the request's heap (`g`).
-    pub(crate) fn cells(&self, view: View<'_, '_>, passed: &[u32], reads: &[CellId], g: blaze_own::Alloc<'static>) -> &'f [CellId] {
-        let mut ids: Vec<CellId, blaze_own::Alloc<'static>> = Vec::with_capacity_in(passed.len() + reads.len(), g);
-        ids.extend(passed.iter().filter_map(|unit| self.not_held_cell(view, *unit)));
+    /// `reads`, in the phase frame. A checked body canonicalizes these with its other IDs.
+    pub(crate) fn cells<'a>(unit_cells: &[CellId], passed: &[u32], reads: &[CellId], frame: &'a Frame) -> Vec<CellId, &'a Frame> {
+        let mut ids = Vec::with_capacity_in(passed.len() + reads.len(), frame);
+        ids.extend(passed.iter().map(|unit| unit_cells[*unit as usize]));
         ids.extend_from_slice(reads);
-        ids.sort_unstable();
-        ids.dedup();
-        &*ids.leak()
+        ids
     }
 }
 
@@ -255,11 +255,11 @@ impl<'f> Holders<'f> {
 /// row that skipped that unit is entered again (rule 21).
 pub(crate) fn not_held_cell(view: View<'_, '_>, name: Name, prefix: [u8; 8]) -> CellId {
     let table = CellId { of: name, cell: CELLS };
-    let cell = match view.cell(&table) != ABSENT {
-        true => Cell(NameCell::Whole { krate: prefix, section: Section::Items }.key()),
-        false => WHOLE,
-    };
-    CellId { of: name, cell }
+    if view.cell(&table) != ABSENT { items_cell(name, prefix) } else { CellId { of: name, cell: WHOLE } }
+}
+
+fn items_cell(of: Name, prefix: [u8; 8]) -> CellId {
+    CellId { of, cell: Cell(NameCell::Whole { krate: prefix, section: Section::Items }.key()) }
 }
 
 /// The outlines (by index, sorted) a crate's module tree reaches from its root file `root`: the
@@ -281,19 +281,6 @@ pub(crate) fn reached(outlined: &[Outlined<'_>], root: Name, g: blaze_own::Alloc
         }
     }
     seen
-}
-
-/// `cells` added to a checked body's reads (each with the digest the view holds), sorted, each
-/// once: the units ranked before the one that checked it, which a fresh run would ask first.
-pub(crate) fn add_reads<A: core::alloc::Allocator>(reads: &mut Vec<(CellId, ContentId), A>, cells: &[CellId], view: View<'_, '_>) {
-    if cells.is_empty() {
-        return;
-    }
-    for id in cells.iter() {
-        reads.push((*id, view.cell(id)));
-    }
-    reads.sort_unstable_by_key(|(id, _)| *id);
-    reads.dedup_by_key(|(id, _)| *id);
 }
 
 /// The out of a body no unit holds: a function of its name alone (its reads say why).

@@ -41,6 +41,30 @@ fn signature(text: &str) -> Lowered<'static, '_> {
     }
 }
 
+#[test]
+fn fn_text_prefix_stops_at_the_definition_block() {
+    use blaze_surface::ItemDetail;
+
+    for (prefix, body, body_holds_items) in [
+        ("fn f() ", "{ fn g() {} g() }", true),
+        ("fn f(_: impl Copy) -> impl Copy ", "{ 1u8 }", false),
+        ("async fn f() ", "{}", false),
+        ("const fn f() -> u8 ", "{ 1 }", false),
+        ("fn f() -> ty!{u8} /* { */ ", "{ 1 }", false),
+    ] {
+        let text = format!("{prefix}{body}");
+        let lowered = signature(&text);
+        assert_eq!(lowered.view().fn_text_prefix(ItemDetail::Fn { body_holds_items }), Ok(Some(prefix.len() as u32)), "{text}");
+    }
+    for (text, detail) in [
+        ("fn f();", ItemDetail::Fn { body_holds_items: false }),
+        ("const X: u8 = { 1 };", ItemDetail::Const { body_holds_items: false }),
+        ("static X: u8 = { 1 };", ItemDetail::Static { body_holds_items: false }),
+    ] {
+        assert_eq!(signature(text).view().fn_text_prefix(detail), Ok(None), "{text}");
+    }
+}
+
 fn dump_of(l: &Lowered<'_, '_>) -> String {
     let mut out = String::new();
     crate::dump::dump(&l.view(), Alloc::global(), &mut out).expect("a String takes every write");

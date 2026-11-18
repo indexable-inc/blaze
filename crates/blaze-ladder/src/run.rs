@@ -479,13 +479,12 @@ impl ClosureTable {
     /// `alloc` holds the table's types for the build that keeps it, and each closure's scratch.
     fn of<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>], alloc: Alloc<'static>) -> ClosureTable {
         let mut table = ClosureTable::new(alloc);
-        let types = program.types();
         for (i, done) in checked.iter().enumerate() {
             let Some(done) = done else { continue };
             let sig = program.sig(i);
             let generics = sig.parent_count + sig.own_count;
             let Some((body, _)) = program.function(i).body else { continue };
-            table.add(&body.view(types), done, generics, alloc);
+            table.add(&body.view(program.body_types(i)), done, generics, alloc);
         }
         table
     }
@@ -641,7 +640,7 @@ impl<P: FrontEnd> ConstWorld for FrontConsts<'_, P> {
         // Not checked yet: the evaluator stops with `NeedKind::Body` (`condition_holds`).
         let Some(checked) = self.checked[i].as_ref() else { return Err(blaze_typeck::Missing) };
         let lits = Lits { text: &l.text, exprs: (&l.exprs, &l.expr_ranges), pats: (&l.pats, &l.pat_ranges) };
-        let view = body.view(self.program.types());
+        let view = body.view(self.program.body_types(i));
         Ok(Some(Typed::new(view, checked, function.text, lits, self.program.code_of(i))))
     }
 
@@ -1074,19 +1073,11 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
         self.0.nounwind(owner)
     }
 
-    /// Held at `None` ("not said": no hidden location is passed, so every call builds as an
-    /// untracked one). A call of a tracked fn from an untracked one makes a `Location` row whose
-    /// line and column are source positions; the literal-word form places them (place.rs
-    /// `resolve_positions`, `FrontEnd::source_position`), but the code record form
-    /// (blaze-emit pass/sites.rs `RECORD_POSITION`) and the LLVM tier refuse such a row, and
-    /// the record walk shares these answers: answering now would stop every record walk that
-    /// reaches `panic_bounds_check`, the overflow panics, `unwrap` or `expect`. Once
-    /// `blaze_code::record::CodeRecord` carries a position field, the answer is
-    /// `self.0.track_caller(instance.item)`: the fn's own attribute, or its trait's
-    /// declaration's for a trait impl's method, one per item.
+    /// The front end resolves the function's own or inherited caller-tracking attribute.
+    /// At a call from an untracked function, the fast emitter records the item-relative
+    /// caller site. Placement supplies its current line and column.
     fn track_caller(&self, instance: Instance, _ground: &mut PortableTys<'_>) -> Option<bool> {
-        let _ = instance;
-        None
+        self.0.track_caller(instance.item)
     }
 
     /// The library's `#[lang = "panic_location"]` struct (core/src/panic/location.rs).
@@ -2279,7 +2270,6 @@ fn build_from<P: FrontEnd>(
         // Shared borrows of the program for this step only: the step takes `program_mut` to
         // pull its instance's constants before the walk.
         let program = &*program_mut;
-        let types = program.types();
         let keyer = FrontAdts(program, entry.unwrap_or(0), &consts, &langs, &checked_bodies);
         at += 1;
         // The stub build: slot `n` is `bodies[n]`, so a slot whose step kept a refusal and left
@@ -2387,7 +2377,7 @@ fn build_from<P: FrontEnd>(
         {
             args.clear();
             args.extend_from_slice(ground.view().list(instance.args).map_err(|_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None })?);
-            let view = body.view(types);
+            let view = body.view(program.body_types(i));
             let facts = FrontAdts(program, i, &consts, &langs, &checked_bodies);
             if let Err(error) = crate::front2::const_at::needs_of(&view, done, &args, &mut ground, &facts, alloc, &mut const_needs) {
                 filed(&mut survey, RunError::Build { function: name(), error, range: None })?;
@@ -2405,7 +2395,6 @@ fn build_from<P: FrontEnd>(
         }
         // The step's borrows again, after the pull.
         let program = &*program_mut;
-        let types = program.types();
         let function = program.function(i);
         let name = || function.named();
         let body = function.body.map(|(body, _)| body);
@@ -2550,7 +2539,7 @@ fn build_from<P: FrontEnd>(
                 Err(e) => step_refused!(e),
             }
         }
-        let view = body.map(|body| body.view(types));
+        let view = body.map(|body| body.view(program.body_types(i)));
         let adts = FrontAdts(program, i, &consts, &langs, &checked_bodies);
         // The record walk hands the builder its world recorded: what the build reads beyond the
         // key is the entry's read list (code_reads.rs).

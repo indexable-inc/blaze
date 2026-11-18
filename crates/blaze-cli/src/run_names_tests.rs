@@ -60,3 +60,20 @@ fn a_record_not_of_the_form_is_refused() {
     let mut out = AVec::new_in(heap.alloc());
     assert!(matches!(encode(graph(), &[(4, input(4)), (4, input(4))], &mut out, heap.alloc()), Err(RunNamesError::Form(FormError::Unsorted { row: 1 }))));
 }
+
+/// Cargo runs a harnessless test target's main exactly once, including when another package
+/// has a target with the same name. The two rows have the same spelling and distinct owners.
+#[test]
+fn harnessless_targets_each_have_one_main() {
+    for n in [1u8, 2] {
+        let main = blaze_id::ItemKey(blaze_id::ContentId([n; 32]));
+        let tests = super::TestRows::Main(main);
+        assert_eq!(tests.len(), 1);
+        let row = tests.row(0).expect("valid test row").expect("one invocation");
+        assert_eq!(
+            (row.key, row.path, row.ignore, row.should_panic, row.bench),
+            (main, "main", None, blaze_scope::tests_record::ShouldPanic::No, false)
+        );
+        assert_eq!(tests.row(1), Ok(None));
+    }
+}

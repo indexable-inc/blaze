@@ -20,7 +20,7 @@ use blaze_ids::Hasher;
 use blaze_own::{ABTreeMap, AVec, Alloc, BTreeMap, Vec};
 
 use crate::a64::{ADD64, ADRP, BLR, LDR64, NOP, add_lo12, adrp, bl, expect, ldr_lo12, up, write32};
-use crate::record::{CodeView, OWN_CODE, OWN_RELRO, SiteKind, Space, Symbol, Target};
+use crate::record::{CodeView, OWN_CODE, OWN_RELRO, PositionRow, SiteKind, Space, Symbol, Target};
 
 const FOLD_DOMAIN: &str = "blaze-code fold 1";
 
@@ -92,6 +92,10 @@ pub enum ImageError {
     OutsideAddend { symbol: Symbol },
     /// A function is given a home by [`Image::define`]: only a segment places a function.
     DefinedFunction { symbol: Symbol },
+    /// The placer has no current source position for an item-relative field.
+    UnresolvedPosition { symbol: Symbol, row: PositionRow },
+    /// Source lines and columns both start at one.
+    ZeroPosition { symbol: Symbol, row: PositionRow },
 }
 
 impl fmt::Display for ImageError {
@@ -105,6 +109,14 @@ impl fmt::Display for ImageError {
             ImageError::Unbound { target } => write!(f, "a word names {:?} {}, which no segment placed and nothing defined", target.space, target.symbol),
             ImageError::OutsideAddend { symbol } => write!(f, "a relro word names the outside symbol {symbol} with an addend; a name is bound by `dlsym` alone"),
             ImageError::DefinedFunction { symbol } => write!(f, "function {symbol} was given a home by `define`; only a segment places a function"),
+            ImageError::UnresolvedPosition { symbol, row } => write!(
+                f, "function {symbol}: no source position for item {:#x} at byte {} ({:?} in {:?} at byte {})",
+                row.item, row.site, row.field, row.part, row.at,
+            ),
+            ImageError::ZeroPosition { symbol, row } => write!(
+                f, "function {symbol}: zero {:?} for item {:#x} at byte {} ({:?} at byte {}), source positions start at one",
+                row.field, row.item, row.site, row.part, row.at,
+            ),
         }
     }
 }
@@ -115,6 +127,18 @@ impl core::error::Error for ImageError {}
 /// on arm64; the largest page a Linux arm64 kernel may use, 64 KiB, so one layout serves every
 /// kernel). Deterministic: the same members in the same order give the same bytes.
 pub fn lay_out<'a>(members: &[Member<'_>], kind: Kind, page: u64, alloc: Alloc<'a>) -> Result<Segment<'a>, ImageError> {
+    lay_out_positions(members, kind, page, alloc, |symbol, row| Err(ImageError::UnresolvedPosition { symbol, row }))
+}
+
+/// Lays out the segment using the current checkout's source positions. Folded members have
+/// equal item keys and sites in their records and therefore share the resolved fields.
+pub fn lay_out_positions<'a>(
+    members: &[Member<'_>],
+    kind: Kind,
+    page: u64,
+    alloc: Alloc<'a>,
+    mut position: impl FnMut(Symbol, PositionRow) -> Result<(u32, u32), ImageError>,
+) -> Result<Segment<'a>, ImageError> {
     if page < 4096 || !page.is_power_of_two() {
         return Err(ImageError::Page { page });
     }
@@ -164,6 +188,9 @@ pub fn lay_out<'a>(members: &[Member<'_>], kind: Kind, page: u64, alloc: Alloc<'
             }
             relro_off[i] = relro.len() as u64;
             relro.extend_from_slice(m.record.relro());
+            crate::place::fill_positions(&m.record, m.symbol, &mut code[code_at[i] as usize..], &mut relro[relro_off[i] as usize..], |_, row| {
+                Ok(row.field.value(position(m.symbol, row)?))
+            })?;
         } else {
             code_at[i] = code_at[r];
             relro_off[i] = relro_off[r];

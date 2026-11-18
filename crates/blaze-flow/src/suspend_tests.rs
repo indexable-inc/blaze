@@ -17,10 +17,9 @@ use crate::suspend::{SavedPlant, saved, saved_planted};
 const S: Span = Span { lo: 0, hi: 0 };
 
 fn finish(b: FlowBuilder<Global>) -> Flow<Global> {
-    match b.finish() {
-        Ok(f) => f,
-        Err(e) => panic!("{e:?}"),
-    }
+    let flow = b.finish().expect("a well-formed suspend fixture");
+    crate::loans::assert_tiers_equal_for_fixture(&flow);
+    flow
 }
 
 /// The first `Suspend` statement of the flow.

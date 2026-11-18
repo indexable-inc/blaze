@@ -143,6 +143,7 @@ use blaze_drive::key::{self, ABSENT, Key, Name, Tool};
 use blaze_id::ContentId;
 use blaze_own::{AVec, Alloc, BTreeMap, BTreeSet, SharedAlloc, Vec};
 
+use crate::cell_table::CellTable;
 use crate::last::{LastAnswer, LastError, Touched};
 use crate::overlay::{Fold, Overlay, RowFacts};
 use crate::readers::{IndexCost, Paired, ReaderIndex};
@@ -437,6 +438,11 @@ pub fn by_cell<'a>(name: Name, reads: &[(CellId, ContentId)], alloc: SharedAlloc
     for (at, _) in (0u32..).zip(reads.iter()) {
         order.push(at);
     }
+    // A row already in canonical order (strictly ascending: the body writer sorts its distinct
+    // ids once, lane BD4) is its own index: no second sort, and strict order proves no cell twice.
+    if reads.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+        return Ok(order);
+    }
     order.sort_unstable_by_key(|at| reads[*at as usize].0);
     if let Some(pair) = order.windows(2).find(|pair| reads[pair[0] as usize].0 == reads[pair[1] as usize].0) {
         return Err(EngineError::ReadTwice { name, read: reads[pair[0] as usize].0 });
@@ -450,7 +456,7 @@ pub struct Answer<'a> {
     pub serial: Gen,
     pub rows: SMap<'a, Name, Row<'a>>,
     /// Each cell's digest and the request it last moved in.
-    pub cells: SMap<'a, CellId, (ContentId, Gen)>,
+    pub cells: CellTable<'a, (ContentId, Gen)>,
     /// Each cell's readers, in order: a SET, so one reader added or dropped costs the logarithm
     /// of the cell's readers. As a sorted vector each insert moved half the list, and a cell
     /// that every task of a crate reads (its crate's scope, `core`'s) made the merge quadratic:
@@ -474,7 +480,7 @@ impl<'a> Answer<'a> {
         Answer {
             serial: Gen(0),
             rows: BTreeMap::new_in(alloc),
-            cells: BTreeMap::new_in(alloc),
+            cells: CellTable::new_in(alloc),
             readers: BTreeMap::new_in(alloc),
             by_file: BTreeMap::new_in(alloc),
             owed_cells: BTreeMap::new_in(alloc),
@@ -799,8 +805,8 @@ pub struct Finished<'a, A = Answer<'a>> {
     pub touched: Touched,
 }
 
-/// The read-only view a task reads the tables through (E2 grows it): `Copy + Sync`, one per
-/// phase, shared by every worker.
+/// The read-only view shared by a phase's workers. Its shared borrow freezes the cell tables
+/// until the workers return. A merge or retirement that changes them needs the engine exclusively.
 pub struct View<'e, 'a, L = Answer<'a>> {
     overlay: &'e Overlay<'a, L>,
 }
@@ -812,6 +818,12 @@ impl<L> Clone for View<'_, '_, L> {
 }
 
 impl<L> Copy for View<'_, '_, L> {}
+
+impl<'e, 'a, L> View<'e, 'a, L> {
+    pub(crate) fn from_overlay(overlay: &'e Overlay<'a, L>) -> Self {
+        Self { overlay }
+    }
+}
 
 /// Held at compile time: a view is shared by the workers and a buffer sent to one.
 const _: () = {
@@ -1298,7 +1310,7 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
 
     /// The tables as they stand: complete for every phase before the open one.
     pub fn view(&self) -> View<'_, 'a, L> {
-        View { overlay: &self.view }
+        View::from_overlay(&self.view)
     }
 
     /// Merges the open phase's buffers in bulk, sorted by name (invariant 3): rows, cells, the

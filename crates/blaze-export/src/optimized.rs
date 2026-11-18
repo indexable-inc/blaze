@@ -128,6 +128,7 @@ pub struct Member02<'r> {
 /// through `CodeRecord::outside`, which adds the target a second time; the seal merges equal
 /// targets. Its in-program targets are declared by `by` (bzcode03, D106).
 pub fn v1_to_v2<'a>(view: CodeView<'_>, by: &dyn Declares, out: &mut AVec<'a, u8>, alloc: Alloc<'a>) -> Result<(), FormError> {
+    view.require_positionless("optimized export").map_err(FormError::V1Record)?;
     let mut r = CodeRecord::new_in(alloc);
     r.code.extend_from_slice(view.code());
     r.relro.extend_from_slice(view.relro());

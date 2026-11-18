@@ -134,7 +134,8 @@ pub struct FnFacts<'a> {
     pub symbol: &'a str,
     /// The symbol it is exported as.
     pub export: Option<&'a str>,
-    /// Its body in the checker's form, with its literals' texts.
+    /// Its body in the checker's form, with its literals' texts. Read its type indices
+    /// through [`FrontEnd::body_types`] at this function's row.
     pub body: Option<(&'a TypeckBody<'static>, &'a LitTexts)>,
     pub const_fn: bool,
     /// A `where const` condition of its owner: evaluated at each selection, never on its own.
@@ -166,8 +167,13 @@ pub trait FrontEnd {
         &[]
     }
     fn entry(&self) -> Option<usize>;
-    /// The program's one type table: signatures' and bodies' types.
+    /// Types of heads, including the return type in `rust_start`.
     fn types(&self) -> PTys<'_>;
+    /// The type indices in the body lent by `function(i)`. A front that lowers every
+    /// body into its head table uses the common view.
+    fn body_types(&self, _i: usize) -> PTys<'_> {
+        self.types()
+    }
     /// A call in fn `i`'s body of `item` at ground `args`, as the instance that runs: a trait's
     /// fn as the selected impl's (`blaze_typeck::resolve_instance` in `i`'s world).
     fn resolve(&self, i: usize, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ResolveError>;

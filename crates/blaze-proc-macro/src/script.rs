@@ -344,10 +344,11 @@ impl ScriptRuntime {
             let compiled = Module::new(&self.engine, wasm).map_err(|e| failed(format!("{e:#}")))?;
             let code = compiled.serialize().map_err(|e| failed(format!("{e:#}")))?;
             let io = |path: &Path, error: std::io::Error| failed(format!("{}: {error}", path.display()));
-            std::fs::create_dir_all(&dir).map_err(|e| io(&dir, e))?;
-            let staging = dir.join(format!("code.{}.tmp", std::process::id()));
-            std::fs::write(&staging, &code).map_err(|e| io(&staging, e))?;
-            std::fs::rename(&staging, &path).map_err(|e| io(&path, e))?;
+            // A temporary name of its own a write, then a rename (blaze-core fs.rs
+            // `write_unsynced`): two scripts of one process loading the same module side by
+            // side (lane CX25) each write their own file, where `code.<pid>.tmp` was one name
+            // for both and a reader could map a file another thread was still writing.
+            blaze_core::fs::write_unsynced(&path, &code).map_err(|e| io(&path, e))?;
             (compiled, true)
         };
         let pre = self.linker.instantiate_pre(&compiled).map_err(|e| failed(format!("{e:#}")))?;

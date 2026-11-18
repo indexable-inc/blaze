@@ -380,6 +380,10 @@ struct Flags<'a> {
 }
 
 fn flags(args: &Args) -> Result<Flags<'_>, CliError> {
+    parse_flags(args, |_| {})
+}
+
+fn parse_flags<'a>(args: &'a Args, mut package: impl FnMut(&'a str)) -> Result<Flags<'a>, CliError> {
     let mut flags = Flags {
         view: None,
         fix: None,
@@ -409,6 +413,15 @@ fn flags(args: &Args) -> Result<Flags<'_>, CliError> {
             at += 1;
             args.get(at - 1).ok_or(CliError::Usage("--color, --origin, --origin-key, --grant, --workers, -p and --bin each take a value"))
         };
+        let selected = match arg {
+            "-p" | "--package" => Some(value()?),
+            _ => arg.strip_prefix("--package="),
+        };
+        if let Some(name) = selected {
+            package(name);
+            flags.select.package = Some(name);
+            continue;
+        }
         match arg {
             "--view" => flags.view = Some(View::parse(value()?).ok_or(CliError::Usage("--view is person, agent or json"))?),
             _ if arg.starts_with("--view=") => flags.view = Some(View::parse(&arg["--view=".len()..]).ok_or(CliError::Usage("--view is person, agent or json"))?),
@@ -431,9 +444,7 @@ fn flags(args: &Args) -> Result<Flags<'_>, CliError> {
             }
             "--stats" => flags.stats = true,
             "--each" => flags.each = true,
-            "-p" | "--package" => flags.select.package = Some(value()?),
             "--bin" => flags.select.bin = Some(value()?),
-            _ if arg.starts_with("--package=") => flags.select.package = Some(&arg["--package=".len()..]),
             _ if arg.starts_with("--bin=") => flags.select.bin = Some(&arg["--bin=".len()..]),
             "--workers" => {
                 let n = value()?.parse::<core::num::NonZeroU32>().map_err(|_| CliError::Usage("--workers takes a count of at least 1"))?;
@@ -562,9 +573,17 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
         Some("store") => return store::publish_command::run(cx, io, out, err, heap),
         Some(_) | None => return Err(CliError::Usage("the command is check, run, test, clean or explain (or check-old, the old checker, going away)")),
     };
-    let flags = flags(&args)?;
-    if command != Command::Run && flags.select != run_package::Select::NONE {
-        return Err(CliError::Usage("-p and --bin choose `blaze run`'s program"));
+    let mut packages = Vec::new_in(cx.frame());
+    let flags = parse_flags(&args, |name| {
+        if command == Command::Test {
+            packages.push(name);
+        }
+    })?;
+    if command == Command::Test && flags.select.bin.is_some() {
+        return Err(CliError::Usage("blaze test takes -p <package>; --bin is not supported for test"));
+    }
+    if command == Command::Check && flags.select != run_package::Select::NONE {
+        return Err(CliError::Usage("-p chooses a package for run or test; --bin chooses a program for run"));
     }
     let out = words(command, out, err);
     phases.mark("argument list");
@@ -616,7 +635,11 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
     phases.mark_in("open checkout", frame);
     let mut ran = None;
     let workers = flags.workers.map_or(u32::try_from(workers).unwrap_or(u32::MAX), |n| n.get());
-    let launch = program::Launch { io, select: flags.select, grants: &flags.grants, args: &flags.program };
+    let select = match command {
+        Command::Test => run_package::Select { test_packages: packages.as_slice(), ..run_package::Select::NONE },
+        _ => flags.select,
+    };
+    let launch = program::Launch { io, select, grants: &flags.grants, args: &flags.program };
     // Cargo's home (D78), read here at the edge (rule 75): `CARGO_HOME`, else `<HOME>/.cargo`.
     // Its archive cache is the second place a dependency's bytes come from (fetch.rs).
     let cargo_home = match (var("CARGO_HOME"), var("HOME")) {
@@ -713,6 +736,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
                 phases.in_main() as f64 / 1e6,
             ),
         )?;
+        phases.write_lowering_stats(cx, err)?;
     }
     let status = close(cx, command, &finished, &shown, ran, phases.in_main(), frame, out);
     phases.mark_in("answer printed", frame);
@@ -1448,10 +1472,24 @@ fn request<'f>(
             // its status is the command's (`close`).
             Effect::StartTests => {
                 started = phases.since(began);
-                // `blaze test`'s words after `--` (test_args.rs): refused by name before any
-                // test starts.
-                // The refusal borrows the words, so it is printed here and the error names it.
-                let args = match test_args::parse(launch.args, alloc) {
+                watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
+                store.commit_puts()?;
+                let mut read = engine_records::EngineRecords::new();
+                let seen = body_types::TreesSeen::default();
+                let packages = run_package::test_packages(&cx, root, launch.select.test_packages, frame)?;
+                let Some(inventory) = run_names::found_tests(&cx, root, &req, &mut store, &mut facts, &mut read, &packages, heap, frame).map_err(CliError::RunNames)? else {
+                    return Err(CliError::AnswerInFull { again: in_full });
+                };
+                // A custom harness owns its arguments. Listing is a command operation, even
+                // for a selection consisting entirely of custom harnesses.
+                let harness_args: &[&str] = if inventory.suites.iter().any(|(_, unit)| unit.tests.harnessed()) || inventory.suites.is_empty() {
+                    launch.args
+                } else if launch.args.contains(&"--list") {
+                    &["--list"]
+                } else {
+                    &[]
+                };
+                let args = match test_args::parse(harness_args, alloc) {
                     Ok(args) => args,
                     Err(error) => {
                         err.line(&cx, format_args!("blaze test: {error}")).map_err(CliError::Out)?;
@@ -1459,7 +1497,8 @@ fn request<'f>(
                     }
                 };
                 // The pool is as wide as the machine's cores, as the request's workers are.
-                let plan = args.config(workers).map_err(CliError::TestPool)?;
+                let mut plan = args.config(workers).map_err(CliError::TestPool)?;
+                plan.width = plan.width.min(workers.max(1));
                 // The failure's rule is the terminal's width, 80 when not a terminal (report.rs
                 // `Style::width`: 4 to 120).
                 let width = out.size().map_or(80, |size| size.cols.clamp(4, 120));
@@ -1467,71 +1506,45 @@ fn request<'f>(
                     blaze_run::report::Format::Text => blaze_run::report::Style::text(width, out.is_terminal()),
                     blaze_run::report::Format::Json => blaze_run::report::Style::json(),
                 };
-                let config = test_loop::LoopConfig { plan, style, list: args.list, run: blaze_run::CheckoutKey(req.certificate().0.0), suites: 1 };
-                watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
-                // The unit's records read in place, as `StartProgram`'s (committed first).
-                store.commit_puts()?;
-                let mut read = engine_records::EngineRecords::new();
-                let seen = body_types::TreesSeen::default();
-                let Some((found, unit)) = test_drive::found_tests(&cx, &req, &mut store, &mut facts.bodies, &mut read, heap, frame).map_err(CliError::RunNames)? else {
-                    return Err(CliError::AnswerInFull { again: in_full });
-                };
-                let ids_refused = |error: run_ids::RunIdsError<'static>| {
-                    CliError::OwnProcess(own_process::OwnError::Parent(run_parent::ParentError::BodyIds { shown: Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) }))
-                };
-                watch.see(blaze_screen::Step::Began(blaze_screen::Stage::BodyIds));
-                let ids = match found.list() {
-                    Some(list) => {
-                        let previous = match last.map(blaze_drive::answers::read_last).transpose().map_err(|error| CliError::Drive(DriveError::LastFile(error)))? {
-                            Some(l) => run_ids::RunIds::from_record(&cx, &mut store, l.cert, toolchain, &tools, alloc).map_err(ids_refused)?,
-                            None => None,
-                        };
-                        run_ids::for_run(&cx, &req, toolchain, list, &tools, previous.as_ref(), &mut store, alloc).map_err(ids_refused)?
+                let suites = u32::try_from(inventory.suites.len()).map_err(|_| CliError::Text { what: "more than u32::MAX test units in this request" })?;
+                let config = test_loop::LoopConfig { plan, style, list: args.list, run: blaze_run::CheckoutKey(req.certificate().0.0), suites };
+                let status = if args.list {
+                    test_drive::list(&cx, &inventory.suites, config, out, frame).map_err(CliError::Test)?
+                } else {
+                    let ids_refused = |error: run_ids::RunIdsError<'static>| {
+                        CliError::OwnProcess(own_process::OwnError::Parent(run_parent::ParentError::BodyIds { shown: Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) }))
+                    };
+                    watch.see(blaze_screen::Step::Began(blaze_screen::Stage::BodyIds));
+                    let ids = match inventory.list() {
+                        Some(list) => {
+                            let previous = match last.map(blaze_drive::answers::read_last).transpose().map_err(|error| CliError::Drive(DriveError::LastFile(error)))? {
+                                Some(l) => run_ids::RunIds::from_record(&cx, &mut store, l.cert, toolchain, &tools, alloc).map_err(ids_refused)?,
+                                None => None,
+                            };
+                            run_ids::for_run(&cx, &req, toolchain, list, &tools, previous.as_ref(), &mut store, alloc).map_err(ids_refused)?
+                        }
+                        None => match run_ids::on_hit(&cx, &req, toolchain, &tools, &mut store, alloc).map_err(ids_refused)? {
+                            run_ids::OnHit::Ids(ids) => ids,
+                            run_ids::OnHit::AnswerInFull => return Err(CliError::AnswerInFull { again: in_full }),
+                        },
+                    };
+                    let overflow = program::dev_overflow(&cx, root, frame)?;
+                    let panic = blaze_ladder::panic_strategy::of_profile(blaze_world::panic::TEST_PROFILE);
+                    let parent = |why| CliError::OwnProcess(own_process::OwnError::Parent(why));
+                    let isa = run_parent::isa().map_err(parent)?;
+                    let mut runnable = Vec::with_capacity_in(inventory.suites.len(), frame);
+                    for (found, unit) in &inventory.suites {
+                        let names = run_names::names_of(
+                            &cx, root, found, run_names::Owner::At(unit.at), &mut store, &mut facts.bodies,
+                            &mut read, &facts.fetch_env, facts.names.as_ref().and_then(|names| names.procs()),
+                            &seen, frame, heap,
+                        )
+                        .map_err(CliError::RunNames)?;
+                        let builder = run_parent::builder_for(unit.edition.name(), overflow, panic, producers.get::<blaze_ids::producer::CodeBuilder>(), isa).map_err(parent)?;
+                        runnable.push(test_drive::Suite { names, builder, unit: *unit });
                     }
-                    None => match run_ids::on_hit(&cx, &req, toolchain, &tools, &mut store, alloc).map_err(ids_refused)? {
-                        run_ids::OnHit::Ids(ids) => ids,
-                        run_ids::OnHit::AnswerInFull => return Err(CliError::AnswerInFull { again: in_full }),
-                    },
+                    test_drive::run_suites(&cx, launch.io, &runnable, &ids, config, launch.args, lent, heap.alloc(), watch, frame).map_err(CliError::Test)?
                 };
-                // The names records, made the one way `run`'s are (run_names.rs): the suite reads
-                // a test's roots and each first call from them.
-                let names = run_names::names_of(
-                    &cx,
-                    root,
-                    &found,
-                    run_names::Owner::At(unit.at),
-                    &mut store,
-                    &mut facts.bodies,
-                    &mut read,
-                    &facts.fetch_env,
-                    facts.names.as_ref().and_then(|names| names.procs()),
-                    &seen,
-                    frame,
-                    heap,
-                )
-                .map_err(CliError::RunNames)?;
-                // What the code is built for: the unit's edition, the `dev` profile's overflow
-                // checks and panic strategy, the code builder (D105), this machine.
-                let overflow = program::dev_overflow(&cx, root, frame)?;
-                let panic = program::dev_panic(&cx, root, frame)?;
-                let parent = |why| CliError::OwnProcess(own_process::OwnError::Parent(why));
-                let isa = run_parent::isa().map_err(parent)?;
-                let builder = run_parent::builder_for(unit.edition.name(), overflow, panic, producers.get::<blaze_ids::producer::CodeBuilder>(), isa).map_err(parent)?;
-                let suite = test_drive::Suite {
-                    io: launch.io,
-                    names,
-                    ids: &ids,
-                    builder,
-                    lent,
-                    tests: unit.tests,
-                    config,
-                    // `StartTests` comes only after a check with no error (request.rs
-                    // `tests_verdict`): the loop is told so, and would run nothing over one.
-                    check_errors: 0,
-                    tables: heap.alloc(),
-                    watch,
-                };
-                let status = test_drive::run_suite(&cx, suite, frame).map_err(CliError::Test)?;
                 phases.run_names = Some(run_names::NamesRead::of(read.counts(), &seen));
                 if let Some(why) = seen.refused() {
                     return Err(CliError::RunNames(run_names::RunNamesError::Trees { why }));

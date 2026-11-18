@@ -3,7 +3,7 @@
 //! `Effect::Kill` handed to test_run.rs's `Runner` (deadlines, kills, verdicts, filing), and the
 //! runner's `Zygotes` seam answered by [`OneEach`]: EACH TEST IN A PROCESS OF ITS OWN, started
 //! the way `blaze run` starts a program (rule 30): the lazy parent (run_parent.rs `Lazy`, its
-//! first calls answered over descriptor 3 by `run_loop::drive`), the launcher beside this
+//! first calls answered over descriptor 3 by `Needs::serve`), the launcher beside this
 //! binary, the records folder of own_process.rs, the code store the command holds. Only the
 //! roots differ: row n's test fn as a `fn()` entry ([`TestFront`] over blaze-ladder
 //! run/special/test_roots.rs).
@@ -31,12 +31,16 @@
 //! Linux has no test sandbox: the runner answers every run there `CannotRun::NoSandbox`
 //! (test_run.rs `Host::has_sandbox`) before this file starts anything.
 //!
-//! One test runs at a time ([`OneEach`]: the plan's width is set to 1 here; the zygote's pool
-//! runs `width` at once). The floor of one test's run is a fork of a warm zygote plus its first
+//! Up to the plan's width of children run at once. Their parents take turns serving first
+//! calls on the command's thread. The floor of one test's run is a fork of a warm zygote plus its first
 //! calls' answers found in the store; today's cost is an exec of the launcher per test, which
 //! the zygote (piece 9) removes. The time of each failing test is in its failure line.
 
+use core::cell::{Cell, RefCell};
 use core::fmt::{self, Write as _};
+use core::future::{Future, poll_fn};
+use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
 use blaze_id::ItemKey as LibKey;
@@ -53,7 +57,7 @@ use blaze_run::postings::{FnName, ReadName};
 use blaze_run::result::{AtAddress, Captured, OUTPUT_CAP};
 use blaze_run::zygote::{How, Said, Status as ZygoteExit};
 use blaze_run::{Nanos, TestId};
-use blaze_scope::tests_record::{TestsRecord, TestsRecordError};
+use blaze_scope::tests_record::TestsRecordError;
 use blaze_screen::Watch;
 use blaze_typeck::ItemKey;
 use bstd::Cx;
@@ -62,16 +66,14 @@ use bstd::fs::{Dir, Durable, FsError, FsKind, ReadWrite};
 use bstd::io::{Io, Missing};
 use bstd::mem::Frame;
 use bstd::path::{Path, PathError};
-use bstd::procs::{Ended, GRACE, Held, Message, OutPipe, ParentDeath, Read as Piped, Run, RunChild, RunError as ProcError, RunSpec, SignalError, Spawner, Streams};
+use bstd::procs::{ChannelError, Ended, GRACE, Held, Message, OutPipe, ParentDeath, ParentSignals, Read as Piped, Relay, RelayAct, RunChild, RunError as ProcError, RunFault, RunSpec, SignalError, Spawner, Streams};
 
-use crate::body_types::Kept;
 use crate::code_store::HomeCodeStore;
-use crate::engine_records::EngineRecords;
-use crate::run_names::{self, Found, Owner, RunNamesError, TestUnit, Walked};
+use crate::run_names::{Found, TestRows, TestUnit};
 use crate::run_ids::{Checked, Grain, RunIds};
-use crate::run_loop::{self, Bounds, LoopError as RunLoopError};
-use crate::run_parent::{self, Front, Gate, Lazy, Needs, ParentError, RECORDS, RecordsDir, Start as _, TICK, WRITE_BOUND};
-use crate::store::{CommandLent, Store};
+use crate::run_loop::LoopError as RunLoopError;
+use crate::run_parent::{self, Front, Gate, Lazy, Needs, ParentError, RECORDS, RecordsDir, Start as _, WRITE_BOUND};
+use crate::store::CommandLent;
 use crate::test_loop::{CannotRun, Effect, Event, LoopConfig, LoopError, Status, SuiteId, TestLoop};
 use crate::test_run::{Answers, ChildEnd, Heard, Host as TestHost, RunError, Runner, Start, Zygotes};
 
@@ -95,10 +97,8 @@ const STEPS_FIXED: usize = 256;
 const ADDRESS_DOMAIN: &str = "blaze test address of an untraced run 1";
 /// The domain of a test output's digest.
 const OUTPUT_DOMAIN: &str = "blaze test output 1";
-/// Beneath `<HOME>`: the folder each command's test folders are made in (`<pid>/<row>`).
+/// Beneath `<HOME>`: the parent of each command's suite and row folders.
 const TEMPS: &str = ".blaze/v2/test/tmp";
-/// The most things one wait can hear: a start, one end, a close and an exit.
-const MOST_HEARD: usize = 4;
 
 /// Why the driver stopped the command: each names the step and the thing (rule 19).
 #[derive(Debug)]
@@ -108,7 +108,7 @@ pub(crate) enum DriveError {
     /// A test's run failed in blaze (not in the test), or the run's setup did.
     One(OneError),
     /// A test's own process could not be run, in blaze: the line above names the test and the
-    /// cause ([`run_suite`] prints it; the cause borrows nothing it could keep here).
+    /// cause ([`run_suites`] prints it).
     OneStopped,
     /// A capability the command needs is not in its `Io`.
     Missing(Missing),
@@ -116,6 +116,7 @@ pub(crate) enum DriveError {
     NoHead { effect: &'static str },
     /// The loop asked to open a suite this request does not have.
     NoSuite { suite: SuiteId },
+    TooManyRows { count: usize },
     /// The tests record could not be read.
     Record(TestsRecordError),
     /// Nothing runs, nothing is owed and no status came.
@@ -124,6 +125,8 @@ pub(crate) enum DriveError {
     Steps { most: usize },
     /// The output stream refused a write.
     Print,
+    /// A pinned child's storage must come from the caller's process heap.
+    ChildHeap,
 }
 
 impl fmt::Display for DriveError {
@@ -135,11 +138,13 @@ impl fmt::Display for DriveError {
             DriveError::OneStopped => f.write_str("blaze test: the suite stopped: a test's own process could not be run (the line above names the test and why)"),
             DriveError::Missing(missing) => write!(f, "blaze test: {missing}"),
             DriveError::NoHead { effect } => write!(f, "blaze test: the loop asked {effect}, but no suite has a head yet (test_drive.rs opens every suite without one)"),
-            DriveError::NoSuite { suite } => write!(f, "blaze test: the loop asked for suite {}, and this request has one suite (0)", suite.0),
+            DriveError::NoSuite { suite } => write!(f, "blaze test: suite {} is outside the selected inventory", suite.0),
+            DriveError::TooManyRows { count } => write!(f, "blaze test: {count} test rows exceed the runner's u32 row limit"),
             DriveError::Record(error) => write!(f, "blaze test: {error}"),
             DriveError::Stalled => f.write_str("blaze test: the loop waits for nothing, runs nothing and gave no status (rule 18)"),
             DriveError::Steps { most } => write!(f, "blaze test: the loop took more than {most} steps (rule 18)"),
             DriveError::Print => f.write_str("blaze test: the output stream refused a write"),
+            DriveError::ChildHeap => f.write_str("blaze test: the child pool needs the process heap to pin its lazy parents"),
         }
     }
 }
@@ -167,6 +172,7 @@ pub(crate) enum OneError {
     Home(bstd::fs::HomeError),
     NoHome,
     Parent(ParentError),
+    CannotBuild(InstanceRefusal),
     Launcher(crate::own_process::OwnError),
     /// The Seatbelt profile could not say a path, or words did not fit: in words.
     Profile { why: Box<str> },
@@ -187,6 +193,7 @@ impl fmt::Display for OneError {
             OneError::Home(error) => write!(f, "the home's folders: {error}"),
             OneError::NoHome => f.write_str("the command's environment names no `HOME`"),
             OneError::Parent(error) => write!(f, "a test's run parent: {error}"),
+            OneError::CannotBuild(refusal) => refusal.fmt(f),
             OneError::Launcher(error) => write!(f, "the launcher: {error}"),
             OneError::Profile { why } => write!(f, "a test's sandbox profile: {why}"),
             OneError::Start(error) => write!(f, "a test's launcher did not start under {SANDBOX_EXEC}: {error}"),
@@ -194,6 +201,153 @@ impl fmt::Display for OneError {
             OneError::Loop(error) => write!(f, "a test's run: {error}"),
             OneError::Signals(error) => write!(f, "a test's run: the parent's signals: {error}"),
         }
+    }
+}
+
+/// A particular first call for which the parent could not produce code. Kept typed until
+/// the plan has matched the answer to the flight for this suite and tests-record row.
+#[derive(Debug)]
+pub(crate) struct InstanceRefusal {
+    instance: crate::run_fault::Named,
+    symbol: [u8; 32],
+    site: Option<InstanceSite>,
+    cause: ParentError,
+}
+
+#[derive(Debug)]
+enum InstanceSite {
+    Source(crate::run_fault::SiteShown),
+    Item { item: ItemKey, byte: u32 },
+}
+
+impl fmt::Display for InstanceRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use crate::run_fault::Named;
+        match &self.instance {
+            Named::Shown { item, args } => {
+                write!(f, "{item}")?;
+                if let Some(args) = args {
+                    write!(f, " {args}")?;
+                }
+            }
+            Named::Path(path) => f.write_str(path)?,
+            Named::Item(item) => write!(f, "fn {:#x}", item.0)?,
+            Named::NoRow => {
+                f.write_str("symbol ")?;
+                for byte in self.symbol {
+                    write!(f, "{byte:02x}")?;
+                }
+            }
+        }
+        match &self.site {
+            Some(InstanceSite::Source(site)) => write!(f, " at {}:{}:{}", site.file, site.line, site.column)?,
+            Some(InstanceSite::Item { item, byte }) => write!(f, " at byte {byte} of item {:#x}", item.0)?,
+            None => {}
+        }
+        match &self.cause {
+            ParentError::Walk {
+                why: blaze_ladder::body_ids::WalkError::Make { why: blaze_ladder::run::RunError::Build { error, .. }, .. }, ..
+            } => write!(f, ": {error}"),
+            ParentError::Walk { why: blaze_ladder::body_ids::WalkError::Make { why, .. }, .. } => write!(f, ": {why}"),
+            ParentError::Special { why, .. } => write!(f, ": {why}"),
+            cause => write!(f, ": {cause}"),
+        }
+    }
+}
+
+/// Only a refusal of the requested instance belongs to its test. A broken shared record,
+/// an unanswered names-record read, a wire error, or an invariant of the parent stops the
+/// command. Keep the walk alive until the instance and item-relative site have been named.
+fn test_parent_error<F: Front, D: run_parent::Folder>(lazy: &mut Lazy<'_, '_, F, D>, cause: ParentError) -> OneError {
+    let Some((symbol, location)) = refused_instance(&cause) else { return OneError::Parent(cause) };
+    let site = location.map(|(item, byte)| match lazy.site_of(item, byte) {
+        Some(shown) => InstanceSite::Source(shown),
+        None => InstanceSite::Item { item, byte },
+    });
+    OneError::CannotBuild(InstanceRefusal { instance: lazy.name_of(symbol), symbol, site, cause })
+}
+
+fn refused_instance(cause: &ParentError) -> Option<([u8; 32], Option<(ItemKey, u32)>)> {
+    use blaze_ladder::body_ids::WalkError;
+    use blaze_ladder::code_records::CodeRecordError;
+    use blaze_ladder::run::RunError;
+
+    Some(match cause {
+        ParentError::Walk { symbol, why: WalkError::Make { tabled, why } } => {
+            let byte = match why {
+                RunError::Build { range, .. } => range.map_or(0, |range| range.start),
+                RunError::ItemRefused { .. } | RunError::NoAdt { .. } | RunError::Emit { .. }
+                | RunError::Callee { .. } | RunError::Projection { .. } | RunError::LeftOut { .. }
+                | RunError::ConstAt { .. } | RunError::Resolve { .. } | RunError::NoBuiltinCall { .. }
+                | RunError::Vtable { .. } | RunError::StaticRecord { .. }
+                | RunError::Check { .. } | RunError::Types { .. } | RunError::Const { .. } | RunError::Need { .. }
+                | RunError::OneBody { .. }
+                | RunError::CodeRecord { error: CodeRecordError::Emit(_) | CodeRecordError::Routine(_), .. } => 0,
+                RunError::Front2(blaze_ladder::front2::program::Front2Refusal::Literal { range, .. }) => range.start,
+                RunError::Front2(why) if instance_front_refusal(why) => 0,
+                _ => return None,
+            };
+            (*symbol, Some((*tabled, byte)))
+        }
+        ParentError::Walk { symbol, why: WalkError::NoBody { tabled } } => (*symbol, Some((*tabled, 0))),
+        ParentError::Special {
+            symbol,
+            why: CodeRecordError::Emit(_) | CodeRecordError::Getter(_) | CodeRecordError::Ender(_) | CodeRecordError::Shim(_) | CodeRecordError::Routine(_),
+        } => (*symbol, None),
+        ParentError::NotChecked { function, symbol, .. } => (*symbol, Some((*function, 0))),
+        ParentError::NoPersonality { function, symbol, .. } => (*symbol, function.map(|item| (item, 0))),
+        _ => return None,
+    })
+}
+
+fn instance_front_refusal(why: &blaze_ladder::front2::program::Front2Refusal) -> bool {
+    use blaze_ladder::front2::check::CheckFail;
+    use blaze_ladder::front2::program::{Front2Refusal as Front, lazy::LazyRefusal};
+    match why {
+        Front::Lazy(LazyRefusal::Row { refusal, .. }) => instance_front_refusal(refusal),
+        Front::Lazy(LazyRefusal::Check { error, .. }) | Front::Asked { error, .. } | Front::Check(error) =>
+            !matches!(error, CheckFail::Tables { .. } | CheckFail::ReadsDiffer { .. }),
+        Front::Lazy(LazyRefusal::Lower { .. } | LazyRefusal::Spell { .. }
+            | LazyRefusal::LocalNotBuilt { .. } | LazyRefusal::Diagnostic { .. }
+            | LazyRefusal::Head { .. } | LazyRefusal::Adt { .. } | LazyRefusal::Const { .. }
+            | LazyRefusal::NotLazyYet { .. } | LazyRefusal::NeedsSolvedNames { .. } | LazyRefusal::FmtArgument { .. })
+        | Front::Unchecked { .. } | Front::NoBody { .. } | Front::Const { .. }
+        | Front::Static { .. } | Front::Abi { .. } | Front::Literal { .. } | Front::Intrinsic { .. }
+        | Front::TargetIntrinsic { .. } | Front::AdtRow { .. } | Front::ObjectTrait { .. } => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod refusal_tests {
+    use super::*;
+    use blaze_ladder::body_ids::WalkError;
+    use blaze_ladder::code_records::{CodeKey, CodeRecordError, StoreError};
+    use blaze_ladder::run::{Named, RunError};
+
+    pub(crate) fn missing_code() -> InstanceRefusal {
+        let symbol = [17; 32];
+        let item = ItemKey(3);
+        InstanceRefusal {
+            instance: crate::run_fault::Named::Path("lib::callee".into()),
+            symbol, site: Some(InstanceSite::Item { item, byte: 15 }),
+            cause: ParentError::NotChecked { function: item, symbol, why: None },
+        }
+    }
+
+    #[test]
+    fn a_store_or_wire_error_is_never_a_test_refusal() {
+        let symbol = [17; 32];
+        let item = ItemKey(3);
+        let named = || Named { path: "lib::callee".into(), at: blaze_ladder::front::At { file: 0, place: 80 } };
+        let make = |why| ParentError::Walk { symbol, why: WalkError::Make { tabled: item, why } };
+        let store = || StoreError::TwoValues { key: CodeKey(ContentId([7; 32])) };
+        assert_eq!(refused_instance(&ParentError::Walk { symbol, why: WalkError::Store(store()) }), None);
+        assert_eq!(refused_instance(&make(RunError::CodeRecord { function: named(), error: CodeRecordError::Store(store()) })), None);
+        assert_eq!(refused_instance(&ParentError::UndeclaredSlot { slot: 4 }), None);
+        let range = blaze_typeck::Range { start: 15, end: 22 };
+        let why = RunError::Front2(blaze_ladder::front2::program::Front2Refusal::Literal { function: "lib::callee".into(), what: "an unsupported literal", range });
+        assert_eq!(refused_instance(&make(why)), Some((symbol, Some((item, range.start)))));
     }
 }
 
@@ -244,20 +398,25 @@ impl fmt::Display for Unkept {
     }
 }
 
-/// A test's id: its function's library key (the tests record row's `key`), its identity and
-/// nothing its code is.
-pub(crate) fn test_id(key: LibKey) -> TestId {
-    TestId(key.0.0)
+fn asked<'s>(unit: TestUnit<'s>, row: blaze_scope::tests_record::TestRow<'s>, args: &[&str]) -> blaze_run::plan::Asked<'s> {
+    use blaze_scope::tests_record::ShouldPanic;
+    let mut id = Hasher::new("blaze test: package target and test 1");
+    id.part(unit.package.as_bytes()).part(unit.target.as_bytes()).id(&unit.key.0).id(&row.key.0);
+    if !unit.tests.harnessed() {
+        for arg in args {
+            id.part(arg.as_bytes());
+        }
+    }
+    let should_panic = match row.should_panic {
+        ShouldPanic::No => blaze_run::plan::ShouldPanic::No,
+        ShouldPanic::Yes => blaze_run::plan::ShouldPanic::Yes,
+        ShouldPanic::WithMessage(text) => blaze_run::plan::ShouldPanic::WithText(text),
+    };
+    blaze_run::plan::Asked { test: TestId(id.finish().0), path: row.path, ignore: row.ignore, bench: row.bench, should_panic }
 }
 
-/// Each row's [`TestId`], in the record's order: the loop's `Opened.ids`.
-pub(crate) fn ids_of<'a>(record: &TestsRecord<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, TestId>, TestsRecordError> {
-    let mut ids = Vec::with_capacity_in(record.len(), alloc);
-    for at in 0..record.len() {
-        let row = record.row(at)?.ok_or(TestsRecordError::Row { row: at, what: "no row inside the count" })?;
-        ids.push(test_id(row.key));
-    }
-    Ok(ids)
+fn record_row<'s>(tests: TestRows<'s>, at: usize) -> Result<blaze_scope::tests_record::TestRow<'s>, DriveError> {
+    tests.row(at).map_err(DriveError::Record)?.ok_or(DriveError::Record(TestsRecordError::Row { row: at, what: "no row inside the count" }))
 }
 
 /// Why a row cannot be entered, asked before its run.
@@ -266,43 +425,39 @@ pub(crate) trait Refuse {
     fn refusal(&mut self, row: u32) -> Result<Option<&str>, OneError>;
 }
 
-/// THE LOOP, driven: one suite (`tests`, the unit's tests record, 16-aligned, `ids` its rows'
-/// ids), the check's error count, the runner over its zygotes, `refuse` asked before each run,
-/// `filed` for what the loop files, `print` for what it prints. The loop's status, or what
-/// stopped it.
+/// Drive the selected rows through one bounded pool, retaining their owning suites.
 #[expect(clippy::too_many_arguments, reason = "the driver's edge: each argument one seam of it")]
-pub(crate) fn drive<'a, 'r, Z: Zygotes>(
+fn drive<'a, 'r, Z: Zygotes>(
     config: LoopConfig<'r>,
-    tests: &'r [u8],
-    ids: &'r [TestId],
-    check_errors: u32,
+    asked: AVec<'a, blaze_run::plan::Asked<'r>>,
+    owners: &'r [SuiteId],
+    filtered: u32,
     runner: &mut Runner<'a, Z>,
     refuse: &mut dyn Refuse,
     filed: &mut dyn Filed,
     print: &mut dyn FnMut(&[u8]) -> Result<(), DriveError>,
     alloc: Alloc<'a>,
 ) -> Result<Status, DriveError> {
-    let most = STEPS_FIXED + STEPS_PER_TEST * ids.len();
+    let most = STEPS_FIXED.saturating_add(STEPS_PER_TEST.saturating_mul(asked.len()));
     let mut machine = TestLoop::new(config, alloc)?;
     let mut out: AVec<'a, Effect<'a>> = Vec::new_in(alloc);
     let mut effects: AVec<'a, Effect<'a>> = Vec::new_in(alloc);
-    let mut line: AString<'a> = String::new_in(alloc);
-    machine.begin(&mut out)?;
-    machine.step(Event::Checked { errors: check_errors }, runner.zygotes().now(), &mut out)?;
+    machine.begin_inventory(asked, owners, filtered, runner.zygotes().now(), &mut out)?;
+    machine.step(Event::Checked { errors: 0 }, runner.zygotes().now(), &mut out)?;
     let mut answers = Untraced;
     for _ in 0..most {
         core::mem::swap(&mut out, &mut effects);
-        let (mut open, mut done) = (None, None);
+        let mut done = None;
         for effect in effects.drain(..) {
             match &effect {
-                Effect::Open { suite } => open = Some(*suite),
+                Effect::Open { suite } => return Err(DriveError::NoSuite { suite: *suite }),
                 Effect::Moved { .. } => return Err(DriveError::NoHead { effect: "the moved asks" }),
                 Effect::Look { .. } => return Err(DriveError::NoHead { effect: "a look-up of a kept pass" }),
                 Effect::Run { test, row, .. } => match refuse.refusal(*row).map_err(DriveError::One)? {
                     Some(why) => {
-                        line.clear();
+                        let mut line = String::new_in(alloc);
                         writeln!(line, "blaze test: {why}").map_err(|_| DriveError::Print)?;
-                        print(line.as_bytes())?;
+                        machine.row_detail(*row, line.into_bytes());
                         machine.step(Event::CannotRun { test: *test, why: CannotRun::EntryRefused }, runner.zygotes().now(), &mut out)?;
                     }
                     None => runner.effect(&effect)?,
@@ -319,14 +474,6 @@ pub(crate) fn drive<'a, 'r, Z: Zygotes>(
         if let Some(status) = done {
             runner.finish()?;
             return Ok(status);
-        }
-        if let Some(suite) = open {
-            if suite != SuiteId(0) {
-                return Err(DriveError::NoSuite { suite });
-            }
-            let event = Event::Opened { suite, tests, ids, head: None, postings: None };
-            machine.step(event, runner.zygotes().now(), &mut out)?;
-            continue;
         }
         if !out.is_empty() {
             continue;
@@ -361,13 +508,6 @@ impl<'o> Output<'o> {
         Output { tail: Vec::new_in(alloc), total: 0, hasher: Hasher::new(OUTPUT_DOMAIN) }
     }
 
-    /// Emptied for the next test; the buffer is kept.
-    pub(crate) fn reset(&mut self) {
-        self.tail.clear();
-        self.total = 0;
-        self.hasher = Hasher::new(OUTPUT_DOMAIN);
-    }
-
     pub(crate) fn push(&mut self, bytes: &[u8]) {
         self.hasher.update(bytes);
         self.total += bytes.len() as u64;
@@ -388,89 +528,153 @@ impl<'o> Output<'o> {
 pub(crate) trait RunOne {
     /// Runs row `row` in a process of its own, killed `budget` after its start: how it ended,
     /// its output into `output`.
-    fn run(&mut self, row: u32, budget: Nanos, output: &mut Output<'_>) -> Result<How, OneError>;
+    async fn run(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<How, OneError>;
+}
+
+/// Process-wide dispositions belong to the pool. A SIGTERM is observed by every child,
+/// each of which keeps its own grace deadline. No borrow lives across a poll.
+#[derive(Default)]
+pub(crate) struct Signals {
+    held: RefCell<Option<Held>>,
+    terminate: Cell<bool>,
+    /// Only one child may block per sweep, for at most one drain interval in total.
+    wait: Cell<Duration>,
+}
+
+impl Signals {
+    fn terminate(&self, now: Duration) -> Result<bool, OneError> {
+        let mut slot = self.held.borrow_mut();
+        let held = match &mut *slot {
+            Some(held) => held,
+            empty @ None => empty.insert(Held::hold().map_err(OneError::Signals)?),
+        };
+        if held.take_terminate(now) {
+            self.terminate.set(true);
+        }
+        Ok(self.terminate.get())
+    }
+}
+
+/// Every pending future is polled once each sweep. Suspension happens only at an explicit
+/// turn boundary, after the child has had a chance to drain, answer and check its deadline.
+async fn next_turn() {
+    let mut yielded = false;
+    poll_fn(|cx| match core::mem::replace(&mut yielded, true) {
+        false => {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+        true => Poll::Ready(()),
+    }).await
 }
 
 /// What [`OneEach`] heard, kept until the runner reads it.
-#[derive(Clone, Copy)]
 enum Item {
     Ready,
-    Ended { row: u32, test: TestId, micros: u64, how: How },
+    Ended { row: u32, test: TestId, micros: u64, how: How, output: Output<'static> },
+    CannotBuild { row: u32, test: TestId, why: InstanceRefusal },
     Closed,
     Exited(ZygoteExit),
 }
 
-/// The runner's zygote seam over one process per test: `ask` runs the test to its end (bounded
-/// by its budget) before it returns, so a wait has its batch ready and never blocks; one test at
-/// a time (a second ask before the first end is heard is `RunError::TwoRuns`). `now` is the
-/// command's clock.
+struct Running<'a> {
+    row: u32,
+    test: TestId,
+    began: Nanos,
+    child: Pin<std::boxed::Box<dyn Future<Output = Result<(How, Output<'static>), OneError>> + 'a>>,
+}
+
+/// One pinned parent per sandbox process. The command thread owns the front end, the lazy
+/// resolvers and the store; children execute in parallel while that thread services them.
 pub(crate) struct OneEach<'b, R: RunOne, C: Fn() -> Nanos> {
-    pub runs: R,
+    runs: &'b R,
+    signals: &'b Signals,
     now: C,
+    heap: Alloc<'static>,
+    suite: SuiteId,
+    width: usize,
+    running: std::vec::Vec<Running<'b>>,
     pending: AVec<'b, Item>,
     batch: AVec<'b, Item>,
-    output: Output<'b>,
     /// The error that stopped a run in blaze, and the tests record row it was of: printed by
-    /// [`run_suite`] as one line naming the test, before the command's own error line.
+    /// [`run_suites`] as one line naming the test, before the command's own error line.
     pub failed: Option<(u32, OneError)>,
 }
 
 impl<'b, R: RunOne, C: Fn() -> Nanos> OneEach<'b, R, C> {
-    pub(crate) fn new(runs: R, now: C, alloc: Alloc<'b>) -> OneEach<'b, R, C> {
-        OneEach { runs, now, pending: Vec::with_capacity_in(MOST_HEARD, alloc), batch: Vec::with_capacity_in(MOST_HEARD, alloc), output: Output::new(alloc), failed: None }
-    }
-
-    fn hear(&mut self, item: Item) -> Result<(), RunError> {
-        if self.pending.len() >= MOST_HEARD {
-            return Err(RunError::Seam { call: "more than four things heard before one wait (test_drive.rs `OneEach`)", errno: 0, suite: None });
-        }
-        self.pending.push(item);
-        Ok(())
+    pub(crate) fn new(runs: &'b R, signals: &'b Signals, now: C, alloc: Alloc<'b>, heap: Alloc<'static>) -> Result<OneEach<'b, R, C>, DriveError> {
+        // Pinning needs proof that this handle's blocks cannot be reset. Validate the
+        // caller's heap once, with a zero-sized vector, and retain its typed allocator.
+        let proof = Vec::<(), _>::new_in(heap).into_global().map_err(|_| DriveError::ChildHeap)?;
+        let running = std::vec::Vec::new_in(*proof.allocator());
+        Ok(OneEach {
+            runs, signals, now, heap, suite: SuiteId(0), width: 0,
+            pending: Vec::new_in(alloc), batch: Vec::new_in(alloc), running, failed: None,
+        })
     }
 }
 
 impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
-    fn start(&mut self, _suite: SuiteId, _width: u32) -> Result<Start, RunError> {
-        self.hear(Item::Ready)?;
+    fn start(&mut self, suite: SuiteId, width: u32) -> Result<Start, RunError> {
+        self.suite = suite;
+        self.width = width as usize;
+        self.pending.push(Item::Ready);
         Ok(Start::Running)
     }
 
     fn ask(&mut self, row: u32, test: TestId, budget: Nanos) -> Result<(), RunError> {
-        let unheard = self.pending.iter().chain(self.batch.iter()).any(|item| matches!(item, Item::Ended { .. }));
-        if unheard {
-            return Err(RunError::TwoRuns { suite: SuiteId(0), row });
+        if self.running.len() >= self.width {
+            return Err(RunError::Seam { call: "asking for a child beyond the selected worker count", errno: 0, suite: Some(self.suite) });
         }
-        self.output.reset();
+        let (runs, signals, heap) = (self.runs, self.signals, self.heap);
         let began = (self.now)();
-        match self.runs.run(row, budget, &mut self.output) {
-            Ok(how) => {
-                let micros = (self.now)().0.saturating_sub(began.0) / 1_000;
-                self.hear(Item::Ended { row, test, micros, how })
-            }
-            Err(error) => {
-                self.failed = Some((row, error));
-                // Never shown when `failed` is set: run_suite prints the cause and returns
-                // `DriveError::OneStopped` in its place. No errno: the cause is `failed`.
-                Err(RunError::Seam { call: "a test's own process (test_drive.rs `OneEach::ask`)", errno: 0, suite: Some(SuiteId(0)) })
-            }
-        }
-    }
-
-    fn end(&mut self) -> Result<(), RunError> {
-        self.hear(Item::Closed)?;
-        self.hear(Item::Exited(ZygoteExit::Exited { code: 0 }))
-    }
-
-    fn kill(&mut self) -> Result<(), RunError> {
-        // Every run ended inside its `ask`, by its deadline: nothing is running to kill.
+        let child = std::boxed::Box::pin_in(async move {
+            let mut output = Output::new(heap);
+            let how = runs.run(row, budget, &mut output, signals).await?;
+            Ok((how, output))
+        }, *self.running.allocator());
+        self.running.push(Running { row, test, began, child });
         Ok(())
     }
 
-    fn wait(&mut self, _until: Nanos) -> Result<(), RunError> {
-        if self.pending.is_empty() {
-            return Err(RunError::Seam { call: "a wait with nothing to hear (test_drive.rs runs each test to its end in `ask`)", errno: 0, suite: None });
-        }
+    fn end(&mut self) -> Result<(), RunError> {
+        self.pending.push(Item::Closed);
+        self.pending.push(Item::Exited(ZygoteExit::Exited { code: 0 }));
+        Ok(())
+    }
+
+    fn kill(&mut self) -> Result<(), RunError> {
+        // Dropping a live Run kills and reaps its process.
+        self.running.clear();
+        Ok(())
+    }
+
+    fn wait(&mut self, until: Nanos) -> Result<(), RunError> {
         self.batch.append(&mut self.pending);
+        if self.batch.is_empty() && self.running.is_empty() {
+            return Err(RunError::Seam { call: "waiting on an empty test pool", errno: 0, suite: Some(self.suite) });
+        }
+        let mut context = Context::from_waker(Waker::noop());
+        let mut interval = Duration::ZERO;
+        while self.batch.is_empty() && (self.now)() < until {
+            let left = Duration::from_nanos(until.0.saturating_sub((self.now)().0));
+            self.signals.wait.set(interval.min(left));
+            let mut at = 0;
+            while at < self.running.len() {
+                let Poll::Ready(result) = self.running[at].child.as_mut().poll(&mut context) else { at += 1; continue };
+                let Running { row, test, began, .. } = self.running.swap_remove(at);
+                let item = match result {
+                    Ok((how, output)) => Item::Ended { row, test, micros: (self.now)().0.saturating_sub(began.0) / 1_000, how, output },
+                    Err(OneError::CannotBuild(why)) => Item::CannotBuild { row, test, why },
+                    Err(error) => {
+                        self.failed = Some((row, error));
+                        return Err(RunError::Seam { call: "serving a test process", errno: 0, suite: Some(self.suite) });
+                    }
+                };
+                self.batch.push(item);
+            }
+            interval = DRAIN_EVERY;
+        }
         Ok(())
     }
 
@@ -479,22 +683,23 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
     }
 
     fn heard(&self, at: usize) -> Option<Heard<'_>> {
-        Some(match *self.batch.get(at)? {
+        Some(match self.batch.get(at)? {
             Item::Ready => Heard::Ready,
-            Item::Ended { row, test, micros, how } => Heard::Ended(ChildEnd {
-                row,
-                test,
-                micros,
-                how,
+            Item::Ended { row, test, micros, how, output } => Heard::Ended(ChildEnd {
+                row: *row,
+                test: *test,
+                micros: *micros,
+                how: *how,
                 // Nothing it entered or read was seen: its pass is never kept.
                 keep: Err(NotKept::Untraced),
                 text: "",
                 entered: &[],
                 reads: &[],
-                output: self.output.captured(),
+                output: output.captured(),
             }),
+            Item::CannotBuild { row, test, why } => Heard::CannotBuild { row: *row, test: *test, why },
             Item::Closed => Heard::Closed,
-            Item::Exited(status) => Heard::Exited(status),
+            Item::Exited(status) => Heard::Exited(*status),
         })
     }
 
@@ -507,26 +712,84 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
     }
 }
 
-fn key_of(tests: &TestsRecord<'_>, row: u32) -> Result<LibKey, OneError> {
+fn key_of(tests: &TestRows<'_>, row: u32) -> Result<LibKey, OneError> {
     let found = tests.row(row as usize).map_err(OneError::Record)?;
     found.map(|row| row.key).ok_or(OneError::NoRow { row })
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    struct Children {
+        started: Cell<u32>,
+        live: Cell<u32>,
+        peak: Cell<u32>,
+    }
+
+    impl RunOne for Children {
+        async fn run(&self, row: u32, _: Nanos, output: &mut Output<'_>, _: &Signals) -> Result<How, OneError> {
+            self.started.set(self.started.get() + 1);
+            self.live.set(self.live.get() + 1);
+            self.peak.set(self.peak.get().max(self.live.get()));
+            output.push(&row.to_le_bytes());
+            next_turn().await;
+            self.live.set(self.live.get() - 1);
+            Ok(How::Reported(Said::Returned))
+        }
+    }
+
+    /// Each child's first turn occurs before any child's second. A serial adapter, an
+    /// over-width adapter or sharing the most recent child's output breaks this oracle.
+    #[test]
+    fn overlapping_children_keep_their_own_capture() {
+        let heap = blaze_own::testing::heap().alloc();
+        let signals = Signals::default();
+        let children = Children { started: Cell::new(0), live: Cell::new(0), peak: Cell::new(0) };
+        let tick = Cell::new(0);
+        let clock = || {
+            tick.set(tick.get() + 1);
+            Nanos(tick.get())
+        };
+        let mut pool = OneEach::new(&children, &signals, clock, heap, heap).expect("the process heap");
+        pool.start(SuiteId(4), 2).expect("two slots");
+        pool.ask(3, TestId([3; 32]), Nanos(100)).expect("first");
+        pool.ask(7, TestId([7; 32]), Nanos(100)).expect("second");
+        assert!(pool.ask(9, TestId([9; 32]), Nanos(100)).is_err());
+        pool.wait(Nanos(100)).expect("ready");
+        assert!(matches!(pool.heard(0), Some(Heard::Ready)));
+        pool.clear();
+        pool.wait(Nanos(100)).expect("both children end");
+        assert_eq!((children.started.get(), children.peak.get(), children.live.get()), (2, 2, 0));
+        assert_eq!(pool.heard_len(), 2);
+        for at in 0..2 {
+            let Some(Heard::Ended(end)) = pool.heard(at) else { panic!("a child's result") };
+            assert_eq!(end.output.tail, &end.row.to_le_bytes());
+            assert_eq!(end.test, TestId([end.row as u8; 32]));
+        }
+    }
+}
+
+fn entry_roots<'a>(harness: bool, names: NamesRecords<'_>, test: LibKey, builder: Builder, tables: Alloc<'static>, alloc: Alloc<'a>)
+    -> Result<Roots<'a>, blaze_ladder::run::special::RootsError>
+{
+    let panic = builder.settings.panic;
+    if harness {
+        test_roots(names.records, test, names.lang_crates, panic, names.frame, tables, alloc)
+    } else {
+        blaze_ladder::run::special::run_roots(names.records, names.lang_crates, panic, names.frame, tables, alloc)
+    }
 }
 
 /// [`Refuse`] over the test roots: each row's roots made in a scratch frame, the words of a
 /// refusal kept for the caller. The run makes them again in its own frame: one head lowered
 /// twice, until the zygote's protocol carries a refusal (NOT DONE, piece 9).
 pub(crate) struct EntryCheck<'c, 'h> {
-    pub tests: TestsRecord<'c>,
+    pub tests: TestRows<'c>,
     pub names: NamesRecords<'h>,
     pub builder: Builder,
     pub tables: Alloc<'static>,
     said: AString<'c>,
-}
-
-impl<'c, 'h> EntryCheck<'c, 'h> {
-    pub(crate) fn new(tests: TestsRecord<'c>, names: NamesRecords<'h>, builder: Builder, tables: Alloc<'static>, alloc: Alloc<'c>) -> EntryCheck<'c, 'h> {
-        EntryCheck { tests, names, builder, tables, said: String::new_in(alloc) }
-    }
 }
 
 impl Refuse for EntryCheck<'_, '_> {
@@ -534,7 +797,7 @@ impl Refuse for EntryCheck<'_, '_> {
         let test = key_of(&self.tests, row)?;
         let frame = Frame::new(bstd::mem::Tag::Other).map_err(OneError::Frame)?;
         let erased = blaze_own::Erased::new(&frame);
-        let made = test_roots(self.names.records, test, self.names.lang_crates, self.builder.settings.panic, self.names.frame, self.tables, erased.handle());
+        let made = entry_roots(self.tests.harnessed(), self.names, test, self.builder, self.tables, erased.handle());
         let Err(why) = made else { return Ok(None) };
         self.said.clear();
         write!(self.said, "{why}").map_err(|_| OneError::Profile { why: Box::from("a refusal's words did not fit in memory") })?;
@@ -558,7 +821,9 @@ pub(crate) struct Launched<'c, 'h> {
     pub temp: &'c str,
     /// The command's environment.
     pub env: &'c [(&'c str, &'c str)],
-    pub tests: TestsRecord<'c>,
+    /// Arguments of a harnessless target's main. A harnessed entry takes none.
+    pub args: &'c [&'c str],
+    pub tests: TestRows<'c>,
     pub names: NamesRecords<'h>,
     pub ids: &'c RunIds<'h>,
     pub builder: Builder,
@@ -568,7 +833,7 @@ pub(crate) struct Launched<'c, 'h> {
 }
 
 impl RunOne for Launched<'_, '_> {
-    fn run(&mut self, row: u32, budget: Nanos, output: &mut Output<'_>) -> Result<How, OneError> {
+    async fn run(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<How, OneError> {
         let cx = self.cx;
         let test = key_of(&self.tests, row)?;
         // The test's own frame: everything of its run, dropped with it.
@@ -582,13 +847,14 @@ impl RunOne for Launched<'_, '_> {
         self.temps.make_dir(cx, &named, Durable::No).map_err(OneError::Temp)?;
         let temp = bstd::mem::format_in!(&frame, "{}/{row}", self.temp);
         // 2. The lazy parent with the test's roots; nothing built yet.
-        let front = TestFront { names: self.names, ids: self.ids, builder: self.builder, tables: self.tables, alloc, test, watch: self.watch };
+        let front = TestFront { names: self.names, ids: self.ids, builder: self.builder, tables: self.tables, alloc, test, harness: self.tests.harnessed(), watch: self.watch };
         let mut codes = HomeCodeStore::new(self.lent);
         let mut lazy = Lazy::new(cx, front, RecordsDir { cx, dir: self.records }, &mut codes, self.builder, alloc);
         let mut needs = Needs::new(alloc);
         let mut ahead = std::vec::Vec::new_in(alloc);
         let mut placed = Vec::new_in(alloc);
-        let head = run_parent::ahead_of(None, &mut lazy, &mut needs, &mut placed, &mut ahead).map_err(OneError::Parent)?;
+        let head = run_parent::ahead_of(None, &mut lazy, &mut needs, &mut placed, &mut ahead)
+            .map_err(|cause| test_parent_error(&mut lazy, cause))?;
         let line = head.line;
         let entry = bstd::mem::format_in!(&frame, "{line}");
         // 3. Its environment: its own `TMPDIR`, then the command's, then the run mode's names.
@@ -597,106 +863,122 @@ impl RunOne for Launched<'_, '_> {
         run_parent::launch_env(self.env.iter().copied().filter(|(name, _)| *name != "TMPDIR"), self.store, entry.as_str(), None, &mut vars);
         // 4. The profile (blaze-run child.rs, the one test profile), the launcher under it.
         let profile = blaze_run::child::seatbelt(temp.as_str(), None, alloc).map_err(|why| OneError::Profile { why: Box::from(bstd::mem::format_in!(&frame, "{why}").as_str()) })?;
-        let args = ["-p", profile.as_str(), self.launcher];
-        let spec = RunSpec { program: SANDBOX_EXEC, arg0: None, args: &args, env: vars.as_slice(), dir: ".", streams: Streams::PIPED, channel: true, own_group: true, parent_death: ParentDeath::STRONGEST };
+        let mut args = Vec::with_capacity_in(self.args.len() + 3, &frame);
+        args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
+        args.extend_from_slice(self.args);
+        let spec = RunSpec { program: SANDBOX_EXEC, arg0: None, args: args.as_slice(), env: vars.as_slice(), dir: ".", streams: Streams::PIPED, channel: true, own_group: true, parent_death: ParentDeath::STRONGEST };
         let mut run = self.spawner.start_run(cx, &spec).map_err(OneError::Start)?;
-        let pipes = [run.take_stdout().map_err(OneError::Pipe)?, run.take_stderr().map_err(OneError::Pipe)?];
-        let mut child = Drained { run, pipes, output };
-        let bounds = Bounds { tick: TICK, write: WRITE_BOUND, until: Deadline::after(child.now(), Duration::from_nanos(budget.0)), grace: GRACE };
-        let ran = {
-            // A hold refused returns here: the child's drop kills and reaps it (bstd `Run`).
-            let mut held = Held::hold().map_err(OneError::Signals)?;
-            let mut inbox = std::vec::Vec::new_in(alloc);
-            let mut out = std::vec::Vec::new_in(alloc);
-            let _span = cx.span("blaze test: one test's process, to its end or its deadline");
-            let ran = run_loop::drive(&mut child, &mut needs, &mut lazy, &ahead, &bounds, &mut held, &mut inbox, &mut out);
-            drop(held);
-            ran
-        };
-        drop(lazy);
-        // What it wrote after its last message, bounded: its group is gone, so the pipes close.
-        let until = Deadline::after(child.now(), DRAIN_AFTER);
-        child.drain_until(until).map_err(OneError::Pipe)?;
-        Ok(match ran {
-            Ok(ran) => match (ran.status, ran.torn) {
-                (0, None) => How::Reported(Said::Returned),
-                (status @ 0..=127, torn) => How::NoReport { code: i32::from(status), torn: torn.map_or(0, |(came, _)| came as u64) },
-                (status, _) => How::Signal { number: i32::from(status - 128) },
-            },
-            Err(RunLoopError::Deadline { .. }) => How::TimedOut { after: budget },
-            Err(error) => return Err(OneError::Loop(error)),
-        })
-    }
-}
-
-/// A run child whose piped output is emptied into an [`Output`] at least every
-/// [`DRAIN_EVERY`] while the run loop waits on its channel or its end.
-struct Drained<'o, 'p> {
-    run: Run,
-    pipes: [Option<OutPipe>; 2],
-    output: &'o mut Output<'p>,
-}
-
-impl Drained<'_, '_> {
-    /// Each pipe read until it closes or `until` passes with nothing in it.
-    fn drain_until(&mut self, until: Deadline) -> Result<(), ProcError> {
-        let mut chunk = [0u8; 16 * 1024];
-        for slot in self.pipes.iter_mut() {
-            while let Some(pipe) = slot.as_ref() {
-                match pipe.read(&mut chunk, until)? {
-                    Piped::Bytes(n) => self.output.push(&chunk[..n]),
-                    Piped::Closed => *slot = None,
-                    Piped::Deadline => break,
+        let until = Deadline::after(run.now(), Duration::from_nanos(budget.0));
+        let mut pipes = [run.take_stdout().map_err(OneError::Pipe)?, run.take_stderr().map_err(OneError::Pipe)?];
+        let mut relay = Relay::new(GRACE);
+        let mut inbox = std::vec::Vec::new_in(alloc);
+        let mut reply = ahead;
+        let mut open = true;
+        let child_error = |error| OneError::Loop(RunLoopError::Child(error));
+        // Start the other ready children before building any first-call answer.
+        let ended = loop {
+            next_turn().await;
+            let _span = cx.span("blaze test: service one child's pipes, requests and deadline");
+            let now = run.now();
+            if until.passed(now) {
+                run.kill().map_err(child_error)?;
+                break How::TimedOut { after: budget };
+            }
+            match relay.turn(now, signals.terminate(now)?) {
+                RelayAct::Forward => run.terminate().map_err(child_error)?,
+                RelayAct::Kill => {
+                    if let Some(how) = child_outcome(run.kill().map_err(child_error)?) {
+                        break how;
+                    }
+                }
+                RelayAct::Nothing => {}
+            }
+            let bound = until.min(relay.bound());
+            drain_pipes(&mut pipes, output, Deadline::PASSED)?;
+            if open && !reply.is_empty() {
+                let by = Deadline::after(run.now(), WRITE_BOUND).min(bound);
+                match run.send(&reply, by) {
+                    Ok(()) => {}
+                    Err(ProcError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => open = false,
+                    Err(error) => return Err(child_error(error)),
+                }
+                reply.clear();
+            }
+            let poll = Deadline::after(run.now(), signals.wait.replace(Duration::ZERO)).min(bound);
+            if open {
+                match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, poll) {
+                    Ok(Message::Whole { .. }) => {
+                        self.watch.see(blaze_screen::Step::Waits);
+                        let taken = match needs.serve(&mut lazy, &inbox, &mut reply) {
+                            Ok(taken) => taken,
+                            Err(cause) => {
+                                // This group is waiting for code it will never receive.
+                                // Kill and reap before returning its typed outcome to the plan.
+                                run.kill().map_err(child_error)?;
+                                return Err(test_parent_error(&mut lazy, cause));
+                            }
+                        };
+                        self.watch.see(blaze_screen::Step::Answers);
+                        // The served prefix out, the rest kept in order, as run_loop.rs does
+                        // (`drain` wants the nightly-only allocator trait of the vec's allocator).
+                        let left = inbox.len() - taken;
+                        inbox.copy_within(taken.., 0);
+                        inbox.truncate(left);
+                        continue;
+                    }
+                    Ok(Message::Closed) => open = false,
+                    Ok(Message::Deadline) => {}
+                    Err(error) => return Err(child_error(error)),
                 }
             }
+            let look = if open { Deadline::PASSED } else { poll };
+            if let Some(how) = child_outcome(run.wait(look).map_err(child_error)?) {
+                break how;
+            }
+        };
+        // The reaped child's remaining output belongs to its own capture.
+        let drain_until = Deadline::after(run.now(), DRAIN_AFTER);
+        while pipes.iter().any(Option::is_some) && !drain_until.passed(run.now()) {
+            let poll = Deadline::after(run.now(), signals.wait.replace(Duration::ZERO)).min(drain_until);
+            drain_pipes(&mut pipes, output, poll)?;
+            if pipes.iter().any(Option::is_some) {
+                next_turn().await;
+            }
         }
-        Ok(())
+        Ok(ended)
     }
 }
 
-impl RunChild for Drained<'_, '_> {
-    fn now(&self) -> Duration {
-        self.run.now()
+fn child_outcome(ended: Ended) -> Option<How> {
+    match ended {
+        Ended::Exited(0) => Some(How::Reported(Said::Returned)),
+        Ended::Exited(code) => Some(How::NoReport { code, torn: 0 }),
+        Ended::Signaled(number) => Some(How::Signal { number }),
+        Ended::Deadline => None,
     }
+}
 
-    fn recv_message<A: core::alloc::Allocator>(&mut self, into: &mut std::vec::Vec<u8, A>, most: u32, deadline: Deadline) -> Result<Message, ProcError> {
-        loop {
-            self.drain_until(Deadline::PASSED)?;
-            let slice = Deadline::after(self.run.now(), DRAIN_EVERY).min(deadline);
-            match self.run.recv_message(into, most, slice)? {
-                Message::Deadline if !deadline.passed(self.run.now()) => continue,
-                said => return Ok(said),
+/// At most a pipeful from each stream per turn, so a writer that never stops cannot starve
+/// another child's first-call channel or deadline.
+fn drain_pipes(pipes: &mut [Option<OutPipe>; 2], output: &mut Output<'_>, by: Deadline) -> Result<(), OneError> {
+    let mut chunk = [0u8; 16 * 1024];
+    for slot in pipes {
+        for _ in 0..4 {
+            let Some(pipe) = slot.as_ref() else { break };
+            match pipe.read(&mut chunk, by).map_err(OneError::Pipe)? {
+                Piped::Bytes(n) => output.push(&chunk[..n]),
+                Piped::Closed => *slot = None,
+                Piped::Deadline => break,
             }
         }
     }
-
-    fn send(&mut self, bytes: &[u8], deadline: Deadline) -> Result<(), ProcError> {
-        self.run.send(bytes, deadline)
-    }
-
-    fn wait(&mut self, deadline: Deadline) -> Result<Ended, ProcError> {
-        loop {
-            self.drain_until(Deadline::PASSED)?;
-            let slice = Deadline::after(self.run.now(), DRAIN_EVERY).min(deadline);
-            match self.run.wait(slice)? {
-                Ended::Deadline if !deadline.passed(self.run.now()) => continue,
-                ended => return Ok(ended),
-            }
-        }
-    }
-
-    fn kill(&mut self) -> Result<Ended, ProcError> {
-        self.run.kill()
-    }
-
-    fn terminate(&mut self) -> Result<(), ProcError> {
-        self.run.terminate()
-    }
+    Ok(())
 }
 
 /// The front of one test's run: the command's names records and body ids (made once for the
 /// suite, shared by every test), the roots of row n's test fn (test_roots.rs).
 pub(crate) struct TestFront<'s, 'h, 'r> {
+    pub harness: bool,
     pub names: NamesRecords<'h>,
     pub ids: &'s RunIds<'h>,
     pub builder: Builder,
@@ -712,7 +994,7 @@ impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
     type Maker = Maker<'h>;
 
     fn start(&mut self) -> Result<Roots<'r>, ParentError> {
-        test_roots(self.names.records, self.test, self.names.lang_crates, self.builder.settings.panic, self.names.frame, self.tables, self.alloc).map_err(ParentError::Roots)
+        entry_roots(self.harness, self.names, self.test, self.builder, self.tables, self.alloc).map_err(ParentError::Roots)
     }
 
     fn ids(&mut self) -> Result<&'s RunIds<'h>, ParentError> {
@@ -729,6 +1011,17 @@ impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
         use blaze_ladder::front2::source::NamesSource;
         let lib = self.names.records.key_beginning(item.0.to_be_bytes())?;
         blaze_ladder::front2::item_shown::ItemShown::of_lib(self.names.records, lib).path().map(Box::from)
+    }
+
+    fn named(&mut self, maker: Option<&Maker<'h>>, tabled: ItemKey, name: &[u8]) -> crate::run_fault::Named {
+        use crate::run_fault::Named;
+        if let Some(shown) = maker.and_then(|maker| maker.instance_shown(tabled, name)) {
+            return Named::Shown { item: shown.item, args: shown.args };
+        }
+        match self.path_of(tabled) {
+            Some(path) => Named::Path(path),
+            None => Named::Item(tabled),
+        }
     }
 
     fn site_shown(&mut self, maker: Option<&Maker<'h>>, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
@@ -777,58 +1070,94 @@ fn made_or_there(cx: &Cx, dir: &Dir<ReadWrite>, name: &str) -> Result<Dir<ReadWr
     }
 }
 
-/// What one `blaze test` request hands the driver: the test unit's names records and body ids
-/// (main.rs's test arm makes them as the StartProgram arm does for `blaze run`), the builder,
-/// the command's store, the unit's tests record and the loop's config.
-/// Where the suite's names rows are, and its test unit, for the request `req` at its
-/// `Effect::StartTests` (main.rs), as run_names.rs `found` finds a program's: on a walk the
-/// answer's test unit ([`run_names::test_unit`]: a library and its test unit share a root, so
-/// the unit is found by its tests record, not by a path), its crates, and their rows written at
-/// the certificate; on a hit the certificate's rows, the unit found among them. `None`: the
-/// request stood and the store holds no rows, so the command answers in full.
-pub(crate) fn found_tests<'m>(
-    cx: &Cx,
-    req: &blaze_drive::Request<'_>,
-    store: &mut dyn Store<'m>,
-    kept: &mut Kept,
-    read: &mut EngineRecords<'m>,
-    heap: &'static blaze_own::Heap,
-    scratch: &Frame,
-) -> Result<Option<(Found<'m>, TestUnit<'m>)>, RunNamesError> {
-    if crate::run_ids::walked(req) {
-        let unit = run_names::test_unit(cx, &Walked(req), store, kept, read, heap, scratch)?;
-        let program = run_names::program_of(cx, &Walked(req), Owner::At(unit.at), store, kept, read, heap, scratch)?;
-        run_names::put(cx, &program, req.certificate(), store, heap)?;
-        return Ok(Some((Found::Walked(program), unit)));
+struct JsonString<'a>(&'a str);
+
+impl fmt::Display for JsonString<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_char('"')?;
+        for c in self.0.chars() {
+            match c {
+                '"' | '\\' => write!(f, "\\{c}")?,
+                c if c < ' ' => write!(f, "\\u{:04x}", c as u32)?,
+                c => f.write_char(c)?,
+            }
+        }
+        f.write_char('"')
     }
-    let Some(rows) = run_names::stood(cx, req.certificate(), store)? else { return Ok(None) };
-    let unit = run_names::test_unit(cx, &rows, store, kept, read, heap, scratch)?;
-    Ok(Some((Found::Stood(rows), unit)))
+}
+
+/// Listing reads test rows in certificate inventory order without starting a launcher.
+pub(crate) fn list(cx: &Cx, suites: &[(Found<'_>, TestUnit<'_>)], config: LoopConfig<'_>, out: &bstd::out::Out, frame: &Frame) -> Result<Status, DriveError> {
+    use blaze_run::report::Format;
+    let erased = blaze_own::Erased::new(frame);
+    let plan = blaze_run::plan::Plan::new(config.plan, erased.handle()).map_err(LoopError::from)?;
+    let (mut tests, mut benches) = (0usize, 0usize);
+    for (_, unit) in suites {
+        let record = unit.tests;
+        if record.len() == 0 {
+            match config.style.format {
+                Format::Text => out.line(cx, format_args!("{}/{}: 0 tests", unit.package, unit.target)),
+                Format::Json => out.line(cx, format_args!("{{\"event\":\"empty_suite\",\"package\":{},\"target\":{}}}", JsonString(unit.package), JsonString(unit.target))),
+            }.map_err(|_| DriveError::Print)?;
+        }
+        for at in 0..record.len() {
+            let row = asked(*unit, record_row(record, at)?, &[]);
+            if record.harnessed() && !plan.lets_through(&row) {
+                continue;
+            }
+            let kind = if row.bench { benches += 1; "bench" } else { tests += 1; "test" };
+            match config.style.format {
+                Format::Text => out.line(cx, format_args!("{}/{}/{}: {kind}", unit.package, unit.target, row.path)),
+                Format::Json => out.line(cx, format_args!("{{\"event\":\"listed\",\"package\":{},\"target\":{},\"path\":{},\"kind\":\"{kind}\"}}", JsonString(unit.package), JsonString(unit.target), JsonString(row.path))),
+            }.map_err(|_| DriveError::Print)?;
+        }
+    }
+    match config.style.format {
+        Format::Text => out.line(cx, format_args!("{tests} tests, {benches} benchmarks")),
+        Format::Json => out.line(cx, format_args!("{{\"event\":\"listed_summary\",\"tests\":{tests},\"benches\":{benches}}}")),
+    }.map_err(|_| DriveError::Print)?;
+    Ok(Status { failed: 0, not_run: 0, check_errors: 0 })
 }
 
 pub(crate) struct Suite<'s, 'h> {
-    pub io: &'s Io,
+    pub unit: TestUnit<'s>,
     pub names: NamesRecords<'h>,
-    pub ids: &'s RunIds<'h>,
     pub builder: Builder,
-    pub lent: &'s CommandLent,
-    /// The unit's tests record (blaze-scope tests_record.rs), 16-aligned.
-    pub tests: &'s [u8],
-    pub config: LoopConfig<'s>,
-    /// The check's errors: a suite whose check failed runs nothing (test_loop.rs `Checked`).
-    pub check_errors: u32,
-    pub tables: Alloc<'static>,
-    pub watch: &'s dyn Watch,
 }
 
-/// THE COMMAND: one suite run, test by test, the report's lines on the output stream as they
-/// come (each failure, each `not kept <test>: <why>` line, the summary). On the error stream:
-/// a run's own error (blaze's, not a test's), and the one closing [`Unkept`] line counting the
-/// records filed but not written. The loop's status (main.rs ends
-/// with `FAILED` unless `failed`, `not_run` and `check_errors` are all 0), or what stopped it.
-pub(crate) fn run_suite(cx: &Cx, suite: Suite<'_, '_>, frame: &Frame) -> Result<Status, DriveError> {
-    let cx = cx.span("blaze test: the suite");
-    let io = suite.io;
+/// The child pool addresses rows across the request. Each launch and precheck uses
+/// the row's own target, frontend and temporary directory.
+#[derive(Clone, Copy)]
+struct Location {
+    suite: SuiteId,
+    row: u32,
+}
+
+struct Selected<'r, T> {
+    suites: &'r mut [T],
+    rows: &'r [Location],
+}
+
+impl Refuse for Selected<'_, EntryCheck<'_, '_>> {
+    fn refusal(&mut self, flat: u32) -> Result<Option<&str>, OneError> {
+        let loc = self.rows.get(flat as usize).ok_or(OneError::NoRow { row: flat })?;
+        self.suites[loc.suite.0 as usize].refusal(loc.row)
+    }
+}
+
+impl RunOne for Selected<'_, Launched<'_, '_>> {
+    async fn run(&self, flat: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<How, OneError> {
+        let loc = self.rows.get(flat as usize).ok_or(OneError::NoRow { row: flat })?;
+        self.suites[loc.suite.0 as usize].run(loc.row, budget, output, signals).await
+    }
+}
+
+#[expect(clippy::too_many_arguments, reason = "the command supplies the selected records and runtime capabilities")]
+pub(crate) fn run_suites<'h>(
+    cx: &Cx, io: &Io, suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, config: LoopConfig<'_>,
+    args: &[&str], lent: &CommandLent, tables: Alloc<'static>, watch: &dyn Watch, frame: &Frame,
+) -> Result<Status, DriveError> {
+    let cx = cx.span("blaze test: selected suites");
     let env = io.need_env().map_err(DriveError::Missing)?;
     let fs = io.need_fs().map_err(DriveError::Missing)?;
     let host = io.need_host().map_err(DriveError::Missing)?;
@@ -851,9 +1180,9 @@ pub(crate) fn run_suite(cx: &Cx, suite: Suite<'_, '_>, frame: &Frame) -> Result<
     let v2 = fs.home(&cx, home, &Path::new(".blaze/v2").map_err(|why| one(OneError::Path(why)))?).map_err(|why| one(OneError::Home(why)))?;
     let test = made_or_there(&cx, &v2, "test").map_err(one)?;
     let temps = made_or_there(&cx, &test, "tmp").map_err(one)?;
-    let pid = bstd::mem::format_in!(frame, "{}", host.pid());
-    let mine = made_or_there(&cx, &temps, pid.as_str()).map_err(one)?;
-    let temp = bstd::mem::format_in!(frame, "{home}/{TEMPS}/{}", pid.as_str());
+    let command = bstd::mem::format_in!(frame, "{}-{}", host.pid(), clock.now().since_start().as_nanos());
+    let command_path = Path::new(command.as_str()).map_err(|why| one(OneError::Path(why)))?;
+    let mine = temps.make_dir(&cx, &command_path, Durable::No).map_err(|why| one(OneError::Temp(why)))?;
     let store = bstd::mem::format_in!(frame, "{home}/{RECORDS}");
     // 2. The launcher beside this binary, the spawner, the command's environment.
     let exe = host.exe().map_err(DriveError::Missing)?;
@@ -861,32 +1190,55 @@ pub(crate) fn run_suite(cx: &Cx, suite: Suite<'_, '_>, frame: &Frame) -> Result<
     let spawner = host.spawner().map_err(DriveError::Missing)?;
     let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
     vars.extend(env.each());
-    // 3. The runner over one process per test, one at a time.
-    let tests = TestsRecord::open(suite.tests).map_err(DriveError::Record)?;
-    let ids = ids_of(&tests, alloc).map_err(DriveError::Record)?;
-    let mut config = suite.config;
-    config.plan.width = 1;
-    let launched = Launched {
-        cx: &cx,
-        spawner: &spawner,
-        launcher: launcher.as_str(),
-        records: &records,
-        store: store.as_str(),
-        temps: &mine,
-        temp: temp.as_str(),
-        env: vars.as_slice(),
-        tests,
-        names: suite.names,
-        ids: suite.ids,
-        builder: suite.builder,
-        lent: suite.lent,
-        tables: suite.tables,
-        watch: suite.watch,
-    };
+    let select = blaze_run::plan::Plan::new(config.plan, alloc).map_err(LoopError::from)?;
+    let mut dirs = Vec::with_capacity_in(suites.len(), frame);
+    for index in 0..suites.len() {
+        let named = bstd::mem::format_in!(frame, "{index}");
+        let suite_path = Path::new(named.as_str()).map_err(|why| one(OneError::Path(why)))?;
+        let dir = mine.make_dir(&cx, &suite_path, Durable::No).map_err(|why| one(OneError::Temp(why)))?;
+        let temp = bstd::mem::format_in!(frame, "{home}/{TEMPS}/{}/{index}", command.as_str());
+        dirs.push((dir, temp));
+    }
+    let mut launches = Vec::with_capacity_in(suites.len(), alloc);
+    let mut checks = Vec::with_capacity_in(suites.len(), alloc);
+    let mut locations = Vec::new_in(alloc);
+    let mut owners = Vec::new_in(alloc);
+    let mut rows = Vec::new_in(alloc);
+    let mut filtered = 0u32;
+    for (index, suite) in suites.iter().enumerate() {
+        let unit = suite.unit;
+        let tests = unit.tests;
+        let (dir, temp) = &dirs[index];
+        let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
+        launches.push(Launched {
+            cx: &cx, spawner: &spawner, launcher: launcher.as_str(), records: &records, store: store.as_str(),
+            temps: dir, temp: temp.as_str(), env: vars.as_slice(), tests, names: suite.names, ids,
+            builder: suite.builder, lent, tables, watch,
+            args: if tests.harnessed() { &[] } else { args },
+        });
+        checks.push(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, said: String::new_in(alloc) });
+        for at in 0..tests.len() {
+            let mut row = asked(unit, record_row(tests, at)?, args);
+            // Custom harnesses receive the raw arguments themselves.
+            if tests.harnessed() && !select.lets_through(&row) {
+                filtered = filtered.checked_add(1).ok_or(DriveError::TooManyRows { count: u32::MAX as usize + 1 })?;
+                continue;
+            }
+            if suites.len() > 1 {
+                let path = bstd::mem::format_in!(frame, "{}/{}/{}", unit.package, unit.target, row.path);
+                row.path = crate::work::held_str(path.as_str(), frame);
+            }
+            rows.push(row);
+            owners.push(suite_id);
+            locations.push(Location { suite: suite_id, row: u32::try_from(at).map_err(|_| DriveError::TooManyRows { count: tests.len() })? });
+        }
+    }
     let now = || Nanos(u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX));
-    let zygotes = OneEach::new(launched, now, alloc);
+    let launched = Selected { suites: launches.as_mut_slice(), rows: &locations };
+    let mut refuse = Selected { suites: checks.as_mut_slice(), rows: &locations };
+    let signals = Signals::default();
+    let zygotes = OneEach::new(&launched, &signals, now, alloc, tables)?;
     let mut runner = Runner::new(zygotes, &config.plan, TestHost::THIS, alloc);
-    let mut refuse = EntryCheck::new(tests, suite.names, suite.builder, suite.tables, alloc);
     let mut unkept = Unkept::default();
     let mut print = |bytes: &[u8]| -> Result<(), DriveError> {
         for chunk in bytes.utf8_chunks() {
@@ -897,16 +1249,16 @@ pub(crate) fn run_suite(cx: &Cx, suite: Suite<'_, '_>, frame: &Frame) -> Result<
         }
         Ok(())
     };
-    let status = drive(config, suite.tests, ids.as_slice(), suite.check_errors, &mut runner, &mut refuse, &mut unkept, &mut print, alloc);
+    let status = drive(config, rows, &owners, filtered, &mut runner, &mut refuse, &mut unkept, &mut print, alloc);
     // A run that stopped in blaze: ONE line naming the test, what failed and its cause, then
     // the command's own error (`OneStopped`) says the line above is why (rule 19). The
     // runner's `Seam` error says only that one stopped, so it is not shown.
     if let (Err(DriveError::Run(_)), Some((row, failed))) = (&status, runner.zygotes().failed.as_ref()) {
-        match tests.row(*row as usize) {
-            Ok(Some(test)) => err.line(&cx, format_args!("blaze test: the test `{}` could not be run: {failed}", test.path)),
-            _ => err.line(&cx, format_args!("blaze test: the test at row {row} of the tests record could not be run: {failed}")),
-        }
-        .map_err(|_| DriveError::Print)?;
+        let location = locations.get(*row as usize).ok_or(one(OneError::NoRow { row: *row }))?;
+        let unit = suites[location.suite.0 as usize].unit;
+        let tests = unit.tests;
+        let path = record_row(tests, location.row as usize)?.path;
+        err.line(&cx, format_args!("blaze test: the test `{}/{}/{path}` could not be run: {failed}", unit.package, unit.target)).map_err(|_| DriveError::Print)?;
         return Err(DriveError::OneStopped);
     }
     let status = status?;

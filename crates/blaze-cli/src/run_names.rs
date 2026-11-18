@@ -34,6 +34,7 @@ use blaze_ladder::front2::source::{Log, Records};
 use blaze_ladder::run::make_one::NamesRecords;
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_scope::items_record::ItemsRecordError;
+use blaze_scope::tests_record::{ShouldPanic, TestRow, TestsRecord, TestsRecordError};
 use blaze_world::crate_list::{CrateGraph, CrateList};
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
@@ -287,7 +288,7 @@ impl Answered for Stood<'_> {
 }
 
 /// The record of `graph` and `rows` (each crate's index and row; any order, one each) in `out`.
-pub(crate) fn encode(graph: Input, rows: &[(usize, Input)], out: &mut AVec<'_, u8>, scratch: Alloc<'_>) -> Result<(), RunNamesError> {
+pub(crate) fn encode<A: core::alloc::Allocator>(graph: Input, rows: &[(usize, Input)], out: &mut Vec<u8, A>, scratch: Alloc<'_>) -> Result<(), RunNamesError> {
     if rows.len() > MOST_ROWS {
         return Err(RunNamesError::Form(FormError::Rows { count: rows.len() }));
     }
@@ -342,10 +343,10 @@ pub(crate) enum RunNamesError {
     TwoProgramCrates { root: std::boxed::Box<str>, first: &'static str, second: &'static str },
     /// No member crate is at place `at` of the list ([`Owner::At`]).
     NoMemberAt { at: usize },
-    /// `test`: no member crate of the answer is a test unit (none holds a tests record).
-    NoTestUnit,
-    /// `test`: two member crates are test units; one suite a command is run yet.
-    TwoTestUnits { first: &'static str, second: &'static str },
+    TestGraph(blaze_unit_graph::record::RecordRefused),
+    TestMap { unit: usize, why: &'static str },
+    TestTarget { package: &'static str, crate_name: &'static str, why: &'static str },
+    TestRecord { package: &'static str, crate_name: &'static str, why: TestsRecordError },
     /// The answer holds no `CrateScope` row for a crate the program's check reads.
     NotAnswered { crate_name: &'static str },
     /// A crate's `CrateScope` record could not be read in place as its names, items and
@@ -374,11 +375,10 @@ impl fmt::Display for RunNamesError {
             RunNamesError::NoProgramCrate { root } => write!(f, "no member crate of the crate list has its root at `{root}`, the program `blaze run` starts ({at})"),
             RunNamesError::TwoProgramCrates { root, first, second } => write!(f, "two crates of the crate list, `{first}` and `{second}`, have their root at `{root}` ({at})"),
             RunNamesError::NoMemberAt { at: place } => write!(f, "the crate list has no member crate at place {place} ({at})"),
-            RunNamesError::NoTestUnit => write!(f, "no member crate of the answer is compiled as a test unit (none holds a tests record), so `blaze test` has no test to run ({at})"),
-            RunNamesError::TwoTestUnits { first, second } => write!(
-                f,
-                "`{first}` and `{second}` are both test units: `blaze test` runs one suite a command yet (test.md, \"The other targets\"; {at})"
-            ),
+            RunNamesError::TestGraph(why) => write!(f, "the test command's unit graph: {why}"),
+            RunNamesError::TestMap { unit, why } => write!(f, "the test command's crate map at graph unit {unit}: {why} ({at})"),
+            RunNamesError::TestTarget { package, crate_name, why } => write!(f, "package `{package}`, test target crate `{crate_name}`: {why} ({at})"),
+            RunNamesError::TestRecord { package, crate_name, why } => write!(f, "package `{package}`, target crate `{crate_name}` tests record: {why} ({at})"),
             RunNamesError::NotAnswered { crate_name } => write!(f, "the answer holds no `CrateScope` row for crate `{crate_name}`, which the program's check reads ({at})"),
             RunNamesError::Records { crate_name, error } => write!(f, "crate `{crate_name}`: {error} ({at})"),
             RunNamesError::Scope { rule } => write!(f, "the program's check scope was refused: {rule}"),
@@ -405,60 +405,231 @@ pub(crate) enum Owner<'s> {
     /// The one rooted at this checkout-relative path: `run`'s picked program (run_package.rs
     /// `Program::root`).
     Root(&'s str),
-    /// The one at this place in the list: `test`'s unit ([`test_unit`]), which shares its root
+    /// The one at this place in the list: `test`'s unit ([`TestUnit`]), which shares its root
     /// with the library it is compiled from.
     At(usize),
 }
 
-/// One test unit of the answer: its place in the crate list, and its tests record (the
-/// `tests` section of its `CrateScope` record, names/sections.rs), in place.
+/// One runnable Cargo unit, even when the unit has no test functions.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TestUnit<'m> {
     pub(crate) at: usize,
-    pub(crate) tests: &'m [u8],
+    pub(crate) key: blaze_id::CrateItemKey,
+    pub(crate) package: &'static str,
+    pub(crate) target: &'m str,
+    pub(crate) tests: TestRows<'m>,
     /// Its edition, as its items record says (front_load.rs `CrateRecords::edition`): what its
     /// code is built for (run_parent.rs `builder_for`).
     pub(crate) edition: blaze_surface::Edition,
 }
 
-/// The answer's one test unit: the member crate whose `CrateScope` record holds a tests
-/// section (a unit compiled without `test` has an empty one, names/sections.rs), read in place
-/// through `read`. A member with no row in `answered` is outside its scope: a walk answers
-/// every member, and on a hit the rows are the suite's scope alone ([`Stood`]), the test unit
-/// among them. More than one test unit is refused by name ([`RunNamesError::TwoTestUnits`]):
-/// the record of the rows at the certificate holds one scope (NOT DONE: one suite per unit,
-/// the rows keyed by the unit). COST: one in-place read of each member's record, and the test
-/// unit's records opened once (the read [`program_of`] then hits).
-pub(crate) fn test_unit<'m>(
-    cx: &Cx,
-    answered: &dyn Answered,
-    store: &mut dyn Store<'m>,
-    kept: &mut Kept,
-    read: &mut EngineRecords<'m>,
-    heap: &'static blaze_own::Heap,
-    scratch: &Frame,
-) -> Result<TestUnit<'m>, RunNamesError> {
-    let _cx = cx.span("run names: the test unit");
-    let graph = answered.graph().ok_or(RunNamesError::NoGraph)?;
-    let list = kept.list(cx, store, &graph, scratch).map_err(stored)?.ok_or(RunNamesError::WorldNotMade)?;
-    let mut found: Option<TestUnit<'m>> = None;
-    for at in 0..CrateGraph::len(&list) {
-        if !list.member(at) {
-            continue;
-        }
-        let Some(input) = answered.crate_input(at, blaze_drive::key::crate_scope_name(&list.key(at))) else { continue };
-        let name = CrateGraph::name(&list, at);
-        let tests = read.tests(cx, store, &input).map_err(|error| unread(name, error))?;
-        if tests.is_empty() {
-            continue;
-        }
-        if let Some(first) = found {
-            return Err(RunNamesError::TwoTestUnits { first: CrateGraph::name(&list, first.at), second: name });
-        }
-        let edition = read.records(cx, store, &input, list.key(at), heap.alloc()).map_err(|error| unread(name, error))?.edition;
-        found = Some(TestUnit { at, tests, edition });
+/// A harness supplies one row per marked function. A custom harness supplies its own main
+/// as the single runnable entry, and has no tests section in its scope record.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TestRows<'m> {
+    Harness(TestsRecord<'m>),
+    Main(blaze_id::ItemKey),
+}
+
+impl<'m> TestRows<'m> {
+    pub(crate) fn harnessed(self) -> bool {
+        matches!(self, Self::Harness(_))
     }
-    found.ok_or(RunNamesError::NoTestUnit)
+
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Harness(tests) => tests.len(),
+            Self::Main(_) => 1,
+        }
+    }
+
+    pub(crate) fn row(self, at: usize) -> Result<Option<TestRow<'m>>, TestsRecordError> {
+        match self {
+            Self::Harness(tests) => tests.row(at),
+            Self::Main(key) => Ok((at == 0).then_some(TestRow { key, path: "main", ignore: None, should_panic: ShouldPanic::No, bench: false })),
+        }
+    }
+}
+
+pub(crate) struct TestInventory<'m> {
+    pub(crate) suites: AVec<'static, (Found<'m>, TestUnit<'m>)>,
+    walked: Option<CrateList<'static>>,
+}
+
+impl TestInventory<'_> {
+    pub(crate) fn list(&self) -> Option<&CrateList<'static>> {
+        self.walked.as_ref()
+    }
+}
+
+/// One row of the graph's unit-to-crate map per unit, including those with no crate.
+/// The world's indices and the crate-list indices have different orders: only their
+/// crate keys join them. Root paths are shared by libraries, binaries and their harnesses.
+fn test_map(
+    names: &crate::names::Names<'_>,
+    list: &CrateList<'_>,
+    alloc: Alloc<'static>,
+) -> Result<AVec<'static, u8>, RunNamesError> {
+    let world = names.world();
+    let mut bytes = AVec::with_capacity_in(world.crate_of_unit.len() * 4, alloc);
+    for (unit, krate) in world.crate_of_unit.iter().enumerate() {
+        let row = match krate {
+            None => u32::MAX,
+            Some(at) => {
+                let key = world.crates[*at as usize].input.key;
+                let row = list.find(key).ok_or(RunNamesError::TestMap { unit, why: "the world's crate key is absent from its crate list" })?;
+                u32::try_from(row).map_err(|_| RunNamesError::TestMap { unit, why: "its crate index exceeds u32" })?
+            }
+        };
+        bytes.extend_from_slice(&row.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+/// Cargo's runnable targets. The graph includes extra targets compiled only to check them,
+/// including examples and benches by default. A required feature has to be enabled on the unit.
+fn test_target<'a>(unit: &'a blaze_unit_graph::Unit<'_>) -> Option<(&'static str, &'a str, bool)> {
+    use blaze_unit_graph::UnitKind;
+    let (kind, extra) = match &unit.kind {
+        UnitKind::Test { bin: None } => {
+            // `package/lib` names its sole library. Show a distinct manifest library name too.
+            let target = if unit.crate_name == unit.name { "" } else { unit.crate_name.as_str() };
+            return Some(("lib", target, true));
+        }
+        UnitKind::Test { bin: Some(name) } => return Some(("bin", name.as_str(), true)),
+        UnitKind::IntegrationTest(extra) => ("test", extra),
+        UnitKind::Example(extra) => ("example", extra),
+        UnitKind::Bench(extra) => ("bench", extra),
+        _ => return None,
+    };
+    (extra.test && extra.required_features.iter().all(|f| unit.features.binary_search(f).is_ok()))
+        .then_some((kind, extra.name.as_str(), extra.harness))
+}
+
+/// Find the user-written main by the same item facts as the program entry. An associated
+/// function named main is not the program's entry.
+fn main_test(
+    records: CrateRecords<'_>, package: &'static str, crate_name: &'static str, alloc: Alloc<'_>,
+) -> Result<blaze_id::ItemKey, RunNamesError> {
+    let items_error = |why| RunNamesError::Items { crate_name, why };
+    let items = blaze_scope::items_record::ItemsRecord::open(records.items, alloc).map_err(items_error)?;
+    for row in 0..items.items() {
+        let Some(item) = items.item_at(row).map_err(items_error)? else { continue };
+        if item.module == items.root_module() && item.name == Some("main") && item.kind == blaze_surface::ItemKind::Function
+            && items.member_owner(item.key).map_err(items_error)?.is_none()
+        {
+            return Ok(item.key);
+        }
+    }
+    Err(RunNamesError::TestTarget { package, crate_name, why: "the harnessless target has no main function in its crate root" })
+}
+
+/// Names rows for a test certificate cover all settled crates, independent of this invocation's
+/// package selection. A later command can use the same certificate with a different selection.
+/// The separate graph map binds each Cargo unit number to its row of this exact crate list.
+#[expect(clippy::too_many_arguments, reason = "the request supplies its capabilities and record readers")]
+pub(crate) fn found_tests<'s, 'f: 's, 'm: 's>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    req: &blaze_drive::Request<'_>,
+    store: &mut dyn Store<'m>,
+    facts: &mut crate::work::Facts<'f, impl crate::sweep::Stamps>,
+    read: &mut EngineRecords<'m>,
+    selected: &[&str],
+    heap: &'static blaze_own::Heap,
+    frame: &'f Frame,
+) -> Result<Option<TestInventory<'s>>, RunNamesError> {
+    let walk = crate::run_ids::walked(req);
+    let (answer, list) = if walk {
+        let walked = Walked(req);
+        let graph = walked.graph().ok_or(RunNamesError::NoGraph)?;
+        let list = facts.bodies.list(cx, store, &graph, frame).map_err(stored)?.ok_or(RunNamesError::WorldNotMade)?;
+        let mut rows = AVec::new_in(heap.alloc());
+        for at in 0..CrateGraph::len(&list) {
+            if let Some(input) = walked.crate_input(at, blaze_drive::key::crate_scope_name(&list.key(at))) {
+                rows.push((at, input));
+            }
+        }
+        let mut encoded = Vec::with_capacity_in(HEAD + ROW * rows.len(), frame);
+        encode(graph, &rows, &mut encoded, heap.alloc())?;
+        store.put(cx, inputs_key(req.certificate()), &encoded).map_err(stored)?;
+        (Stood::open(encoded.leak()).map_err(RunNamesError::Form)?, list)
+    } else {
+        let Some(answer) = stood(cx, req.certificate(), store)? else { return Ok(None) };
+        let list = facts.bodies.list(cx, store, &answer.graph, frame).map_err(stored)?.ok_or(RunNamesError::WorldNotMade)?;
+        (answer, list)
+    };
+    let graph = answer.graph;
+    let mut digest = Hasher::new("blaze test: unit rows of a sealed unit graph 1");
+    digest.id(&graph.out);
+    let map_key = Key(digest.finish());
+    let made;
+    let mapping = if let Some(held) = store.get(cx, map_key).map_err(stored)? {
+        held.bytes
+    } else {
+        let erased = blaze_own::Erased::new(frame);
+        crate::body_types::names_world(cx, root, store, facts, &graph, frame, erased.handle())
+            .map_err(stored)?.map_err(|why| RunNamesError::Scope { rule: why })?;
+        let names = facts.names.as_ref().ok_or(RunNamesError::WorldNotMade)?;
+        made = test_map(names, &list, heap.alloc())?;
+        store.put(cx, map_key, &made).map_err(stored)?;
+        made.as_slice()
+    };
+    let decoded;
+    let units = match facts.names.as_ref() {
+        Some(names) => &names.graph().units,
+        None => {
+            let bytes = crate::work::payload(cx, store, &graph, frame).map_err(stored)?;
+            decoded = blaze_unit_graph::record::decode(bytes.unit_graph(graph.name).map_err(stored)?.graph, heap.alloc()).map_err(RunNamesError::TestGraph)?;
+            &decoded.graph.units
+        }
+    };
+    if mapping.len() != units.len() * 4 {
+        return Err(RunNamesError::TestMap { unit: units.len(), why: "the number of indices differs from the unit graph" });
+    }
+    let mut suites = AVec::new_in(heap.alloc());
+    for (index, unit) in units.iter().enumerate() {
+        let Some((kind, target_name, harness)) = test_target(unit) else { continue };
+        // run_package::test_packages orders the selection by package name.
+        if selected.binary_search(&unit.name.as_str()).is_err() {
+            continue;
+        }
+        let at = u32_at(mapping, index * 4) as usize;
+        if at >= CrateGraph::len(&list) || !list.member(at) {
+            return Err(RunNamesError::TestMap { unit: index, why: "the selected target has no member crate at its mapped index" });
+        }
+        let name = CrateGraph::name(&list, at);
+        let key = list.key(at);
+        let input = answer.crate_input(at, blaze_drive::key::crate_scope_name(&key)).ok_or(RunNamesError::NotAnswered { crate_name: name })?;
+        let records = read.records(cx, store, &input, key, heap.alloc()).map_err(|why| unread(name, why))?;
+        let Some((package, version)) = list.env_facts(at).package else {
+            return Err(RunNamesError::TestMap { unit: index, why: "the selected target's crate has no package" });
+        };
+        if package != unit.name.as_str() || version != unit.version.as_str() || name != unit.crate_name.as_str() {
+            return Err(RunNamesError::TestMap { unit: index, why: "the mapped crate does not belong to this unit" });
+        }
+        let tests = if harness {
+            let bytes = read.tests(cx, store, &input).map_err(|why| unread(name, why))?;
+            if bytes.is_empty() {
+                return Err(RunNamesError::TestTarget { package, crate_name: name, why: "the harnessed target's scope has no tests record" });
+            }
+            let rows = TestsRecord::open(bytes).map_err(|why| RunNamesError::TestRecord { package, crate_name: name, why })?;
+            if rows.key() != key {
+                return Err(RunNamesError::TestTarget { package, crate_name: name, why: "the tests record belongs to a different unit" });
+            }
+            TestRows::Harness(rows)
+        } else {
+            TestRows::Main(main_test(records, package, name, heap.alloc())?)
+        };
+        let target = if target_name.is_empty() {
+            kind
+        } else {
+            crate::work::held_str(bstd::mem::format_in!(frame, "{kind}:{target_name}").as_str(), frame)
+        };
+        suites.push((Found::Stood(answer), TestUnit { at, key, package, target, tests, edition: records.edition }));
+    }
+    suites.sort_unstable_by(|(_, a), (_, b)| (a.package, a.target, a.key).cmp(&(b.package, b.target, b.key)));
+    Ok(Some(TestInventory { suites, walked: walk.then_some(list) }))
 }
 
 /// The program's crates from `answered`: the crate list of its `UnitGraph` row (read once a

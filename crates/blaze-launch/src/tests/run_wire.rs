@@ -16,6 +16,7 @@ enum Owned {
     Need { need: Needed, thread: u64 },
     Declare { pairs: Vec<Declared> },
     Publish { slot: u32, optimized: bool, record: [u8; 32] },
+    Positioned { slot: u32, optimized: bool, record: [u8; 32], values: Vec<u8> },
     Failed { need: Needed, why: OwnedFailure },
 }
 
@@ -42,6 +43,12 @@ impl Owned {
                 slot: Slot(*slot),
                 tier: if *optimized { Tier::Optimized } else { Tier::Zero },
                 record: RecordId(*record),
+            }),
+            Owned::Positioned { slot, optimized, record, values } => Message::Down(Down::Positioned {
+                slot: Slot(*slot),
+                tier: if *optimized { Tier::Optimized } else { Tier::Zero },
+                record: RecordId(*record),
+                values,
             }),
             Owned::Failed { need, why } => {
                 let why = match why {
@@ -87,7 +94,7 @@ fn need(tape: &Tape) -> Needed {
 }
 
 fn owned(tape: &Tape) -> Owned {
-    match tape.below(4, "message") {
+    match tape.below(5, "message") {
         0 => Owned::Need { need: need(tape), thread: number(tape) },
         1 => {
             let count = tape.below(5, "pairs") as usize;
@@ -95,6 +102,12 @@ fn owned(tape: &Tape) -> Owned {
             Owned::Declare { pairs }
         }
         2 => Owned::Publish { slot: small(tape), optimized: tape.coin("optimized"), record: bytes32(tape) },
+        3 => Owned::Positioned {
+            slot: small(tape),
+            optimized: tape.coin("optimized"),
+            record: bytes32(tape),
+            values: (0..tape.range(1..8, "position fields")).flat_map(|_| small(tape).max(1).to_le_bytes()).collect(),
+        },
         _ => {
             let why = match tape.below(5, "failure") {
                 0 => OwnedFailure::Unresolved,
@@ -163,7 +176,7 @@ const NEED: [u8; 46] = [
     0, 0, 0, 42, // the frame's length
     0xa3, // a map of 3
     0x62, b'i', b'd', 0x01, //
-    0x63, b'r', b'u', b'n', 0x03, // the run schema
+    0x63, b'r', b'u', b'n', 0x04, // the run schema
     0x64, b'b', b'o', b'd', b'y', //
     0xa1, 0x64, b'N', b'e', b'e', b'd', //
     0xa2, //
@@ -176,7 +189,7 @@ const NEED: [u8; 46] = [
 /// Expected: passes with no output.
 #[test]
 fn a_need_by_slot_is_these_bytes() {
-    assert_eq!(RUN_SCHEMA, 3, "a schema step changes the pinned bytes: update NEED");
+    assert_eq!(RUN_SCHEMA, 4, "a schema step changes the pinned bytes: update NEED");
     let need = Up::Need { need: Needed::Slot(Slot(3)), thread: Thread(7) };
     assert_eq!(encoded(&Message::Up(need), 1), NEED);
     assert_eq!(cbor::check(&NEED[4..]).map_err(|it| it.to_string()), Ok(()));
@@ -195,6 +208,8 @@ fn what_is_not_a_run_message_is_refused_by_name() {
     other[9] = 0x01;
     assert_eq!(Up::decode(&other), Err(WireError::RunSchema { said: 1 }));
     assert!(WireError::RunSchema { said: 1 }.to_string().contains("schema 1"));
+    other[9] = 0x03;
+    assert_eq!(Down::decode(&other), Err(WireError::RunSchema { said: 3 }));
 
     // The patch protocol's `Need`: `{id, body, schema}` is refused at its second key.
     let mut patch = Vec::new();

@@ -458,88 +458,99 @@ fn head_body_world(text: &str) -> Io {
     io
 }
 
-fn one_fn_head_key_moved(now: &Answer) {
-    assert!(now.checked.from_last, "the edit used the stored answer");
-    assert_eq!(now.checked.signatures_entered, 1, "only the defining function's head entered");
-    let moved = now.checked.because.iter().any(|(group, n)| group.stage == Stage::Heads && group.cause == "key moved" && *n == 1);
-    assert!(moved, "the defining function entered by its source key: {}", entries(&now.checked));
-    println!("defining function head entered by its key: {}", now.checked.signatures_entered);
-}
-
-#[test]
-fn r5_a_local_fn_body_edit_enters_the_outer_head() {
-    let io = head_body_world("pub fn outer() -> u8 { fn local() -> u8 { 1 } local() }");
-    let _ = cold(&io, "R5 local fn");
-    write(&io, "src/lib.rs", "pub fn outer() -> u8 { fn local() -> u8 { 2 } local() }");
+fn only_fn_body_enters(label: &str, before: &str, after: &str) {
+    let io = head_body_world(before);
+    let first = cold(&io, label);
+    assert!(first.checked.signatures_entered > 0);
+    write(&io, "src/lib.rs", after);
     let now = request(&io, false);
-    settle(&io, "R5 local fn", &now, Oracle::Equal);
-    one_fn_head_key_moved(&now);
-}
-
-#[test]
-fn r5_an_opaque_return_body_edit_enters_its_head() {
-    // The fixture shelf has an empty prelude. Supply its Sized lang item in this crate.
-    const PREFIX: &str = "#![feature(lang_items)]\n#[lang = \"sized\"] pub trait Sized {}\n";
-    let io = head_body_world(&format!("{PREFIX}pub fn f() -> impl Sized {{ 1u8 }}"));
-    let _ = cold(&io, "R5 opaque return");
-    write(&io, "src/lib.rs", &format!("{PREFIX}pub fn f() -> impl Sized {{ 1u16 }}"));
-    let now = request(&io, false);
-    settle(&io, "R5 opaque return", &now, Oracle::Equal);
-    one_fn_head_key_moved(&now);
-}
-
-/// Plan the fixture's real signature parts with the body input removed from every fn.
-/// Leave the ordinary body parts, the read lists and the edited file itself intact.
-fn request_without_fn_head_bodies(io: &Io, text: &str) -> Answer {
-    use crate::engine_heads::{FnHeadBodies, PLANTED_HEAD_SOURCES, outline_head_source};
-
-    let edition = blaze_surface::Edition::E2024;
-    let outline = blaze_file_items::outline(text, edition, blaze_own::testing::heap().alloc());
-    let file = crate::signature::file_subject("src/lib.rs");
-    let sources = outline.items().iter().enumerate()
-        .filter(|(_, item)| crate::signature::is_signature_entry(&outline, item))
-        .map(|(at, item)| {
-            let name = crate::signature::signature_name(file, &outline, item, text);
-            let source = outline_head_source(&outline, blaze_surface::ItemIndex(at as u32), text, edition, FnHeadBodies::DropAll);
-            (name, source)
-        })
-        .collect();
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            PLANTED_HEAD_SOURCES.with_borrow_mut(|parts| parts.clear());
-        }
+    let row = settle(&head_body_world(after), label, &now, Oracle::Equal);
+    assert!(now.checked.from_last, "{label}: the edit used the stored answer");
+    assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 0, 1), "{label}: {}", entries(&now.checked));
+    assert_eq!(now.checked.seeds.bodies.refused, 0, "{label}: the body must import its frozen head");
+    for answer in [&first, &now] {
+        assert!(findings(&answer.lines).all(|line| !line.contains("error[")), "{label}: {:?}", answer.lines);
+        assert!(answer.lines.iter().all(|line| !line.starts_with("note: NOT checked: types")), "{label}: {:?}", answer.lines);
     }
-    assert!(PLANTED_HEAD_SOURCES.replace(sources).is_empty());
-    let _reset = Reset;
-    request(io, false)
 }
 
 #[test]
-#[ignore = "OPEN (first compile, 2026-11-18 04:41): this control does NOT fail: with every fn body dropped from the head keys the edit still answers as a fresh world, because adding the block's impl moves the file's items, so the heads re-enter by `read moved CrateScope` whatever their keys hold. The rule it stands for (a fn whose body holds items keeps its body in its head's key) is so far shown by no planted bug: find an edit that moves no name and goes stale, or drop the rule (lane CX19)"]
-#[should_panic(expected = "row R5 dropped fn bodies: the answer after the edit is a fresh world's")]
-fn r5_dropping_every_fn_body_from_heads_leaves_a_stale_answer() {
-    // A block's impl is visible outside the block (Reference, “Items”). The existing caller
-    // needs the first head the block contributes. Before the edit the outer head read no
-    // member of an impl there. Both versions already contain a local fn.
+fn r5_a_local_fn_body_edit_enters_only_the_enclosing_body() {
+    only_fn_body_enters(
+        "R5 local fn",
+        "pub fn outer() -> u8 { fn local() -> u8 { 1 } local() }",
+        "pub fn outer() -> u8 { fn local() -> u8 { 2 } local() }",
+    );
+}
+
+// The fixture shelf has an empty prelude. Supply the lang items these signatures use.
+const SIZED: &str = "#![feature(lang_items)]\n#[lang = \"sized\"] pub trait Sized {}\n";
+
+#[test]
+fn r5_an_opaque_hidden_type_changes_in_the_body() {
+    only_fn_body_enters("R5 opaque return", &format!("{SIZED}pub fn f() -> impl Sized {{ 1u8 }}"), &format!("{SIZED}pub fn f() -> impl Sized {{ 1u16 }}"));
+}
+
+#[test]
+fn r5_an_impl_trait_parameter_is_a_signature_input() {
+    let sig = "pub fn f(_: impl Sized) -> u8";
+    only_fn_body_enters("R5 impl parameter", &format!("{SIZED}{sig} {{ 1 }}"), &format!("{SIZED}{sig} {{ 2 }}"));
+}
+
+#[test]
+fn r5_an_async_body_edit_keeps_the_declared_future() {
+    let sig = "pub mod future { #[lang = \"future_trait\"] pub trait Future { #[lang = \"future_output\"] type Output; } }\npub async fn f() -> u8";
+    only_fn_body_enters("R5 async fn", &format!("{SIZED}{sig} {{ 1 }}"), &format!("{SIZED}{sig} {{ 2 }}"));
+}
+
+#[test]
+fn r5_a_refused_async_method_uses_its_signature_range() {
+    // A trait freezes a refused member's reason and range. The fixture has no Sized
+    // lang item. Making the body longer cannot change where its signature was refused.
+    const BEFORE: &str = "pub trait T { async fn f() {} }";
+    const AFTER: &str = "pub trait T { async fn f() { () } }";
+    let io = head_body_world(BEFORE);
+    let _ = cold(&io, "R5 refused async method");
+    let outline = blaze_file_items::outline(BEFORE, blaze_surface::Edition::E2024, blaze_own::testing::heap().alloc());
+    let name = crate::signature::signature_name(crate::signature::file_subject("src/lib.rs"), &outline, &outline.items()[0], BEFORE);
+    let (_, before) = super::engine_heads_once_tests::frozen_runs(&io, name);
+    let reason = b"an `async fn` in a program with no `Sized`";
+    assert!(before.windows(reason.len()).any(|part| part == reason), "the trait recorded the missing lang item");
+    write(&io, "src/lib.rs", AFTER);
+    let now = request(&io, false);
+    let fresh = head_body_world(AFTER);
+    let row = settle(&fresh, "R5 refused async method", &now, Oracle::Equal);
+    assert_eq!((row.heads, row.bodies), (0, 1));
+    let (_, after) = super::engine_heads_once_tests::frozen_runs(&fresh, name);
+    assert_eq!(before, after, "a signature refusal must have the same bytes in a fresh world");
+}
+
+#[test]
+fn r5_a_const_fn_body_edit_keeps_its_signature() {
+    only_fn_body_enters("R5 const fn", "pub const fn f() -> u8 { 1 }", "pub const fn f() -> u8 { 2 }");
+}
+
+#[test]
+fn r5_a_return_type_macro_reads_its_definition() {
+    let sig = "macro_rules! ty { () => { u8 } }\npub fn f() -> ty!()";
+    only_fn_body_enters("R5 return type macro", &format!("{sig} {{ 1 }}"), &format!("{sig} {{ 2 }}"));
+}
+
+#[test]
+fn r5_a_block_impl_reaches_its_caller_through_names() {
+    // An impl applies outside the block where it is declared. Adding the first method
+    // changes the answer to the caller's lookup even though outer() has the same signature.
     const BEFORE: &str = "pub struct S;\npub fn outer() { fn local() {} local(); }\npub fn read() -> u8 { S::value() }";
     const AFTER: &str = "pub struct S;\npub fn outer() { fn local() {} impl S { pub fn value() -> u8 { 1 } } local(); }\npub fn read() -> u8 { S::value() }";
-    for planted in [false, true] {
-        let io = head_body_world(BEFORE);
-        let run = |text| if planted { request_without_fn_head_bodies(&io, text) } else { request(&io, false) };
-        let _ = run(BEFORE);
-        write(&io, "src/lib.rs", AFTER);
-        let now = run(AFTER);
-        assert!(now.checked.from_last, "the edit used the stored answer");
-        if planted {
-            let fresh_world = head_body_world(AFTER);
-            settle(&fresh_world, "R5 dropped fn bodies", &now, Oracle::Equal);
-        } else {
-            settle(&io, "R5 first block impl", &now, Oracle::Equal);
-            assert!(findings(&now.lines).all(|line| !line.contains("error[")), "the block's impl supplies S::value: {:?}", now.lines);
-            assert_eq!(now.checked.seeds.bodies.refused, 0, "the caller can read the new method's frozen head");
-        }
-    }
+    let io = head_body_world(BEFORE);
+    let _ = cold(&io, "R5 first block impl");
+    write(&io, "src/lib.rs", AFTER);
+    let now = request(&io, false);
+    let row = settle(&head_body_world(AFTER), "R5 first block impl", &now, Oracle::Equal);
+    assert!(now.checked.from_last && row.names > 0);
+    assert!(now.checked.because.iter().any(|(group, _)| group.stage == Stage::Heads && group.cause == "read moved" && group.definer.is_some_and(|n| n.kind == blaze_drive::Kind::CrateScope)));
+    assert!(findings(&now.lines).all(|line| !line.contains("error[")), "the block's impl supplies S::value: {:?}", now.lines);
+    assert_eq!(now.checked.seeds.bodies.refused, 0, "the caller can read the new method's frozen head");
 }
 
 /// R6, A PRIVATE FN ADDED TO `a` (row "A private fn added": 1 names group, 1 head, 1 body): its

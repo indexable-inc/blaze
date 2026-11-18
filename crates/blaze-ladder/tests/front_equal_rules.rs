@@ -1,5 +1,4 @@
-//! Compare a specific declaration's row after checking its caller. The whole program reads
-//! solved names and the lazy program reads the two records written from that same solve.
+//! Compare function facts over solved names and the two records written from the same solve.
 
 #![feature(allocator_api)]
 
@@ -9,7 +8,7 @@ use blaze_engine::{CellId, Made, Phase, Planned, SVec, Stage, Task};
 use blaze_id::{ContentId, CrateItemKey, ItemKey as LibKey};
 use blaze_ladder::crates::{Inputs, Toolchain};
 use blaze_ladder::front::{At, FnKind};
-use blaze_ladder::front2::keys::checker_of;
+use blaze_ladder::front2::keys::{MemberKind, checker_of, member_key_of};
 use blaze_ladder::front2::internal_symbol::{InternalRefused, definition};
 use blaze_ladder::front2::program::{Front2Program, Front2Refusal, lazy::LazyProgram};
 use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
@@ -28,7 +27,7 @@ use blaze_scope::names_cells::{NameCell, Section};
 use blaze_scope::resolve::{CrateInput, Names, SourceTexts, aligned, resolve_crates};
 use blaze_scope::task::Serial;
 use blaze_scope::{items_record, names_record};
-use blaze_typeck::{ItemKey, List, PortableTys};
+use blaze_typeck::{Expr, ExprId, ItemKey, List, PortableTys};
 
 const ROOT: &str = "src/main.rs";
 const ISB: &str = "llvm.aarch64.isb";
@@ -75,13 +74,60 @@ mod runtime {
 pub extern "C" fn main() -> i32 { __rust_drop_panic() }
 "#;
 
-/// Each fixture crate has one file and no expansions.
+const TRACKED: &str = r#"#![feature(no_core, lang_items, intrinsics, rustc_attrs)]
+#![no_core]
+#![no_main]
+#[lang = "sized"] trait Sized {}
+#[lang = "copy"] trait Copy {}
+#[lang = "panic_location"]
+struct Location<'a> { file: &'a str, line: u32, col: u32 }
+#[rustc_intrinsic]
+const fn caller_location() -> &'static Location<'static>;
+impl<'a> Location<'a> {
+    fn plain_member() {}
+    #[track_caller]
+    pub const fn caller() -> &'static Location<'static> { caller_location() }
+}
+#[track_caller]
+fn tracked_free() { plain_free(); Location::caller(); }
+fn plain_free() {}
+
+struct Token;
+trait Report {
+    fn explicit(&self);
+    #[track_caller] fn inherited(&self);
+    fn plain(&self);
+    #[track_caller] fn provided(&self) {}
+    #[track_caller] fn overridden(&self) {}
+}
+impl Report for Token {
+    #[track_caller] fn explicit(&self) {}
+    fn inherited(&self) {}
+    fn plain(&self) {}
+    fn overridden(&self) {}
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    Location::plain_member();
+    tracked_free();
+    Report::explicit(&Token);
+    Report::inherited(&Token);
+    Report::plain(&Token);
+    Report::provided(&Token);
+    Report::overridden(&Token);
+    0
+}
+"#;
+
+/// Each fixture crate has one source file.
+#[derive(Clone)]
 struct KeptCrate<'a> {
     key: CrateItemKey,
     names: &'a [u8],
     items: &'a [u8],
     path: &'a str,
     text: &'a str,
+    expansions: Vec<(LibKey, &'a str, &'a [u8])>,
 }
 
 struct Kept<'a>(Vec<KeptCrate<'a>>);
@@ -100,12 +146,16 @@ impl<'a> Load<'a> for Kept<'a> {
         (path.as_str() == c.path).then_some(c.text)
     }
 
-    fn expansion(&self, _: usize, _: LibKey) -> Option<&'a str> {
-        None
+    fn expansion(&self, krate: usize, call: LibKey) -> Option<&'a str> {
+        Some(self.0.get(krate)?.expansions.iter().find(|e| e.0 == call)?.1)
     }
 
-    fn expansion_origins(&self, _: usize, _: LibKey) -> Option<(&'a [u8], &'a [u8])> {
-        None
+    fn expansion_origins(&self, krate: usize, call: LibKey) -> Option<(&'a [u8], &'a [u8])> {
+        let bytes = self.0.get(krate)?.expansions.iter().find(|e| e.0 == call)?.2;
+        if bytes.is_empty() {
+            return Some((&[], &[]));
+        }
+        Some(blaze_scope::expansion_origins::split(bytes).expect("the fixture expansion's origin column"))
     }
 }
 
@@ -118,14 +168,25 @@ fn keep<'a>(names: &Names<'_>, frame: &'a Frame, alloc: blaze_own::Alloc<'a>) ->
             items: aligned(&items_record::encode_with(c, names, alloc).expect("items record"), alloc),
             path: frame.alloc_str(file.package.as_str()),
             text: frame.alloc_str(file.text),
+            expansions: c.expansions.iter().filter_map(|(call, e)| {
+                use blaze_scope::expansion_origins::OriginsError;
+                let made = e.made?;
+                let origins: &[u8] = match made.origins {
+                    Ok(bytes) => frame.alloc_slice_copy(bytes),
+                    Err(OriginsError::Rewritten { .. } | OriginsError::Unplaced { .. }) => &[],
+                    Err(error) => panic!("origins of expansion {call:x}: {error}"),
+                };
+                Some((*call, &*frame.alloc_str(made.text), origins))
+            }).collect(),
         }
     }).collect();
     frame.alloc(Kept(crates))
 }
 
-fn on_checker_stack(run: impl FnOnce() + Send + 'static) {
-    if let Err(panic) = std::thread::Builder::new().stack_size(256 << 20).spawn(run).expect("fixture thread").join() {
-        std::panic::resume_unwind(panic);
+fn on_checker_stack<R: Send + 'static>(run: impl FnOnce() -> R + Send + 'static) -> R {
+    match std::thread::Builder::new().stack_size(256 << 20).spawn(run).expect("fixture thread").join() {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
     }
 }
 
@@ -149,7 +210,7 @@ struct Row<'a> {
     track_caller: Option<bool>,
 }
 
-fn row(front: &impl FrontEnd, key: ItemKey) -> Row<'_> {
+fn row(front: &dyn FrontEnd, key: ItemKey) -> Row<'_> {
     let f = front.function(front.fn_index(key).expect("the caller reached the declaration"));
     Row {
         key: f.key,
@@ -170,7 +231,7 @@ fn row(front: &impl FrontEnd, key: ItemKey) -> Row<'_> {
     }
 }
 
-fn compare(text: &'static str, name: &'static str, block: &'static str, inspect: fn(Row<'_>, Row<'_>)) {
+fn with_programs<R: Send + 'static>(text: &'static str, inspect: impl for<'n> FnOnce(&'n Names<'n>, &dyn FrontEnd, &mut dyn FrontEnd) -> R + Send + 'static) -> R {
     let run = move || {
         let frame: &'static Frame = Box::leak(Box::new(Frame::new(blaze_mem::tag::Tag::Infer).expect("the fixture's frame")));
         let erased: &'static Erased<&'static Frame> = frame.alloc(Erased::new(frame));
@@ -183,9 +244,6 @@ fn compare(text: &'static str, name: &'static str, block: &'static str, inspect:
         let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("fixture inputs: {e}"));
         let crates = inputs.crates();
         let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("fixture names: {e}"));
-        let lib = names.items(0).map(|(k, _, _)| k).find(|&k| names.name_of(k) == Some(name) && names.extern_abi(k) == Some(Some(block)))
-            .unwrap_or_else(|| panic!("no declaration of {name} in an extern {block} block"));
-        let key = checker_of(lib);
         let whole = Front2Program::new(&names, frame, &files, a).unwrap_or_else(|e| panic!("whole program: {e}"));
         let entry = whole.function(whole.entry().expect("the fixture exports main")).key;
 
@@ -196,16 +254,26 @@ fn compare(text: &'static str, name: &'static str, block: &'static str, inspect:
         let mut lazy = LazyProgram::from_records(records, frame, &[0], Some(entry), a).unwrap_or_else(|e| panic!("lazy program: {e}"));
         lazy.decide_start(blaze_ladder::run::special::MakerStart::ByRule).unwrap_or_else(|e| panic!("lazy entry: {e}"));
         lazy.check_one(entry).unwrap_or_else(|e| panic!("checking main: {e}")).expect("main has a body");
-        let (w, l) = (row(&whole, key), row(&lazy, key));
-        assert!(records.errors().is_empty(), "record reads for {name}: {:?}", records.errors());
+        let result = inspect(&names, &whole, &mut lazy);
+        assert!(records.errors().is_empty(), "fixture record reads: {:?}", records.errors());
+        result
+    };
+    on_checker_stack(run)
+}
+
+fn compare(text: &'static str, name: &'static str, block: &'static str, inspect: fn(Row<'_>, Row<'_>)) {
+    with_programs(text, move |names, whole, lazy| {
+        let lib = names.items(0).map(|(k, _, _)| k).find(|&k| names.name_of(k) == Some(name) && names.extern_abi(k) == Some(Some(block)))
+            .unwrap_or_else(|| panic!("no declaration of {name} in an extern {block} block"));
+        let key = checker_of(lib);
+        let (w, l) = (row(whole, key), row(lazy, key));
         assert_eq!(w, l, "row of {name}");
         assert_eq!(w.key, key);
         assert!(!w.has_body);
         assert_eq!(w.call_abi, Some(w.abi));
         assert_eq!(w.track_caller, Some(false));
         inspect(w, l);
-    };
-    on_checker_stack(run);
+    });
 }
 
 #[test]
@@ -507,4 +575,335 @@ pub extern "C" fn main() -> i32 {
         }
     });
     println!("both front ends bind start and cleanup to panic_abort for Abort and panic_unwind for Unwind");
+}
+
+/// Identify an impl by one of its methods. Both the trait and its impl declare `inherited`,
+/// so a search for that method by name alone would exercise the wrong key.
+fn impl_with<'n>(names: &'n Names<'n>, method: &str) -> ItemKey {
+    let mut owners = names.items(0).map(|(k, _, _)| k).filter(|&k| {
+        names.kind_of_item(k) == Some(blaze_surface::ItemKind::Impl)
+            && names.members(k).is_some_and(|members| members.iter().any(|m| m.name == Some(method)))
+    });
+    let key = owners.next().unwrap_or_else(|| panic!("fixture impl declaring {method}"));
+    assert!(owners.next().is_none(), "two fixture impls declare {method}");
+    checker_of(key)
+}
+
+fn tracking(whole: &dyn FrontEnd, lazy: &dyn FrontEnd, key: ItemKey) -> [Option<bool>; 2] {
+    [whole.track_caller(key), lazy.track_caller(key)]
+}
+
+#[test]
+fn track_caller_reads_the_function_and_its_trait_declaration() {
+    with_programs(TRACKED, |names, whole, lazy| {
+        let item = |name: &str| {
+            let (key, _, _) = names.items(0).find(|&(k, _, _)| names.name_of(k) == Some(name)).unwrap_or_else(|| panic!("fixture item {name}"));
+            checker_of(key)
+        };
+        let location = impl_with(names, "caller");
+        let report = item("Report");
+        let token = impl_with(names, "inherited");
+        let member = |owner, name: &str| member_key_of(owner, MemberKind::Fn, name);
+        let caller = member(location, "caller");
+        // main names the sibling in the same impl. Only tracked_free's body calls caller.
+        assert!(lazy.fn_index(caller).is_none(), "caller must have no lazy function row yet");
+        assert!(lazy.fn_index(item("plain_free")).is_none(), "plain_free must have no lazy function row yet");
+        for (key, label, expected) in [
+            (caller, "Location::caller before its row", true),
+            (member(location, "plain_member"), "Location::plain_member", false),
+            (item("tracked_free"), "tracked_free", true),
+            (item("plain_free"), "plain_free", false),
+            (member(report, "explicit"), "Report::explicit", false),
+            (member(token, "explicit"), "impl's own attribute", true),
+            (member(token, "inherited"), "required trait declaration", true),
+            (member(token, "plain"), "plain trait impl method", false),
+            (member(report, "provided"), "provided trait method", true),
+            (member(token, "overridden"), "override of provided method", true),
+        ] {
+            assert_eq!(tracking(whole, lazy, key), [Some(expected); 2], "{label}");
+        }
+        lazy.check_one(caller).expect("checking Location::caller").expect("caller has a body");
+        assert_eq!(tracking(whole, lazy, caller), [Some(true); 2], "Location::caller with its row");
+        println!("both front ends track Location::caller, tracked_free, and annotated or inheriting methods");
+    });
+}
+
+#[test]
+fn a_missing_lazy_track_caller_is_caught() {
+    with_programs(TRACKED, |names, whole, lazy| {
+        let key = member_key_of(impl_with(names, "caller"), MemberKind::Fn, "caller");
+        let mut answers = tracking(whole, lazy, key);
+        let expected = [Some(true); 2];
+        assert_eq!(answers, expected, "Location::caller is tracked");
+        answers[1] = None;
+        assert_ne!(answers, expected, "losing the lazy answer must fail the same comparison");
+        println!("caught a missing lazy track_caller answer for Location::caller");
+    });
+}
+
+#[test]
+fn a_stored_caller_site_uses_the_current_file_before_building_a_body() {
+    with_programs(TRACKED, |names, whole, lazy| {
+        let (lib, _, _) = names.items(0).find(|&(k, _, _)| names.name_of(k) == Some("main")).unwrap();
+        let key = checker_of(lib);
+        let (_, start) = names.item_start(lib).expect("main is written in the fixture file");
+        let call = TRACKED.find("    tracked_free();").unwrap() + 4;
+        let site = u32::try_from(call).unwrap() - start;
+        let line = 1 + TRACKED[..call].bytes().filter(|&b| b == b'\n').count() as u32;
+        assert_eq!(whole.source_position(key, site), Ok((line, 5)));
+        assert_eq!(lazy.source_position(key, site), Ok((line, 5)));
+
+        // Use the original names and items bytes over the changed file, exactly as a
+        // first-call store hit does. No program has been made over these records.
+        let frame: &'static Frame = Box::leak(Box::new(Frame::new(blaze_mem::tag::Tag::Infer).unwrap()));
+        let erased = frame.alloc(Erased::new(frame));
+        let a = erased.handle();
+        let c = names.krate(0);
+        let kept = keep(names, frame, a);
+        let mut moved = kept.0.clone();
+        moved[0].text = frame.alloc_str(&format!("\n\n\n{TRACKED}"));
+        let kept = frame.alloc(Kept(moved));
+        let log = frame.alloc(Log::new(&["ladder"], a));
+        let records = frame.alloc(Records::new(frame.alloc_slice_copy(&[c.key]), kept, log, frame, a));
+        assert_eq!(records.source_position(key, site, a), Ok((line + 3, 5)));
+        assert!(records.errors().is_empty(), "{:?}", records.errors());
+        println!("stored caller site: three lines later in the current file, still column 5");
+    });
+}
+
+const SITE_HEAD: &str = r#"#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+#[lang = "sized"] trait Sized {}
+#[lang = "copy"] trait Copy {}
+impl Copy for u8 {}
+#[track_caller] const fn tracked(_: u8) -> u8 { 7 }
+"#;
+
+/// Place a previously sealed site using the original names records and today's file.
+fn cold_position(names: &Names<'_>, current: &'static str, item: ItemKey, offset: u32) -> Result<(u32, u32), blaze_ladder::seam::PositionGap> {
+    let frame = Box::leak(Box::new(Frame::new(blaze_mem::tag::Tag::Infer).expect("records reader's frame")));
+    let erased = frame.alloc(Erased::new(&*frame));
+    let a = erased.handle();
+    let mut old = keep(names, frame, a).0.clone();
+    old[0].text = current;
+    let kept = frame.alloc(Kept(old));
+    let keys = frame.alloc_slice_copy(&[names.krate(0).key]);
+    let log = frame.alloc(Log::new(&["ladder"], a));
+    let records = frame.alloc(Records::new(keys, kept, log, frame, a));
+    let result = records.source_position(item, offset, a);
+    if result.is_ok() {
+        assert!(records.errors().is_empty(), "{:?}", records.errors());
+    }
+    result
+}
+
+/// Each fixture has exactly one direct call in the body under inspection. The expected
+/// coordinates come from the written program, independently of the lowering and either
+/// front's idea of the beginning of the item.
+fn check_site(decls: &str, main: &str, owner: &'static str, written: &'static str, insert_before: &str) {
+    let text = format!("{SITE_HEAD}{decls}\n#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 {{ {main} }}");
+    let insert = text.find(insert_before).expect("edit anchor");
+    let mut moved = text.clone();
+    moved.insert_str(insert, "\n\n\n");
+    let inspect = |text: &'static str, current: &'static str, shift: u32| with_programs(text, move |names, whole, lazy| {
+        let at = text.find(written).expect("the invocation is written in the fixture");
+        assert_eq!(text.matches(written).count(), 1);
+        let prefix = &text[..at];
+        let line = 1 + prefix.bytes().filter(|&b| b == b'\n').count() as u32;
+        let col = 1 + prefix.rsplit('\n').next().unwrap().chars().count() as u32;
+        let ident = owner.split_whitespace().last().expect("fixture owner name");
+        let mut owners = (0..whole.fn_count()).map(|i| whole.function(i))
+            .filter(|f| f.body.is_some() && f.path.rsplit("::").next() == Some(ident));
+        let body = owners.next().unwrap_or_else(|| panic!("no live body for {owner}"));
+        assert!(owners.next().is_none(), "ambiguous owner {owner}");
+        if let Some((outer, _, _)) = names.items(0).find(|&(k, _, _)| names.name_of(k) == Some("outer") && names.kind_of_item(k) == Some(blaze_surface::ItemKind::Function)) {
+            lazy.check_one(checker_of(outer)).expect("check the enclosing body that declares the local item").expect("enclosing body");
+        }
+        lazy.check_one(body.key).expect("check the caller").expect("the caller has a body");
+        let site = |label: &str, front: &dyn FrontEnd| {
+            let row = front.function(front.fn_index(body.key).expect("owner row"));
+            let exprs = &row.body.expect("live caller").0.exprs;
+            let mut calls = exprs.iter().enumerate().filter(|(_, e)| matches!(e, Expr::Call { .. }));
+            let (i, _) = calls.next().expect("a direct call to tracked");
+            assert!(calls.next().is_none(), "only the tracked call belongs to this body");
+            let s = front.caller_site(row.key, ExprId(i as u32)).unwrap_or_else(|| panic!("{label}: call in {owner} has no source site"));
+            assert!(s.file.ends_with(ROOT), "shown path {}", s.file);
+            if written.starts_with("tracked(") {
+                let start = prefix.rfind(owner).expect("written declaration containing the tracked call");
+                assert_eq!(s.offset as usize, at - start, "{label}: offset from the written declaration");
+            }
+            if owner == "const SAMPLE" || owner == "static SAMPLE" {
+                let (lib, _, _) = names.items(0).find(|&(k, _, _)| names.name_of(k) == Some(ident)).expect("initializer item");
+                assert_eq!(s.item, checker_of(lib), "the initializer owns its tracked call");
+            }
+            assert_eq!(front.source_position(s.item, s.offset), Ok((line, col)), "{label}: {owner}");
+            (s.file.to_owned(), s.item, s.offset)
+        };
+        let saved = site("lazy", lazy);
+        assert_eq!(whole.source_position(saved.1, saved.2), Ok((line, col)), "site from a different front before this front produced it");
+        assert_eq!(site("whole", whole), saved);
+        assert_eq!(cold_position(names, current, saved.1, saved.2), Ok((line + shift, col)), "cold publication");
+        (saved, line, col)
+    });
+    let text = Box::leak(text.into_boxed_str());
+    let moved = Box::leak(moved.into_boxed_str());
+    let (saved, line, col) = inspect(text, moved, 3);
+    let after = inspect(moved, moved, 0);
+    assert_eq!(after, (saved, line + 3, col));
+    println!("{owner}: both fronts and cold records place the call three lines later in the same column");
+}
+
+#[test]
+fn a_free_function_call_site_moves_with_its_item() {
+    check_site("fn sample() -> u8 { tracked(1) }", "sample() as i32", "fn sample", "tracked(1)", "fn sample");
+}
+
+#[test]
+fn an_inherent_method_call_site_starts_at_the_method() {
+    check_site("struct S;\nimpl S {\n    fn sibling() {}\n    fn sample() -> u8 { tracked(2) }\n}",
+        "S::sample() as i32", "fn sample", "tracked(2)", "    fn sample");
+}
+
+#[test]
+fn a_member_offset_applied_to_the_impl_start_is_caught() {
+    let text = Box::leak(format!("{SITE_HEAD}struct S;\nimpl S {{\n    fn other() {{}}\n    fn sample() -> u8 {{ tracked(2) }}\n}}\n#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 {{ S::sample() as i32 }}").into_boxed_str());
+    with_programs(text, |names, whole, lazy| {
+        let imp = impl_with(names, "sample");
+        let key = member_key_of(imp, MemberKind::Fn, "sample");
+        let (_, checked) = lazy.check_one(key).expect("check the method").expect("method body");
+        let &[call] = checked.callees.column::<0>() else { panic!("sample calls tracked once") };
+        let site = lazy.caller_site(key, call).expect("method's call site");
+        let offset = "fn sample() -> u8 { ".len() as u32;
+        let expected = (SITE_HEAD.lines().count() as u32 + 4, 5 + offset);
+        for (label, front) in [("whole", whole), ("lazy", &*lazy)] {
+            assert_eq!(front.source_position(site.item, site.offset), Ok(expected), "{label}: method's own declaration");
+            let planted = front.source_position(imp, offset).expect("the impl has a start");
+            assert_ne!(planted, expected, "using the impl's start must change the answer");
+        }
+        println!("caught the method offset placed at the impl's first byte");
+    });
+}
+
+#[test]
+fn a_trait_impl_method_call_site_starts_at_the_method() {
+    check_site("struct S;\ntrait T { fn sample(&self) -> u8; }\nimpl T for S {\n    fn sample(&self) -> u8 { tracked(3) }\n}",
+        "T::sample(&S) as i32", "fn sample", "tracked(3)", "    fn sample");
+}
+
+#[test]
+fn a_provided_method_call_site_starts_at_the_method() {
+    check_site("struct S;\ntrait T {\n    fn sample(&self) -> u8 { tracked(4) }\n}\nimpl T for S {}",
+        "T::sample(&S) as i32", "fn sample", "tracked(4)", "    fn sample");
+}
+
+#[test]
+fn a_closures_call_site_uses_its_enclosing_method() {
+    check_site("struct S;\nimpl S {\n    fn sample() { let _f = || tracked(5); }\n}",
+        "S::sample(); 0", "fn sample", "tracked(5)", "    fn sample");
+}
+
+#[test]
+fn an_async_blocks_call_site_uses_its_enclosing_method() {
+    check_site("struct S;\nimpl S {\n    fn sample() { let _f = async { tracked(6) }; }\n}",
+        "S::sample(); 0", "fn sample", "tracked(6)", "    fn sample");
+}
+
+#[test]
+fn a_nested_functions_call_site_uses_its_own_body() {
+    check_site("fn outer() -> u8 {\n    fn sample() -> u8 { tracked(7) }\n    sample()\n}",
+        "outer() as i32", "fn sample", "tracked(7)", "    fn sample");
+}
+
+#[test]
+fn a_method_in_a_function_local_impl_uses_its_written_declaration() {
+    check_site("fn outer() -> u8 {\n    struct S;\n    impl S {\n        fn sample() -> u8 { tracked(13) }\n    }\n    S::sample()\n}",
+        "outer() as i32", "fn sample", "tracked(13)", "        fn sample");
+}
+
+#[test]
+fn an_edit_inside_outer_moves_the_local_closures_caller() {
+    check_site("fn outer() {\n    fn sample() { let _f = || tracked(14); }\n    sample()\n}",
+        "outer(); 0", "fn sample", "tracked(14)", "    fn sample");
+}
+
+#[test]
+fn an_edit_inside_a_local_impl_moves_its_methods_closure() {
+    check_site("fn outer() {\n    struct S;\n    impl S {\n        fn sibling() {}\n        fn sample() { let _f = || tracked(15); }\n    }\n    S::sample()\n}",
+        "outer(); 0", "fn sample", "tracked(15)", "        fn sample");
+}
+
+#[test]
+fn removing_a_function_local_method_refuses_its_stored_site() {
+    let text: &'static str = Box::leak(format!("{SITE_HEAD}fn outer() -> u8 {{ struct S; impl S {{ fn sample() -> u8 {{ tracked(16) }} }} S::sample() }}\n#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 {{ outer() as i32 }}").into_boxed_str());
+    let changed = Box::leak(text.replace("sample", "sibling").into_boxed_str());
+    with_programs(text, move |names, _, _| {
+        let member = names.items(0).find_map(|(lib, _, _)| {
+            names.members(lib)?.iter().find(|m| m.name == Some("sample")).map(|m| m.key)
+        }).expect("the original method row");
+        let offset = "fn sample() -> u8 { ".len() as u32;
+        let col = text.lines().find_map(|line| line.find("tracked(16)")).expect("original call") as u32 + 1;
+        assert_eq!(cold_position(names, text, checker_of(member), offset), Ok((SITE_HEAD.lines().count() as u32 + 1, col)));
+        assert_eq!(cold_position(names, changed, checker_of(member), offset), Err(blaze_ladder::seam::PositionGap::NoItem));
+        println!("removed local method: NoItem for its stored site");
+    });
+}
+
+#[test]
+fn an_expanded_calls_site_is_its_outermost_invocation() {
+    check_site("macro_rules! inner { () => { tracked(8) } }\nmacro_rules! outer { () => { inner!() } }\nfn sample() -> u8 { outer!() }",
+        "sample() as i32", "fn sample", "outer!()", "fn sample");
+}
+
+#[test]
+fn a_macro_generated_functions_call_site_is_the_item_invocation() {
+    check_site("macro_rules! define { () => { fn sample() -> u8 { tracked(9) } } }\ndefine!();",
+        "sample() as i32", "fn sample", "define!()", "define!();");
+}
+
+#[test]
+fn a_macro_generated_methods_call_site_is_the_member_invocation() {
+    check_site("macro_rules! define_method { () => { fn sample() -> u8 { tracked(12) } } }\nstruct S;\nimpl S {\n    define_method!();\n}",
+        "S::sample() as i32", "fn sample", "define_method!()", "    define_method!();");
+}
+
+// A closure gives the whole-program census a live owner row. Its value is the
+// empty environment. Only the direct const fn call supplies the initializer's value.
+#[test]
+fn a_const_initializers_call_site_uses_the_constant() {
+    check_site("const SAMPLE: u8 = { let _ = || (); tracked(10) };",
+        "SAMPLE as i32", "const SAMPLE", "tracked(10)", "const SAMPLE");
+}
+
+#[test]
+fn a_static_initializers_call_site_uses_the_static() {
+    check_site("static SAMPLE: u8 = { let _ = || (); tracked(11) };",
+        "SAMPLE as i32", "static SAMPLE", "tracked(11)", "static SAMPLE");
+}
+
+#[test]
+fn pure_initializers_place_their_calls_without_a_runtime_function_row() {
+    let inspect = |space: &'static str, shift: u32| {
+        let text = Box::leak(format!("{SITE_HEAD}{space}const C: u8 = tracked(1);\nstatic S: u8 = tracked(2);\n#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 {{ let _ = C; S as i32 }}").into_boxed_str());
+        with_programs(text, move |names, whole, lazy| {
+            ["C", "S"].map(|name| {
+                let (lib, _, _) = names.items(0).find(|&(lib, _, _)| names.name_of(lib) == Some(name)).expect("initializer");
+                let key = checker_of(lib);
+                let (_, checked) = lazy.check_one(key).expect("check initializer as a body").expect("initializer body");
+                let &[call] = checked.callees.column::<0>() else { panic!("one tracked call in {name}") };
+                let site = lazy.caller_site(key, call).expect("initializer call site");
+                assert!(site.file.ends_with(ROOT));
+                let (line, col) = match name {
+                    "C" => (1, "const C: u8 = ".len() + 1),
+                    _ => (2, "static S: u8 = ".len() + 1),
+                };
+                let expected = (SITE_HEAD.lines().count() as u32 + line + shift, col as u32);
+                assert_eq!(whole.source_position(site.item, site.offset), Ok(expected));
+                assert_eq!(lazy.source_position(site.item, site.offset), Ok(expected));
+                (site.file.to_owned(), site.item, site.offset)
+            })
+        })
+    };
+    assert_eq!(inspect("", 0), inspect("\n\n\n", 3));
+    println!("const and static initializer calls move by three lines with identical stored sites");
 }

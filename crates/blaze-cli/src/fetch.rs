@@ -98,6 +98,19 @@ pub struct Lockfile<'f> {
 }
 
 impl<'f> Lockfile<'f> {
+    /// The fetched source record `key`, mapped read-only from the sources store through the
+    /// directory `Fetch` opened (opened here when this command's fetches were all satisfied
+    /// by an earlier one): the unit graph reads its records in place through the same
+    /// directory the fetch wrote them by, never through a path of the host's (lane BD4: a
+    /// simulated world has no such path, so no graph was made of a registry crate there).
+    pub(crate) fn map_source(&mut self, cx: &Cx, env: &FetchEnv<'_>, key: &ContentId) -> Result<blaze_core::Mapping, CliError> {
+        let dir = match &mut self.sources {
+            Some(dir) => dir,
+            slot => slot.insert(sources_dir(cx, env)?),
+        };
+        Ok(dir.map_read(cx, &record_path(key)?)?)
+    }
+
     /// The lock's text planned. A refusal is `Err` with its words, which the caller makes a
     /// [`LOCK_UNREAD`] finding.
     ///

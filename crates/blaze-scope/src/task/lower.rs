@@ -1817,10 +1817,10 @@ impl<'t> BodySrc<'t> {
         // eight substring searches and no scan. A trait declared in a block makes one too
         // (core's `Write::write_fmt` declares `trait SpecWriteFmt` in its body), and a `mod`
         // and an `extern crate` (whose first word is `extern`).
-        const WORDS: [&str; 8] = ["impl", "struct", "enum", "union", "type", "trait", "mod", "extern"];
         // A `!` too: a statement call may declare items (crate::expanded_blocks); the scan
-        // decides whether one is in statement position.
-        (holds && (text.contains('!') || WORDS.iter().any(|w| text.contains(w)))).then_some(BodySrc { key, module, text, loc, written, depth, place, marks, tokens })
+        // decides whether one is in statement position. The one test, shared with the names
+        // digest (`blaze_file_items::nested::may_write_block`, lane CX19).
+        (holds && blaze_file_items::nested::may_write_block(text)).then_some(BodySrc { key, module, text, loc, written, depth, place, marks, tokens })
     }
 }
 

@@ -25,7 +25,7 @@ pub enum NotPrinted {
     /// The lowering refused a form, by name.
     Lower(blaze_flow_lower::Refusal),
     /// The checker passed its bound.
-    Bound,
+    Bound(blaze_flow::Bound<blaze_typeck::ItemKey>),
     /// The writer `out` failed.
     Write,
 }
@@ -50,7 +50,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
                 writeln!(out, "flow:").map_err(|_| NotPrinted::Write)?;
                 l.flow.print(out).map_err(|_| NotPrinted::Write)?;
                 writeln!(out, "stats: {:?}", l.stats).map_err(|_| NotPrinted::Write)?;
-                let record = blaze_flow::check(&l.flow, alloc).map_err(|_| NotPrinted::Bound)?;
+                let record = blaze_flow::check_named(view.owner, &l.flow, alloc).map_err(NotPrinted::Bound)?;
                 for m in record.moves.iter() {
                     writeln!(out, "finding: {m:?}").map_err(|_| NotPrinted::Write)?;
                 }

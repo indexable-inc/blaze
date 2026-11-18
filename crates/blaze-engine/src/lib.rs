@@ -27,6 +27,8 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod cell_table;
+pub mod code_pool;
 pub mod engine;
 pub mod last;
 mod last_mem;

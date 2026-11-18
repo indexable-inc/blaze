@@ -69,17 +69,18 @@ impl Resolve for Refuses {
 enum Said {
     Data(std::vec::Vec<Datum>),
     Publish { symbol: Symbol, record: RecordId },
+    Positioned { symbol: Symbol, record: RecordId, values: std::vec::Vec<u8> },
     ThreadLocals,
     Personality(Symbol),
     Failed,
     Native,
 }
 
-/// `bytes`' messages in order; with `firsts`, a `Publish` of a record published before is
-/// dropped too (a need of a placed row republishes it, a first run's second need too).
+/// With `firsts`, keep the first publication of each record to each slot. Two slots
+/// may share code bytes and still require separate placements.
 fn said(bytes: &[u8], firsts: bool) -> std::vec::Vec<Said> {
     let mut slots: BTreeMap<u32, Symbol> = BTreeMap::new();
-    let mut published: BTreeSet<[u8; 32]> = BTreeSet::new();
+    let mut published = BTreeSet::new();
     let mut out = std::vec::Vec::new();
     let mut at = 0;
     while let Some((item, len)) = split(&bytes[at..]).expect("a frame") {
@@ -93,8 +94,14 @@ fn said(bytes: &[u8], firsts: bool) -> std::vec::Vec<Said> {
             Down::Data { data } => out.push(Said::Data(data.iter().collect())),
             Down::Publish { slot, record, .. } => {
                 let symbol = *slots.get(&slot.0).expect("a Publish of a slot never declared");
-                if published.insert(record.0) || !firsts {
+                if published.insert((slot.0, record.0)) || !firsts {
                     out.push(Said::Publish { symbol, record });
+                }
+            }
+            Down::Positioned { slot, record, values, .. } => {
+                let symbol = *slots.get(&slot.0).expect("a Positioned publication of a slot never declared");
+                if published.insert((slot.0, record.0)) || !firsts {
+                    out.push(Said::Positioned { symbol, record, values: values.to_vec() });
                 }
             }
             Down::ThreadLocals { .. } => out.push(Said::ThreadLocals),

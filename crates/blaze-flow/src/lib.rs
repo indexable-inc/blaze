@@ -10,7 +10,8 @@
 //! - [`record`]: one body's record: findings, and the [`record::Checked`] proof the builder takes.
 //!
 //! Every analysis is a sans-IO function of a flow and an allocator the caller names; every loop
-//! over a graph counts its passes against a stated bound and stops with [`flow::Bound`].
+//! over a graph is bounded. Tier two counts deterministic work and refuses the body
+//! with [`flow::Bound::TierTwo`] if its budget is exhausted.
 
 #![no_std]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
@@ -41,5 +42,5 @@ pub use flow::{
 };
 pub use loans::{BorrowFinding, TierOne};
 pub use moves::{DropKind, MoveFinding, MoveFindingKind, MoveOut};
-pub use record::{Checked, Record, check};
+pub use record::{Checked, Record, check, check_named};
 pub use suspend::{Saved, saved};

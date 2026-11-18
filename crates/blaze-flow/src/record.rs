@@ -54,6 +54,14 @@ pub fn check<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Record<A>
     check_planted(flow, Plant::None, alloc)
 }
 
+/// Carry the caller's function identity in a refusal. This can be the complete
+/// borrowed spelling, or the item key a driver resolves when printing its diagnostic.
+pub fn check_named<N, A: Allocator + Clone>(
+    function: N, flow: &Flow<A>, alloc: A,
+) -> Result<Record<A>, Bound<N>> {
+    check(flow, alloc).map_err(|bound| bound.in_function(function))
+}
+
 #[doc(hidden)]
 pub fn check_planted<A: Allocator + Clone>(
     flow: &Flow<A>,

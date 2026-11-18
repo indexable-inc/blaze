@@ -198,11 +198,34 @@ pub struct LoanRow {
     pub at: Stmt,
 }
 
-/// A loop over a graph that went past its stated bound: a bug, named (rule 18).
+/// A dataflow exceeded its convergence bound or tier two exhausted its work budget.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Bound {
-    pub what: &'static str,
-    pub limit: u64,
+pub enum Bound<N = ()> {
+    Passes { what: &'static str, limit: u64 },
+    TierTwo { function: N, points: usize, origins: usize, loans: usize, budget: u64 },
+}
+
+impl<F> Bound<F> {
+    /// The flow tables are anonymous. The driver owns the function's spelling and
+    /// can attach it without copying, truncating, or interning diagnostic text.
+    pub fn in_function<N>(self, name: N) -> Bound<N> {
+        match self {
+            Self::Passes { what, limit } => Bound::Passes { what, limit },
+            Self::TierTwo { points, origins, loans, budget, .. } =>
+                Bound::TierTwo { function: name, points, origins, loans, budget },
+        }
+    }
+}
+
+impl<N: fmt::Display> fmt::Display for Bound<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Passes { what, limit } => write!(f, "{what} exceeded the limit of {limit}"),
+            Self::TierTwo { function, points, origins, loans, budget } => write!(
+                f, "tier two exceeded {budget} steps in function `{function}` ({points} points, {origins} origins, {loans} loans)"
+            ),
+        }
+    }
 }
 
 /// A malformed hand-built flow.

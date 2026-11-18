@@ -78,7 +78,7 @@ use crate::front2::index::Index;
 use crate::front2::receiver::Pointers;
 use crate::front2::types::Why;
 use crate::front2::head_record::{self, Head, HeadAt, HeadRecordError, HeadRef};
-use crate::front2::heads::{HeadError, SeedFailed, Seeded, Store, Want};
+use crate::front2::heads::{HeadError, SeedFailed, Seeded, Signatures, Store, Want};
 use crate::front2::keys::{Keys, MemberKind, checker_of, member_key_of};
 use crate::front2::project::head_digest::{digest_of_heads, want_heads};
 use crate::front2::source::NamesSource;
@@ -259,6 +259,7 @@ pub enum FrozenError {
     Order { entry: u32 },
     /// Bytes after the last head's record.
     Trailing { at: usize },
+    WrongCell { found: Want },
 }
 
 impl core::fmt::Display for FrozenError {
@@ -270,6 +271,7 @@ impl core::fmt::Display for FrozenError {
             FrozenError::Byte { what, byte } => write!(f, "frozen head: {byte:#04x} is no value of {what}"),
             FrozenError::Order { entry } => write!(f, "frozen head: head {entry}'s record does not start where the one before it ended"),
             FrozenError::Trailing { at } => write!(f, "frozen head: bytes after the last head's record (at byte {at})"),
+            FrozenError::WrongCell { found } => write!(f, "frozen head: the record belongs to {found:?}"),
         }
     }
 }
@@ -440,14 +442,121 @@ pub fn export<'n, 'a, N: NamesSource<'n>>(names: N, keys: &Keys, store: &mut Sto
         dir.extend_from_slice(&offset.to_le_bytes());
         dir.extend_from_slice(&len.to_le_bytes());
     }
+    Ok(frame_heads(want, count, &dir, &payload, alloc))
+}
+
+fn frame_heads<'a>(want: Want, count: u32, dir: &[u8], payload: &[u8], alloc: Alloc<'a>) -> RecordBytes<'a> {
     let mut out = RecordBytes::with_capacity_in(HEADER + dir.len() + payload.len(), alloc);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&want_bytes(want));
     out.extend_from_slice(&count.to_le_bytes());
-    out.extend_from_slice(&dir);
-    out.extend_from_slice(&payload);
-    Ok(out)
+    out.extend_from_slice(dir);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// A request-local `Head(k)` record containing only the columns the declaration made.
+/// The ordinary BZHD term writer relocates defaults and const parameter types. The
+/// ADT's field columns are empty and are never installed as a definition.
+fn declaration<'n, 'a, N: NamesSource<'n>>(names: N, store: &Store<'n>, want: Want, full: Want, alloc: Alloc<'a>) -> Result<RecordBytes<'a>, FreezeError> {
+    let key = want.key();
+    let at = match full {
+        Want::Adt(_) => HeadAt::Adt(key),
+        Want::Members(_) => HeadAt::Trait(key),
+        _ => return Err(FreezeError::NotACell { want, cell: full }),
+    };
+    let refused = |error| FreezeError::Record { want, at, error };
+    let row;
+    let head = match at {
+        HeadAt::Adt(_) => {
+            let kind = match names.kind_of_item(key) {
+                Some(ItemKind::Struct) => blaze_typeck::AdtKind::Struct,
+                Some(ItemKind::Enum) => blaze_typeck::AdtKind::Enum,
+                Some(ItemKind::Union) => blaze_typeck::AdtKind::Union,
+                _ => return Err(refused(HeadRecordError::Shape { what: "an ADT declaration with no ADT item" })),
+            };
+            let (generics, defaults) = store.maps.generics.get(&key).ok_or_else(|| refused(HeadRecordError::NotMade { at }))?;
+            let const_params = store.maps.const_params.get(&key).ok_or_else(|| refused(HeadRecordError::NotMade { at }))?;
+            let empty = *defaults.allocator();
+            row = crate::front2::heads::AdtRow {
+                kind, generics: *generics, variants: std::vec::Vec::new_in(empty), fields: std::vec::Vec::new_in(empty),
+                repr: blaze_build::layout::ReprAttrs::RUST, valid: Default::default(), discrs: std::vec::Vec::new_in(empty), args: false,
+            };
+            HeadRef::Adt { key, row: &row, defaults, const_params, field_defaults: &[], preds: None, life: None, fieldless: store.maps.fieldless_enums.get(&checker_of(key)).copied() }
+        }
+        _ => head_record::from_store(store, at).map_err(refused)?,
+    };
+    let bytes = head_record::encode(head, store.tys.view(), alloc).map_err(refused)?;
+    let len = u32::try_from(bytes.len()).map_err(|_| FreezeError::TooBig { want, what: "the declaration" })?;
+    let mut dir = RecordBytes::with_capacity_in(ENTRY, alloc);
+    dir.extend_from_slice(&at_bytes(at));
+    dir.extend_from_slice(&head_record::digest(&bytes).0);
+    dir.extend_from_slice(&0u32.to_le_bytes());
+    dir.extend_from_slice(&len.to_le_bytes());
+    Ok(frame_heads(want, 1, &dir, &bytes, alloc))
+}
+
+fn is_declaration(want: Want, full: Want) -> bool {
+    matches!((want, full), (Want::Head(k), Want::Adt(owner) | Want::Members(owner)) if k == owner)
+}
+
+/// Scratch for one chain of demands. A trait can establish its supertraits before
+/// a method signature asks for another trait's members. That other trait can then
+/// resolve an inherited associated type through the open trait's established edges.
+struct FreezeInputs<'n> {
+    signatures: Signatures<'n>,
+    supers: crate::front2::rows::Rows<LibKey, RecordBytes<'static>, Alloc<'static>>,
+    alloc: Alloc<'static>,
+}
+
+impl<'n> FreezeInputs<'n> {
+    fn new(alloc: Alloc<'static>) -> Self {
+        Self { signatures: Signatures::new(alloc), supers: crate::front2::rows::Rows::new_in(alloc), alloc }
+    }
+
+    fn suspend(&self, want: Want, store: &Store<'n>) -> Result<(), FreezeError> {
+        let Want::Members(key) = want else { return Ok(()) };
+        if self.supers.contains_key(&key) || !store.maps.supers.contains_key(&key) {
+            return Ok(());
+        }
+        // gat_bounds::gat_const_want also uses a held supertrait list as evidence that
+        // the associated type parameter rows are ready. Until those rows are complete,
+        // lending the edges alone could turn a needed const parameter into a refusal.
+        if store.maps.traits.get(&key).is_some_and(|head| head.assoc.iter().any(|name| {
+            store.maps.assoc_generics.get(&(key, *name)).is_some_and(|count| *count > 0)
+                && !store.maps.assoc_consts.contains_key(&(key, *name))
+        })) {
+            return Ok(());
+        }
+        let at = HeadAt::Trait(key);
+        let refused = |error| FreezeError::Record { want, at, error };
+        let row = head_record::from_store(store, at).map_err(refused)?;
+        self.supers.insert(key, head_record::encode(row, store.tys.view(), self.alloc).map_err(refused)?);
+        Ok(())
+    }
+
+    /// File the established supertrait edges in the reader's own type table, along
+    /// with the GAT const-parameter rows whose availability those edges imply.
+    fn file_supers(&self, key: LibKey, store: &Store<'n>) -> Result<bool, FreezeError> {
+        let Some(bytes) = self.supers.get(&key) else { return Ok(false) };
+        if store.maps.supers.contains_key(&key) {
+            return Ok(false);
+        }
+        let refuse = |error| FreezeError::Record { want: Want::Members(key), at: HeadAt::Trait(key), error };
+        match head_record::decode(bytes, None, &store.tys, self.alloc).map_err(refuse)? {
+            Head::Trait { key: saved, supers, assoc_side, .. } if saved == key => {
+                for side in assoc_side {
+                    if let Some(params) = side.consts {
+                        store.maps.assoc_consts.insert((key, side.name), params.iter().copied().collect());
+                    }
+                }
+                store.maps.supers.insert(key, supers.iter().copied().collect());
+                Ok(true)
+            }
+            _ => Err(refuse(HeadRecordError::Shape { what: "a suspended supertrait list for a different trait" })),
+        }
+    }
 }
 
 /// One item frozen: its bytes and the cells its making read.
@@ -468,13 +577,9 @@ pub struct Frozen<'a> {
     /// evaluation: over a store seeded from frozen heads ([`freeze_seeded`]), only the item's
     /// own.
     pub lowered: u32,
-    /// The wants the CONSTANT EVALUATOR made by lowering in its store ([`ConstSource::eval_const`]):
-    /// its `Records` make the heads an evaluation needs by an unseeded `Store::ensure`, so a
-    /// constant ITEM an anonymous constant names (`[u8; N]`: the anon const's body reads `N`)
-    /// has its head lowered again here though `N`'s own cell froze it (owned_reads_tests.rs
-    /// `one_source_lowers_each_head_and_evaluates_each_constant_once`, lane H7: the 31st of 30).
-    /// Counted apart, so the freeze's floor is stated exactly; seeding the evaluator's store is
-    /// front2 check.rs `Records`' piece (the report's NOT DONE).
+    /// Wants lowered inside [`ConstSource::eval_const`]. The request-backed evaluator
+    /// asks the head driver for external items. A private evaluator makes those items
+    /// in its own store and its work is included in the private schedule's counter.
     pub eval_lowered: u32,
 }
 
@@ -528,7 +633,8 @@ pub fn freeze_seeded<'n, 'a, N: NamesSource<'n>, H: ConstSource<'n>>(
     alloc: Alloc<'a>,
 ) -> Result<Frozen<'a>, FreezeError> {
     let mut needed: AVec<'a, Want> = AVec::new_in(alloc);
-    freeze_noting(names, sized, pointers, want, source, frame, scratch, alloc, &mut needed)
+    let inputs = FreezeInputs::new(scratch);
+    freeze_noting(names, sized, pointers, want, source, frame, scratch, alloc, &mut needed, &inputs, None)
 }
 
 /// [`freeze_seeded`], each need its making met noted in `needed` as it is met (before its seed),
@@ -545,24 +651,73 @@ fn freeze_noting<'n, 'a, N: NamesSource<'n>, H: ConstSource<'n>>(
     scratch: Alloc<'static>,
     alloc: Alloc<'a>,
     needed: &mut AVec<'a, Want>,
+    inputs: &FreezeInputs<'n>,
+    mut eval_inputs: Option<&mut AVec<'a, (Want, LibKey, Want)>>,
 ) -> Result<Frozen<'a>, FreezeError> {
     let cell = cell_of(names, want)?;
-    if cell != want {
+    let partial = source.shares_declarations() && is_declaration(want, cell);
+    if cell != want && !partial {
         return Err(FreezeError::NotACell { want, cell });
     }
-    let mut store = Store::new(sized, frame, scratch);
-    store.pointers = pointers;
+    // An evaluation can discover heads through its body's checker. Start with a
+    // fresh store after such a discovery: a refused anonymous value, partially filed
+    // by eval_len, must never become the answer of the resumed evaluation.
+    for _ in 0..MOST_ATTEMPTS {
+        let mut store = Store::new(sized, frame, scratch);
+        store.pointers = pointers;
+        let step = freeze_in_store(names, want, cell, source, &mut store, scratch, alloc, needed, inputs, eval_inputs.as_deref().map(|inputs| inputs.as_slice()));
+        let (c, need) = match step {
+            Ok(FreezeStep::Done(frozen)) => return Ok(frozen),
+            Ok(FreezeStep::Prepare(c, need)) => (c, need),
+            Err(error) => {
+                source.unfinished_lowerings(store.lowered);
+                if matches!(error, FreezeError::Unfrozen { .. }) && source.shares_declarations() {
+                    inputs.suspend(want, &store)?;
+                }
+                return Err(error);
+            }
+        };
+        source.unfinished_lowerings(store.lowered);
+        let Some(inputs) = eval_inputs.as_deref_mut() else {
+            return Err(FreezeError::Head { want, error: HeadError::Seed { need, by: want } });
+        };
+        if inputs.contains(&(want, c, need)) {
+            return Err(FreezeError::Head { want, error: HeadError::NeedMade { need, by: want } });
+        }
+        inputs.push((want, c, need));
+    }
+    Err(FreezeError::Steps { want, most: MOST_ATTEMPTS })
+}
+
+enum FreezeStep<'a> {
+    Done(Frozen<'a>),
+    Prepare(LibKey, Want),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn freeze_in_store<'n, 'a, N: NamesSource<'n>, H: ConstSource<'n>>(
+    names: N,
+    want: Want,
+    cell: Want,
+    source: &mut H,
+    store: &mut Store<'n>,
+    scratch: Alloc<'static>,
+    alloc: Alloc<'a>,
+    needed: &mut AVec<'a, Want>,
+    inputs: &FreezeInputs<'n>,
+    eval_inputs: Option<&[(Want, LibKey, Want)]>,
+) -> Result<FreezeStep<'a>, FreezeError> {
     let mut keys = Keys::new();
     let mut asked: AVec<'a, LibKey> = AVec::new_in(alloc);
     // What the constant evaluator lowered in this store ([`Frozen::eval_lowered`]).
     let mut by_eval = 0u32;
     for _ in 0..=MOST_FREEZE_CONSTS {
-        let c = match ensure_in(names, want, want, source, &mut store, &mut keys, needed, scratch) {
+        let c = match ensure_in(names, want, want, source, store, &mut keys, needed, scratch, inputs) {
             Ok(()) => {
-                let mut frozen = finish(names, &keys, &mut store, want, &needed[..], alloc)?;
+                let mut frozen = finish_cell(names, &keys, store, want, cell, &needed[..], alloc)?;
                 frozen.lowered = frozen.lowered.saturating_sub(by_eval);
                 frozen.eval_lowered = by_eval;
-                return Ok(frozen);
+                return Ok(FreezeStep::Done(frozen));
             }
             Err(Need::Fail(e)) => return Err(e),
             Err(Need::Const(c)) => c,
@@ -582,14 +737,31 @@ fn freeze_noting<'n, 'a, N: NamesSource<'n>, H: ConstSource<'n>>(
             // Its key's origin, which the evaluator lowers its body by (keys.rs `library_in`;
             // `Front2::new` files every item's in a body's keys, a freeze's start empty).
             keys.item(c).map_err(|clash| FreezeError::Head { want, error: HeadError::Key(clash) })?;
-            match ensure_in(names, want, Want::Fn(c), source, &mut store, &mut keys, needed, scratch) {
+            match ensure_in(names, want, Want::Fn(c), source, store, &mut keys, needed, scratch, inputs) {
                 Ok(()) => {}
                 Err(Need::Fail(e)) => return Err(e),
                 Err(Need::Const(of)) => return Err(FreezeError::Const { want, c, error: ConstRefused::TypeNeedsConst { of } }),
             }
         }
+        store.eval_head_reads.clear();
+        if let Some(evals) = eval_inputs {
+            for &(_, _, need) in evals.iter().filter(|(cell, of, _)| *cell == want && *of == c) {
+                match ensure_in(names, want, need, source, store, &mut keys, needed, scratch, inputs) {
+                    Ok(()) => {}
+                    Err(Need::Fail(e)) => return Err(e),
+                    Err(Need::Const(of)) => return Err(FreezeError::Const { want, c, error: ConstRefused::TypeNeedsConst { of } }),
+                }
+                store.eval_head_reads.push(need);
+            }
+        }
+        store.evaluating_head = eval_inputs.is_some();
         let before = store.lowered;
-        let evaluated = source.eval_const(&mut store, &mut keys, c);
+        let evaluated = source.eval_const(store, &mut keys, c);
+        store.evaluating_head = false;
+        if let Some(need) = store.eval_head_need.take() {
+            return Ok(FreezeStep::Prepare(c, need));
+        }
+        needed.extend_from_slice(&store.eval_head_reads);
         by_eval = by_eval.saturating_add(store.lowered.saturating_sub(before));
         match evaluated {
             Ok(()) => {}
@@ -597,7 +769,8 @@ fn freeze_noting<'n, 'a, N: NamesSource<'n>, H: ConstSource<'n>>(
             // refusal is (`Maps::anon_failed`; types.rs `const_value_bits`): the member is
             // refused by name with this reason (head_record.rs `FnRefused`), the others stand.
             Err(error) if matches!(want, Want::Members(_)) => {
-                store.maps.anon_failed.insert(c, std::format!("{error}").into_boxed_str());
+                let message = blaze_own::text::format(scratch, format_args!("{error}"));
+                store.maps.anon_failed.insert(c, message.as_str().into());
             }
             Err(error) => return Err(FreezeError::Const { want, c, error }),
         }
@@ -623,14 +796,24 @@ fn ensure_in<'n, 'a, N: NamesSource<'n>, H: HeadSource>(
     keys: &mut Keys,
     needed: &mut AVec<'a, Want>,
     scratch: Alloc<'static>,
+    inputs: &FreezeInputs<'n>,
 ) -> Result<(), Need> {
+    // ensure_seeded seeds needs found by a step. Its starting want is normally this
+    // cell; an evaluator prerequisite (including the named constant's own Fn) is a
+    // foreign starting want and must go through the same seed lookup first.
+    if target != own && source.shares_declarations() {
+        needed.push(target);
+        if store.made(target) || seed(names, Some(own), target, source, store, keys, scratch).map_err(Need::Fail)? == Seeded::Filed {
+            return Ok(());
+        }
+    }
     let mut failed: Option<FreezeError> = None;
-    let made = store.ensure_seeded(names, keys, target, &mut |w| needed.push(w), &mut |store, keys, need| {
-        seed(names, Some(own), need, source, store, keys, scratch).map_err(|e| {
+    let made = store.ensure_with_signatures(names, keys, target, &mut |w| needed.push(w), &mut |store, keys, need| {
+        seed_in(names, Some(own), need, source, store, keys, scratch, Some(inputs)).map_err(|e| {
             failed = Some(e);
             SeedFailed
         })
-    });
+    }, &inputs.signatures);
     match (made, failed) {
         (Ok(()), _) => Ok(()),
         (Err(HeadError::Seed { .. }), Some(e)) => Err(Need::Fail(e)),
@@ -641,11 +824,19 @@ fn ensure_in<'n, 'a, N: NamesSource<'n>, H: HeadSource>(
 
 /// What [`freeze`] and [`freeze_seeded`] hand back once `want` is made in `store`.
 fn finish<'n, 'a, N: NamesSource<'n>>(names: N, keys: &Keys, store: &mut Store<'n>, want: Want, needed: &[Want], alloc: Alloc<'a>) -> Result<Frozen<'a>, FreezeError> {
-    let bytes = export(names, keys, store, want, Plant::None, alloc)?;
+    finish_cell(names, keys, store, want, want, needed, alloc)
+}
+
+fn finish_cell<'n, 'a, N: NamesSource<'n>>(names: N, keys: &Keys, store: &mut Store<'n>, want: Want, full: Want, needed: &[Want], alloc: Alloc<'a>) -> Result<Frozen<'a>, FreezeError> {
+    let bytes = if full == want {
+        export(names, keys, store, want, Plant::None, alloc)?
+    } else {
+        declaration(names, store, want, full, alloc)?
+    };
     let mut reads: AVec<'a, Want> = AVec::new_in(alloc);
     for w in needed.iter().copied() {
         let c = cell_of(names, w)?;
-        if c != want {
+        if c != full {
             reads.push(c);
         }
     }
@@ -662,16 +853,45 @@ fn finish<'n, 'a, N: NamesSource<'n>>(names: N, keys: &Keys, store: &mut Store<'
 /// making) lowered there. The seed a body's store passes to heads.rs `Store::ensure_seeded`,
 /// as [`freeze_seeded`] does (stash the error, hand back `SeedFailed`).
 pub fn seed<'n, N: NamesSource<'n>, H: HeadSource>(names: N, own: Option<Want>, need: Want, source: &mut H, store: &Store<'n>, keys: &Keys, scratch: Alloc<'static>) -> Result<Seeded, FreezeError> {
+    seed_in(names, own, need, source, store, keys, scratch, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seed_in<'n, N: NamesSource<'n>, H: HeadSource>(names: N, own: Option<Want>, need: Want, source: &mut H, store: &Store<'n>, keys: &Keys, scratch: Alloc<'static>, inputs: Option<&FreezeInputs<'n>>) -> Result<Seeded, FreezeError> {
     let cell = cell_of(names, need)?;
-    if Some(cell) == own || source.open(cell) {
-        return Ok(Seeded::Lower);
+    let making = Some(cell) == own || source.open(cell);
+    if making && Some(cell) != own && source.shares_declarations()
+        && let Want::Members(key) = need
+        && let Some(inputs) = inputs
+        && inputs.file_supers(key, store)?
+    {
+        return Ok(Seeded::Filed);
     }
-    let frozen = source.frozen(cell)?;
-    let members = members_of(names, cell, scratch);
-    let mut text_of = |at: HeadAt| fn_text(names, cell, &members, at);
+    let ask = if making && source.shares_declarations() && is_declaration(need, cell) {
+        // A recursive reference needs the generics or trait header before the complete
+        // cell can exist. Its owner and every recursive reader ask the same declaration.
+        need
+    } else if making {
+        return Ok(Seeded::Lower);
+    } else {
+        cell
+    };
+    if ask != cell && source.open(ask) {
+        return Err(FreezeError::Head { want: ask, error: HeadError::declaration_cycle(own, ask) });
+    }
+    let frozen = source.frozen(ask)?;
+    let members = if ask != cell && matches!(cell, Want::Adt(_)) {
+        AVec::new_in(scratch)
+    } else {
+        members_of(names, ask, scratch)
+    };
+    let mut text_of = |at: HeadAt| fn_text(names, ask, &members, at);
     let heads = import(&frozen, &mut text_of, &store.tys, scratch, scratch)?;
-    file_keys(cell, &members, &heads, keys)?;
-    store.file_heads(cell, heads).map_err(|error| FreezeError::Head { want: cell, error })?;
+    // The declaration of an ADT files no constructor (Store::adt makes those).
+    if ask == cell || !matches!(cell, Want::Adt(_)) {
+        file_keys(ask, &members, &heads, keys)?;
+    }
+    store.file_heads(ask, heads).map_err(|error| FreezeError::Head { want: ask, error })?;
     Ok(Seeded::Filed)
 }
 
@@ -891,6 +1111,9 @@ pub fn import<'n, 'a>(
 /// - [`FrozenHeads`]: each cell frozen alone ([`freeze`]);
 /// - [`SeededHeads`]: each cell frozen in a store seeded from the others ([`freeze_seeded`]).
 pub trait HeadSource {
+    /// Whether this source has separate request-local records for the declaration of an
+    /// ADT or a trait while its complete cell is being made.
+    fn shares_declarations(&self) -> bool { false }
     /// The frozen head of cell `want` ([`cell_of`]), made on first ask.
     fn frozen(&mut self, want: Want) -> Result<FrozenHead<'_>, FreezeError>;
     /// Whether cell `want` is being made by this source now (up the stack of a
@@ -901,6 +1124,9 @@ pub trait HeadSource {
 
 /// A [`HeadSource`] a [`freeze_seeded`] asks for the value of a constant a head's type holds.
 pub trait ConstSource<'n>: HeadSource {
+    /// Include completed wants even when a later step suspends or refuses this attempt.
+    fn unfinished_lowerings(&mut self, _count: u32) {}
+
     /// Constant `c` evaluated and its bits filed in `store` ([`ConstValues::eval`]).
     fn eval_const(&mut self, store: &mut Store<'n>, keys: &mut Keys, c: LibKey) -> Result<(), ConstRefused>;
 }
@@ -1000,7 +1226,40 @@ fn head_task_made<'a, H: HeadCells>(
 
 /// The kept frozen heads of one source, by cell, in the order first asked.
 struct Kept<'a> {
-    cells: AVec<'a, (Want, RecordBytes<'a>)>,
+    cells: AVec<'a, (Want, KeptBytes<'a>)>,
+}
+
+enum KeptBytes<'a> {
+    Local(RecordBytes<'a>),
+    Shared(FrozenHead<'a>),
+}
+
+impl<'a> KeptBytes<'a> {
+    fn shared(want: Want, bytes: &'a [u8]) -> Result<Self, FreezeError> {
+        let frozen = FrozenHead::read(bytes).map_err(|error| FreezeError::Read { want, error })?;
+        if frozen.want() != want {
+            return Err(FreezeError::Read { want, error: FrozenError::WrongCell { found: frozen.want() } });
+        }
+        Ok(Self::Shared(frozen))
+    }
+
+    fn frozen(&self, want: Want) -> Result<FrozenHead<'_>, FreezeError> {
+        match self {
+            Self::Shared(frozen) => Ok(*frozen),
+            Self::Local(bytes) => FrozenHead::read(bytes).map_err(|error| FreezeError::Read { want, error }),
+        }
+    }
+}
+
+impl core::ops::Deref for KeptBytes<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Local(bytes) => bytes,
+            Self::Shared(frozen) => frozen.bytes(),
+        }
+    }
 }
 
 impl<'a> Kept<'a> {
@@ -1009,12 +1268,12 @@ impl<'a> Kept<'a> {
             Some(at) => at,
             None => {
                 let bytes = make()?;
-                self.cells.push((want, bytes));
+                self.cells.push((want, KeptBytes::Local(bytes)));
                 self.cells.len() - 1
             }
         };
         let (_, bytes) = &self.cells[at];
-        FrozenHead::read(bytes).map_err(|error| FreezeError::Read { want, error })
+        bytes.frozen(want)
     }
 }
 
@@ -1131,17 +1390,19 @@ pub struct SeededHeads<'n, 'a, N> {
     pub lowered: u32,
     /// The wants its constant evaluator made by lowering ([`Frozen::eval_lowered`]).
     pub eval_lowered: u32,
+    /// Completed lowerings in scratch stores discarded on suspension or failure.
+    unfinished: u32,
     /// Each kept cell's own [`Frozen::lowered`], at its index in `kept` (0 for one taken from
     /// `known`): which cell a count past its floor is (owned_reads_tests.rs prints it).
     lowered_each: AVec<'a, u32>,
     /// The needs met of a cell up the stack ([`HeadSource::open`]), each lowered where met.
     pub reentered: u32,
     /// The frozen heads known before this source freezes a cell itself (the request's, seeds.rs
-    /// `RequestHeads`): a cell it knows is copied in, never frozen again.
+    /// `RequestHeads`): known bytes are borrowed for the lifetime of the source.
     known: Option<&'a (dyn KnownHeads + 'a)>,
-    /// For each kept cell (at its index in `kept`), whether it was copied from `known`.
+    /// Whether the bytes at this index are already available from the shared table.
     from_known: AVec<'a, bool>,
-    /// The cells copied from `known`.
+    /// Cells taken from the table without running the successful freeze here.
     pub taken: u32,
     /// Told each cell's freeze as it begins and ends ([`SeededHeadsOpts::owners`]).
     owners: Option<&'a (dyn ReadOwners + 'a)>,
@@ -1217,6 +1478,22 @@ pub trait KnownHeads {
     /// Cell `cell`'s frozen bytes (the `BZFZ` form) when known; else whether the asker may
     /// freeze it itself, or must not (a head only its owner's task freezes).
     fn known(&self, cell: Want) -> Known<'_>;
+
+    /// Whether the driver's evaluator must also demand external heads from this table.
+    fn shares_evaluator_heads(&self) -> bool { false }
+
+    /// Run one attempt. A missing dependency leaves the attempt before its maker is
+    /// entered, so two workers discovering opposite ends of a chain never wait nested.
+    fn make<'s>(&self, _cell: Want, noted: &mut AVec<'s, Want>, freeze: &mut dyn FnMut(&mut AVec<'s, Want>) -> Result<Frozen<'s>, FreezeError>) -> Result<MadeHead<'s, '_>, FreezeError> {
+        freeze(noted).map(MadeHead::Local)
+    }
+}
+
+pub enum MadeHead<'s, 'table> {
+    Local(Frozen<'s>),
+    Shared { bytes: &'table [u8], work: Option<(u32, u32)> },
+    /// The table holds this cell's terminal failure and its direct reads.
+    Failed { said: &'static str },
 }
 
 /// What [`KnownHeads::known`] answers of one cell.
@@ -1302,6 +1579,7 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
             consts: o.consts,
             lowered: 0,
             eval_lowered: 0,
+            unfinished: 0,
             lowered_each: AVec::new_in(o.alloc),
             reentered: 0,
             known: o.known,
@@ -1328,6 +1606,11 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
     /// order finished; 0 for a cell taken from the known heads.
     pub fn lowered_each(&self) -> impl Iterator<Item = (Want, u32)> + '_ {
         self.kept.cells.iter().zip(self.lowered_each.iter()).map(|((w, _), n)| (*w, *n))
+    }
+
+    /// All work performed, including completed wants in attempts that made no record.
+    pub fn total_lowered(&self) -> u32 {
+        self.lowered.saturating_add(self.eval_lowered).saturating_add(self.unfinished)
     }
 
     /// How many cells it keeps (frozen here or taken from its known heads).
@@ -1408,8 +1691,7 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
             let unmade = self.failed[at].1;
             return Err(unmade.again(want));
         }
-        // Known already (the request's table, another worker's freeze): copied in, so its
-        // bytes are read like a cell frozen here, and never frozen again.
+        // Known bytes stay in the request table. This source retains a borrowed slice.
         // Not the asker's to freeze: refused by the knower's words, never frozen here.
         let bytes = match self.known.map(|known| known.known(want)) {
             Some(Known::Bytes(bytes)) => Some(bytes),
@@ -1417,9 +1699,7 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
             Some(Known::Freeze) | None => None,
         };
         if let Some(bytes) = bytes {
-            let mut copy = RecordBytes::with_capacity_in(bytes.len(), self.alloc);
-            copy.extend_from_slice(bytes);
-            self.kept.cells.push((want, copy));
+            self.kept.cells.push((want, KeptBytes::shared(want, bytes)?));
             self.index_last(want);
             self.reads.push(AVec::new_in(self.alloc));
             self.values.push(AVec::new_in(self.alloc));
@@ -1449,6 +1729,9 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
     /// cell above it, its direct need. The asker is answered its own cell's kept failure, as every
     /// later ask is (lane HF1).
     fn drive(&mut self, want: Want) -> Result<(), FreezeError> {
+        let inputs = FreezeInputs::new(self.scratch);
+        let mut eval_inputs = AVec::new_in(self.alloc);
+        let mut failed_need = None;
         let (names, sized, pointers, frame, scratch, alloc, owners) = (self.names, self.sized, self.pointers, self.frame, self.scratch, self.alloc, self.owners);
         for _ in 0..MOST_ATTEMPTS {
             let Some(&top) = self.making.last() else { return Ok(()) };
@@ -1459,23 +1742,51 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
             if let Some(owners) = owners {
                 owners.enter(top);
             }
-            let mut noted: AVec<'a, Want> = AVec::new_in(alloc);
-            let attempt = freeze_noting(names, sized, pointers, top, self, frame, scratch, alloc, &mut noted);
+            let mut noted = self.making_noted.pop().expect("every pending head has its attempted reads");
+            let inherited = failed_need.take();
+            if inherited.is_none() {
+                noted.clear();
+            }
+            let known = self.known;
+            let shared_eval = known.is_some_and(|table| table.shares_evaluator_heads());
+            // A suspended parent already discovered its direct need. Once the need
+            // fails, carry its refusal and the parent's original reads into the
+            // parent's claim without running its lowering again.
+            let mut make = |reads: &mut AVec<'a, Want>| match inherited {
+                Some((want, why)) => Err(FreezeError::NotTheirs { want, why }),
+                None => freeze_noting(names, sized, pointers, top, self, frame, scratch, alloc, reads, &inputs, shared_eval.then_some(&mut eval_inputs)),
+            };
+            let attempt = match known {
+                Some(table) => table.make(top, &mut noted, &mut make),
+                None => make(&mut noted).map(MadeHead::Local),
+            };
             if let Some(owners) = owners {
                 owners.leave();
             }
             // What this attempt met of other heads: `top`'s, should it be given up for good.
-            if let Some(last) = self.making_noted.last_mut() {
-                *last = noted;
-            }
+            self.making_noted.push(noted);
             match attempt {
-                Ok(f) => {
+                Ok(MadeHead::Shared { bytes, work }) => {
+                    self.making.pop();
+                    self.making_noted.pop();
+                    let (lowered, eval_lowered) = work.unwrap_or((0, 0));
+                    self.lowered += lowered;
+                    self.eval_lowered += eval_lowered;
+                    self.taken += u32::from(work.is_none());
+                    self.lowered_each.push(lowered);
+                    self.kept.cells.push((top, KeptBytes::shared(top, bytes)?));
+                    self.index_last(top);
+                    self.reads.push(AVec::new_in(alloc));
+                    self.values.push(AVec::new_in(alloc));
+                    self.from_known.push(true);
+                }
+                Ok(MadeHead::Local(f)) => {
                     self.making.pop();
                     self.making_noted.pop();
                     self.lowered += f.lowered;
                     self.eval_lowered += f.eval_lowered;
                     self.lowered_each.push(f.lowered);
-                    self.kept.cells.push((top, f.bytes));
+                    self.kept.cells.push((top, KeptBytes::Local(f.bytes)));
                     self.index_last(top);
                     self.reads.push(f.reads);
                     self.values.push(f.consts);
@@ -1491,6 +1802,15 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
                     }
                     self.making.push(need);
                     self.making_noted.push(AVec::new_in(alloc));
+                }
+                Ok(MadeHead::Failed { said }) => {
+                    self.making.pop();
+                    self.making_noted.pop();
+                    let why = NotTheirs::Failed { said };
+                    if self.making.is_empty() {
+                        return Err(FreezeError::NotTheirs { want: top, why });
+                    }
+                    failed_need = Some((top, why));
                 }
                 Err(e) => {
                     let making = core::mem::replace(&mut self.making, AVec::new_in(alloc));
@@ -1565,8 +1885,18 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
             FreezeError::Again { want: need, .. } => Unmade::Needs(*need),
             _ => Unmade::Own(self.own.len()),
         };
+        // A worker can publish this very cell's failure between the driver's miss
+        // and the claim. Its published failure is the end of the local stack. Filing
+        // "top needs top" would replace the cause with an artificial cycle.
+        let already_failed = matches!(&e, FreezeError::NotTheirs { want, why: NotTheirs::Failed { .. } } if *want == top);
         let mut asked: Option<Unmade> = None;
         for (at, w) in making.iter().copied().enumerate() {
+            if w == top && already_failed {
+                if at == 0 {
+                    return e;
+                }
+                break;
+            }
             let unmade = match (making.get(at + 1), top_unmade) {
                 (None, _) => top_unmade,
                 (Some(_), Unmade::Refused { .. }) => top_unmade,
@@ -1597,6 +1927,10 @@ pub const MOST_MAKING: usize = 1 << 12;
 pub const MOST_ATTEMPTS: usize = 2 << 20;
 
 impl<'n, N: NamesSource<'n>> ConstSource<'n> for SeededHeads<'n, '_, N> {
+    fn unfinished_lowerings(&mut self, count: u32) {
+        self.unfinished = self.unfinished.saturating_add(count);
+    }
+
     fn eval_const(&mut self, store: &mut Store<'n>, keys: &mut Keys, c: LibKey) -> Result<(), ConstRefused> {
         match self.consts.as_deref_mut() {
             Some(values) => values.eval(store, keys, c).map_err(ConstRefused::Eval),
@@ -1622,16 +1956,19 @@ impl<'n, N: NamesSource<'n>> HeadCells for SeededHeads<'n, '_, N> {
     fn cell(&mut self, want: Want) -> Result<(FrozenHead<'_>, CellReads<'_>), FreezeError> {
         let at = self.made(want)?;
         let (_, bytes) = &self.kept.cells[at];
-        let frozen = FrozenHead::read(bytes).map_err(|error| FreezeError::Read { want, error })?;
+        let frozen = bytes.frozen(want)?;
         Ok((frozen, CellReads { heads: &self.reads[at][..], consts: &self.values[at][..] }))
     }
 }
 
 impl<'n, N: NamesSource<'n>> HeadSource for SeededHeads<'n, '_, N> {
+    fn shares_declarations(&self) -> bool {
+        self.known.is_some_and(|table| table.shares_evaluator_heads())
+    }
     fn frozen(&mut self, want: Want) -> Result<FrozenHead<'_>, FreezeError> {
         let at = self.made(want)?;
         let (_, bytes) = &self.kept.cells[at];
-        FrozenHead::read(bytes).map_err(|error| FreezeError::Read { want, error })
+        bytes.frozen(want)
     }
 
     fn open(&mut self, want: Want) -> bool {

@@ -188,7 +188,7 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
         | ItemDetail::Static { body_holds_items } => {
             sink.part(&[u8::from(body_holds_items)]);
             // `BodySrc::of`: a body that holds items is scanned for the modules its blocks make.
-            whole |= body_holds_items;
+            whole |= body_holds_items && crate::nested::may_write_block(item.range.of(text));
         }
         ItemDetail::Struct | ItemDetail::Variant { discriminant: _ } => {
             sink.part(&form(text, item));

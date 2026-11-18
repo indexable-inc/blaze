@@ -127,6 +127,10 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         self.inner.types()
     }
 
+    fn body_types(&self, i: usize) -> PTys<'_> {
+        self.inner.body_types(i)
+    }
+
     fn resolve(&self, i: usize, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ResolveError> {
         let mut q = self.text();
         write!(q, "resolve in {:?}: ", self.key_of(i)).expect(WRITES);

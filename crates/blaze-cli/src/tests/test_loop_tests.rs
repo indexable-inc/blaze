@@ -123,6 +123,7 @@ enum Pending {
     Moved,
     Looked(usize),
     CannotRun(usize),
+    CannotBuild(usize),
     Killed(usize),
     Checked,
 }
@@ -136,6 +137,7 @@ struct World {
     store: AVec<'static, (Address, Slot, AVec<'static, u8>)>,
     fail: Option<usize>,
     hang: Option<usize>,
+    unbuilt: Option<usize>,
     runnable: bool,
     check_errors: u32,
     requests: u8,
@@ -152,6 +154,7 @@ impl World {
             store: Vec::new_in(g),
             fail: None,
             hang: None,
+            unbuilt: None,
             runnable: true,
             check_errors: 0,
             requests: 0,
@@ -259,6 +262,8 @@ fn request(tape: &Tape, world: &mut World, plant: Plant) -> Result<Seen, Broke> 
                         seen.runs.push(i);
                         if !world.runnable {
                             inbox.push(Pending::CannotRun(i));
+                        } else if world.unbuilt == Some(i) {
+                            inbox.push(Pending::CannotBuild(i));
                         } else if world.hang == Some(i) {
                             running.push((i, now, None));
                         } else {
@@ -321,6 +326,11 @@ fn request(tape: &Tape, world: &mut World, plant: Plant) -> Result<Seen, Broke> 
                     Pending::CannotRun(i) => {
                         seen.not_run.push(i);
                         machine.step(Event::CannotRun { test: id(i), why: CannotRun::BodiesNotBuilt }, now, &mut out).map_err(harness)?;
+                    }
+                    Pending::CannotBuild(i) => {
+                        seen.not_run.push(i);
+                        let why = crate::test_drive::refusal_tests::missing_code();
+                        machine.step(Event::CannotBuild { suite: SuiteId(0), test: id(i), why: &why }, now, &mut out).map_err(harness)?;
                     }
                     Pending::Killed(i) => {
                         let ended = TestEnded {
@@ -525,6 +535,30 @@ fn scenario(tape: &Tape, plant: Plant) -> Result<(), Broke> {
 #[test]
 fn the_loop_reuses_selects_files_and_fails_honestly() {
     check(SimConfig::cases(200), |tape| scenario(tape, Plant::None));
+}
+
+#[test]
+fn a_refused_first_call_invalidates_the_previous_pass() {
+    check(SimConfig::cases(32), |tape| {
+        let mut world = World::new();
+        let first = request(tape, &mut world, Plant::None)?;
+        if !first.status.passed() {
+            return Err(Broke::Oracle("initial passes were not saved".into()));
+        }
+        let edited = tape.index(FNS, "edit a callee");
+        let dependents = holders(edited);
+        let test = dependents[tape.index(dependents.len(), "refused first call")];
+        world.versions[edited] += 1;
+        world.unbuilt = Some(test);
+        let refused = request(tape, &mut world, Plant::None)?;
+        says(&refused, "1 not run (code not built)", "the build refusal is counted separately")?;
+        world.unbuilt = None;
+        world.versions[edited] -= 1;
+        // Old result bytes are still in the store. Only the refused row lost its pass
+        // and asks, so the other tests can reuse the old address when the edit is undone.
+        let restored = request(tape, &mut world, Plant::None)?;
+        asked_exactly(&restored, &[test], "an old pass was reused despite the refused first call")
+    });
 }
 
 /// Planted: the loop hands the plan a kept FAILURE as a kept pass. Caught by (iv).

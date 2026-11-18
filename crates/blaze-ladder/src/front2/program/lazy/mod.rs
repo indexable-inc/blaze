@@ -5,8 +5,8 @@
 //! [`super::Front2Program`] is made by a census: every fn `main` reaches is lowered, checked and
 //! tabled before the back half asks anything (`make_from`), about 6 KB a row. [`LazyProgram`]
 //! answers the same seam ([`crate::seam::FrontEnd`]) with NO census: its state is columns that
-//! grow by one row when a body is asked for, and the one body (or the few) the instance being
-//! made needs. The back half's per-instance step (run/make_one.rs, piece X) drives it:
+//! grow when a function is asked for, with one lowering per live body. The back half's
+//! per-instance step (run/make_one.rs, piece X) drives it:
 //!
 //! 1. `check_one(key)` (`&mut self`, the ONE place a row is added): fn `key`'s row; its body
 //!    lowered (each head and constant the lowering names made first: `lower_made`) and checked
@@ -14,8 +14,8 @@
 //!    fn it calls, the row of each ADT its types name, the value of each constant it reads. The
 //!    `Checked` is handed over owned (the program keeps none).
 //! 2. the build of the instance reads the `&self` getters, which answer from the columns.
-//! 3. `done(i)`: the instance is made; the program drops row `i`'s body (its lowering and
-//!    literals). A row's head facts stay (a few words): a later instance calling it reads them.
+//! 3. The maker keeps the body for later instances at other arguments. A caller that releases
+//!    it with `done(i)` drops its lowering and literals. The row's head facts stay.
 //!
 //! Why `&mut self` alone adds rows: the seam's getters lend `&'_` data (`FnFacts`, `FnSig`,
 //! `Adt`, `PTys`) out of the program, so nothing may be added under `&self`; `fn_index` answers
@@ -28,16 +28,15 @@
 //! solved names (`NamesSource::solved`), the records instantiation refuses by name
 //! ([`LazyRefusal::NeedsSolvedNames`]); the list is in the notes, "## Piece Y".
 //!
-//! The types table: each `check_one` forks the head store's table afresh and lowers again into
-//! it only the bodies still live, so the table is the heads made plus the few live bodies, never
-//! every body the run made (today's `tys` holds every tabled body's types). A body's type index
-//! is valid until the next `check_one`: the step reads them while it builds that instance.
+//! Each live body owns its lowered types. Its view joins the prefix of the head table it saw
+//! at lowering with its own nodes and lists, so later heads leave its indices valid.
 
 mod fill;
 mod front_end;
 mod locate;
 /// The per-fn seam rules both programs answer by (rule 30), `Front2Program`'s calls included.
 pub(in crate::front2::program) mod seam_rules;
+pub use seam_rules::PositionSource;
 
 use super::*;
 
@@ -218,13 +217,10 @@ impl<'n> Rows<'n> {
     }
 }
 
-/// A body made for the instance being built: its first lowering (whose scope `resolve` and
-/// `selects` read), the same body lowered again into the program's table (what `function`
-/// lends), and its literals. Dropped by `done`.
+/// The checked lowering and literals lent to each instance of this row until `done`.
 struct Live<'n> {
     row: u32,
     made: Body<'n>,
-    again: Body<'n>,
     lits: Literals,
 }
 
@@ -246,10 +242,7 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     buckets: Option<Buckets>,
     consts: Consts<'n>,
     prepared: &'n Prepares<'n>,
-    /// The head store's table forked, then each live body lowered again into it (module docs);
-    /// `None` until the first `check_one` (the seam's `types` is then the empty table).
-    /// `'static` (so the store's allocator at the fork) because `lower_again` takes that table type.
-    tys: Option<PortableTys<'static>>,
+    lowerings: fill::Lowerings,
     rows: Rows<'n>,
     live: AVec<'n, Option<Live<'n>>>,
     /// Each constant a checked body read by value, by key, sorted: the seam's `const_record`.
@@ -323,7 +316,7 @@ impl<'n> LazyProgram<'n, &'n crate::front2::source::Records<'n>> {
     }
 }
 
-impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
+impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     fn over(front: Front2<'n, S>, entry: Option<ItemKey>, alloc: Alloc<'static>) -> Result<LazyProgram<'n, S>, Front2Refusal> {
         let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
         store.pointers = super::super::receiver::Pointers::find(&front.index, front.resolver);
@@ -339,7 +332,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             buckets: None,
             consts: Consts::default(),
             prepared: Prepares::new_in(alloc),
-            tys: None,
+            lowerings: fill::Lowerings::default(),
             rows: Rows::new_in(alloc),
             live: AVec::new_in(alloc),
             const_values: AVec::new_in(alloc),

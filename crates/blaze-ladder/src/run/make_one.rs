@@ -70,6 +70,22 @@ pub struct CheckCount {
     pub constructed: usize,
 }
 
+/// Work at the lazy program's body boundary for this run. An initial lowering counts
+/// when it produces a body. Declarations and requests for other instances of that body
+/// add none. The other two counters count calls.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoweringCounts {
+    pub bodies_lowered: u64,
+    pub lower_again: u64,
+    pub forks: u64,
+}
+
+impl core::fmt::Display for LoweringCounts {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "bodies lowered {}, lower_again calls {}, forks {}", self.bodies_lowered, self.lower_again, self.forks)
+    }
+}
+
 impl CheckCount {
     /// Every check the makes cost.
     pub fn all(&self) -> usize {
@@ -245,7 +261,7 @@ impl MakerState {
                 }
                 let mut refresh = done.closures.len() != 0;
                 if !refresh && let Some((body, _)) = program.function(i).body {
-                    let view = body.view(program.types());
+                    let view = body.view(program.body_types(i));
                     refresh = blaze_build::coroutines_in(&view).into_iter().next().is_some();
                 }
                 self.checked[i] = Some(done);
@@ -255,7 +271,7 @@ impl MakerState {
                     // never re-made over the bodies checked before.
                     if let (Some((body, _)), Some(done)) = (program.function(i).body, self.checked[i].as_ref()) {
                         let sig = program.sig(i);
-                        tables.closures.add(&body.view(program.types()), done, sig.parent_count + sig.own_count, self.work.alloc);
+                        tables.closures.add(&body.view(program.body_types(i)), done, sig.parent_count + sig.own_count, self.work.alloc);
                     }
                     tables.coroutines.table = CoroutineTable::of(&*program, &self.checked, self.work.alloc);
                     // The library's async items, read again with the rows made so far: before the
@@ -372,7 +388,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     args.extend_from_slice(work.ground.view().list(instance.args).map_err(malformed)?);
     let t = tables.take().ok_or_else(|| tables_gone(function.key))?;
     let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
-    let view = body.view(program.types());
+    let view = body.view(program.body_types(i));
     let facts = FrontAdts(&*program, i, &[], &work.langs, &bodies);
     let found = crate::front2::const_at::needs_of(&view, done, &args, &mut work.ground, &facts, work.alloc, &mut work.needs);
     *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
@@ -393,7 +409,6 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
 /// build_from's step for one instance, from "A closure's `Fn*` method instance" to
 /// `make_entry`, over one borrow of the bodies.
 fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: usize, instance: Instance, entry: &mut AVec<'_, u8>) -> Result<Step, RunError> {
-    let types = program.types();
     let function = program.function(i);
     let name = || function.named();
     // A ctor's row has no body: its own instance is built as a fn, and a `Fn*` shim of it
@@ -469,7 +484,7 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
             return Ok(Step::Check(owner));
         }
     }
-    let view = checked.map(|(body, done)| (body.view(types), done));
+    let view = checked.map(|(body, done)| (body.view(program.body_types(i)), done));
     let own = if from_coroutine.is_some() {
         None
     } else {
@@ -951,6 +966,10 @@ impl<'n> Maker<'n> {
         self.checks
     }
 
+    pub fn lowering_counts(&self) -> LoweringCounts {
+        self.program().map_or_else(LoweringCounts::default, |program| program.lowering_counts())
+    }
+
     /// The lazy program, once a miss made it.
     pub fn program(&self) -> Option<&RecordsProgram<'n>> {
         self.made.as_ref().map(|(p, _)| p)
@@ -1113,6 +1132,10 @@ impl core::error::Error for RecordWalkError {}
 
 /// The most instances one record walk reaches (rule 18).
 pub const MOST_WALKED: usize = 1 << 22;
+
+#[cfg(test)]
+#[path = "../../tests/front_equal/lazy_lowering.rs"]
+mod lazy_lowering;
 
 /// `blaze run`'s code records by D106: from `entry` (the program's `main`, by its checker key:
 /// the command reads it from crate 0's names record) every instance reached is FOUND in `store`

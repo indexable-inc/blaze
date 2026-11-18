@@ -91,7 +91,7 @@ pub enum BorrowRefused {
     /// The lowering refused a form, by name, at an item-relative range.
     Lower(Refusal),
     /// A check went past its stated bound (rule 18): a bug of the checker, named.
-    Bound(blaze_flow::Bound),
+    Bound(blaze_flow::Bound<tc::ItemKey>),
     /// A closure's or async block's body needs a lifetime relation among its captures,
     /// parameters and result that its owner would have to prove and that is no requirement on
     /// the closure's or future's value's own regions (one that is becomes the owner's to prove:
@@ -1418,7 +1418,7 @@ fn file_flow<'a>(
     verdict: &mut BorrowVerdict<'a>,
     alloc: Alloc<'a>,
 ) -> bool {
-    let record = match blaze_flow::check(flow, alloc) {
+    let record = match blaze_flow::check_named(view.owner, flow, alloc) {
         Ok(record) => record,
         Err(bound) => {
             verdict.refused = Some(BorrowRefused::Bound(bound));

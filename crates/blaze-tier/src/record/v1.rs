@@ -34,6 +34,7 @@ pub fn from_v1<'a>(record: CodeRecord<'a>, alloc: Alloc<'a>) -> Result<Emitted<'
     sealed.encode(&mut bytes);
     drop(sealed);
     let view = CodeView::read(&bytes).map_err(FormError::V1Decode)?;
+    view.require_positionless("tier record conversion").map_err(FormError::V1Record)?;
     let rows = unwind::read(view).map_err(FormError::Unwind)?;
     let mut e = Emitted::new_in(alloc);
     e.code.extend_from_slice(view.code());

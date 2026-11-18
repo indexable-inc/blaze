@@ -3,8 +3,8 @@
 //! Per body, what `Front2Program::make_from` does for the whole program: the body lowered and
 //! checked (`lower_made`, `check_body`), a row for each fn it calls (as `program/tabled.rs`
 //! `row` makes one, without a body), the row of each ADT its types name (make_from's rounds),
-//! each constant it reads by value (`const_values`). Then the types table forked again with
-//! the live bodies (module docs). Each step is bounded by the one body.
+//! each constant it reads by value (`const_values`). The build reads the same body and
+//! type overlay that the checker used.
 
 use super::*;
 
@@ -13,8 +13,16 @@ use crate::front2::program::head_abi::{BuildAbi, head_abi};
 use crate::front2::heads::{HeadError, Want};
 use crate::front2::keys::Origin;
 use crate::front2::lower_made::{LowerTarget, lower_made};
+use crate::run::make_one::LoweringCounts;
 
-impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
+#[derive(Default)]
+pub(super) struct Lowerings {
+    count: LoweringCounts,
+    #[cfg(test)]
+    refork: Option<PortableTys<'static>>,
+}
+
+impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// The seam's `check_one` (module docs, step 1). A declaration with no body answers
     /// `Ok(None)`. A key the records search cannot find gives [`LazyRefusal::NotFound`].
     pub(super) fn check_one_key(&mut self, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, LazyRefusal> {
@@ -31,7 +39,10 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             lower_made(&mut r, prepared, target)
         };
         let made = match lowered {
-            Ok(body) => body,
+            Ok(body) => {
+                self.lowerings.count.bodies_lowered += 1;
+                body
+            }
             Err(BodyError::NoBody(owner)) if owner == key => {
                 // A free fn can reach lowering before its head has been made. Its declaration
                 // decides whether the missing body is expected.
@@ -75,7 +86,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         // lifetimes), and with no head there the call is refused `ElisionAmbiguous`. A body
         // with no async block asks nothing.
         self.body_recipes(&made, &checked, &function)?;
-        self.refork(i, made, &function)?;
+        self.keep_body(i, made, &function)?;
         Ok(Some((i, checked)))
     }
 
@@ -124,10 +135,8 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
     /// The seam's `done`: row `i`'s body is dropped (its head facts stay).
     pub(super) fn done_row(&mut self, i: usize) {
         let Some(slot) = self.rows.live.get_mut(i).and_then(Option::take) else { return };
-        if let Some(cell) = self.live.get_mut(slot as usize) {
-            *cell = None;
-        }
-        self.counts.live = self.live.iter().filter(|l| l.is_some()).count() as u32;
+        self.live[slot as usize] = None;
+        self.counts.live -= 1;
     }
 
     /// How fn `key`'s body is lowered and its head made.
@@ -286,22 +295,6 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         Ok(self.push(key, kind, build, symbols.track_caller, at, &path, symbol, symbols.export.as_deref(), intrinsic))
     }
 
-    /// Fn `key`'s own `#[track_caller]` (program/seam_rules.rs `track_caller` asks it of the fn
-    /// and of its trait's declaration): its row's when it has one, else read from its head in
-    /// the store (`symbols_of`, as `row` reads it) without adding a row (`&self`: a callee the
-    /// build resolved to, whose row its own `check_one` makes later). `None`: no row and no
-    /// head, or the head's attributes refused.
-    pub(super) fn own_track_caller(&self, key: ItemKey) -> Option<bool> {
-        if let Some(&i) = self.rows.by_key.get(&key) {
-            return self.rows.track_caller.get(i as usize).copied();
-        }
-        if self.store.ctors.contains_key(&key) {
-            return Some(false);
-        }
-        let head = self.store.fns.get(&key)?;
-        symbols_of(self.front.names, head.lib, head.text, "").ok().map(|s| s.track_caller)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn push(&mut self, key: ItemKey, kind: FnKind, build: BuildAbi, track_caller: bool, at: At, path: &str, symbol: &str, export: Option<&str>, intrinsic: Option<Intrinsic>) -> usize {
         let i = self.rows.len();
@@ -428,7 +421,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         let place = names.place_of(lib)?;
         let blaze_scope::resolve::At::File(i) = place.at else { return None };
         let shown = names.file_shown(place.krate, i)?;
-        let (line, _) = super::seam_rules::source_position(names, keys, outer, start).ok()?;
+        let (line, _) = super::seam_rules::source_position(names, keys, &self.store, outer, start).ok()?;
         // The text written at the range, when the range is the file's own (an expansion's row
         // is at its outermost call: the call's text).
         let written = names.item_start(lib).and_then(|(_, item_start)| {
@@ -460,8 +453,8 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
     /// column today (seam_rules.rs, THE POSITION RULE). `None`: the item's text is in no file
     /// (a macro's expansion) or the names do not place it.
     pub fn site_shown(&self, item: ItemKey, site: u32) -> Option<(&'n str, u32, u32)> {
-        let file = super::seam_rules::item_file(self.front.names, &self.front.keys, item)?;
-        let (line, column) = super::seam_rules::source_position(self.front.names, &self.front.keys, item, site).ok()?;
+        let file = super::seam_rules::item_file(self.front.names, &self.front.keys, &self.store, item)?;
+        let (line, column) = super::seam_rules::source_position(self.front.names, &self.front.keys, &self.store, item, site).ok()?;
         Some((file, line, column))
     }
 
@@ -701,31 +694,71 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         made.map_err(|refusal| LazyRefusal::Row { function: Box::from(function), refusal: Box::new(refusal) })
     }
 
-    /// The types table forked afresh from the heads' and each live body lowered again into it,
-    /// then `made` (row `i`'s new body) too, its literals read: module docs.
-    fn refork(&mut self, i: usize, made: Body<'n>, function: &str) -> Result<(), LazyRefusal> {
-        let lower = |error| LazyRefusal::Lower { function: Box::from(function), error };
-        let mut tys = self.store.tys.fork_in(self.store.tys.alloc()).map_err(|_| LazyRefusal::Table { function: Box::from(function) })?;
-        let (names, prepared) = (self.front.names, self.prepared);
-        for l in self.live.iter_mut().flatten() {
-            l.again = lower_again(names, prepared, &mut self.front.keys, &mut self.store, &l.made, &mut tys).map_err(lower)?;
+    pub fn lowering_counts(&self) -> LoweringCounts {
+        self.lowerings.count
+    }
+
+    pub(super) fn head_types(&self) -> PTys<'_> {
+        #[cfg(test)]
+        if let Some(tys) = &self.lowerings.refork {
+            return tys.view();
         }
-        let again = lower_again(names, prepared, &mut self.front.keys, &mut self.store, &made, &mut tys).map_err(lower)?;
-        self.tys = Some(tys);
-        let lits = literals(&again, function).map_err(|refusal| LazyRefusal::Row { function: Box::from(function), refusal: Box::new(refusal) })?;
-        let live = Live { row: i as u32, made, again, lits };
-        let slot = match self.live.iter().position(Option::is_none) {
-            Some(free) => {
-                self.live[free] = Some(live);
-                free
-            }
-            None => {
-                self.live.push(Some(live));
-                self.live.len() - 1
-            }
+        self.store.tys.view()
+    }
+
+    /// The body owns its suffix of nodes and list entries. OwnTys::view truncates both
+    /// head columns to their lengths at conversion, even after another check grew them.
+    pub(super) fn types_of_body(&self, i: usize) -> PTys<'_> {
+        #[cfg(test)]
+        if let Some(tys) = &self.lowerings.refork {
+            return tys.view();
+        }
+        let live = self.live_of(i).expect("body types require a live function row");
+        // check_body already read this overlay over this very store. Both head columns
+        // are append-only and the store is never replaced.
+        live.made.tys.view(&self.store.tys).expect("a checked body's head prefix must still exist")
+    }
+
+    fn keep_body(&mut self, i: usize, made: Body<'n>, function: &str) -> Result<(), LazyRefusal> {
+        #[cfg(test)]
+        let made = if self.lowerings.refork.is_some() { self.refork(&made, function)? } else { made };
+        let lits = literals(&made, function).map_err(|refusal| LazyRefusal::Row { function: function.into(), refusal: refusal.into() })?;
+        let live = Live { row: i as u32, made, lits };
+        let slot = if self.counts.live as usize == self.live.len() {
+            self.live.push(Some(live));
+            self.live.len() - 1
+        } else {
+            let free = self.live.iter().position(Option::is_none).expect("a released live slot");
+            self.live[free] = Some(live);
+            free
         };
         self.rows.live[i] = Some(slot as u32);
-        self.counts.live = self.live.iter().filter(|l| l.is_some()).count() as u32;
+        self.counts.live += 1;
         Ok(())
+    }
+
+    /// The pre-overlay build path, selected on a fresh program by the byte-equality test.
+    #[cfg(test)]
+    pub(crate) fn use_refork_oracle(&mut self) {
+        assert_eq!(self.lowerings.count, LoweringCounts::default());
+        self.lowerings.refork = Some(PortableTys::new_in(self.store.tys.alloc()));
+    }
+
+    #[cfg(test)]
+    fn refork(&mut self, made: &Body<'n>, function: &str) -> Result<Body<'n>, LazyRefusal> {
+        self.lowerings.count.forks += 1;
+        let mut tys = self.store.tys.fork_in(self.store.tys.alloc()).map_err(|_| LazyRefusal::Table { function: Box::from(function) })?;
+        let mut again = |body: &Body<'n>| {
+            self.lowerings.count.lower_again += 1;
+            lower_again(self.front.names, self.prepared, &mut self.front.keys, &mut self.store, body, &mut tys)
+                .map_err(|error| LazyRefusal::Lower { function: Box::from(function), error })
+        };
+        // lower_again identifies its input solely by owner, which both lowerings share.
+        for live in self.live.iter_mut().flatten() {
+            live.made = again(&live.made)?;
+        }
+        let body = again(made)?;
+        self.lowerings.refork = Some(tys);
+        Ok(body)
     }
 }

@@ -59,10 +59,10 @@ fn a_body_edit_imports_the_fresh_head_with_todays_text() {
 }
 
 #[test]
-fn a_body_keyed_head_refuses_a_body_edit() {
+fn const_and_static_heads_refuse_initializer_edits() {
     for (app, edited) in [
-        ("#![no_std]\npub const fn f() -> u8 { 1 }", "pub const fn f() -> u8 { 2 }"),
-        ("#![no_std]\npub fn f() -> u8 { fn g() -> u8 { 1 } g() }", "pub fn f() -> u8 { fn g() -> u8 { 2 } g() }"),
+        ("#![no_std]\npub const f: u8 = 1;", "pub const f: u8 = 2;"),
+        ("#![no_std]\npub static f: u8 = 1;", "pub static f: u8 = 2;"),
     ] {
         let (before, at, text) = freeze_f(app);
         let frozen = FrozenHead::read(&before.bytes).expect("body-keyed head");
@@ -71,5 +71,5 @@ fn a_body_keyed_head_refuses_a_body_edit() {
         // The full old text is still a prefix: the whole-text length must be exact.
         refuses_text(&frozen, at, &std::format!("{text} "));
     }
-    std::println!("const fn and local-item fn both refuse edited body text");
+    std::println!("const and static heads refuse edited initializer text");
 }

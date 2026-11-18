@@ -237,6 +237,13 @@ impl Phases {
     pub fn in_main(&self) -> u64 {
         self.since(self.began)
     }
+
+    pub(crate) fn write_lowering_stats(&self, cx: &bstd::Cx, err: &bstd::out::Out) -> Result<(), bstd::out::OutError> {
+        if let Some(tally) = self.code_records {
+            err.line(cx, format_args!("blaze: {}", tally.lowerings))?;
+        }
+        Ok(())
+    }
 }
 
 fn nanos(d: core::time::Duration) -> u64 {
@@ -275,6 +282,7 @@ impl fmt::Display for Phases {
         if let Some(tally) = self.code_records {
             writeln!(f, "run          {}", tally.codes)?;
             writeln!(f, "run          {}", tally.start)?;
+            writeln!(f, "run          {}", tally.lowerings)?;
         }
         if let Some(read) = self.run_names {
             writeln!(f, "run          {read}")?;
@@ -332,4 +340,28 @@ fn held_line(f: &mut fmt::Formatter<'_>, s: &blaze_mem::tag::Snapshot) -> fmt::R
         }
     }
     writeln!(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Phases;
+    use crate::run_parent::{Built, ListHeld, RunTally, StartTally, Tally};
+    use blaze_ladder::run::make_one::LoweringCounts;
+    use bstd::io::{Io, Limits, SimWorld};
+
+    #[test]
+    fn run_stats_and_profile_print_lowering_counts() {
+        let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+        let mut phases = Phases::new(io.need_clock().expect("the simulated clock"));
+        let start = StartTally { placed: 0, answered: 0, data: 0, resolved: 0, built: Built::Head, held: ListHeld::None };
+        let lowerings = LoweringCounts { bodies_lowered: 7, lower_again: 2, forks: 1 };
+        phases.code_records = Some(RunTally { codes: Tally::default(), start, lowerings });
+        let profile = std::format!("{phases}");
+        assert!(profile.lines().any(|line| line == "run          bodies lowered 7, lower_again calls 2, forks 1"), "{profile}");
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("the simulated context");
+        let err = io.need_err().expect("stderr");
+        phases.write_lowering_stats(&cx, &err).unwrap();
+        err.flush(&cx).unwrap();
+        io.script(|host| assert_eq!(host.err.as_slice(), b"blaze: bodies lowered 7, lower_again calls 2, forks 1\n")).expect("the simulated host");
+    }
 }

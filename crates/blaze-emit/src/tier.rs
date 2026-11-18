@@ -31,6 +31,13 @@ impl Tier for Reference {
         // places): an `f128` operation is refused naming its routine. The run path binds the
         // routines through `emit_record_measured` (blaze-ladder code_records.rs `make_entry`).
         let (record, _none_called) = emit_record(func, names, &crate::RoutinePlaces::NONE, isa, alloc).map_err(refused)?;
+        if !record.positions.is_empty() {
+            return Err(TierError::Refused {
+                tier: Self::NAME,
+                inst: None,
+                what: "a source position field in a record converted to blaze-tier's form, which has no source field column",
+            });
+        }
         blaze_tier::record::from_v1(record, alloc).map_err(|error| TierError::Record { tier: Self::NAME, error })
     }
 }

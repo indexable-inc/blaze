@@ -421,7 +421,7 @@ fn a_moved_head_enters_exactly_its_readers() {
     let field = edit("a struct gains a field", lib(p2, area_u64, other), &[("read moved", sig, 2), ("read moved", Some(blaze_drive::Kind::CrateScope), 3)], None);
     let (entered, identical) = heads(&field);
     assert!((3..=7).contains(&entered) && identical + 1 == entered, "a struct gains a field: the head tasks (entered, identical) are `P`'s, moved, and readers that come out identical: {}", entries(&field));
-    edit("a body edit", lib(p2, area_u64, "    4\n"), &[("key moved", None, 1)], Some((1, 1)));
+    edit("a body edit", lib(p2, area_u64, "    4\n"), &[("key moved", None, 1)], Some((0, 0)));
     edit("a comment inside a body", lib(p2, area_u64, "    // four\n    4\n"), &[], Some((0, 0)));
 }
 
@@ -692,11 +692,11 @@ fn engine_check_starts_from_its_stored_answer() {
     let (_, statement) = engine_from(&io, 2, false);
     assert_eq!(
         because(&statement),
-        [(blaze_engine::Stage::Outlines, "key moved", None, 1), (blaze_engine::Stage::Heads, "key moved", None, 1), (blaze_engine::Stage::Bodies, "key moved", None, 1)],
-        "a statement enters its outline, its item's head task and its body alone: {}",
+        [(blaze_engine::Stage::Outlines, "key moved", None, 1), (blaze_engine::Stage::Bodies, "key moved", None, 1)],
+        "a statement enters its outline and body alone: {}",
         entries(&statement)
     );
-    assert_eq!(statement.stages[blaze_engine::Stage::Heads.index()].identical, 1, "a statement: its head task makes the heads it made: {}", entries(&statement));
+    assert_eq!(statement.stages[blaze_engine::Stage::Heads.index()].identical, 0, "a statement enters no heads: {}", entries(&statement));
     nothing("a statement");
 
     // An item added: its outline by its key, then each crate's names whose read moved.

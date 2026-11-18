@@ -33,8 +33,9 @@ use crate::{Slot, Thread, Tier};
 /// The version of the run wire's bodies. A reader of another refuses the message by name
 /// ([`WireError::RunSchema`]). 2: `Up::Fault` carries the code around the pc and the thread's
 /// registers (wire/fault.rs). 3: `Up::Fault` carries the faulting thread's callers, its
-/// frame-pointer chain (wire/fault.rs `Callers`).
-pub const RUN_SCHEMA: u32 = 3;
+/// frame-pointer chain (wire/fault.rs `Callers`). 4: `Down::Positioned` publishes a code
+/// record with this run's source-position values.
+pub const RUN_SCHEMA: u32 = 4;
 
 /// A function instance as a code record names it: the bytes of blaze-code's `record::Symbol`
 /// (the item's stable id and its type arguments by content). This crate depends on no other,
@@ -76,8 +77,8 @@ pub enum Failure<'a> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Up {
     /// A stub fired: `thread` called what `need` names, which has no code here, and waits.
-    /// Answered by a [`Down::Publish`] of the slot (after the [`Down::Declare`] that numbers it,
-    /// for a symbol) or a [`Down::Failed`] naming the same need.
+    /// Answered by a [`Down::Publish`] or [`Down::Positioned`] of the slot (after the
+    /// [`Down::Declare`] that numbers it, for a symbol) or a [`Down::Failed`] naming the same need.
     Need { need: Needed, thread: Thread },
     /// The program dies on a fault or a trap, struck where `fault` says (wire/fault.rs): sent
     /// by the crash handler with id 0, once, just before the process ends by the signal. Nothing
@@ -94,6 +95,9 @@ pub enum Down<'a> {
     /// Place the code record `record` (the store's, read in place) as `slot`'s body at `tier`
     /// (`Zero` is the fast tier), then wake the threads waiting on it.
     Publish { slot: Slot, tier: Tier, record: RecordId },
+    /// Place the same record with one little-endian u32 per sealed source-position row.
+    /// The values describe this checkout and travel with this publication only.
+    Positioned { slot: Slot, tier: Tier, record: RecordId, values: &'a [u8] },
     /// `need` has no code, for `why`: each thread waiting on it fails its call (rule 20).
     Failed { need: Needed, why: Failure<'a> },
     /// `slot` is the program's `#[lang = "eh_personality"]` fn. Sent once, after the `Declare`
@@ -268,12 +272,13 @@ impl<'a> Down<'a> {
             }
             Down::Publish { slot, tier, record } => {
                 variant(to, "Publish", 3);
-                to.text("slot");
-                to.uint(u64::from(slot.0));
-                to.text("tier");
-                to.text(tier_name(tier));
-                to.text("record");
-                to.bytes(&record.0);
+                publication_fields(to, slot, tier, record);
+            }
+            Down::Positioned { slot, tier, record, values } => {
+                variant(to, "Positioned", 4);
+                publication_fields(to, slot, tier, record);
+                to.text("values");
+                to.bytes(values);
             }
             Down::Personality { slot } => personality::write(to, slot),
             Down::Native { library, words } => native::write(to, library, words),
@@ -302,15 +307,24 @@ impl<'a> Down<'a> {
                 from.key("pairs")?;
                 Down::Declare { pairs: List::read(&mut from)? }
             }
-            "Publish" => {
-                from.map(3, "Publish, a map of 3")?;
+            name @ ("Publish" | "Positioned") => {
+                if name == "Publish" {
+                    from.map(3, "Publish, a map of 3")?;
+                } else {
+                    from.map(4, "Positioned, a map of 4")?;
+                }
                 from.key("slot")?;
                 let slot = Slot(from.uint32("a slot past the 32 bits a table has")?);
                 from.key("tier")?;
                 let tier = tier(&mut from)?;
                 from.key("record")?;
                 let record = RecordId(id(&mut from, "a record id is 32 bytes")?);
-                Down::Publish { slot, tier, record }
+                if name == "Publish" {
+                    Down::Publish { slot, tier, record }
+                } else {
+                    from.key("values")?;
+                    Down::Positioned { slot, tier, record, values: from.bytes()? }
+                }
             }
             personality::NAME => Down::Personality { slot: personality::read(&mut from)? },
             native::NAME => {
@@ -335,6 +349,15 @@ impl<'a> Down<'a> {
         from.end()?;
         Ok((message, down))
     }
+}
+
+fn publication_fields<A: Allocator>(to: &mut Writer<'_, A>, slot: Slot, tier: Tier, record: RecordId) {
+    to.text("slot");
+    to.uint(u64::from(slot.0));
+    to.text("tier");
+    to.text(tier_name(tier));
+    to.text("record");
+    to.bytes(&record.0);
 }
 
 /// One frame onto the end of `out`: the length, then `{id, run, body}` with `body` writing the

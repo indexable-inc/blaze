@@ -202,7 +202,7 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// sees the old file or the new; a crash may leave either, or the new name over any part of
 /// the bytes.
 #[cfg(any(unix, target_os = "wasi"))]
-pub(crate) fn write_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub fn write_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     blaze_mem::scratch::with_path(|temporary| {
         temporary_into(path, temporary);
         let written = (|| {

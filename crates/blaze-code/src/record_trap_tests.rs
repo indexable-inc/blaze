@@ -38,7 +38,7 @@ fn traps_seal_by_offset_and_read_back() {
     assert_eq!(view.trap_at(8), None, "a `ret` has no row");
     assert_eq!(view.trap_at(0), None);
     assert_eq!(view.trap_at(16), None);
-    assert_eq!(&one[..8], b"bzcode06");
+    assert_eq!(&one[..8], b"bzcode07");
 }
 
 #[test]
@@ -56,8 +56,8 @@ fn a_bad_trap_row_is_refused() {
 fn an_unknown_trap_kind_is_refused_on_read() {
     let alloc = blaze_own::testing::heap().alloc();
     let mut bytes = sealed(&[TrapRow { at: 4, kind: TrapKind::Intrinsic, site: None, held: Held::Unknown, subject: None }], alloc).unwrap();
-    // The trap rows follow the head (56), the code (16) and no relro, target, site, word or pad.
-    let kind_byte = 56 + 16 + 4;
+    // The trap rows follow the head (64), the code (16) and no relro, target, site, word or pad.
+    let kind_byte = 64 + 16 + 4;
     assert_eq!(bytes[kind_byte], TrapKind::Intrinsic as u8);
     bytes[kind_byte] = 200;
     assert_eq!(CodeView::read(&bytes).err(), Some(crate::record::DecodeError::TrapKind { row: 0, byte: 200 }));

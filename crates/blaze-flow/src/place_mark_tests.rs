@@ -27,6 +27,7 @@ fn each_mark_is_its_own_fact() {
     b.start(bb);
     b.ret(S);
     let f = b.finish().expect("a well-formed flow");
+    crate::loans::assert_tiers_equal_for_fixture(&f);
     let (e, d, p, o) = (f.place(elem), f.place(field), f.place(plain), f.place(old));
     assert!(e.of_slice && !e.of_drop_type, "{e:?}");
     // CONTROL: the `Drop` field mark is not the slice fact (before item 6 one bit meant both).

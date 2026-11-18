@@ -145,6 +145,7 @@ pub(crate) fn emit_record_sourced<'a>(
     let mut record = CodeRecord::new_in(alloc);
     record.code.extend_from_slice(&out.bytes);
     record.relro.extend_from_slice(&form.relro);
+    record.positions = form.positions;
     // What each part asks of its placement: the most its data rows' alignments (pass/sites.rs).
     record.code_align = form.code_align;
     record.relro_align = form.relro_align;

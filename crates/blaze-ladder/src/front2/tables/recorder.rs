@@ -254,20 +254,32 @@ impl<'a> Recorder<'a> {
     /// [`Recorder::finish`] with what was offered, kept and compared ([`ReadTally`]). The list
     /// holds each read once already (`seen`), so the sort is of the distinct reads alone.
     pub fn finish_tallied(self) -> Result<(AVec<'a, TableRead>, ReadTally), ReadsFull> {
-        if self.full.get() {
-            return Err(ReadsFull { most: MOST_READS });
-        }
-        let offered = self.offered.get();
-        let mut reads = self.reads.into_inner();
+        let (mut reads, mut tally) = self.distinct()?;
         let compares = Cell::new(0u64);
         reads.sort_unstable_by(|a, b| {
             compares.set(compares.get() + 1);
             a.cmp(b)
         });
-        // Each once by `seen`; kept as the guard of the list's form (rule 25), a no-op.
-        reads.dedup();
-        let tally = ReadTally { offered, kept: reads.len() as u64, sort_compares: compares.get() };
+        tally.sort_compares = compares.get();
         Ok((reads, tally))
+    }
+
+    /// For consumers that canonicalize the placed IDs. Insertion order, each key once.
+    pub fn distinct(self) -> Result<(AVec<'a, TableRead>, ReadTally), ReadsFull> {
+        let tally = self.tally();
+        self.check_bound()?;
+        Ok((self.reads.into_inner(), tally))
+    }
+
+    /// A growing evaluator's distinct keys. A cursor into this slice remains valid until the
+    /// recorder is dropped, since reads only append. An overflow invalidates the entire proof.
+    pub fn keys(&self) -> Result<core::cell::Ref<'_, [TableRead]>, ReadsFull> {
+        self.check_bound()?;
+        Ok(core::cell::Ref::map(self.reads.borrow(), |reads| &reads[..]))
+    }
+
+    fn check_bound(&self) -> Result<(), ReadsFull> {
+        if self.full.get() { Err(ReadsFull { most: MOST_READS }) } else { Ok(()) }
     }
 }
 
@@ -285,16 +297,15 @@ impl ReadSink for Recorder<'_> {
         }
         self.last.set(Some(read));
         let mut seen = self.seen.borrow_mut();
-        if seen.contains(&read) {
+        if seen.len() == MOST_READS {
+            if !seen.contains(&read) {
+                self.full.set(true);
+            }
             return;
         }
-        let mut reads = self.reads.borrow_mut();
-        if reads.len() >= MOST_READS {
-            self.full.set(true);
-            return;
+        if seen.insert(read) {
+            self.reads.borrow_mut().push(read);
         }
-        seen.insert(read);
-        reads.push(read);
     }
 
     fn binding(&self, module: ItemKey, ns: Namespace, name: &str) {

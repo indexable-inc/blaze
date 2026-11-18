@@ -4,9 +4,9 @@
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::a64::{adrp_add_target, adrp_ldr_target};
-use crate::image::ImageError;
-use crate::place::{At, PlaceError, Words, place};
-use crate::record::{CodeRecord, CodeView, NO_TARGET, OWN_CODE, Site, SiteKind, Space, Symbol, Target, Word};
+use crate::image::{ImageError, Kind, Member, lay_out, lay_out_positions};
+use crate::place::{At, PlaceError, Words, place, place_positions, place_resolved};
+use crate::record::{CodeRecord, CodeView, NO_TARGET, OWN_CODE, PositionField, PositionPart, PositionRow, Site, SiteKind, Space, Symbol, Target, Word};
 
 const ADRP_X16: u32 = 0x9000_0010;
 const LDR_X16: u32 = 0xF940_0210;
@@ -118,4 +118,61 @@ fn a_word_out_of_reach_is_refused() {
         "{error:?}"
     );
     println!("place: a word 8 GiB away is refused by name");
+}
+
+/// Prints `place: current line and column in code and relro, missing positions refused`.
+#[test]
+fn positions_are_filled_only_in_the_placed_parts() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let symbol = Symbol::of_name("caller");
+    let line = PositionRow { part: PositionPart::Code, at: 4, item: 0x1234, site: 15, field: PositionField::Line };
+    let col = PositionRow { part: PositionPart::Relro, at: 0, field: PositionField::Col, ..line };
+    let mut record = CodeRecord::new_in(alloc);
+    record.code.extend_from_slice(&RET.to_le_bytes());
+    record.code.extend_from_slice(&[0; 4]);
+    record.relro.extend_from_slice(&[0; 8]);
+    record.positions.push(col);
+    record.positions.push(line);
+    let mut bytes = Vec::new_in(alloc);
+    record.seal().unwrap().encode(&mut bytes);
+    let view = CodeView::read(&bytes).unwrap();
+    let at = At { code: CODE, relro: CODE + 0x8000 };
+    let mut code = [0u8; 8];
+    let mut relro = [0u8; 8];
+    let mut words = Table { far: false };
+    let members = [Member { symbol, record: view }];
+    let missing = ImageError::UnresolvedPosition { symbol, row: line };
+    assert_eq!(place(&view, symbol, at, &mut words, &mut code, &mut relro), Err(PlaceError::Site(missing)));
+    assert_eq!(lay_out(&members, Kind::Delta, 4096, alloc).err(), Some(missing));
+    for bytes in [0, 4, 7, 9, 12] {
+        assert_eq!(
+            place_resolved(&view, symbol, at, &mut words, &mut code, &mut relro, &[0; 12][..bytes]),
+            Err(PlaceError::PositionBytes { symbol, rows: 2, bytes }),
+        );
+    }
+    assert_eq!(
+        place_resolved(&view, symbol, at, &mut words, &mut code, &mut relro, &[1, 0, 0, 0, 0, 0, 0, 0]),
+        Err(PlaceError::Site(ImageError::ZeroPosition { symbol, row: col })),
+    );
+    for expected_line in [7, 10] {
+        let source_position = |row: PositionRow| {
+            assert_eq!((row.item, row.site), (line.item, line.site));
+            Ok((expected_line, 16))
+        };
+        place_positions(&view, symbol, at, &mut words, &mut code, &mut relro, |i, row| {
+            assert_eq!(row, [line, col][i]);
+            Ok(row.field.value(source_position(row)?))
+        }).unwrap();
+        assert_eq!(inst(&code, 4), expected_line);
+        assert_eq!(inst(&relro, 0), 16);
+        let segment = lay_out_positions(&members, Kind::Delta, 4096, alloc, |_, row| source_position(row)).unwrap();
+        assert_eq!(segment.code.as_slice(), &code[..]);
+        assert_eq!(segment.relro.as_slice(), &relro[..]);
+        assert_eq!(inst(view.code(), 4), 0);
+        assert_eq!(inst(view.relro(), 0), 0);
+    }
+    place_resolved(&view, symbol, at, &mut words, &mut code, &mut relro, &[4, 3, 2, 1, 16, 0, 0, 0]).unwrap();
+    assert_eq!(inst(&code, 4), 0x0102_0304);
+    assert_eq!(inst(&relro, 0), 16);
+    println!("place: current line and column in code and relro, missing positions refused");
 }

@@ -170,6 +170,8 @@ pub(crate) enum Heard<'e> {
     /// The suite is placed; it forks from now on.
     Ready,
     Ended(ChildEnd<'e>),
+    /// The child was reaped after a first call whose instance the parent could not build.
+    CannotBuild { row: u32, test: TestId, why: &'e crate::test_drive::InstanceRefusal },
     /// The zygote's channel reached its end.
     Closed,
     /// The zygote process was reaped.
@@ -263,6 +265,8 @@ impl<C: Fn() -> Nanos> Zygotes for Unbuilt<C> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RunPlant {
     None,
+    /// Advances all flights' plan clocks at the first actual expiration.
+    TickBeforeSibling,
     /// Takes a wake's batch in the order it was read and decides the zygote's death at its exit,
     /// before its channel is drained.
     ExitBeforeDrain,
@@ -426,6 +430,21 @@ struct Flight {
     asked: Nanos,
     /// The loop asked its kill.
     killed: bool,
+    /// The child was killed at its own allowance. The global plan clock can advance to its
+    /// deadline once the other flights with an earlier or equal deadline have answered.
+    expired: bool,
+}
+
+struct Timeout<'b> {
+    row: u32,
+    test: TestId,
+    deadline: Nanos,
+    after: Nanos,
+    keep: Result<(), NotKept>,
+    micros: u64,
+    digest: [u8; 32],
+    total: u64,
+    tail: AVec<'b, u8>,
 }
 
 /// The latest of (the zygote's ready, the run's ask) plus the allowance and [`ANSWER_SLACK`].
@@ -470,6 +489,7 @@ pub(crate) struct Runner<'b, Z: Zygotes> {
     closed: bool,
     exited: Option<(ZygoteExit, Nanos)>,
     flights: AVec<'b, Flight>,
+    timeouts: AVec<'b, Timeout<'b>>,
     /// Runs to answer "cannot be run", in the order the plan started them.
     owed: AVec<'b, (TestId, CannotRun)>,
     asks: AVec<'b, Ask>,
@@ -493,6 +513,7 @@ impl<'b, Z: Zygotes> Runner<'b, Z> {
             closed: false,
             exited: None,
             flights: Vec::new_in(alloc),
+            timeouts: Vec::new_in(alloc),
             owed: Vec::new_in(alloc),
             asks: Vec::new_in(alloc),
             digests: Vec::new_in(alloc),
@@ -556,12 +577,12 @@ impl<'b, Z: Zygotes> Runner<'b, Z> {
             // held out so the death, decided at the channel's end ([`Runner::take`]) or past
             // [`CHANNEL_GRACE`] ([`Runner::watch`]), counts it as not answered.
             let asked = self.zygotes.now();
-            self.flights.push(Flight { test, row, deadline, asked, killed: false });
+            self.flights.push(Flight { test, row, deadline, asked, killed: false, expired: false });
             return Ok(());
         }
         self.zygotes.ask(row, test, self.budget)?;
         let asked = self.zygotes.now();
-        self.flights.push(Flight { test, row, deadline, asked, killed: false });
+        self.flights.push(Flight { test, row, deadline, asked, killed: false, expired: false });
         Ok(())
     }
 
@@ -611,7 +632,7 @@ impl<'b, Z: Zygotes> Runner<'b, Z> {
         match self.phase {
             Phase::Starting { at } => wake = earliest(wake, at.after(START_DEADLINE)),
             Phase::Ready { at } => {
-                for flight in self.flights.iter() {
+                for flight in self.flights.iter().filter(|flight| !flight.expired) {
                     wake = earliest(wake, answer_due(at, flight, self.budget));
                 }
             }
@@ -668,6 +689,7 @@ impl<'b, Z: Zygotes> Runner<'b, Z> {
                     }
                     _ => (1, 0, end.row),
                 },
+                Heard::CannotBuild { row, .. } => (1, 0, row),
                 Heard::Closed => (3, 0, 0),
                 Heard::Exited(_) => (4, 0, 0),
             };
@@ -685,12 +707,32 @@ impl<'b, Z: Zygotes> Runner<'b, Z> {
                     Phase::Starting { .. } => self.phase = Phase::Ready { at: now },
                     _ => return Err(RunError::ReadyTwice { suite }),
                 },
+                Heard::Ended(end @ ChildEnd { how: How::TimedOut { after }, .. }) => {
+                    let Some(flight) = self.flights.iter_mut().find(|f| f.row == end.row && !f.expired) else {
+                        return Err(RunError::Unasked { suite, row: end.row });
+                    };
+                    if flight.test != end.test {
+                        return Err(RunError::WrongTest { suite, row: end.row });
+                    }
+                    flight.expired = true;
+                    self.timeouts.push(Timeout {
+                        row: end.row, test: end.test, deadline: flight.deadline, after, keep: end.keep,
+                        micros: end.micros, digest: end.output.digest, total: end.output.total,
+                        tail: Vec::from_slice_in(end.output.tail, self.alloc),
+                    });
+                }
                 Heard::Ended(end) => {
                     ended(&end, &mut self.flights, &mut self.asks, &mut self.digests, suite, machine, answers, out, now, self.alloc)?;
                     self.answered += 1;
                 }
+                Heard::CannotBuild { row, test, why } => {
+                    take_flight(&mut self.flights, suite, row, test)?;
+                    machine.step(Event::CannotBuild { suite, test, why }, now, out)?;
+                    self.answered += 1;
+                }
                 Heard::Closed => {
                     self.closed = true;
+                    self.flush_timeouts(suite, machine, answers, out, now)?;
                     if self.exited.is_some() {
                         return Err(self.died(suite));
                     }
@@ -702,6 +744,31 @@ impl<'b, Z: Zygotes> Runner<'b, Z> {
                     }
                 }
             }
+            self.flush_timeouts(suite, machine, answers, out, now)?;
+        }
+        Ok(())
+    }
+
+    /// A tick applies to *all* flights at its deadline. Children started in one plan step
+    /// have that same deadline even when their real forks are apart. Apply the tick only
+    /// once every such flight has either returned or reported its own timeout. After EOF
+    /// there can be no more child reports; drain the last receipts before reporting a death.
+    fn flush_timeouts<'a, 'r>(&mut self, suite: SuiteId, machine: &mut TestLoop<'a, 'r>, answers: &mut dyn Answers, out: &mut AVec<'_, Effect<'a>>, now: Nanos) -> Result<(), RunError> {
+        while let Some((at, due)) = self.timeouts.iter().enumerate().min_by_key(|(_, due)| (due.deadline, due.row)) {
+            if !self.closed && self.plant != RunPlant::TickBeforeSibling && self.flights.iter().any(|flight| !flight.expired && flight.deadline <= due.deadline) {
+                break;
+            }
+            let due = self.timeouts.remove_swap(at);
+            let Some(flight) = self.flights.iter_mut().find(|flight| flight.row == due.row) else {
+                return Err(RunError::Unasked { suite, row: due.row });
+            };
+            flight.expired = false;
+            let end = ChildEnd {
+                row: due.row, test: due.test, micros: due.micros, how: How::TimedOut { after: due.after }, keep: due.keep,
+                text: "", entered: &[], reads: &[], output: Captured { digest: due.digest, total: due.total, tail: &due.tail },
+            };
+            ended(&end, &mut self.flights, &mut self.asks, &mut self.digests, suite, machine, answers, out, now, self.alloc)?;
+            self.answered += 1;
         }
         Ok(())
     }
@@ -714,7 +781,7 @@ impl<'b, Z: Zygotes> Runner<'b, Z> {
             Phase::Ready { at } => self
                 .flights
                 .iter()
-                .filter(|flight| now >= answer_due(at, flight, budget))
+                .filter(|flight| !flight.expired && now >= answer_due(at, flight, budget))
                 .min_by_key(|flight| flight.row)
                 .map(|flight| RunError::ZygoteSilent { suite, row: flight.row, test: flight.test }),
             _ => None,
@@ -778,6 +845,7 @@ impl<'b, Z: Zygotes> Runner<'b, Z> {
                     Some(Heard::Closed) => self.closed = true,
                     Some(Heard::Exited(status)) => self.exited = Some((status, now)),
                     Some(Heard::Ended(end)) => heard_end = Some(RunError::Unasked { suite, row: end.row }),
+                    Some(Heard::CannotBuild { row, .. }) => heard_end = Some(RunError::Unasked { suite, row }),
                     None => heard_end = Some(RunError::HeardPast { at }),
                 }
             }
@@ -787,6 +855,14 @@ impl<'b, Z: Zygotes> Runner<'b, Z> {
             }
         }
     }
+}
+
+fn take_flight(flights: &mut AVec<'_, Flight>, suite: SuiteId, row: u32, test: TestId) -> Result<Flight, RunError> {
+    let Some(at) = flights.iter().position(|flight| flight.row == row && !flight.expired) else { return Err(RunError::Unasked { suite, row }) };
+    if flights[at].test != test {
+        return Err(RunError::WrongTest { suite, row });
+    }
+    Ok(flights.remove_swap(at))
 }
 
 /// One run's end, stepped into the loop.
@@ -803,11 +879,7 @@ fn ended<'a, 'r>(
     now: Nanos,
     alloc: Alloc<'_>,
 ) -> Result<(), RunError> {
-    let Some(at) = flights.iter().position(|flight| flight.row == end.row) else { return Err(RunError::Unasked { suite, row: end.row }) };
-    if flights[at].test != end.test {
-        return Err(RunError::WrongTest { suite, row: end.row });
-    }
-    let flight = flights.remove_swap(at);
+    let flight = take_flight(flights, suite, end.row, end.test)?;
     let mut killed = flight.killed;
     if !killed && matches!(end.how, How::TimedOut { .. }) {
         // The pool kept the allowance from the fork; the plan kills at its own deadline.

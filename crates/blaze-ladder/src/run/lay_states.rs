@@ -128,7 +128,7 @@ pub(super) fn roots_of_instance<P: FrontEnd>(
     let (Some((body, _)), Some(done)) = (program.function(i).body, bodies.checked.get(i).and_then(Option::as_ref)) else {
         return Ok(AVec::new_in(alloc));
     };
-    let view = body.view(program.types());
+    let view = body.view(program.body_types(i));
     let record = done.types.view();
     let mut tys: AVec<'_, PTy> = AVec::new_in(alloc);
     tys.extend_from_slice(&done.expr_ty);
@@ -310,7 +310,7 @@ fn build_laid<P: FrontEnd>(
         let (Some((body, _)), Some(done)) = (function.body, bodies.checked.get(ci).and_then(Option::as_ref)) else {
             return Err(refuse(function.named(), "an async block whose owner fn has no checked body"));
         };
-        let view = body.view(program.types());
+        let view = body.view(program.body_types(ci));
         // The flow's saved locals by identity (async-P8-4): what the build names its slots by.
         let names = StateNames::new(&rows[..], laid.region).map_err(at_owner)?;
         let plan = StatePlan { laid: *laid, names, plant: StatePlant::None };
@@ -348,7 +348,7 @@ fn held_types<P: FrontEnd>(
     let (Some((body, _)), Some(done)) = (function.body, bodies.checked.get(ci).and_then(Option::as_ref)) else {
         return Err(not_answered());
     };
-    let view = body.view(program.types());
+    let view = body.view(program.body_types(ci));
     let facts = bodies.coroutines.table.get(c.owner, c.ordinal).ok_or_else(not_answered)?;
     let recipe = match program.coroutine_recipe(c.owner, c.ordinal) {
         Some(Ok(r)) => r,

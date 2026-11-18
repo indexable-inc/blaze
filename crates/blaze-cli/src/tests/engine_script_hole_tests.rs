@@ -70,7 +70,7 @@ fn no_reads(plant: ReadsPlant) -> std::vec::Vec<CheckoutRead> {
 }
 
 impl crate::engine_scripts::ScriptRunner for Double {
-    fn run(&self, cx: &Cx, root: &bstd::fs::Dir<bstd::fs::ReadWrite>, name: blaze_drive::Name, kept: Option<ReadsPlant>) -> crate::scripts::PooledScript {
+    fn run(&self, cx: &Cx, root: &bstd::fs::Dir<bstd::fs::ReadWrite>, name: blaze_drive::Name, kept: Option<ReadsPlant>, _: &[(blaze_drive::Input, &[u8])]) -> crate::scripts::PooledScript {
         self.runs.fetch_add(1, Ordering::SeqCst);
         let frame = cx.frame();
         let plant = kept.expect("the request plans the reads' cells, so a member's reads are kept");

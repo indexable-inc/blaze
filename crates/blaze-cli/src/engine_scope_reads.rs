@@ -4,17 +4,15 @@
 //!
 //! - [`Whole`], today's: the impl-bucket fact of the whole graph (`ImplBucket` of no crate,
 //!   blaze-ladder tables/view.rs `incoherent_crates`, asked by every probe of a primitive's
-//!   inherent methods: `i64::wrapping_add`, `str::len`) is widened to every scope crate's
-//!   `CrateScope` record WHOLE. A member's record moves with any item added to it, so one
+//!   inherent methods: `i64::wrapping_add`, `str::len`) reads the whole scope, including the
+//!   graph proof for its settled crates. A member's record moves with any item added to it, so one
 //!   private fn added re-entered every body that called a method on a primitive (the tiny
 //!   fixture, g200823: 66 of 72).
 //! - [`Cells`]: that coarse read is dropped. Every fact behind it has a cell the body read
 //!   beside it: which crates are asked (the lang set: the owner and, without `#![no_core]`,
 //!   the toolchain crates, fixed by the owner's root, its `Root` cell, whose digest holds its
 //!   head (`no_core`) and its dependencies) and each one's answer (its
-//!   `NameCell::Incoherent`, blaze-scope names_cells.rs). A dependency defines no cell table,
-//!   so its cells are read as its record whole (engine_bodies.rs `widen`), which no edit in
-//!   the checkout moves.
+//!   `NameCell::Incoherent`, blaze-scope names_cells.rs).
 //!
 //! What stays coarse under both (the census, reported by lane BH1): the sections read whole
 //! (`NameCell::Whole`: the files, every impl row, every item, a failed call's rows, the crates
@@ -25,26 +23,10 @@
 //! head read are widened to records whole too, [`ScopeReads::TABLES_AT_CELLS`]), and the script
 //! run (whole).
 //!
-//! A DEPENDENCY'S BUCKETS (lane BD3, under both strategies): a body's read of a bucket of a
-//! crate that defines no cell table (`CELLS` ABSENT: engine_names.rs `cells_of` defines one only
-//! for a crate whose names read a checkout file, a member's or a path dependency's) is its impl
-//! tables task's `WHOLE` (engine_bodies.rs `widen`, `dependency_tables`), one cell a crate,
-//! where it was one cell a bucket probed: on a 700-crate workspace a body's lookups probe a
-//! bucket in most of its scope's crates, and each cell is a read in the row, in the engine's
-//! cell index and in its reverse index for the request's whole life.
-//! - SOUND: `WHOLE` is the digest of the tables' records (front2 buckets/records.rs: the
-//!   directory, which names every bucket's content id, and `NoImplsOf`), so it moves whenever
-//!   any bucket cell of that crate moves, a bucket going from absent to filed included: the
-//!   coarse read never misses an edit its fine reads would have seen (a superset; rule 21).
-//! - WHAT IT COSTS: precision only where a crate's tables move, and a dependency's move only
-//!   with its text, which is keyed by the lock and the shelf (registry sources are never
-//!   statted): a new graph, which re-enters every body of its readers anyway.
-//! - WHERE IT WOULD BE WRONG: an edited PATH dependency (or any crate whose text the checkout
-//!   holds). It is not unsound (the digest still moves) but every body that probed any of its
-//!   buckets would re-enter on any impl added to it, which is why such a crate keeps its
-//!   bucket cells: it defines `CELLS`, and `dependency_tables` reads it as fine. Reading it whole
-//!   would be UNSOUND only if `WHOLE` were a key of the tables' inputs that an edit can leave
-//!   unmoved (a lock digest, say), not their content's digest; it is the content's.
+//! Both strategies use the same proof for settled crates. The graph record contains the
+//! source key and tree digest of each package or toolchain tree. A successful names record
+//! whose inputs are fixed by those trees, and its successful impl tables, read the graph
+//! cell. A checkout keeps its published cells. Other dependencies keep their own records.
 
 use blaze_drive::Name;
 use blaze_drive::cells::Cell;
@@ -72,6 +54,91 @@ pub(crate) fn today(cells: &[(CellId, ContentId)], id: &CellId) -> Option<Conten
 }
 
 use crate::engine_tasks::{CELLS, HEADS, SURFACE, WHOLE};
+
+/// What can cover a read of a crate's names or impl tables in this snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadGrain {
+    Cell,
+    Record,
+    Graph,
+}
+
+impl ReadGrain {
+    pub(crate) fn place(self, id: CellId, graph: CellId) -> CellId {
+        match self {
+            Self::Cell => id,
+            Self::Record => CellId { of: id.of, cell: WHOLE },
+            Self::Graph => graph,
+        }
+    }
+}
+
+/// At most two entries per unit. The CELLS mark and the state of the tables are read once
+/// per crate before workers start. An ID outside these records keeps its original grain.
+pub(crate) struct ReadGrains<'a> {
+    by_name: blaze_hash::HashMap<Name, ReadGrain, blaze_own::SharedAlloc<'a>>,
+    graph: CellId,
+}
+
+impl<'a> ReadGrains<'a> {
+    pub(crate) fn new(list: blaze_world::crate_list::CrateList<'_>, packs: &[blaze_fetch::PackView<'_>], graph: CellId, view: blaze_engine::View<'_, '_>, alloc: blaze_own::SharedAlloc<'a>) -> Self {
+        use blaze_drive::key::{ABSENT, crate_scope_name};
+        use blaze_world::{PackOrigin, Side};
+        use blaze_world::crate_list::CrateGraph;
+        let n = CrateGraph::len(&list);
+        let mut settled = blaze_own::Vec::with_capacity_in(n, alloc.local());
+        let mut crates = blaze_own::Vec::with_capacity_in(n, alloc.local());
+        for at in 0..n {
+            let key = list.key(at);
+            let scope = crate_scope_name(&key);
+            let cells = view.cell(&CellId { of: scope, cell: CELLS }) != ABSENT;
+            let tables = blaze_ladder::front2::buckets::impl_tables_name(key);
+            crates.push((scope, tables, cells));
+            // A tree is one-based in the checked crate list. The pack's kind distinguishes
+            // registry archives from git records (both have PackOrigin::Source).
+            let tree = list.root(at).strip_prefix('/').and_then(|s| s.split_once('/'))
+                .and_then(|(tree, _)| tree.parse::<usize>().ok());
+            let origin = tree.and_then(|k| Some((list.tree(k)?.origin, packs.get(k.checked_sub(1)?)?.kind())));
+            let pinned = matches!((list.toolchain(at), origin),
+                (true, Some((PackOrigin::Shelf { .. }, blaze_fetch::pack::Kind::Tree)))
+                | (false, Some((PackOrigin::Source { .. }, blaze_fetch::pack::Kind::Crate))));
+            settled.push(pinned && !list.member(at) && !cells && !list.refused(at)
+                && list.script(at).is_none() && !list.proc_macro(at)
+                && view.row(scope).is_some_and(|row| !row.failed));
+        }
+        // An immutable archive can resolve a path through a patched dependency or import
+        // names generated by its build script. Its derived records then have a mutable input.
+        // Each changing pass removes at least one of the n candidates.
+        for _ in 0..n {
+            let mut changed = false;
+            let sysroot_settled = list.sysroot().into_iter().flatten().all(|dep| settled[dep]);
+            for at in 0..n {
+                if settled[at] && (list.deps(at).any(|dep| !settled[dep])
+                    || (list.side(at) == Side::Target && !sysroot_settled)) {
+                    settled[at] = false;
+                    changed = true;
+                }
+            }
+            if !changed { break }
+        }
+        let mut by_name = blaze_hash::HashMap::with_capacity_in(2 * n, alloc);
+        for (at, &(scope, tables, cells)) in crates.iter().enumerate() {
+            let grain = if settled[at] { ReadGrain::Graph } else if cells { ReadGrain::Cell } else { ReadGrain::Record };
+            by_name.insert(scope, grain);
+            // Missing/failed tables may become available independently of a graph edit.
+            let tables_grain = if settled[at] && !view.row(tables).is_some_and(|row| !row.failed) { ReadGrain::Record } else { grain };
+            by_name.insert(tables, tables_grain);
+        }
+        Self { by_name, graph }
+    }
+
+    pub(crate) fn place(&self, id: CellId, fine_buckets: bool) -> CellId {
+        if fine_buckets && id.of.kind == blaze_drive::Kind::ImplBucket {
+            return id;
+        }
+        self.by_name.get(&id.of).copied().unwrap_or(ReadGrain::Cell).place(id, self.graph)
+    }
+}
 
 /// The kind of a cell that moved, for the profile's "entered because" lines (lane BH1, part E):
 /// a coarse read shows as `whole record`, so a cause at cell grain and one widened to a record

@@ -6,8 +6,8 @@
 //! NOTHING IS SHARED OR KEPT. The checker's mutable world (its key map, head store, impl index,
 //! constants and prepared macros: `ProjectWorld`) is made for this one body and dropped with
 //! it, so a body's answer and its read list are the same whichever bodies ran before it, in
-//! which order, on how many workers. The recorder is the task's own; its list is sorted once,
-//! when the body is done.
+//! which order, on how many workers. The recorder is the task's own. The engine takes the
+//! distinct keys through [`check_body_reads`] and sorts the combined row after placement.
 //!
 //! TWO ALLOCATORS ([`check_body_split`], lane BD3): `work`, where the check works (the recorder,
 //! its `seen` set, the cells before the engine widens them, the verdict's words and bytes),
@@ -273,7 +273,7 @@ pub enum SaidWhat<'a> {
 }
 
 /// The body `task` names, checked over `tables` (module docs), every list in `shared`: the
-/// tests' form, the answer and its row in one allocator ([`check_body_split`] is the engine's).
+/// tests' form, the answer and its row in one allocator.
 pub fn check_body<'n, 'a>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, make: &dyn Make<'a>, shared: SharedAlloc<'a>) -> Result<BodyOut<'a>, TaskError> {
     check_body_in(tables, task, frame, make, shared, Coverage::WithLocals)
 }
@@ -301,8 +301,42 @@ pub fn check_body_split<'n, 'a, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: 
     check_split(tables, task, frame, make, work, out, Coverage::WithLocals)
 }
 
+/// A verdict and the distinct questions that produced it. No ID has been derived and no
+/// engine cell has been looked up. A stretch places and combines these with its other reads.
+pub struct BodyReads<'w> {
+    pub out: ContentId,
+    pub failed: bool,
+    pub findings: u32,
+    pub reads: AVec<'w, TableRead>,
+    pub said: AVec<'w, Said<'w>>,
+    pub read_tally: super::recorder::ReadTally,
+    pub work: WorkBytes,
+    bytes: AVec<'w, u8>,
+    held: AVec<'w, (TableRead, u128)>,
+    goal_hits: AVec<'w, blaze_solve::share::GoalHit>,
+}
+
+pub fn check_body_reads<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>) -> Result<BodyReads<'w>, TaskError> {
+    record_body(tables, task, frame, work, Coverage::WithLocals, false)
+}
+
 /// The one check behind [`check_body`], [`check_body_in`] and [`check_body_split`].
 fn check_split<'n, 'a, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, make: &dyn Make<'a>, work: Alloc<'w>, out: SharedAlloc<'a>, coverage: Coverage) -> Result<BodyChecked<'a, 'w>, TaskError> {
+    let BodyReads { out: digest, failed, findings, reads, bytes, held, said, goal_hits, read_tally, work: mut work_bytes } = record_body(tables, task, frame, work, coverage, true)?;
+    let mut made = SVec::new_in(out);
+    let mut cells = AVec::with_capacity_in(reads.len(), work);
+    for read in &reads {
+        let Some(id) = cell_id(tables, *read)? else { continue };
+        let saw = make.make(&id, &mut made).map_err(TaskError::Make)?;
+        cells.push((id, saw));
+    }
+    cells.sort_unstable_by_key(|pair| pair.0);
+    cells.dedup_by_key(|pair| pair.0);
+    work_bytes.cells = (cells.capacity() * core::mem::size_of::<(CellId, ContentId)>()) as u64;
+    Ok(BodyChecked { out: digest, failed, findings, cells, made, bytes, reads, held, said, goal_hits, read_tally, work: work_bytes })
+}
+
+fn record_body<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, coverage: Coverage, sorted_report: bool) -> Result<BodyReads<'w>, TaskError> {
     let name = task.planned.name;
     let setup = Cost::enter(frame.cost, Part::Setup);
     let alloc = work;
@@ -390,7 +424,9 @@ fn check_split<'n, 'a, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFram
     // THE CONTROL'S INSTRUMENT: the cell of each head the body's own store holds, beside the
     // read list (tests: every one must be in it; the store makes a head only when asked).
     let mut held_keys: AVec<'_, u128> = AVec::new_in(alloc);
-    world.each_held_head(&mut |k| held_keys.push(k));
+    if sorted_report {
+        world.each_held_head(&mut |k| held_keys.push(k));
+    }
     let mut held: AVec<'w, (TableRead, u128)> = AVec::with_capacity_in(held_keys.len(), alloc);
     for &k in held_keys.iter() {
         if let Some(read) = fact_read(view.records(), &world.front.keys, FactKind::Head, k)? {
@@ -401,25 +437,15 @@ fn check_split<'n, 'a, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFram
     drop(world);
     // Counted before the recorder is consumed: its tables at their most (they only grow).
     let recorder_bytes = recorder.table_bytes();
-    let (reads, read_tally) = recorder.finish_tallied().map_err(TaskError::Full)?;
+    let (reads, read_tally) = if sorted_report { recorder.finish_tallied() } else { recorder.distinct() }.map_err(TaskError::Full)?;
     // The root's verdict bytes, then each local fn's (a root with no local fn keeps its bytes).
     let bytes: AVec<'w, u8> = bytes.into_bytes();
     let digest = ContentId::of(OUT_DOMAIN, &bytes);
-    // Only what outlives the body in `out`; the cells are a step toward the row (`work`).
-    let mut made: SVec<'a, Made<'a>> = SVec::new_in(out);
-    let mut cells: AVec<'w, (CellId, ContentId)> = AVec::with_capacity_in(reads.len(), alloc);
-    for read in reads.iter() {
-        let Some(id) = cell_id(tables, *read)? else { continue };
-        let saw = make.make(&id, &mut made).map_err(TaskError::Make)?;
-        cells.push((id, saw));
-    }
-    cells.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    cells.dedup_by(|a, b| a.0 == b.0);
     let size = |n: usize, each: usize| (n as u64).saturating_mul(each as u64);
     let work_bytes = WorkBytes {
         recorder: recorder_bytes,
         recorder_floor: size(reads.len(), core::mem::size_of::<TableRead>()),
-        cells: size(cells.capacity(), core::mem::size_of::<(CellId, ContentId)>()),
+        cells: 0,
         held: size(held_keys.capacity(), core::mem::size_of::<u128>()) + size(held.capacity(), core::mem::size_of::<(TableRead, u128)>()),
         said: size(said.capacity(), core::mem::size_of::<Said<'_>>())
             + said.iter().map(|s| s.words.capacity() as u64 + s.within.as_ref().map_or(0, |w| w.capacity() as u64) + if let SaidWhat::NotChecked { cause } = &s.what { cause.capacity() as u64 } else { 0 }).sum::<u64>(),
@@ -429,7 +455,7 @@ fn check_split<'n, 'a, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFram
     drop(held_keys);
     drop(reading);
     // `findings` summed over the root and its local fns (u32, saturating), as the row's.
-    Ok(BodyChecked { out: digest, failed, findings, cells, made, bytes, reads, held, said, goal_hits, read_tally, work: work_bytes })
+    Ok(BodyReads { out: digest, failed, findings, bytes, reads, held, said, goal_hits, read_tally, work: work_bytes })
 }
 
 /// A local fn's path below the task root. The work list puts every parent before its children.
@@ -492,7 +518,11 @@ fn said_of<'n, 'a>(verdict: &BodyVerdict<'_>, borrows: &BorrowVerdict<'_>, names
     {
         let (start, end) = refused.range().unwrap_or((0, 0));
         let mut words = AString::new_in(alloc);
-        write!(words, "{}: {refused:?}", refused.text()).map_err(|_| TaskError::Write)?;
+        match refused {
+            BorrowRefused::Bound(bound @ blaze_flow::Bound::TierTwo { function, .. }) =>
+                write!(words, "{}", bound.in_function(ItemShown::of(names, keys, *function))),
+            _ => write!(words, "{}: {refused:?}", refused.text()),
+        }.map_err(|_| TaskError::Write)?;
         push(SaidWhat::BorrowsNotChecked, start, end, words);
     }
     Ok(said)
@@ -624,4 +654,67 @@ pub fn cell_id(view: Tables<'_, '_>, read: TableRead) -> Result<Option<CellId>, 
         }
     };
     Ok(Some(CellId { of, cell: Cell(read.cell()) }))
+}
+
+/// One immutable scope's translation from recorder keys to engine IDs. The table keeps at
+/// most 65,536 keys (including builtins with no cell). A miss at capacity clears it in place.
+/// Clearing changes only the amount of work: every miss uses the same canonical `cell_id`.
+pub struct ReadIds<'t, 'n, 'a> {
+    tables: Tables<'t, 'n>,
+    ids: blaze_hash::HashMap<TableRead, Option<CellId>, Alloc<'a>>,
+    made: u64,
+    hits: u64,
+}
+
+impl<'t, 'n, 'a> ReadIds<'t, 'n, 'a> {
+    const LIMIT: usize = 1 << 16;
+
+    pub fn new(tables: Tables<'t, 'n>, alloc: Alloc<'a>) -> Self {
+        Self { tables, ids: blaze_hash::HashMap::new_in(alloc), made: 0, hits: 0 }
+    }
+
+    pub fn id(&mut self, read: TableRead) -> Result<Option<CellId>, TaskError> {
+        if let Some(id) = self.ids.get(&read) {
+            self.hits += 1;
+            return Ok(*id);
+        }
+        let id = cell_id(self.tables, read)?;
+        if self.ids.len() == Self::LIMIT {
+            self.ids.clear();
+        }
+        self.ids.insert(read, id);
+        self.made += u64::from(id.is_some());
+        Ok(id)
+    }
+
+    pub fn counts(&self) -> (u64, u64) {
+        (self.made, self.hits)
+    }
+}
+
+#[cfg(test)]
+mod read_id_tests {
+    use super::*;
+    use super::super::head_tests::{CORE_AT, a, world_of};
+    use super::super::view::TablesOpts;
+
+    #[test]
+    fn resetting_the_stretch_memo_preserves_cell_identity() {
+        let (records, _, _) = world_of("#![no_std]\npub fn f() {}");
+        let recorder = Recorder::new(RecorderOpts { alloc: a() });
+        let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[CORE_AT], reads: &recorder });
+        let read = TableRead::Names(NameCell::Lang { krate: records.crate_key(CORE_AT).expect("fixture core").prefix() });
+        let expected = cell_id(tables, read).expect("core belongs to this scope").expect("core's lang cell");
+        let mut memo = ReadIds::new(tables, a());
+        assert_eq!(memo.id(read).unwrap(), Some(expected));
+        assert_eq!(memo.id(read).unwrap(), Some(expected));
+        assert_eq!(memo.counts(), (1, 1));
+        for at in 1..=ReadIds::LIMIT {
+            memo.id(TableRead::Head { item: (at as u128).to_be_bytes(), part: 0 }).unwrap();
+        }
+        assert_eq!(memo.ids.len(), 1, "the first miss at capacity resets the table");
+        assert_eq!(memo.id(read).unwrap(), Some(expected));
+        assert_eq!(memo.counts(), (ReadIds::LIMIT as u64 + 2, 1));
+        std::println!("read ID unchanged after 65,536 entries and a reset");
+    }
 }
