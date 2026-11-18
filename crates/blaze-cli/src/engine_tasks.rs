@@ -11,7 +11,7 @@
 
 use blaze_drive::cells::Cell;
 use blaze_drive::{Name, Why};
-use blaze_engine::{Buffer, Done, SVec, Stage, Task, View};
+use blaze_engine::{Buffer, CellId, Done, SVec, Stage, Task, View};
 use blaze_ids::ContentId;
 use blaze_own::SharedAlloc;
 use bstd::cx::Cx;
@@ -144,13 +144,23 @@ impl Tasks<'_, '_> {
 }
 
 /// A failed result: no cell, one finding (the failure itself), the failure's out.
+///
+/// Its read list is empty: such a row stands forever or is owed on every request. A stage that
+/// knows what the task read before it failed passes that list through [`failed_with`] instead
+/// (plan row A8; the names stage does).
 pub(crate) fn failed<'a>(task: &Task, alloc: SharedAlloc<'a>) -> Done<'a> {
+    failed_with(task, SVec::new_in(alloc), alloc)
+}
+
+/// A failed result with the reads it saw before it failed, sorted by cell id, each once: the
+/// row stands until one of them moves, and is then entered again once (invariant 7).
+pub(crate) fn failed_with<'a>(task: &Task, reads: SVec<'a, (CellId, ContentId)>, alloc: SharedAlloc<'a>) -> Done<'a> {
     Done {
         name: task.planned.name,
         key: task.key,
         out: work::failed_out(),
         defines: SVec::new_in(alloc),
-        reads: SVec::new_in(alloc),
+        reads,
         findings: 1,
         failed: true,
     }

@@ -388,10 +388,26 @@ fn lexical<'w, N: Name, W: World<N>>(
     if ns == Namespace::Macros {
         // Textual scope: the module's own `macro_rules!`, latest first, then each ancestor's
         // before the `mod` line of the child the chain came through.
+        //
+        // A body's outermost written block has no `mod` line: its module is an expansion of
+        // the body, its `mod` dropped (blocks.rs, resolve.rs `make_blocks`), so its parent (the
+        // body's module, or the block around a local item's body) marks no place for it. The
+        // block is inside the body and the body is one of the parent's items, so the parent's
+        // `macro_rules!` are in the block's textual scope (the Reference, "Macros by example",
+        // "Textual scope": a definition's scope "extends to the end of the enclosing module or
+        // block"), read as the parent's whole sequence: what every call of a body read before
+        // the call was read at its block (the body's module, `child` `None`). Rust's own place
+        // is the body item's, so a `macro_rules!` written after the body is in scope here too;
+        // a mark at the item's place is the owed record change. An unmarked child that is no
+        // block's module is a missing record and stays the empty prefix.
         let mut child: Option<ItemKey> = None;
         for m in chain.iter() {
             if let Some(scope) = world.scope(*m) {
-                if let Some((key, shapes)) = scope.textual(child, name) {
+                let upto = match child {
+                    Some(c) if !scope.marked(c) && world.anonymous(c) => None,
+                    other => other,
+                };
+                if let Some((key, shapes)) = scope.textual(upto, name) {
                     return Ok(Def { key, kind: DefKind::Macro(shapes) });
                 }
             }

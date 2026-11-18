@@ -91,6 +91,10 @@ pub enum NameCell {
     /// refused), so the cell moves when a second key with the prefix is added. Absent: no key
     /// begins so.
     Beginning { first: [u8; 16] },
+    /// The crate's lang rows, in (name, key) order ([`ItemsRecord::lang_at`]): what a reader
+    /// walking every crate's `#[lang]` items reads of this one. Absent: the crate declares
+    /// none (most crates), so a reader of a workspace crate moves only when one is added there.
+    Lang { krate: [u8; 8] },
     /// A section of the crate's record read WHOLE, by a question no cell answers (every impl,
     /// every item, the lang rows, the files): its digest is the section's bytes'.
     Whole { krate: [u8; 8], section: Section },
@@ -121,6 +125,7 @@ impl NameCell {
             NameCell::MemberOf { member } => h.update(&[9]).id(&member.0),
             NameCell::VariantOf { variant } => h.update(&[10]).id(&variant.0),
             NameCell::Beginning { first } => h.update(&[11]).update(&first),
+            NameCell::Lang { krate } => h.update(&[12]).update(&krate),
         };
         let mut key = [0; 16];
         key.copy_from_slice(&h.finish().0[..16]);
@@ -131,7 +136,7 @@ impl NameCell {
     pub fn crate_prefix(self) -> [u8; 8] {
         match self {
             NameCell::Binding { module, .. } | NameCell::Module { module } => module.crate_prefix(),
-            NameCell::Root { krate } | NameCell::Whole { krate, .. } => krate,
+            NameCell::Root { krate } | NameCell::Whole { krate, .. } | NameCell::Lang { krate } => krate,
             NameCell::Variants { owner } | NameCell::Members { owner } => owner.crate_prefix(),
             NameCell::Item { key } => key.crate_prefix(),
             NameCell::Expansion { call } => call.crate_prefix(),
@@ -182,6 +187,10 @@ fn item_digest<'a>(items: &ItemsRecord<'a>, key: ItemKey, read: ReadText<'_, 'a>
         Some(row) => {
             h.update(&[1]).id(&row.key.0).std(&row.kind).id(&row.module.0).std(&row.name);
             h.update(&[u8::from(row.body_holds_items), u8::from(row.ctor), u8::from(row.impl_row.is_some())]);
+            // The block ABI of a foreign fn or static (`ItemRow::foreign`): what
+            // `NamesSource::extern_abi` answers through this cell alone, so an edit of the
+            // block's string moves it.
+            h.std(&row.foreign);
             if row.kind == ItemKind::Module {
                 // A module's row holds its HEAD only (attributes, visibility, name): what it
                 // holds is its own cells', so an item added inside an inline module moves that
@@ -294,6 +303,21 @@ fn members_digest<'a>(items: &ItemsRecord<'a>, owner: ItemKey, read: ReadText<'_
 /// What `Expansion(call)` holds, `None` for no expansion row.
 fn expansion_digest(items: &ItemsRecord<'_>, call: ItemKey) -> Option<ContentId> {
     items.expansion(call).map(|row| Hasher::of(&DIGESTS).update(&[7]).std(&row).finish())
+}
+
+/// What `Lang(krate)` holds: every lang row of the crate in order, each name and key; `None`
+/// for a crate that declares no lang item.
+fn lang_digest(items: &ItemsRecord<'_>) -> Result<Option<ContentId>, ItemsRecordError> {
+    if items.langs() == 0 {
+        return Ok(None);
+    }
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[12]).update(&(items.langs() as u64).to_le_bytes());
+    for i in 0..items.langs() {
+        let (name, key) = items.lang_at(i)?.ok_or(ItemsRecordError::Short { what: "the lang rows", at: i })?;
+        h.part(name.as_bytes()).id(&key.0);
+    }
+    Ok(Some(h.finish()))
 }
 
 /// The first 16 bytes of a key: what [`NameCell::Beginning`] is keyed by (`key_beginning`'s
@@ -631,6 +655,9 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
                 rows.push((NameCell::Beginning { first: *first }.key(), digest));
             }
         }
+        if let Some(digest) = lang_digest(items).map_err(CellsError::Items)? {
+            rows.push((NameCell::Lang { krate }.key(), digest));
+        }
     }
     for module in record.modules() {
         if let Some(digest) = module_digest(record, module) {
@@ -768,6 +795,12 @@ impl<'w, N: Name, S: ScopeRead<'w, N>> ScopeRead<'w, N> for LoggedScope<'w, S> {
         self.scope.textual(child, name)
     }
 
+    /// The marks are the scope's `Module` cell's (names_cells `module_digest`), logged when
+    /// the scope was handed out.
+    fn marked(self, child: ItemKey) -> bool {
+        self.scope.marked(child)
+    }
+
     fn each_trait(self, each: &mut dyn FnMut(ItemKey)) {
         self.scope.each_trait(each)
     }
@@ -874,6 +907,8 @@ pub fn seen_by_record<'a>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<
             }
         }
         NameCell::Beginning { first } => beginning_by_record(items_of()?, first)?,
+        NameCell::Lang { krate } if krate == record.key().prefix() => lang_digest(items_of()?).map_err(CellsError::Items)?,
+        NameCell::Lang { .. } => None,
     })
 }
 

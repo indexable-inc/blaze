@@ -1002,6 +1002,13 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             if self.by_key.contains_key(&m) || !keys.insert(m) {
                 continue;
             }
+            // The module tree record's lines: no text of it is lowered for them.
+            let mut own: AVec<'a, (ItemKey, bool)> = AVec::new_in(alloc);
+            if facts.mod_lines(m, &mut own) {
+                todo.extend(own.iter().map(|l| l.0));
+                lines.insert(m, own);
+                continue;
+            }
             let d = match facts.decls(m) {
                 Ok(d) => d,
                 // A `mod` line of a module the facts hold no text of: bound, its inside unknown.
@@ -1014,7 +1021,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 }
                 Err(error) => return Err(CellError::Facts { module: m, error }),
             };
-            let mut own: AVec<'a, (ItemKey, bool)> = AVec::with_capacity_in(d.mods.len(), alloc);
+            own.reserve(d.mods.len());
             for c in d.mods.iter() {
                 todo.push(c.module);
                 own.push((c.module, c.macro_use));

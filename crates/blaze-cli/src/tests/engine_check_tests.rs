@@ -294,6 +294,112 @@ fn engine_check_rechecks_the_callers_of_an_edited_signature() {
     }
 }
 
+/// The head reads of every body of the stored answer (engine_heads.rs `Owners::place`): each must
+/// name a cell its head task defines, at the digest it defines, or it is a read no edit moves
+/// (rule 21), returned in the list. The count: head reads judged good.
+fn head_reads_of_bodies(io: &Io) -> (std::vec::Vec<std::string::String>, u32) {
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+    let err = io.need_err().expect("err");
+    let mut phases = Phases::new(io.need_clock().expect("a clock"));
+    let judged = crate::engine_why::with_kept(&cx, io, &root, &opts(io, 2, false), &mut phases, &err, |kept| {
+        let rows = &kept.answer.rows;
+        let (mut bad, mut good) = (std::vec::Vec::new(), 0u32);
+        for (name, row) in rows.iter().filter(|(name, _)| name.kind == blaze_drive::Kind::BodyCheck) {
+            for (id, digest) in row.reads.iter().filter(|(id, _)| id.of.kind == blaze_drive::Kind::Signature) {
+                match rows.get(&id.of).and_then(|owner| owner.defines.iter().find(|(c, _)| *c == id.cell).map(|(_, d)| *d)) {
+                    Some(d) if d == *digest => good += 1,
+                    Some(d) => bad.push(format!("{name:?} reads {id:?} at {digest:?}, its head task defines {d:?}")),
+                    None => bad.push(format!("{name:?} reads {id:?} at {digest:?}: no head task defines it")),
+                }
+            }
+        }
+        (bad, good)
+    });
+    match judged {
+        Ok(Some(judged)) => judged,
+        Ok(None) => panic!("no stored answer to judge the head reads of"),
+        Err(error) => panic!("the stored answer: {error:?}"),
+    }
+}
+
+/// A HEAD READ ACROSS CRATES IS ITS HEAD TASK'S CELL (lane EY): `two` and `one` in `a`, `b::h`
+/// calling `a::one`: each of the five head reads (each body its own head, `two` and `h` also
+/// `one`'s) is a cell `a`'s or `b`'s head task defines. CONTROL: with the cell named by the
+/// item's checker key, `h`'s read of `one` named a cell no task defined (`b`'s unit keys `a`'s
+/// items apart from `a`'s own scope), so `one`'s new signature did not enter `h`.
+#[test]
+fn every_head_read_of_a_body_is_a_head_task_cell() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    typed_crates(&io, Typed::Plain);
+    write(&io, "a/src/lib.rs", "pub fn one() -> u8 {\n    1\n}\n\npub fn two() -> u8 {\n    one() + 1\n}\n");
+    let _ = engine_from(&io, 2, false);
+    let (bad, good) = head_reads_of_bodies(&io);
+    assert!(bad.is_empty(), "head reads no head task answers:\n{}", bad.join("\n"));
+    assert_eq!(good, 5, "the five head reads of the three bodies");
+}
+
+/// A HEAD TASK PER ITEM (lane EY): a body is entered only when a head it read moved. One crate:
+/// `P`, read by `make` and `get`; `area`, called by `top` and `helper`; `other`, called by
+/// `top`. Each edit enters, exactly:
+/// - a fn's parameter type changed: that fn's body (its key moved) and its two callers (their
+///   read of its head moved); three head tasks: `area`'s, whose heads moved, and two identical
+///   (`make`'s and `get`'s, which read a head of the file: see the edits below);
+/// - a struct gains a field: the two bodies that read its head (and three more by a names cell,
+///   OPEN, below); every head task of the file, `P`'s alone moving;
+/// - a body edit, and a comment inside a body: that body by its key, and the floor of the head
+///   tasks: one, its item's (keyed by the item's whole text, engine_heads.rs `plan_items`),
+///   which makes the heads it made (identical), so nothing reads a moved head.
+/// (A comment between items enters no head task: engine_check_starts_from_its_stored_answer.)
+#[test]
+fn a_moved_head_enters_exactly_its_readers() {
+    let io = Io::simulated(SimWorld::new(13, Limits::USUAL));
+    write(&io, "Cargo.toml", "[package]\nname = \"heads\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    let lib = |p: &str, area: &str, other: &str| {
+        format!(
+            "pub struct P {{\n{p}}}\n\npub fn make() -> P {{\n    P {{ x: 1 }}\n}}\n\npub fn get(p: &P) -> u32 {{\n    p.x\n}}\n\n{area}\n\npub fn other() -> u32 {{\n{other}}}\n\npub fn top() -> u32 {{\n    area(2, 3) + other()\n}}\n\npub fn helper() -> u32 {{\n    area(1, 1)\n}}\n"
+        )
+    };
+    let (p, area, other) = ("    pub x: u32,\n", "pub fn area(_w: u32, h: u32) -> u32 {\n    h\n}", "    3\n");
+    write(&io, "src/lib.rs", &lib(p, area, other));
+    let (_, first) = engine_from(&io, 2, false);
+    println!("the first request: {}", entries(&first));
+    assert_eq!(first.stages[blaze_engine::Stage::Bodies.index()].entered, 6, "six bodies: {}", entries(&first));
+    let (bad, _) = head_reads_of_bodies(&io);
+    assert!(bad.is_empty(), "head reads no head task answers:\n{}", bad.join("\n"));
+    let bodies = |checked: &engine_check::Checked| -> std::vec::Vec<(&'static str, Option<blaze_drive::Kind>, u32)> {
+        let mut groups: std::vec::Vec<_> = checked.because.iter().filter(|(group, _)| group.stage == blaze_engine::Stage::Bodies).map(|(group, count)| (group.cause, group.definer.map(|name| name.kind), *count)).collect();
+        groups.sort();
+        groups
+    };
+    let heads = |checked: &engine_check::Checked| {
+        let s = &checked.stages[blaze_engine::Stage::Heads.index()];
+        (s.entered, s.identical)
+    };
+    let sig = Some(blaze_drive::Kind::Signature);
+    let edit = |what: &str, text: std::string::String, want_bodies: &[(&'static str, Option<blaze_drive::Kind>, u32)], want_heads: (u32, u32)| {
+        write(&io, "src/lib.rs", &text);
+        let (_, checked) = engine_from(&io, 2, false);
+        println!("{what}: {}", entries(&checked));
+        assert_eq!(bodies(&checked), want_bodies, "{what}: the bodies entered, by cause: {}", entries(&checked));
+        assert_eq!(heads(&checked), want_heads, "{what}: the head tasks (entered, identical): {}", entries(&checked));
+    };
+    let area_u64 = "pub fn area(_w: u64, h: u32) -> u32 {\n    h\n}";
+    // The head tasks: the edited item's, and the two whose heads read another head of the file
+    // (`make`'s and `get`'s read `P`): a head task reads a head as its file's `HEADS` cell (one
+    // phase earlier; engine_heads.rs `heads_of`), which any signature edit of the file moves;
+    // they make equal heads (identical), so no body is entered for them.
+    edit("a parameter's type changed", lib(p, area_u64, other), &[("key moved", None, 1), ("read moved", sig, 2)], (3, 2));
+    let p2 = "    pub x: u32,\n    pub y: u32,\n";
+    // The field is part of the file's surface: every head task's key holds it (7 entered, 6
+    // identical, `P`'s moving), and the names move too. OPEN (lane EY, for the names lanes):
+    // three bodies that name no `P` are entered by a names cell that moved, all identical; which
+    // cell is not yet found, so it is asserted as seen, not as wanted.
+    edit("a struct gains a field", lib(p2, area_u64, other), &[("read moved", sig, 2), ("read moved", Some(blaze_drive::Kind::CrateScope), 3)], (7, 6));
+    edit("a body edit", lib(p2, area_u64, "    4\n"), &[("key moved", None, 1)], (1, 1));
+    edit("a comment inside a body", lib(p2, area_u64, "    // four\n    4\n"), &[("key moved", None, 1)], (1, 1));
+}
+
 /// AN EDITION EDIT IS IN THE KEYS (rule 21): `a`'s body names a local `gen`, a name in 2021 and
 /// a keyword in 2024. From the stored answer of the 2021 crate, `a/Cargo.toml` alone moves to
 /// 2024: no file's text moved, and the incremental request must answer as a fresh run does.
@@ -551,15 +657,18 @@ fn engine_check_starts_from_its_stored_answer() {
     assert_eq!(comment.entered, 1, "a comment: {}", entries(&comment));
     nothing("a comment");
 
-    // A statement added to one body: that file's outline and that one body, each by its key.
+    // A statement added to one body: that file's outline, that one body, and the floor of the
+    // head tasks: the one head task of its item (keyed by the item's whole text, engine_heads.rs
+    // `plan_items`), which makes equal heads, so no reader moves.
     write(&io, "a/src/m.rs", "pub fn k() -> u8 {\n    let two = 2;\n    two\n}\n// a comment\n");
     let (_, statement) = engine_from(&io, 2, false);
     assert_eq!(
         because(&statement),
-        [(blaze_engine::Stage::Outlines, "key moved", None, 1), (blaze_engine::Stage::Bodies, "key moved", None, 1)],
-        "a statement enters its outline and its body alone: {}",
+        [(blaze_engine::Stage::Outlines, "key moved", None, 1), (blaze_engine::Stage::Heads, "key moved", None, 1), (blaze_engine::Stage::Bodies, "key moved", None, 1)],
+        "a statement enters its outline, its item's head task and its body alone: {}",
         entries(&statement)
     );
+    assert_eq!(statement.stages[blaze_engine::Stage::Heads.index()].identical, 1, "a statement: its head task makes the heads it made: {}", entries(&statement));
     nothing("a statement");
 
     // An item added: its outline by its key, then each crate's names whose read moved.
@@ -585,18 +694,20 @@ fn engine_check_starts_from_its_stored_answer() {
     nothing("a module dropped");
 }
 
-/// `blaze why` (engine_why.rs): after an item is added to crate `a`'s root, `why` of `b`'s body
-/// `h`, which reads `a`'s names through its glob, prints the chain back to the edit: the body
-/// entered for a read that moved, each task that defined the moved cell, and last the edited
-/// file's outline, entered because its key moved. CONTROL: `why` of the file alone is that last
-/// step; an item the file does not have is said, not guessed.
+/// `blaze why` (engine_why.rs): after `a::f` is made private, `why` of `b`'s body `h`, which
+/// finds `f` through its glob of `a`'s names, prints the chain back to the edit: the body
+/// entered for a read that moved (`f`'s binding cell), each task that defined the moved cell,
+/// and last the edited file's outline, entered because its key moved. (It was an item added to
+/// `a`'s root; with a head task per item and names read by cell, `h` reads nothing that edit
+/// moves and is not entered, lane EY.) CONTROL: `why` of the file alone is that last step; an
+/// item the file does not have is said, not guessed.
 #[test]
 fn engine_why_walks_back_to_the_edit() {
     let io = Io::simulated(SimWorld::new(13, Limits::USUAL));
     two_crates(&io);
     write(&io, "b/src/lib.rs", "use a::*;\n\npub fn h() -> u8 {\n    f() + m::k()\n}\n");
     let _ = engine_from(&io, 2, false);
-    write(&io, "a/src/lib.rs", "pub mod m;\n\npub fn f() -> u8 {\n    1\n}\n\npub fn f2() -> u8 {\n    3\n}\n");
+    write(&io, "a/src/lib.rs", "pub mod m;\n\nfn f() -> u8 {\n    1\n}\n");
     let (_, item) = engine_from(&io, 2, false);
     let said = why(&io, "b/src/lib.rs::h");
     let lines: std::vec::Vec<&str> = said.lines().collect();
@@ -877,18 +988,17 @@ fn adding_a_private_fn_rechecks_one_body() {
         }
         checked
     };
-    // A private fn added: no body for a names cell; the new fn's body, new. What else is entered
-    // is lane EW's: every body that read a head of the file is entered by the file's `HEADS`
-    // cell (engine_tasks.rs, INTERIM until a Heads stage defines a cell per head).
+    // A private fn added: the new fn's body, new, and no other (each body reads its heads by
+    // their head tasks' cells, engine_heads.rs, lane EY; before, every body that read a head of
+    // the file was entered by the file's `HEADS` cell: "Bodies read moved FileItems 8").
     let geom = "use crate::stats::*;\n\npub fn area(w: u32, h: u32) -> u32 {\n    scale(w) * h\n}\n\nfn scale(x: u32) -> u32 {\n    x + crate::stats::total(0, 0)\n}\n\npub fn side() -> u32 {\n    total(1, 1)\n}\n";
-    edit("a private fn added", "src/geom.rs", &format!("{geom}\nfn extra() -> u32 {{\n    7\n}}\n"), Some(0), 1, None, true);
+    let new_alone: &[(&'static str, Option<blaze_drive::Kind>, u32)] = &[("new", None, 1)];
+    edit("a private fn added", "src/geom.rs", &format!("{geom}\nfn extra() -> u32 {{\n    7\n}}\n"), Some(0), 1, Some(new_alone), true);
     let stats = "pub fn total(a: u32, b: u32) -> u32 {\n    a + b\n}\n\npub fn mean(a: u32, b: u32) -> u32 {\n    total(a, b) / 2\n}\n\npub fn spread() -> u32 {\n    crate::geom::side() + 1\n}\n";
-    edit("a pub fn added nobody calls", "src/stats.rs", &format!("{stats}\npub fn unused() -> u32 {{\n    9\n}}\n"), Some(0), 1, None, true);
-    // A `use` no body reads: the names move and no body is entered for a names cell. (Today
-    // every body is still entered by `HEADS`, lane EW's interim, all ten coming out identical,
-    // tag of 13:05; with per-head cells this edit's whole Bodies list is empty.)
+    edit("a pub fn added nobody calls", "src/stats.rs", &format!("{stats}\npub fn unused() -> u32 {{\n    9\n}}\n"), Some(0), 1, Some(new_alone), true);
+    // A `use` no body reads: the names move and no body is entered.
     let lib = "mod geom;\nmod stats;\n\npub fn top() -> u32 {\n    geom::area(2, 3) + stats::mean(4, 6)\n}\n\npub fn helper() -> u32 {\n    stats::total(1, 2)\n}\n";
-    edit("a `use` no body reads", "src/lib.rs", &format!("use stats::spread;\n{lib}"), Some(0), 0, None, true);
+    edit("a `use` no body reads", "src/lib.rs", &format!("use stats::spread;\n{lib}"), Some(0), 0, Some(&[]), true);
     // A `use` that shadows the glob's `total` in `geom`: `side`, which looks `total` up there
     // (its binding cell, absent before, moved), is entered; with `HEADS` moving too the cause
     // names whichever moved read comes first, so only "entered, not new" is asserted.
@@ -913,6 +1023,161 @@ fn three_crates(io: &Io) {
     write(io, "b/src/lib.rs", "pub fn g() -> u8 {\n    a::f() + a::m::k()\n}\n");
     write(io, "c/Cargo.toml", "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nb = { path = \"../b\" }\n");
     write(io, "c/src/lib.rs", "pub fn h() -> u8 {\n    b::g() + 1\n}\n");
+}
+
+/// Three members in a chain, `c` reads `b`, `b` reads `a`, and `a` has one import that names
+/// nothing (`nowhere`, no crate). `reexport`: the import is `pub use` and `b` has one more body,
+/// `bad`, that names `a::Missing` through it.
+fn broken_chain(io: &Io, broken: bool, reexport: bool) {
+    write(io, "Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n");
+    write(io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    let import = match (broken, reexport) {
+        (false, _) => "",
+        (true, false) => "use nowhere::Missing;\n\n",
+        (true, true) => "pub use nowhere::Missing;\n\n",
+    };
+    write(io, "a/src/lib.rs", &format!("{import}pub fn good() -> u8 {{\n    1\n}}\n"));
+    write(io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\na = { path = \"../a\" }\n");
+    let bad = if reexport { "\npub fn bad() -> u8 {\n    let _m: a::Missing;\n    2\n}\n" } else { "" };
+    write(io, "b/src/lib.rs", &format!("pub fn f() -> u8 {{\n    a::good() + 1\n}}\n{bad}"));
+    write(io, "c/Cargo.toml", "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nb = { path = \"../b\" }\n");
+    write(io, "c/src/lib.rs", "pub fn h() -> u8 {\n    b::f() + 1\n}\n");
+}
+
+/// One request's whole printed text (its closing line too) and its counts.
+fn printed(io: &Io, fresh: bool) -> (std::vec::Vec<(std::string::String, std::string::String)>, std::string::String, engine_check::Checked) {
+    let before = stdout(io).len();
+    let (ids, checked) = engine_from(io, 2, fresh);
+    (ids, stdout(io).split_off(before), checked)
+}
+
+/// The words a cascade printed: a task that waited on a failed one, a member refused whole.
+const CASCADE: [&str; 3] = ["waits on a task that failed", "has no `Names` task", "has no names record"];
+
+fn no_cascade(text: &str, when: &str) {
+    for words in CASCADE {
+        assert!(!text.contains(words), "{when}: printed {words:?}, a failure stopping more than what reads it:\n{text}");
+    }
+}
+
+/// The `Names` stage's entries of one request.
+fn names_entered(checked: &engine_check::Checked) -> u32 {
+    checked.stages[blaze_engine::Stage::Names.index()].entered
+}
+
+/// AN ERROR STOPS ONLY WHAT READS IT (plan row A8): `a`'s one unresolved import is one error,
+/// at it; `a` still writes its names record (the finding is in it), so `b` and `c` are solved
+/// and every body is checked clean; nothing "waits on a task that failed" and no member is
+/// refused whole. With nothing changed the certificate stands with the finding (no task
+/// entered); fixed, the error is gone, `a`'s names were entered again, the answer is a fresh
+/// run's, and the next request is the certificate again. CONTROL: the fixed tree prints no
+/// error, so the one error is `a`'s import.
+#[test]
+fn an_unresolved_import_stops_only_what_reads_it() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    broken_chain(&io, true, false);
+    let (_, first, checked) = printed(&io, false);
+    println!("broken a:\n{first}\n{}", entries(&checked));
+    no_cascade(&first, "broken a");
+    let errors = error_lines(&first);
+    assert_eq!(errors.len(), 1, "one error, at its cause:\n{first}");
+    assert!(first.contains("nowhere"), "the error names the import's path:\n{first}");
+    assert!(names_entered(&checked) >= 3, "every member's names task ran: {}", entries(&checked));
+
+    // Nothing changed: the certificate stands with the finding.
+    let (_, again, certificate) = printed(&io, false);
+    assert!(certificate.certified && certificate.entered == 0, "nothing changed: no task entered; {}", entries(&certificate));
+    assert_eq!(error_lines(&again), errors, "the certificate prints the error again");
+
+    // Fixed: no error, `a`'s names entered, as a fresh run.
+    broken_chain(&io, false, false);
+    let (fixed_ids, fixed, fixed_checked) = printed(&io, false);
+    println!("fixed a: {}", entries(&fixed_checked));
+    assert!(error_lines(&fixed).is_empty(), "fixed: no error:\n{fixed}");
+    // The `Names` entries, by cause, exactly (run 184110-RA8): `a`'s two units (its library and
+    // its test unit) by its edited file, and the four units of `b` and `c` by `a`'s record
+    // cell, which each reads (`c` too: a names task reads its whole closure, engine_names.rs
+    // `closure_of`), all four coming out identical. Those four are this design's cost, not the
+    // floor: the cell a dependent reads is `a`'s whole out (exports and inner records,
+    // names/scope.rs `OUT_DOMAIN`), and removing a private import moves only the inner one. The
+    // floor is 2 entries (ratio 6/2); the fix is a dependent reading an exports-only cell.
+    let mut names_because: std::vec::Vec<(std::string::String, std::string::String, u32)> = fixed_checked
+        .because
+        .iter()
+        .filter(|(group, _)| group.stage == blaze_engine::Stage::Names)
+        .map(|(group, count)| (group.cause.to_owned(), format!("{:?}", group.definer.map(|name| name.kind)), *count))
+        .collect();
+    names_because.sort();
+    let expected: std::vec::Vec<(std::string::String, std::string::String, u32)> =
+        vec![("read moved".to_owned(), "Some(CrateScope)".to_owned(), 4), ("read moved".to_owned(), "Some(FileItems)".to_owned(), 2)];
+    assert_eq!(names_because, expected, "fixed: `a`'s two units by its file, `b`'s and `c`'s four by `a`'s cell: {}", entries(&fixed_checked));
+    assert_eq!(fixed_checked.stages[blaze_engine::Stage::Names.index()], blaze_engine::StageCount { entered: 6, identical: 4 }, "fixed: the four readers came out identical: {}", entries(&fixed_checked));
+    let (fresh_ids, fresh, _) = printed(&io, true);
+    assert_eq!((placed_ids(&fixed_ids), error_lines(&fixed)), (placed_ids(&fresh_ids), error_lines(&fresh)), "fixed: the incremental answer is a fresh run's");
+    let (_, _, settled) = printed(&io, false);
+    assert!(settled.certified && settled.entered == 0, "fixed, then nothing changed: no task entered; {}", entries(&settled));
+}
+
+/// A PATH THROUGH THE BROKEN IMPORT FAILS ONLY ITS READER (plan row A8): `a`'s `pub use
+/// nowhere::Missing;` is one error; `b::bad`, whose body names `a::Missing`, is the one other,
+/// naming `Missing`; `b::f` and `c::h` check clean, and no member is refused whole.
+#[test]
+fn a_body_through_a_broken_import_alone_fails() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    broken_chain(&io, true, true);
+    let (_, text, checked) = printed(&io, false);
+    println!("a re-exports a broken import:\n{text}\n{}", entries(&checked));
+    no_cascade(&text, "a broken re-export");
+    let errors = error_lines(&text);
+    assert_eq!(errors.len(), 2, "the import's error and `b::bad`'s, no other:\n{text}");
+    assert!(errors.iter().any(|line| line.contains("Missing")) || text.contains("a::Missing"), "`b::bad`'s error names `a::Missing`:\n{text}");
+    assert!(!text.contains("c/src/lib.rs"), "`c` reads nothing through the import: nothing of it is printed:\n{text}");
+}
+
+/// A crate whose names cannot be made at all (a member proc macro: the test shelf has no
+/// `wasm32-wasip1` side, names/scope.rs `prepare`'s refused crate) and a member that depends on
+/// it and names nothing of it.
+fn failed_dep(io: &Io) {
+    write(io, "Cargo.toml", "[workspace]\nmembers = [\"p\", \"b\", \"c\"]\nresolver = \"2\"\n");
+    write(io, "p/Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\nproc-macro = true\n");
+    write(io, "p/src/lib.rs", "pub fn nothing() {}\n");
+    write(io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\np = { path = \"../p\" }\n");
+    write(io, "b/src/lib.rs", "pub fn f() -> u8 {\n    1\n}\n");
+    write(io, "c/Cargo.toml", "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nb = { path = \"../b\" }\n");
+    write(io, "c/src/lib.rs", "pub fn h() -> u8 {\n    b::f() + 1\n}\n");
+}
+
+/// A FAILED DEPENDENCY STOPS ONLY WHAT READS IT (plan row A8; tempo: two failed build scripts
+/// left 110 names tasks "waiting" and 13,538 bodies refused): `p`'s `CrateScope` task fails,
+/// once, naming itself; `b` and `c` are still solved (`b` against `p` as an error crate) and
+/// nothing "waits on a task that failed"; their bodies' refusal names `p` (body-level isolation
+/// is the next piece). The failed row records what it read, so with nothing
+/// changed the certificate stands with the failure: NO task entered. CONTROL: the fixture's
+/// dependency really failed (its failure is printed), so the test is of a failure.
+#[test]
+fn a_failed_dependency_leaves_its_dependents_solved() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    failed_dep(&io);
+    let (_, text, checked) = printed(&io, false);
+    println!("p fails:\n{text}\n{}", entries(&checked));
+    assert!(text.contains("crate `p`"), "control: `p`'s names failed, naming it (else the fixture fails nothing):\n{text}");
+    assert!(!text.contains("waits on a task that failed"), "a dependent of `p` waited on it:\n{text}");
+    assert!(names_entered(&checked) >= 3, "`p`, `b` and `c` each entered their names task: {}", entries(&checked));
+    // `b` and `c` have names records (only `p`'s two units fail, each once); their bodies are
+    // still refused whole, since `p` is in their check scope and the bodies stage cuts the
+    // scope at the first crate without records (engine_bodies.rs `scope_of`). Today's truth,
+    // asserted: the refusal names `p`. Next lane (plan row A8, NOT DONE): a records hole per
+    // failed crate in `group.crates`, so only a body that reads through `p` fails.
+    assert_eq!(text.matches("a crate the toolchain shelf cannot build").count(), 2, "`p`'s library and test unit fail, nothing else:\n{text}");
+    for member in ["b/src/lib.rs", "c/src/lib.rs"] {
+        assert!(
+            text.lines().any(|line| line.contains(member) && line.contains("check scope holds `p`")),
+            "{member}'s refusal names `p`, the crate that failed:\n{text}"
+        );
+    }
+    let (_, again, certificate) = printed(&io, false);
+    assert!(certificate.entered == 0, "nothing changed: no task entered, the failed row stands by its reads; {}", entries(&certificate));
+    assert!(again.contains("crate `p`"), "and the failure is printed again:\n{again}");
 }
 
 /// THE RECORDS' COST (rules 50, 51; engine_store.rs `Ledger`): each stage's line, "N put, B
@@ -940,4 +1205,42 @@ fn engine_check_counts_the_records_it_holds() {
     assert!(names.puts >= 3, "a names record a member at least: {names}");
     assert_eq!(names.copies, names.puts, "each names record copied once, into the arena, and joined nowhere: {names}");
     assert_eq!(names.held, 0, "nothing of a names record is held after its merge: {names}");
+}
+
+/// The digest of the answers of [`engine_check_reads_records_in_place`]: the bodies' notes,
+/// their clean count and every record put. TODO-digest: the coordinator fills it from the first
+/// run on the tree BEFORE the in-place reader (so the constant shows the answers did not move),
+/// then from this tree; both must print the same. They did (b0b8b00a0dd0, 2026-11-17), and the
+/// digest is PRINTED, not pinned, since: every later piece that adds a record moves it by design.
+const READS_IN_PLACE_DIGEST: &str = "printed, not pinned";
+
+/// THE READ SIDE HOLDS NOTHING (runtime.md C3; engine_records.rs): on the three-crate chain the
+/// Heads and Bodies stages read every crate's `CrateScope` record in place from the store's
+/// mapping, "records read (Bodies): N, B bytes; copied into the heap: 0 bytes", and answer as
+/// before (the digest). The before: each crate's three sections were copied 16-aligned into the
+/// heap once a command (body_types.rs `Kept::records`, front_load.rs `crate_records`), 670 MB on
+/// tempo. CONTROL: front_load.rs `the_copying_route_counts_every_byte_it_copies` opens the same
+/// records through the copying route and sees its copy counted, so a 0 here is a count, not a
+/// counter that counts nothing.
+#[test]
+fn engine_check_reads_records_in_place() {
+    let io = Io::simulated(SimWorld::new(13, Limits::USUAL));
+    three_crates(&io);
+    let (_, checked) = engine(&io, 2);
+    for stage in blaze_engine::Stage::ALL {
+        println!("records read ({stage:?}): {}", checked.records.reads[stage.index()]);
+    }
+    let heads = checked.records.reads[blaze_engine::Stage::Heads.index()];
+    let bodies = checked.records.reads[blaze_engine::Stage::Bodies.index()];
+    assert!(heads.records + bodies.records >= 3, "each member's records read at least once, in place: heads {heads}, bodies {bodies}");
+    assert!(bodies.records + bodies.again > 0, "the Bodies stage read its crates' records: {bodies}");
+    assert_eq!((heads.copied, bodies.copied), (0, 0), "no byte of a record read was copied into the heap: heads {heads}, bodies {bodies}");
+    let mut answers = blaze_ids::Hasher::new("blaze-cli engine check reads in place test");
+    for note in checked.bodies.0.iter() {
+        answers.update(note.as_bytes());
+    }
+    answers.update(&checked.bodies.1.to_le_bytes()).update(&checked.records.digest().0);
+    let digest = format!("{:?}", answers.finish());
+    println!("READS_IN_PLACE_DIGEST {digest}");
+    assert_ne!(digest, READS_IN_PLACE_DIGEST, "a digest of the answers is printed above");
 }

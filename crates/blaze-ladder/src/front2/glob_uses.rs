@@ -414,21 +414,10 @@ pub struct PatternBlocks<'a> {
 impl<'a> PatternBlocks<'a> {
     /// Of the body whose text is `text`, the item `item` (a member's: its container) of crate
     /// `krate`.
-    pub fn of<'n, S: NamesSource<'n>>(names: S, krate: usize, item: LibKey, text: &str, alloc: Alloc<'a>) -> PatternBlocks<'a> {
+    pub fn of<'n, S: NamesSource<'n>>(names: S, locals: &super::locals::Locals<'n>, krate: usize, item: LibKey, text: &str, alloc: Alloc<'a>) -> PatternBlocks<'a> {
         let nested = blaze_file_items::nested::scan(text, alloc);
-        let same = |t: &str| core::ptr::eq(t.as_ptr(), text.as_ptr()) && t.len() == text.len();
-        // The library's key of the body, as `Locals::keep` finds it: the item whose text is
-        // the body's, else the first member of `item` whose text is.
-        let mut body = None;
-        if names.text_of(item).is_some_and(|it| same(it.text)) {
-            body = Some(item);
-        } else {
-            names.each_member(item, &mut |m| {
-                if body.is_none() && same(m.text) {
-                    body = Some(m.key);
-                }
-            });
-        }
+        // The library's key of the body, the one answer `Locals::keep` takes too.
+        let body = locals.library_body(names, item, text);
         let modules = match (body, names.crate_key(krate)) {
             (Some(body), Some(crate_key)) if nested.end == NestedEnd::Whole => Some(blaze_scope::blocks::block_modules(crate_key, body, &nested, alloc)),
             _ => None,

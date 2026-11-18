@@ -39,6 +39,8 @@ const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// One crate's groups, solved from `texts`: each group's members (by path) and record.
 pub(super) struct Groups {
     pub(super) groups: Vec<(Vec<std::string::String>, NameGroup<'static>)>,
+    /// The crate's module tree record, as the solve wrote it.
+    pub(super) tree: &'static [u8],
 }
 
 impl Groups {
@@ -57,7 +59,7 @@ impl Groups {
             assert!(grp.cells_read.windows(2).all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1)), "{m:?}: reads not sorted by cell, each once");
             assert_eq!(grp.own.len(), grp.members.len(), "{m:?}: an own text per member");
         }
-        Groups { groups }
+        Groups { groups, tree: names.tree_record }
     }
 
     /// The members of each group, by path.

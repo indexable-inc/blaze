@@ -40,6 +40,7 @@ mod include_macros;
 mod include_nested_mods;
 mod include_roots;
 mod expansions;
+mod expansion_records;
 mod exports;
 mod fixtures;
 mod global_allocator;

@@ -1,6 +1,6 @@
 //! The per-task recorder of every read (engine.md, E2): ONE list a task fills while it runs,
 //! of the names cells its walks and rows consulted (lane CELL's [`NameCell`], put through
-//! [`CellSink`]), the heads it read, the impl buckets it read and the lang rows it read. The
+//! [`CellSink`]; a crate's lang rows are one, [`NameCell::Lang`]), the heads it read and the impl buckets it read. The
 //! list is sorted and deduplicated ONCE, when the task ends ([`Recorder::finish`], rule 25):
 //! what a task read is then a function of its questions, never of the order it asked them.
 //!
@@ -32,8 +32,6 @@ pub enum TableRead {
     /// One crate's impl bucket (crate: its key's first 16 bytes, all zero for a fact of the
     /// whole graph; bucket: [`bucket_cell`], or [`UNFILED`], or [`INCOHERENT`]).
     Impls { krate: [u8; 16], bucket: [u8; 16] },
-    /// The lang rows of the crate whose keys begin with these 8 bytes, read whole.
-    Lang { krate: [u8; 8] },
 }
 
 /// The bucket cell of a crate's list of impls filed under no bucket.
@@ -61,8 +59,6 @@ pub enum ReadOf {
     Head { item: [u8; 16] },
     /// The impl table of the crate (its key's first 16 bytes; zero: the whole graph's fact).
     Impls { krate: [u8; 16] },
-    /// The lang rows of the crate.
-    Lang { krate: [u8; 8] },
 }
 
 impl TableRead {
@@ -72,12 +68,11 @@ impl TableRead {
             TableRead::Names(cell) => ReadOf::Names { krate: cell.crate_prefix() },
             TableRead::Head { item, .. } => ReadOf::Head { item },
             TableRead::Impls { krate, .. } => ReadOf::Impls { krate },
-            TableRead::Lang { krate } => ReadOf::Lang { krate },
         }
     }
 
     /// The read's cell in its record ([`TableRead::of`]): a names cell's key, a head's part, an
-    /// impl table's bucket; a lang read is the whole rows (all zero).
+    /// impl table's bucket.
     pub fn cell(self) -> [u8; 16] {
         match self {
             TableRead::Names(cell) => cell.key(),
@@ -87,7 +82,6 @@ impl TableRead {
                 cell
             }
             TableRead::Impls { bucket, .. } => bucket,
-            TableRead::Lang { .. } => [0; 16],
         }
     }
 }
@@ -154,9 +148,9 @@ impl<'a> Recorder<'a> {
         self.read(TableRead::Impls { krate, bucket });
     }
 
-    /// A crate's lang rows read whole.
+    /// A crate's lang rows ([`NameCell::Lang`]: a names cell, absent where it declares none).
     pub fn lang(&self, krate: [u8; 8]) {
-        self.read(TableRead::Lang { krate });
+        self.read(TableRead::Names(NameCell::Lang { krate }));
     }
 
     /// A section of a crate's names read whole (a question no cell answers).
@@ -223,7 +217,7 @@ mod tests {
             TableRead::Head { item: [1; 16], part: 3 },
             TableRead::Names(NameCell::Module { module: key(1) }),
             TableRead::Impls { krate: [2; 16], bucket: [9; 16] },
-            TableRead::Lang { krate: [4; 8] },
+            TableRead::Names(NameCell::Lang { krate: [4; 8] }),
         ];
         let forward = Recorder::new(RecorderOpts { alloc });
         for r in reads.iter().chain(reads.iter()) {

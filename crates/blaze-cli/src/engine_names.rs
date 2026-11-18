@@ -125,6 +125,9 @@ impl<'f> NamesStage<'f> {
         let mut jobs: Vec<(usize, blaze_drive::Task<'_>, &crate::names::ScopeJob<'_>), &Frame> = Vec::new_in(frame);
         let mut answered: Vec<(usize, Result<work::Made<'f>, Failure<'f>>), &Frame> = Vec::new_in(frame);
         let mut closure: Vec<usize, &Frame> = Vec::new_in(frame);
+        // What each answered task was handed (its dependencies, script and surfaces), by task
+        // index: a failure's read list (plan row A8).
+        let mut saw: Vec<(usize, Vec<(Name, ContentId), &Frame>), &Frame> = Vec::new_in(frame);
         for (i, task) in tasks.iter().enumerate() {
             let name = task.planned.name;
             let names = self.names.as_ref().ok_or(CliError::Text { what: "the names world is gone (engine_names.rs `run_phase`)" })?;
@@ -147,9 +150,15 @@ impl<'f> NamesStage<'f> {
             for g in closure.iter() {
                 let dep = blaze_drive::key::crate_scope_name(&names.world().crates[*g].input.key);
                 match self.made.binary_search_by_key(&dep, |(name, _)| *name) {
+                    // A dependency that failed is handed by the failed out, never as a failed
+                    // need: the crate is solved with it as an error crate (names/scope.rs
+                    // `prepare`), so a failure stops only what reads through it (plan row A8),
+                    // and the read of that out is the crate's (rule 21): the dependency fixed
+                    // moves it. Before, every crate above one failed build script failed
+                    // `Waited` (tempo: 110 tasks above tempo-precompiles' and zone-node's).
                     Ok(at) => match self.made[at].1 {
                         Some((key, out)) => inputs.push(Input { name: dep, at: key, out }),
-                        None => failed.push(dep),
+                        None => inputs.push(Input { name: dep, at: Key::default(), out: work::failed_out() }),
                     },
                     Err(_) => return Err(EngineCheckError::Unseen { task: name, read: dep }.into()),
                 }
@@ -164,7 +173,10 @@ impl<'f> NamesStage<'f> {
             let prepared = crate::names::prepare(&cx, handles.root, store, &mut self.names, handles.lock, handles.members, handles.env, handles.side, &drive, &mut round, frame)?;
             match prepared {
                 Prepared::Resolve(job) => jobs.push((i, drive, job)),
-                Prepared::Answer(did) => answered.push((i, published(name, did)?)),
+                Prepared::Answer(did) => {
+                    saw.push((i, handed(&drive, frame)));
+                    answered.push((i, published(name, did)?));
+                }
                 Prepared::Made => return Err(EngineCheckError::Twice { task: name }.into()),
             }
         }
@@ -205,6 +217,7 @@ impl<'f> NamesStage<'f> {
         // 3. Each answered, on this thread, with the surfaces and data files it read.
         for ((i, mut drive, _), resolution) in jobs.into_iter().zip(resolutions) {
             let name = drive.name;
+            saw.push((i, handed(&drive, frame)));
             let names = self.names.as_mut().ok_or(CliError::Text { what: "the names world is gone (engine_names.rs `run_phase`)" })?;
             let resolution = match resolution {
                 Ok(resolution) => resolution,
@@ -239,34 +252,25 @@ impl<'f> NamesStage<'f> {
         }
         // Each result as the engine's row and this stage's record, in task order.
         answered.sort_unstable_by_key(|(i, _)| *i);
+        saw.sort_unstable_by_key(|(i, _)| *i);
         for (i, made) in answered.into_iter() {
             let task = &tasks[i];
             let name = task.planned.name;
             let done = match &made {
                 Ok(record) => {
-                    let mut reads: SVec<'a, (CellId, ContentId)> = SVec::new_in(alloc);
-                    for (read, digest) in record.reads.iter() {
-                        reads.push(match read.kind {
-                            // A file's surface is its outline's `SURFACE` cell (engine_tasks.rs),
-                            // with the digest that task defines: a comment or a body's statement
-                            // leaves it, so this crate's names are not entered for them.
-                            Kind::Surface => {
-                                let file = Name::new(Kind::FileItems, read.subject);
-                                let out = handles.outlined.binary_search_by(|one| one.name.cmp(&file)).ok().and_then(|at| handles.outlined[at].made.as_ref().ok()).and_then(crate::engine_tasks::surface_of).unwrap_or(*digest);
-                                (CellId { of: file, cell: crate::engine_tasks::SURFACE }, out)
-                            }
-                            _ => (CellId { of: *read, cell: WHOLE }, *digest),
-                        });
-                    }
-                    reads.sort_unstable_by_key(|(id, _)| *id);
-                    reads.dedup_by_key(|(id, _)| *id);
+                    let reads = self.cells_read(handles.outlined, record.reads.iter().copied(), alloc);
                     let defines = cells_of(name, record, alloc)?;
                     self.mark(name, Some((task.key, record.out)));
                     Done { name, key: task.key, out: record.out, defines, reads, findings: u32::try_from(record.findings.len()).unwrap_or(u32::MAX), failed: false }
                 }
+                // A failure records what it read before it failed (invariant 7): its row stands
+                // until one of them moves, then is entered again once, never owed on every
+                // request (plan row A8).
                 Err(_) => {
+                    let seen = saw.binary_search_by_key(&i, |(at, _)| *at).ok().map_or(&[][..], |at| saw[at].1.as_slice());
+                    let reads = self.cells_read(handles.outlined, seen.iter().copied(), alloc);
                     self.mark(name, None);
-                    crate::engine_tasks::failed(task, alloc)
+                    crate::engine_tasks::failed_with(task, reads, alloc)
                 }
             };
             buffer.done.push(done);
@@ -275,11 +279,50 @@ impl<'f> NamesStage<'f> {
         Ok(())
     }
 
+    /// A names task's reads, each `(record, digest)` as the task saw it, as the engine's cells:
+    /// sorted by cell id, each once.
+    fn cells_read<'a>(&self, outlined: &[Outlined<'_>], read: impl Iterator<Item = (Name, ContentId)>, alloc: SharedAlloc<'a>) -> SVec<'a, (CellId, ContentId)> {
+        let mut reads: SVec<'a, (CellId, ContentId)> = SVec::new_in(alloc);
+        for (read, digest) in read {
+            reads.push(match read.kind {
+                // A file's surface is its outline's `SURFACE` cell (engine_tasks.rs), with the
+                // digest that task defines: a comment or a body's statement leaves it, so this
+                // crate's names are not entered for them.
+                Kind::Surface => {
+                    let file = Name::new(Kind::FileItems, read.subject);
+                    let out = outlined.binary_search_by(|one| one.name.cmp(&file)).ok().and_then(|at| outlined[at].made.as_ref().ok()).and_then(crate::engine_tasks::surface_of).unwrap_or(digest);
+                    (CellId { of: file, cell: crate::engine_tasks::SURFACE }, out)
+                }
+                // A dependency (or build script) whose task failed defines no cell (invariant 7):
+                // read through its failed out, its record cell is absent, and appears (moving
+                // this crate) once it is fixed (plan row A8).
+                _ if digest == work::failed_out() && self.made.binary_search_by_key(&read, |(name, _)| *name).is_ok_and(|at| self.made[at].1.is_none()) => {
+                    (CellId { of: read, cell: WHOLE }, blaze_drive::key::ABSENT)
+                }
+                _ => (CellId { of: read, cell: WHOLE }, digest),
+            });
+        }
+        reads.sort_unstable_by_key(|(id, _)| *id);
+        reads.dedup_by_key(|(id, _)| *id);
+        reads
+    }
+
     /// The crate `name`'s `CrateScope` as a reader takes it (its key and out), when its task
-    /// was entered and made its record: what the Bodies stage reads a crate's records by.
+    /// was entered and made its record: what the Bodies stage reads a crate's records by. A
+    /// crate whose resolution failed (its out the failed out, a row with its failure as a
+    /// finding) has no record to read: `None`, as for a failed task.
     pub(crate) fn input_of(&self, name: Name) -> Option<Input> {
         let at = self.made.binary_search_by_key(&name, |(name, _)| *name).ok()?;
-        self.made[at].1.map(|(at, out)| Input { name, at, out })
+        self.made[at].1.filter(|(_, out)| *out != work::failed_out()).map(|(at, out)| Input { name, at, out })
+    }
+
+    /// Whether the crate `name`'s `CrateScope` was entered this command and has no record of
+    /// its names (its task failed, or its resolution did): what a body's refusal names.
+    pub(crate) fn failed(&self, name: Name) -> bool {
+        match self.made.binary_search_by_key(&name, |(name, _)| *name) {
+            Ok(at) => self.made[at].1.is_none_or(|(_, out)| out == work::failed_out()),
+            Err(_) => false,
+        }
     }
 
     /// `name` entered: its key and out, `None` when it failed. The `Scripts` stage marks each
@@ -341,6 +384,15 @@ fn cells_of<'a>(name: Name, record: &work::Made<'_>, alloc: SharedAlloc<'a>) -> 
     }
     defines.sort_unstable_by_key(|(cell, _)| *cell);
     Ok(defines)
+}
+
+/// What `drive` was handed, as `(record, digest)`: each input by its out, each failed need by
+/// the failed out (read as absent, engine_names.rs `cells_read`).
+fn handed<'r>(drive: &blaze_drive::Task<'_>, frame: &'r Frame) -> Vec<(Name, ContentId), &'r Frame> {
+    let mut seen = Vec::with_capacity_in(drive.inputs.len() + drive.failed.len(), frame);
+    seen.extend(drive.inputs.iter().map(|input| (input.name, input.out)));
+    seen.extend(drive.failed.iter().map(|failed| (*failed, work::failed_out())));
+    seen
 }
 
 fn refusal(name: Name, what: &'static str) -> Failure<'static> {

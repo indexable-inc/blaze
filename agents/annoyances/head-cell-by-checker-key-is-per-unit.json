@@ -1,0 +1,15 @@
+{
+ "id": "head-cell-by-checker-key-is-per-unit",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane EY",
+ "where": "crates/blaze-cli/src/engine_heads.rs (head_cell, Owners::place, heads_of_crate); seen as engine_check_rechecks_the_callers_of_an_edited_signature missing b::h's error",
+ "what": "With a head task per outline entry, `b::h` (calling `a::one`) was not entered when `one`'s return type changed. Two causes, found one after the other. (1) Every body read its own crate's lang rows as the crate's names record WHOLE (TableRead::Lang, LANG_CELL), so any names edit entered every body; it was hidden before because the file's HEADS cell entered them first. (2) The head cell was named by the item's checker key, and `b`'s view of `a` (a dependency's unit) keys `a`'s items apart from `a`'s own check scope, where the head task runs: `h` read a cell no task defines (ABSENT, never moves).",
+ "cost": "about an hour: worker-thread eprintln output never reaches the runner's answer, so the reads had to be printed from the test thread through engine_why::with_kept",
+ "cause": "(1) the lang rows had no names cell; (2) a cell named by a unit-dependent key, read across units",
+ "whys": "an id that is per unit (item keys hash the crate's unit key) was used as a name that must be the same for every reader of the same text",
+ "class": "a cell named by a key of the reader's unit instead of by what the text names: a read that silently never moves",
+ "prevention": "done: NameCell::Lang (blaze-scope names_cells.rs) replaces TableRead::Lang and LANG_CELL; head_cell is named by the want's kind, the item's name and an impl fn's name, two heads of one entry under one cell refused; test every_head_read_of_a_body_is_a_head_task_cell judges every head read of the stored answer against the cell its task defines",
+ "annoyance": "stderr of engine worker threads is not in the runner's answer; print from the test thread",
+ "workaround": "a temporary test reading the stored answer with engine_why::with_kept",
+ "state": "fixed"
+}

@@ -1,0 +1,15 @@
+{
+ "id": "one-group-solve-walked-every-file",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane CM",
+ "where": "crates/blaze-scope/src/resolve.rs resolve_one (members mode), cells/mod.rs make_modules",
+ "what": "The one-group names solve answered from one group but outlined, walked, lowered and wrote declarations for every file of the crate: on a 2,000-module crate a private fn added cost 50 ms against 92 ms for the whole solve (ratio 1.8). The module tree had no record of its own, so every solve rebuilt it from every file's text, and make_modules read every module's lowered decls for its `mod` lines.",
+ "cost": "the lane's piece",
+ "cause": "the tree was a by-product of the walk, not a record a later solve could read",
+ "whys": "the one-group solve was built on the whole solve's pipeline with members marked, keeping its front half (files, walk, lowering) crate-wide",
+ "class": "a derived index rebuilt from all inputs on each run instead of kept as a record keyed by them",
+ "prevention": "done: crates/blaze-scope/src/tree_record.rs, written by every names solve (CrateNames::tree_record), read by a one-group solve handed it (Members::tree); members' files alone read, outlined and lowered, each checked against its row; ScopeFacts::mod_lines answers the other modules' `mod` lines from it",
+ "annoyance": "the build queue takes minutes per ask when several lanes ask; a cost test's numbers move ~30% with load",
+ "workaround": "read which parts go to ~0 rather than absolute times",
+ "state": "fixed for the tree; the per-cell fill and the driver's O(groups) maps are the next cuts"
+}

@@ -91,6 +91,10 @@ pub enum NamesPart {
     Walk,
     /// Inside [`Stage::Files`]: the files a walk named read and outlined.
     Outline,
+    /// Inside [`Stage::Files`]: a one-group solve handed the module tree record found its
+    /// inputs moved (a member in no row, a file gone, rows, lines, exports or macros not the
+    /// record's) and makes the tree again from the files (tree_record.rs: the stated path).
+    TreeAgain,
     /// The files' blocks made modules, before the cell core.
     Blocks,
     /// The cell core loaded: the module tree and the members' texts.

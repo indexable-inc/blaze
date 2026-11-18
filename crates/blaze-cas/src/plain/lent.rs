@@ -160,6 +160,95 @@ pub struct Lend<'l> {
     pub own: bool,
 }
 
+impl<'l> Lend<'l> {
+    /// The record as bytes of a segment's mapping, for a reader that reads them where they lie
+    /// for `'l` (blaze-cli engine_records.rs): refused when it is this command's own put (the
+    /// arena's copy, which a get keeps in the heap to the `Lent`'s end) or when it does not start
+    /// at a multiple of [`ALIGN`](blaze_keyed::store::ALIGN), which the layout gives every record
+    /// (core.rs `lay_out`, format.rs `check_segment`). Never a copy in its place (rule 3).
+    pub fn in_place(self) -> Result<Aligned16<'l>, NotInPlace> {
+        if self.own {
+            return Err(NotInPlace::Arena { len: self.bytes.len() });
+        }
+        Aligned16::new(self.bytes).map_err(NotInPlace::Misaligned)
+    }
+}
+
+/// The alignment every record of a segment starts at, and every section a reader cuts at a
+/// multiple of it inside one (blaze-drive record.rs `PAYLOAD_ALIGN`, blaze-cli names/sections.rs).
+const ALIGN_BYTES: usize = blaze_keyed::store::ALIGN as usize;
+
+/// Bytes that start at a multiple of sixteen (rule 76: the property the store gives, said by a
+/// type): a reader whose views read words in place takes one, so a misaligned slice is refused
+/// where it is made, once, and never copied to an aligned place behind the reader's back. An
+/// empty slice is aligned: no byte of it is read.
+#[derive(Clone, Copy, Debug)]
+pub struct Aligned16<'a>(&'a [u8]);
+
+/// Bytes refused as [`Aligned16`]: how far past a multiple of sixteen they start, and their length.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Misaligned {
+    pub by: usize,
+    pub len: usize,
+}
+
+impl fmt::Display for Misaligned {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} bytes that start {} past a multiple of {ALIGN_BYTES} (rule 76: read in place only when aligned)", self.len, self.by)
+    }
+}
+
+impl core::error::Error for Misaligned {}
+
+/// Why a record is not lent as bytes of a mapping ([`Lend::in_place`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NotInPlace {
+    /// This command's own put: the arena's copy in the heap, not yet committed.
+    Arena { len: usize },
+    Misaligned(Misaligned),
+}
+
+impl fmt::Display for NotInPlace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NotInPlace::Arena { len } => write!(f, "a record of {len} bytes read from this command's arena, not from a segment's mapping (rule 51: read in place after its commit)"),
+            NotInPlace::Misaligned(why) => write!(f, "a record of a segment: {why}"),
+        }
+    }
+}
+
+impl core::error::Error for NotInPlace {}
+
+impl<'a> Aligned16<'a> {
+    /// `bytes`, when they start at a multiple of sixteen.
+    pub fn new(bytes: &'a [u8]) -> Result<Aligned16<'a>, Misaligned> {
+        let by = bytes.as_ptr().addr() % ALIGN_BYTES;
+        if by != 0 && !bytes.is_empty() {
+            return Err(Misaligned { by, len: bytes.len() });
+        }
+        Ok(Aligned16(bytes))
+    }
+
+    /// `bytes[at..at + len]`, when `at` is a multiple of sixteen and the range is inside;
+    /// `None` past the end. A cut at another place is [`Misaligned`] (`Ok(None)` never hides it).
+    pub fn cut(self, at: usize, len: usize) -> Result<Option<Aligned16<'a>>, Misaligned> {
+        let Some(part) = at.checked_add(len).and_then(|end| self.0.get(at..end)) else { return Ok(None) };
+        Aligned16::new(part).map(Some)
+    }
+
+    pub fn bytes(self) -> &'a [u8] {
+        self.0
+    }
+
+    pub fn len(self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// What the lends of one command did, for `--stats`.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct LentCounts {

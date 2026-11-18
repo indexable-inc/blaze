@@ -1700,32 +1700,251 @@ fn local_types_of_a_body_are_found_over_names_records() {
     assert!(seen.iter().all(|s| s.contains(": Ok(")), "{}", seen.join("\n"));
 }
 
-/// A local item whose form is not built yet is refused as a user reads it (rule 19): the
-/// enclosing item's path, the item's head as written and its `file:line`, never an
-/// item-relative range and raw keys. The form: a struct in the body of a fn that is itself
-/// declared in a body (locals.rs `LocalKind::unplaced`).
-/// Prints "d106 local refusal: <the refusal>".
+/// A struct in the body of a fn that is itself declared in a body is an item of that body's
+/// block module (blaze-file-items nested.rs `NestedItem::body_writes`: the local fn `h` is then
+/// an item of `g`'s block module, and `h`'s own block a module under it): it is checked, built
+/// and run, 3. Until 2026-11-17 it was refused as "a struct in a block that a macro call wrote
+/// or that is in a local item's body" (locals.rs `LocalKind::unplaced`); the control is
+/// [`a_path_into_a_block_mod_that_names_nothing_is_refused_at_its_file_and_line`].
+/// Prints "d106 local fn's struct: {counts}; run status 3".
 #[test]
-fn a_local_item_not_built_is_refused_at_its_file_and_line() {
+fn a_struct_in_a_local_fns_body_is_built() {
     let twin = "#[cfg(any())]";
     let head = &CATCH[..CATCH.find(twin).expect("twin")];
     let text = format!(
         "{head}fn g() -> u32 {{\n    fn h() -> u32 {{\n        struct P {{ a: u32 }}\n        let p = P {{ a: 3 }};\n        p.a\n    }}\n    h()\n}}\n\n#[unsafe(no_mangle)]\npub extern \"C-unwind\" fn main() -> i32 {{\n    g() as i32\n}}\n"
     );
-    let line = text[..text.find("struct P").expect("P")].lines().count();
+    let (counts, status) = walk_and_run(&text);
+    assert_eq!(status, 3);
+    println!("d106 local fn's struct: {counts}; run status {status}");
+}
+
+/// The lang items a block-`mod` program needs: CATCH's sized traits, `Copy` for the integers it
+/// returns, and the fn traits a closure is called through (the pinned library's
+/// core/src/ops/function.rs, as tests/front2_closure_fn_ptr.rs writes them).
+const BLOCK_MOD_PRELUDE: &str = "#![feature(no_core, lang_items, unboxed_closures, rustc_attrs)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+#[lang = \"pointee_sized\"]
+trait PointeeSized {}
+
+#[lang = \"meta_sized\"]
+trait MetaSized: PointeeSized {}
+
+#[lang = \"sized\"]
+trait Sized: MetaSized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u8 {}
+impl Copy for u32 {}
+
+#[lang = \"tuple_trait\"]
+trait Tuple {}
+
+#[lang = \"fn_once\"]
+#[rustc_paren_sugar]
+trait FnOnce<Args: Tuple> {
+    #[lang = \"fn_once_output\"]
+    type Output;
+    extern \"rust-call\" fn call_once(self, args: Args) -> Self::Output;
+}
+
+#[lang = \"fn_mut\"]
+#[rustc_paren_sugar]
+trait FnMut<Args: Tuple>: FnOnce<Args> {
+    extern \"rust-call\" fn call_mut(&mut self, args: Args) -> Self::Output;
+}
+
+#[lang = \"fn\"]
+#[rustc_paren_sugar]
+trait Fn<Args: Tuple>: FnMut<Args> {
+    extern \"rust-call\" fn call(&self, args: Args) -> Self::Output;
+}
+";
+
+/// The program `text` walked over NAMES RECORDS (every instance made) and then run whole: the
+/// walk's counts and the run's status; a refusal of either panics naming it.
+fn walk_and_run(text: &str) -> (String, u8) {
+    let f = fixture(text);
+    let main = fn_named(&f, "main");
+    let mut store = MemoryStore::new_in(alloc());
+    let mut maker = Maker::new(reader(&f), Some(main), &builder(), alloc());
+    let counts = match walk_records(main, &EveryItem, &mut store, &builder(), &producer(), &mut maker, alloc()) {
+        Ok((_, counts)) => counts.to_string(),
+        Err(e) => panic!("the walk refused: {e}"),
+    };
+    (counts, run_whole(text))
+}
+
+/// The program `text` built by the new front end and run whole: its status; a refusal panics
+/// naming it.
+fn run_whole(text: &str) -> u8 {
+    let files = [blaze_ladder::refusal::SourceFile { path: "src/main.rs", text }];
+    let new = blaze_ladder::run::NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::Off };
+    blaze_ladder::run::run_with(&files, "src/main.rs", None, blaze_ladder::run::FrontChoice::New(new), blaze_own::testing::heap().shared())
+        .unwrap_or_else(|e| panic!("the whole program's run: {e}"))
+}
+
+/// A module declared in a block is a module like any other (the Reference, "Statements",
+/// "Item declarations": its scope is the block; "Paths": `m::f` continues into it): `main`'s
+/// block declares `mod m { pub const A: u8 = 3; pub fn f() -> u8 { A } }` and returns
+/// `m::f()`: checked, built and run, 3.
+/// Prints "d106 block mod: {counts}; run status 3".
+#[test]
+fn a_block_mod_is_read_through_its_path() {
+    let text = format!(
+        "{BLOCK_MOD_PRELUDE}\n#[unsafe(no_mangle)]\npub extern \"C-unwind\" fn main() -> i32 {{\n    mod m {{\n        pub const A: u8 = 3;\n        pub fn f() -> u8 {{\n            A\n        }}\n    }}\n    m::f() as i32\n}}\n"
+    );
+    let (counts, status) = walk_and_run(&text);
+    assert_eq!(status, 3);
+    println!("d106 block mod: {counts}; run status {status}");
+}
+
+/// The pinned std's `sys::pal::unix::init` shape (std-hello's stop of g174916: "`mod sigpipe`
+/// .. is not built yet"): a local `unsafe fn reset` whose `#[cfg(..)]` block declares `mod
+/// sigpipe { pub const DEFAULT: u8 = 0; .. }` and matches on `sigpipe::DEFAULT`. The local fn
+/// is an item of `g`'s block module, its body's blocks modules under it (blaze-file-items
+/// nested.rs `NestedItem::body_writes`, front2 locals.rs `Locals::library_twin`): walked over
+/// names records and run, `reset(0)` is 3. Without `body_writes` the walk is refused with "a
+/// mod in a block that a macro call wrote or that is in a local item's body".
+/// Prints "d106 local fn block mod: {counts}; run status 3".
+#[test]
+fn a_block_mod_in_a_local_fn_is_read() {
+    let text = format!(
+        "{BLOCK_MOD_PRELUDE}
+fn g(s: u8) -> u8 {{
+    unsafe fn reset(s: u8) -> u8 {{
+        #[cfg(not(any(target_os = \"nowhere\", target_vendor = \"nobody\")))]
+        {{
+            mod sigpipe {{
+                pub const DEFAULT: u8 = 0;
+                pub const INHERIT: u8 = 1;
+            }}
+            match s {{
+                sigpipe::DEFAULT => 3,
+                sigpipe::INHERIT => 4,
+                _ => 5,
+            }}
+        }}
+    }}
+    unsafe {{ reset(s) }}
+}}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    g(0) as i32
+}}
+"
+    );
+    let (counts, status) = walk_and_run(&text);
+    assert_eq!(status, 3);
+    println!("d106 local fn block mod: {counts}; run status {status}");
+}
+
+/// A block `mod` inside a `#[cfg(all())]` block inside a closure, inside a local fn whose
+/// block holds another `mod`: `inner::three()` is 3 and `sigpipe::DEFAULT` matches, so the
+/// run's status is 3. Run whole by the new front end only: the walk over records refuses a
+/// closure called through a fn pointer for its own reason ("needs the `call_once` lang item
+/// fn": the records walk does not ask the fn trait's method, front2 back_needs.rs), owed
+/// apart from block modules.
+/// Prints "d106 closure block mod: run status 3".
+#[test]
+fn a_block_mod_in_a_closure_is_read() {
+    let text = format!(
+        "{BLOCK_MOD_PRELUDE}
+fn g(s: u8) -> u8 {{
+    unsafe fn reset(s: u8) -> u8 {{
+        #[cfg(not(any(target_os = \"nowhere\", target_vendor = \"nobody\")))]
+        {{
+            mod sigpipe {{
+                pub const DEFAULT: u8 = 0;
+                pub const INHERIT: u8 = 1;
+            }}
+            match s {{
+                sigpipe::DEFAULT => 3,
+                sigpipe::INHERIT => 4,
+                _ => 5,
+            }}
+        }}
+    }}
+    unsafe {{ reset(s) }}
+}}
+
+fn h() -> u8 {{
+    let c: fn() -> u8 = || -> u8 {{
+        #[cfg(all())]
+        {{
+            mod inner {{
+                pub const THREE: u8 = 3;
+                pub fn three() -> u8 {{
+                    THREE
+                }}
+            }}
+            inner::three()
+        }}
+    }};
+    c()
+}}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    match g(0) {{
+        3 => h() as i32,
+        _ => 0,
+    }}
+}}
+"
+    );
+    let status = run_whole(&text);
+    assert_eq!(status, 3);
+    println!("d106 closure block mod: run status {status}");
+}
+
+/// The control of the block-`mod` tests: a path into a block `mod` that names nothing there
+/// (`m::B` beside `mod m { pub const A: u8 = 3; }` in a local fn's body) is refused as a user
+/// reads it (rule 19): the segment that names nothing and its `file:line`, never an
+/// item-relative range or a raw key, and never as a form "not built yet".
+/// Prints "d106 block mod miss: <the refusal>".
+#[test]
+fn a_path_into_a_block_mod_that_names_nothing_is_refused_at_its_file_and_line() {
+    let text = format!(
+        "{BLOCK_MOD_PRELUDE}
+fn g() -> u8 {{
+    fn h() -> u8 {{
+        {{
+            mod m {{
+                pub const A: u8 = 3;
+            }}
+            m::B
+        }}
+    }}
+    h()
+}}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    g() as i32
+}}
+"
+    );
+    let line = text[..text.find("m::B").expect("the path")].lines().count();
     let f = fixture(&text);
     let main = fn_named(&f, "main");
     let mut store = MemoryStore::new_in(alloc());
     let mut maker = Maker::new(reader(&f), Some(main), &builder(), alloc());
     let said = match walk_records(main, &EveryItem, &mut store, &builder(), &producer(), &mut maker, alloc()) {
-        Ok((_, counts)) => panic!("the struct in a local fn's body is not built yet, and the walk made {counts}"),
+        Ok((_, counts)) => panic!("`m::B` names nothing, and the walk made {counts}"),
         Err(e) => e.to_string(),
     };
-    println!("d106 local refusal: {said}");
-    assert!(said.contains("`struct P `") || said.contains("`struct P`"), "the head as written: {said}");
-    assert!(said.contains(&format!("main.rs:{line})")), "its file and line {line}: {said}");
-    assert!(said.contains("in `") && said.contains("h"), "the enclosing item: {said}");
-    assert!(!said.contains("Range {"), "no item-relative range: {said}");
+    println!("d106 block mod miss: {said}");
+    assert!(said.contains('B'), "the segment that names nothing: {said}");
+    assert!(said.contains(&format!("main.rs:{line}")), "its file and line {line}: {said}");
+    assert!(!said.contains("not built yet") && !said.contains("has no record yet"), "a miss, not a form not built: {said}");
+    assert!(!said.contains("Range {") && !said.contains("ItemKey("), "no raw range or key: {said}");
 }
 
 /// A fixture whose local fn `h` reads a trait method in a block that also holds `{the_use}`.
@@ -1808,4 +2027,182 @@ fn a_local_generic_union_is_made_over_names_records() {
         .unwrap_or_else(|e| panic!("the whole program's run: {e}"));
     assert_eq!(status, 5);
     println!("d106 local union: first {first}; again {again}; run status {status}");
+}
+
+/// The prelude of the foreign-item programs: PROGRAM's lang items.
+const FOREIGN_PRELUDE: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+";
+
+/// What the names records answer `extern_abi` of crate 0's item of `kind` named `name`, asked
+/// by a fresh reader, whose log must stay empty.
+fn foreign_abi_of(f: &Fixture, kind: ItemKind, name: &str) -> Option<Option<&'static str>> {
+    let records = reader(f).records;
+    let mut found = None;
+    assert!(records.each_item(0, &mut |key, _| if found.is_none() && records.kind_of_item(key) == Some(kind) && records.name_of(key) == Some(name) {
+        found = Some(key);
+    }), "the program's items record lists its items");
+    let key = found.unwrap_or_else(|| panic!("no {kind:?} named `{name}`: {:?}", logged(records)));
+    let abi = records.extern_abi(key);
+    assert!(logged(records).is_empty(), "`extern_abi` of `{name}` filed {:?}", logged(records));
+    abi
+}
+
+/// The program `text` walked from `main` over NAMES RECORDS (every instance made, the records'
+/// log empty after it) and then run whole: the walk's counts, the run's status and the fixture.
+fn walk_clean_and_run(text: &str) -> (String, u8, Fixture) {
+    let f = fixture(text);
+    let main = fn_named(&f, "main");
+    let mut store = MemoryStore::new_in(alloc());
+    let (counts, _) = walk_keeping(&f, &EveryItem, main, &mut store, &builder());
+    (counts.to_string(), run_whole(text), f)
+}
+
+/// std's and libc's shape (std-hello's stop of g184356: "extern_abi: a bodiless fn or a static
+/// written by a macro call's expansion (the expansion's outline is not made again over
+/// records)"): `decl!()`'s expansion declares `extern "C" { fn abs(..); }`. The block's ABI is
+/// a fact of the item in its items row (blaze-scope items_record.rs `ItemRow::foreign`), so
+/// over records `extern_abi` answers "C" with nothing filed, `main` (a fn with a body) answers
+/// no block, and the program is walked and run: `abs(0 - 3)` is 3.
+/// Prints "d106 macro-written foreign fn: {counts}; run status 3".
+#[test]
+fn a_foreign_fn_a_macro_writes_is_made_over_names_records() {
+    let text = format!(
+        "{FOREIGN_PRELUDE}
+macro_rules! decl {{
+    () => {{
+        unsafe extern \"C\" {{
+            fn abs(x: i32) -> i32;
+        }}
+    }};
+}}
+
+decl!();
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    unsafe {{ abs(0 - 3) }}
+}}
+"
+    );
+    let (counts, status, f) = walk_clean_and_run(&text);
+    assert_eq!(foreign_abi_of(&f, ItemKind::Function, "abs"), Some(Some("C")), "`abs`'s block, an expansion's");
+    assert_eq!(foreign_abi_of(&f, ItemKind::Function, "main"), Some(None), "`main` is in no block");
+    assert_eq!(status, 3);
+    println!("d106 macro-written foreign fn: {counts}; run status {status}");
+}
+
+/// (b) The same through a nested macro, inside a `mod`: `outer!()` in `mod sys` expands to
+/// `decl!()`, whose expansion declares `pub fn abs`; `main` returns `sys::abs(0 - 3)`, 3.
+/// Prints "d106 nested macro foreign fn: {counts}; run status 3".
+#[test]
+fn a_foreign_fn_a_nested_macro_writes_in_a_mod_is_made_over_names_records() {
+    let text = format!(
+        "{FOREIGN_PRELUDE}
+macro_rules! decl {{
+    () => {{
+        unsafe extern \"C\" {{
+            pub fn abs(x: i32) -> i32;
+        }}
+    }};
+}}
+
+macro_rules! outer {{
+    () => {{
+        decl!();
+    }};
+}}
+
+mod sys {{
+    outer!();
+}}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    unsafe {{ sys::abs(0 - 3) }}
+}}
+"
+    );
+    let (counts, status, f) = walk_clean_and_run(&text);
+    assert_eq!(foreign_abi_of(&f, ItemKind::Function, "abs"), Some(Some("C")), "`abs`'s block, two expansions deep in `mod sys`");
+    assert_eq!(status, 3);
+    println!("d106 nested macro foreign fn: {counts}; run status {status}");
+}
+
+/// (c) A hand-written `extern "system"` block and a macro-written block with no ABI string:
+/// the rows hold "system" and "C" (the Reference, [items.extern.abi.default]), and the program
+/// runs: `abs(0 - 1) + labs(0 - 2) as i32` is 3. The hand-written block is the control that the
+/// file's path still answers.
+/// Prints "d106 system and bare blocks: {counts}; run status 3".
+#[test]
+fn a_system_block_and_a_bare_block_hold_their_abis_over_names_records() {
+    let text = format!(
+        "{FOREIGN_PRELUDE}
+unsafe extern \"system\" {{
+    fn abs(x: i32) -> i32;
+}}
+
+macro_rules! bare {{
+    () => {{
+        unsafe extern {{
+            fn labs(x: i64) -> i64;
+        }}
+    }};
+}}
+
+bare!();
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    unsafe {{ abs(0 - 1) + labs(0 - 2) as i32 }}
+}}
+"
+    );
+    let (counts, status, f) = walk_clean_and_run(&text);
+    assert_eq!(foreign_abi_of(&f, ItemKind::Function, "abs"), Some(Some("system")), "`abs`'s hand-written `extern \"system\"`");
+    assert_eq!(foreign_abi_of(&f, ItemKind::Function, "labs"), Some(Some("C")), "`labs`'s macro-written bare `extern`");
+    assert_eq!(status, 3);
+    println!("d106 system and bare blocks: {counts}; run status {status}");
+}
+
+/// (d) A foreign STATIC a macro writes: `decl_static!()` declares libc's `optind` (POSIX:
+/// "initialized to 1"; libSystem and glibc both export it); `main` returns `optind + 2`, 3.
+/// Over records its `extern_abi` is "C".
+/// Prints "d106 macro-written foreign static: {counts}; run status 3".
+/// IGNORED until the lazy run path imports foreign DATA: the first run (2026-11-17) stopped with "the
+/// static `ladder::optind`, reached by the program, was not made: constant ..: a body it needs": a foreign
+/// static is treated as a static with an initializer to evaluate, not as an imported symbol. Its ABI row
+/// (this piece) is covered by blaze-scope's `a_foreign_items_block_abi_is_in_its_row`.
+#[test]
+#[ignore = "the lazy run path does not import foreign statics yet"]
+fn a_foreign_static_a_macro_writes_is_made_over_names_records() {
+    let text = format!(
+        "{FOREIGN_PRELUDE}
+macro_rules! decl_static {{
+    () => {{
+        unsafe extern \"C\" {{
+            static optind: i32;
+        }}
+    }};
+}}
+
+decl_static!();
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    unsafe {{ optind + 2 }}
+}}
+"
+    );
+    let (counts, status, f) = walk_clean_and_run(&text);
+    assert_eq!(foreign_abi_of(&f, ItemKind::Static, "optind"), Some(Some("C")), "`optind`'s block, an expansion's");
+    assert_eq!(status, 3);
+    println!("d106 macro-written foreign static: {counts}; run status {status}");
 }

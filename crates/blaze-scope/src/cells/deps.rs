@@ -83,7 +83,6 @@ impl<'a> DepNames<&'a str> for BuiltDeps<'_, '_, 'a> {
     fn has_enum(&self, key: ItemKey) -> bool {
         self.built.of(key).is_some_and(|d| d.enum_of(key).is_some())
     }
-
     fn name_in(&self, module: ItemKey, ns: Namespace, name: &'a str) -> DepAnswer {
         let mut scratch = self.through.take().unwrap_or_else(|| blaze_surface::ThroughScratch::new_in(self.alloc));
         let found = self.built.lookup_in(module, ns, name, &mut scratch);

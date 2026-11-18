@@ -720,8 +720,8 @@ fn records_answer_what_the_solved_names_answer() {
         let candidates = asked_lazy.trait_candidates(checker_of(clone.key), Shape::Bool, home);
         (
             asked.opened(),
-            asked_lazy.filed_from_rows,
-            asked_lazy.filed_from_text,
+            asked_lazy.index().filed_from_rows,
+            asked_lazy.index().filed_from_text,
             asked_lazy.filed_from_index(),
             asked_lazy.crates_asked(),
             asked_lazy.trait_reads(checker_of(clone.key), Shape::Bool).to_vec(),
@@ -750,7 +750,7 @@ fn records_answer_what_the_solved_names_answer() {
     let (by_text_impls, _) = impl_answers(by_text, by_text_front.index.lang("sized"), by_text_frame, root, &mut by_text_lazy);
     assert_eq!(by_text_impls, solved_impls, "the impl index over a fresh reader, every impl filed from text");
     let by_text_opened = by_text.opened();
-    assert_eq!(by_text_lazy.filed_from_rows, 0, "with the rows off no impl is filed from a row");
+    assert_eq!(by_text_lazy.index().filed_from_rows, 0,"with the rows off no impl is filed from a row");
     assert!(asked_lazy.filed_from_index() > 0, "no impl was filed from a bucket of an items record");
     assert_eq!(by_text_lazy.filed_from_index(), 0, "with the rows off no impl is filed from a bucket");
 
@@ -809,15 +809,15 @@ fn records_answer_what_the_solved_names_answer() {
         ),
         format!(
             "bool: Clone, then impl bool, over that reader: texts opened {} (crates {}); impls filed from rows {}, from header text {}",
-            asked_opened.items.texts, asked_opened.items.crates, asked_lazy.filed_from_rows, asked_lazy.filed_from_text
+            asked_opened.items.texts, asked_opened.items.crates, asked_lazy.index().filed_from_rows, asked_lazy.index().filed_from_text
         ),
         format!(
             "bool: Clone with the rows off: texts opened {} (crates {}); impls filed from header text {}",
-            by_text_opened.items.texts, by_text_opened.items.crates, by_text_lazy.filed_from_text
+            by_text_opened.items.texts, by_text_opened.items.crates, by_text_lazy.index().filed_from_text
         ),
         format!(
             "row misses: {}",
-            blaze_ladder::front2::buckets::ROW_MISSES.iter().zip(asked_lazy.row_misses.iter()).map(|(class, n)| format!("{class} {n}")).collect::<Vec<_>>().join(", ")
+            blaze_ladder::front2::buckets::ROW_MISSES.iter().zip(asked_lazy.index().row_misses.iter()).map(|(class, n)| format!("{class} {n}")).collect::<Vec<_>>().join(", ")
         ),
         format!(
             "bool: Clone alone, by bucket: crates asked {alone_asked}; items records opened by the question {}; impls filed from the index {alone_index}; (crate, bucket) facts read {}",

@@ -27,10 +27,11 @@
 //! Names stage defines cells finer than its record's one whole cell (E4's wiring), the other
 //! reads are WIDENED to a cell some phase defines ([`widen`]): a `CrateScope` cell to that
 //! record's whole cell, the whole graph's bucket fact (made from the names records) to every
-//! scope crate's. A `Signature` cell is defined by no phase yet (lane FJ; the body makes the
-//! heads it needs from its crates' records, task.rs), so it widens to the `HEADS` cell of each
-//! outlined file of the head's crate (engine_tasks.rs, INTERIM): a signature edit enters its
-//! callers. Widened reads
+//! scope crate's. A `Signature` read of a member's head is the cell of the head task of the
+//! entry that covers it (engine_heads.rs `Owners::place`; the body still makes the heads it
+//! needs in its own store, task.rs), so a signature edit enters exactly the bodies whose head
+//! read moved; a dependency's head, or one a macro wrote, is its crate's names record whole.
+//! Widened reads
 //! are a superset of the true ones: an edit can enter a body that did not need it, never miss
 //! one. So `Make` made nothing inline here: every cell a body reads is the engine's.
 
@@ -49,7 +50,7 @@ use blaze_ladder::front2::project::BodyRef;
 use blaze_ladder::front2::project_records::{BodySource, Listing, index_by_chain, list_with};
 use blaze_ladder::front2::source::NamesSource;
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts};
-use blaze_ladder::front2::tables::task::{BodyFrame, LANG_CELL, Make, MakeRefused, Said as Line, SaidWhat, TaskError, check_body};
+use blaze_ladder::front2::tables::task::{BodyFrame, Make, MakeRefused, Said as Line, SaidWhat, TaskError, check_body};
 use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
 use blaze_own::{SharedAlloc, Vec};
 use blaze_scope::crate_env::EnvLent;
@@ -66,6 +67,7 @@ use crate::CliError;
 use crate::body_types::Kept;
 use crate::engine_check::EngineCheckError;
 use crate::engine_names::NamesStage;
+use crate::engine_records::EngineRecords;
 use crate::engine_tasks::{CELLS, Outlined, WHOLE};
 use crate::fetch::FetchEnv;
 use crate::run_names::Crate;
@@ -196,12 +198,13 @@ fn key_of<'n>(records: &'n blaze_ladder::front2::source::Records<'n>, body: Body
     }
 }
 
-/// One member crate's check scope as a run reads it: all read-only, shared by its runs.
-struct Group<'f> {
+/// One member crate's check scope as a run reads it: all read-only, shared by its runs. Its
+/// crates' records are borrowed in place from the store's mapping for `'r` (engine_records.rs).
+struct Group<'f, 'r> {
     /// The member's own `CrateScope` name.
     own: Name,
     /// Its scope's crates in reader order, the member at 0.
-    crates: Vec<Crate<'static>, Global>,
+    crates: Vec<Crate<'r>, Global>,
     /// The member's environment, what its bodies' `env!` read: its crate list facts with its
     /// build script's outputs joined (body_types.rs `owner_env_by`), lent to each run, and the
     /// script run read for it (a `Script` task's WHOLE cell), in every body's read list.
@@ -215,39 +218,44 @@ struct Group<'f> {
 
 /// One crate's check scope with its records opened: what the Heads stage files a crate's impls
 /// over and the Bodies stage checks a member's bodies over ([`scope_of`], the one rule of both).
-pub(crate) struct Scope {
+pub(crate) struct Scope<'r> {
     /// The crate's own records.
-    pub(crate) own_records: crate::front_load::CrateRecords<'static>,
+    pub(crate) own_records: crate::front_load::CrateRecords<'r>,
     /// Its scope's crates in reader order, the crate at 0 (cut at the first without records).
-    pub(crate) crates: Vec<Crate<'static>, Global>,
+    pub(crate) crates: Vec<Crate<'r>, Global>,
     /// The places of its lang crates among `crates`.
     pub(crate) lang: Vec<usize, Global>,
     /// Each scope crate's `CrateScope` name, sorted.
     pub(crate) scope: Vec<Name, Global>,
+    /// The first scope crate without records, by its world index, when `crates` was cut there:
+    /// what a refusal names (rule 19, plan row A8).
+    pub(crate) cut: Option<usize>,
 }
 
 /// Crate `at`'s check scope (blaze-world check_scope.rs `check_scope_in`), each crate's
-/// records read through `kept`, and whether every crate of it had records (`false`: a `Names`
-/// task failed, and the caller refuses by name). `None`: the crate's own names record or its
-/// scope could not be read.
+/// records read in place through `read` (engine_records.rs), and whether every crate of it had
+/// records (`false`: a `Names` task failed, and the caller refuses by name). `None`: the crate's
+/// own names record or its scope could not be read.
 #[expect(clippy::too_many_arguments, reason = "a stage's handles, each named")]
-pub(crate) fn scope_of(kept: &mut Kept, cx: &Cx, store: &mut dyn crate::store::Store<'_>, names: &NamesStage<'_>, list: &blaze_world::crate_list::CrateList<'static>, at: usize, heap: &'static blaze_own::Heap) -> Option<(Scope, bool)> {
+pub(crate) fn scope_of<'r>(read: &mut EngineRecords<'r>, cx: &Cx, store: &mut dyn crate::store::Store<'r>, names: &NamesStage<'_>, list: &blaze_world::crate_list::CrateList<'static>, at: usize, heap: &'static blaze_own::Heap) -> Option<(Scope<'r>, bool)> {
     let g = heap.alloc();
     let input_at = |at: usize| names.input_of(blaze_drive::key::crate_scope_name(&list.key(at)));
     let own = input_at(at)?;
-    let own_records = kept.records(cx, store, &own, list.key(at), heap).ok()?;
+    let own_records = read.records(cx, store, &own, list.key(at), g).ok()?;
     let no_core = blaze_scope::names_record::NamesRecord::open(own_records.names_proof).crate_root().head().no_core;
     let checked = blaze_world::check_scope::check_scope_in(list, at, no_core, g).ok()?;
-    let mut scope = Scope { own_records, crates: Vec::new_in(Global), lang: Vec::new_in(Global), scope: Vec::new_in(Global) };
+    let mut scope = Scope { own_records, crates: Vec::new_in(Global), lang: Vec::new_in(Global), scope: Vec::new_in(Global), cut: None };
     scope.lang.extend(checked.lang_places());
     let mut whole = true;
     for one in checked.crates() {
         let Some(input) = input_at(one) else {
             whole = false;
+            scope.cut = Some(one);
             break;
         };
-        let Ok(records) = kept.records(cx, store, &input, list.key(one), heap) else {
+        let Ok(records) = read.records(cx, store, &input, list.key(one), g) else {
             whole = false;
+            scope.cut = Some(one);
             break;
         };
         scope.crates.push(Crate { records, name: CrateGraph::name(list, one), package: list.shown_from(one), world_at: one });
@@ -286,16 +294,16 @@ type Trees = (&'static [blaze_fetch::PackView<'static>], &'static [(u32, &'stati
 
 /// What [`BodiesStage::groups`] found: each member's group, each body's place, the files of
 /// member crates, and the members' names.
-struct Found<'f> {
-    groups: Vec<Group<'f>, Global>,
+struct Found<'f, 'r> {
+    groups: Vec<Group<'f, 'r>, Global>,
     /// One a body of the project: in the request's heap, never the command's fixed frame.
     took: Vec<Took<'f>, blaze_own::Alloc<'static>>,
     /// Each outline (by index) a member crate's records list, or why its bodies were not checked.
     files: Vec<(u32, Option<&'static str>), Global>,
     members: Vec<Name, Global>,
-    /// Each member crate's outlined files by its key's prefix, sorted: what a head read widens
-    /// to (engine_tasks.rs `HEADS`, [`widen`]).
-    heads: Vec<([u8; 8], Name), Global>,
+    /// Each member crate's outlined files by its key's prefix and its items record's file
+    /// index, sorted: where a head read finds its head task (engine_heads.rs `Owners`, [`widen`]).
+    heads: Vec<([u8; 8], u32, Name), Global>,
     trees: Trees,
 }
 
@@ -338,10 +346,11 @@ impl<'f> BodiesStage<'f> {
 
     /// One Bodies phase: every task entered once, its result in `buffer`.
     #[expect(clippy::too_many_arguments, reason = "a phase's edge: each argument one handle of it")]
-    pub(crate) fn run_phase<'a>(
+    pub(crate) fn run_phase<'a, 'r>(
         &mut self,
         cx: &Cx,
-        store: &mut dyn crate::store::Store<'_>,
+        store: &mut dyn crate::store::Store<'r>,
+        read: &mut EngineRecords<'r>,
         handles: &Handles<'_, '_, '_, '_>,
         tasks: &[Task],
         view: View<'_, 'a>,
@@ -354,7 +363,7 @@ impl<'f> BodiesStage<'f> {
         let began = handles.clock.now();
         let heap = handles.env.heap;
         // 1. Each member's check scope and files, and each body's item key, on this thread.
-        let found = self.groups(&cx, store, handles, frame)?;
+        let found = self.groups(&cx, store, read, handles, frame)?;
         let (found, stopped) = match found {
             Ok(found) => (Some(found), None),
             Err(why) => (None, Some(why)),
@@ -469,7 +478,7 @@ impl<'f> BodiesStage<'f> {
 
     /// Each member crate's [`Group`] and each body of its files as a [`Took`]; `Err(why)` when
     /// no body can be checked this command (the stop is every body's note).
-    fn groups(&mut self, cx: &Cx, store: &mut dyn crate::store::Store<'_>, handles: &Handles<'_, '_, '_, '_>, frame: &'f Frame) -> Result<Result<Found<'f>, &'static str>, CliError> {
+    fn groups<'r>(&mut self, cx: &Cx, store: &mut dyn crate::store::Store<'r>, read: &mut EngineRecords<'r>, handles: &Handles<'_, '_, '_, '_>, frame: &'f Frame) -> Result<Result<Found<'f, 'r>, &'static str>, CliError> {
         let heap = handles.env.heap;
         let g = heap.alloc();
         let Some(graph) = handles.graph else {
@@ -485,13 +494,13 @@ impl<'f> BodiesStage<'f> {
             Ok(trees) => trees,
             Err(why) => return Ok(Err(why)),
         };
-        let mut groups: Vec<Group<'f>, Global> = Vec::new_in(Global);
+        let mut groups: Vec<Group<'f, 'r>, Global> = Vec::new_in(Global);
         let mut took: Vec<Took<'f>, blaze_own::Alloc<'static>> = Vec::new_in(g);
         // The first list that could not grow: the stage's typed stop (rule 3).
         let mut grown: Result<(), EngineCheckError> = Ok(());
         let mut member_files: Vec<(u32, Option<&'static str>), Global> = Vec::new_in(Global);
         let mut members: Vec<Name, Global> = Vec::new_in(Global);
-        let mut heads: Vec<([u8; 8], Name), Global> = Vec::new_in(Global);
+        let mut heads: Vec<([u8; 8], u32, Name), Global> = Vec::new_in(Global);
         let procs = names.names.as_ref().and_then(|names| names.procs());
         let input_at = |at: usize| names.input_of(blaze_drive::key::crate_scope_name(&list.key(at)));
         for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at)) {
@@ -501,15 +510,22 @@ impl<'f> BodiesStage<'f> {
             let reach = reached(handles.outlined, Name::file(list.root(member).strip_prefix("/0/").unwrap_or(list.root(member)).as_bytes()));
             let mut refuse_all = |why: &'static str| member_files.extend(reach.iter().map(|at| (*at, Some(why))));
             let Some(own) = input_at(member) else {
-                refuse_all("its crate has no `Names` task this command (engine_names.rs `plan`)");
+                // Its crate's own names failed (a build script, its resolution): that failure
+                // is the crate's `CrateScope` row, reported there once; its bodies say so.
+                refuse_all(if names.failed(blaze_drive::key::crate_scope_name(&list.key(member))) {
+                    "its crate has no names record this command: its `CrateScope` task failed, and that failure is reported at it"
+                } else {
+                    "its crate has no `Names` task this command (engine_names.rs `plan`)"
+                });
                 continue;
             };
             members.push(own.name);
-            let Some((scope, whole)) = scope_of(&mut self.kept, cx, store, names, &list, member, heap) else {
+            let Some((scope, whole)) = scope_of(read, cx, store, names, &list, member, heap) else {
                 refuse_all("its crate's records or its check scope could not be read (engine_bodies.rs `scope_of`)");
                 continue;
             };
             let own_records = scope.own_records;
+            let cut = scope.cut;
             // The member's environment, its script run's record handed by the Scripts stage.
             let env = crate::body_types::owner_env_by(cx, store, &|script| names.input_of(script), &list, member, handles.env.home, frame)?;
             let (env, script, env_refused) = match env {
@@ -529,7 +545,7 @@ impl<'f> BodiesStage<'f> {
                 let Some(path) = path.strip_prefix("/0/") else { continue };
                 if let Some(at) = handles.outlined.iter().position(|one| one.path.as_slice() == path.as_bytes()) {
                     files.push((file, u32::try_from(at).unwrap_or(u32::MAX)));
-                    heads.push((list.key(member).prefix(), handles.outlined[at].name));
+                    heads.push((list.key(member).prefix(), file, handles.outlined[at].name));
                 }
             }
             // A file the module tree reaches that the items record lists at no path of it.
@@ -539,8 +555,15 @@ impl<'f> BodiesStage<'f> {
             let at = u32::try_from(groups.len()).unwrap_or(u32::MAX);
             // A member whose environment could not be made is refused by name, never checked
             // under none (rule 3).
+            // The note names the crate that failed (rule 19), once per member, never per body.
             let refused = match (whole, env_refused) {
-                (false, _) => Some("a crate of its member's check scope has no names record this command (its `Names` task failed)"),
+                (false, _) => Some(match cut {
+                    Some(one) => {
+                        let words = bstd::mem::format_in!(g, "its member's check scope holds `{}`, which has no names record this command (its `CrateScope` task failed: that failure is reported at it)", CrateGraph::name(&list, one));
+                        core::str::from_utf8(words.into_bytes().leak()).unwrap_or("")
+                    }
+                    None => "a crate of its member's check scope has no names record this command (its `CrateScope` task failed)",
+                }),
                 (true, Some(why)) => Some(why),
                 (true, None) => None,
             };
@@ -753,13 +776,13 @@ impl<'f> BodiesStage<'f> {
 }
 
 /// What every run reads: all read-only and shared.
-struct Shared<'s, 'a, 'f> {
+struct Shared<'s, 'a, 'f, 'r> {
     root: &'s Dir<ReadWrite>,
     packs: &'s [blaze_fetch::PackView<'static>],
     corrected: &'s [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
-    groups: &'s [Group<'f>],
-    heads: &'s [([u8; 8], Name)],
+    groups: &'s [Group<'f, 'r>],
+    heads: &'s crate::engine_heads::Subjects,
     view: View<'s, 'a>,
     heap: &'static blaze_own::Heap,
     /// Every crate's impl tables (the Heads stage's), read only.
@@ -787,7 +810,7 @@ const STRETCH_FULL: usize = BODIES_FRAME / 2;
 
 /// One run: its bodies checked in stretches, each over a frame of its own that ends with it
 /// ([`STRETCH_FULL`]), so no run uses up a frame however many bodies it holds.
-fn run_bodies<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_>, run: &[One<'f>], clock: &Clock, out: &mut Buffer<'a>, ran: &mut Vec<Ran<'f>, Global>, alloc: SharedAlloc<'a>) {
+fn run_bodies<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>], clock: &Clock, out: &mut Buffer<'a>, ran: &mut Vec<Ran<'f>, Global>, alloc: SharedAlloc<'a>) {
     let mut at = 0;
     while at < run.len() {
         let rest = &run[at..];
@@ -810,7 +833,7 @@ fn refuse<'a, 'f>(rest: &[One<'f>], why: &'static str, out: &mut Buffer<'a>, ran
 
 /// One stretch of a run: its member's records opened once into `frame`, each body checked over
 /// one view until the frame is past [`STRETCH_FULL`]. How many bodies it took (at least one).
-fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_>, run: &[One<'f>], frame: &Frame, clock: &Clock, out: &mut Buffer<'a>, ran: &mut Vec<Ran<'f>, Global>, alloc: SharedAlloc<'a>) -> usize {
+fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>], frame: &Frame, clock: &Clock, out: &mut Buffer<'a>, ran: &mut Vec<Ran<'f>, Global>, alloc: SharedAlloc<'a>) -> usize {
     let Some(first) = run.first() else { return 0 };
     let Some(group) = shared.groups.get(first.group as usize) else {
         return refuse(run, "a body's member group is gone", out, ran, alloc);
@@ -833,6 +856,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_>, run: &[One<'f>], fr
     // `First`: under `All` clap-root's `Cmd` was refused with a false cycle among core's
     // iterator traits (front2 heads.rs `Store::new`; lane FL).
     let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: None, needs: NeedsMet::First, heads: None, sources: Some(opened.sources) };
+    let mut owners = crate::engine_heads::Owners::new(shared.heads);
     let mut taken = 0usize;
     for one in run {
         if taken > 0 && frame.used() > STRETCH_FULL {
@@ -950,7 +974,16 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_>, run: &[One<'f>], fr
         if one.items.is_empty() {
             done.reads.push((CellId { of: group.own, cell: WHOLE }, ABSENT));
         }
-        done.reads = widen(&done.reads, group, shared.heads, shared.view, alloc);
+        let (wide, unfrozen) = widen(&done.reads, group, &mut owners, opened.records, shared.view, g, alloc);
+        done.reads = wide;
+        // A head it read has no frozen head (its head task failed): the body fails by that read
+        // (rule 3), its reads kept so the head's repair enters it again.
+        if unfrozen && !done.failed {
+            done.failed = true;
+            done.defines.clear();
+            done.findings = done.findings.max(1);
+            why.push_str("a head it reads could not be frozen: its head task failed (engine_heads.rs; the Heads stage's refusals name it)");
+        }
         // One a body not checked whole (its verdict failed, or a line of it could not be said
         // as a finding): in the request's heap, as the labels are.
         let said = (done.failed || !why.is_empty()).then(|| Said::Unchecked(core::str::from_utf8(bstd::mem::format_in!(g, "{why}").into_bytes().leak()).unwrap_or("")));
@@ -1025,8 +1058,18 @@ fn env_in<'l: 'n, 'n>(lent: Option<EnvLent<'_, 'l>>, frame: &'n Frame) -> Result
 }
 
 /// A body's reads widened to cells a phase defines (module docs), each with the digest the view
-/// holds, sorted and one each.
-fn widen<'a>(reads: &[(CellId, ContentId)], group: &Group<'_>, heads: &[([u8; 8], Name)], view: View<'_, 'a>, alloc: SharedAlloc<'a>) -> SVec<'a, (CellId, ContentId)> {
+/// holds, sorted and one each; and whether a head it read is a failed head task's.
+#[expect(clippy::too_many_arguments, reason = "a body's reads and every table that names them")]
+fn widen<'a, 'n>(
+    reads: &[(CellId, ContentId)],
+    group: &Group<'_, '_>,
+    owners: &mut crate::engine_heads::Owners<'_>,
+    records: &'n blaze_ladder::front2::source::Records<'n>,
+    view: View<'_, 'a>,
+    g: blaze_own::Alloc<'static>,
+    alloc: SharedAlloc<'a>,
+) -> (SVec<'a, (CellId, ContentId)>, bool) {
+    let mut unfrozen = false;
     let mut wide: SVec<'a, (CellId, ContentId)> = SVec::with_capacity_in(reads.len(), alloc);
     let mut push = |of: Name, cell: Cell| {
         let id = CellId { of, cell };
@@ -1038,32 +1081,26 @@ fn widen<'a>(reads: &[(CellId, ContentId)], group: &Group<'_>, heads: &[([u8; 8]
             // `cells_of`, marked by `CELLS`) stays its cell: the table holds every cell a walk
             // can name that holds something, each digest over all the cell answers, so the cell
             // moves whenever the answer can (rule 21); a cell it does not hold is the name not
-            // found, read ABSENT, and the name added defines it, which moves it. The lang rows
-            // (`LANG_CELL`) are no row of the table: read whole.
-            Kind::CrateScope if id.cell != WHOLE && id.cell != LANG_CELL && view.cell(&CellId { of: id.of, cell: CELLS }) != ABSENT => push(id.of, id.cell),
+            // found, read ABSENT, and the name added defines it, which moves it. A crate's lang
+            // rows are one such cell (blaze-scope names_cells.rs `NameCell::Lang`).
+            Kind::CrateScope if id.cell != WHOLE && view.cell(&CellId { of: id.of, cell: CELLS }) != ABSENT => push(id.of, id.cell),
             Kind::CrateScope => push(id.of, WHOLE),
             Kind::ImplBucket if id.of.subject == ABSENT => {
                 for name in group.scope.iter() {
                     push(*name, WHOLE);
                 }
             }
-            // A head no task defines yet (INTERIM, engine_tasks.rs `HEADS`): its crate's files'
-            // heads cells, by the key's crate prefix (blaze-id `ItemKey::crate_prefix`). A head
-            // of a crate no outline covers (the shelf's) is the toolchain's, in every key.
-            Kind::Signature => {
-                let mut prefix = [0u8; 8];
-                prefix.copy_from_slice(&id.of.subject.0[..8]);
-                let from = heads.partition_point(|(p, _)| *p < prefix);
-                let files = heads[from..].iter().take_while(|(p, _)| *p == prefix);
-                let mut any = false;
-                for (_, file) in files {
-                    push(*file, crate::engine_tasks::HEADS);
-                    any = true;
+            // A head (engine_heads.rs `Owners::place`): a member's, the cell of the head task of
+            // the entry that covers it; a dependency's, or one a macro wrote, its crate's names
+            // record whole. A head of a crate none of the records holds is read as read.
+            Kind::Signature => match owners.place(records, id, g) {
+                Some(crate::engine_heads::HeadAt::Cell { cell, .. }) => {
+                    unfrozen |= view.row(cell.of).is_some_and(|row| row.failed);
+                    push(cell.of, cell.cell);
                 }
-                if !any {
-                    push(id.of, id.cell);
-                }
-            }
+                Some(crate::engine_heads::HeadAt::Dependency(scope) | crate::engine_heads::HeadAt::Unplaced(scope)) => push(scope, WHOLE),
+                None => push(id.of, id.cell),
+            },
             // A crate's bucket: its cell as the crate's Heads task defined it (engine_heads.rs),
             // or ABSENT when the crate files no impl there (a later impl defines it, and the
             // read moves).
@@ -1076,5 +1113,5 @@ fn widen<'a>(reads: &[(CellId, ContentId)], group: &Group<'_>, heads: &[([u8; 8]
     }
     wide.sort_unstable_by_key(|(id, _)| *id);
     wide.dedup_by_key(|(id, _)| *id);
-    wide
+    (wide, unfrozen)
 }

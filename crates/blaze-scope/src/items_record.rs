@@ -63,8 +63,11 @@ const MAGIC: [u8; 4] = *b"BZIT";
 /// refused the same way. 7: the crate's `std` (header field [`F_STD`], [`ItemsRecord::std_is`]);
 /// a version-6 record is refused the same way. 8: an impl row keeps the crate each path's root
 /// names when an expansion wrote `crate` for another crate's `$crate` (token-mark-2 R2; row 128
-/// bytes); a version-7 record is refused the same way.
-const VERSION: u32 = 8;
+/// bytes); a version-7 record is refused the same way. 9: an item row keeps the ABI of the
+/// `extern` block that declares it ([`ItemRow::foreign`], flag [`FOREIGN`]; row 80 bytes),
+/// whoever wrote the item (a file or a macro call's expansion); a version-8 record is refused
+/// the same way.
+const VERSION: u32 = 9;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
 const KEYS_AT: usize = 160;
@@ -74,7 +77,7 @@ const EXPANSION: u32 = 1 << 31;
 
 const FILE_ROW: usize = 56;
 const EXPANSION_ROW: usize = 72;
-const ITEM_ROW: usize = 72;
+const ITEM_ROW: usize = 80;
 const OWNER_ROW: usize = 40;
 const MEMBER_ROW: usize = 56;
 const IMPL_ROW: usize = 128;
@@ -128,6 +131,9 @@ const BODY_HOLDS_ITEMS: u8 = 1 << 1;
 /// Item: a tuple or unit struct, its own constructor. Member: written by a macro call's
 /// expansion (its `at` is that expansion).
 const CTOR_OR_WRITTEN_BY: u8 = 1 << 2;
+/// Item only: an `extern` block declares it, and the row's ABI string ([`ItemRow::foreign`])
+/// is set.
+const FOREIGN: u8 = 1 << 3;
 
 // Impl marks.
 const HAS_TRAIT: u8 = 1;
@@ -211,6 +217,10 @@ pub enum ItemsRecordError {
     RootMark { impl_: ItemKey, miss: crate::crate_roots::MarkMiss },
     /// An impl row's roots word holds bits no row has.
     Roots { key: ItemKey, bits: u32 },
+    /// The `extern` block that declares `item` writes its ABI as no one quoted string
+    /// (`extern "abi"`, or a bare `extern`): the row's ABI cannot be written, so the record is
+    /// not written.
+    ForeignAbi { item: ItemKey },
 }
 
 /// Header field [`F_STD`]: 0 for Rust's `std`, 1 + the edition's discriminant for bstd under a
@@ -302,6 +312,37 @@ fn span_in(base: &str, part: &str) -> Option<(u32, u32)> {
         return None;
     }
     Some((u32::try_from(start).ok()?, u32::try_from(part.len()).ok()?))
+}
+
+/// The ABI of the `extern` block that declares `entry` of `outline` (the outline of `text`, a
+/// file's or a macro call's expansion's): the block's string unquoted as written, `"C"` for a
+/// bare `extern` (the Reference, [items.extern.abi.default]); `None` when no block declares it
+/// (its parent is no `extern` block, or it has none). The fact of the item the names task
+/// writes into its row ([`ItemRow::foreign`]), so no reader outlines a text again to ask it.
+///
+/// The outline's ABI range is the block's `Abi` node, `extern "abi"` (blaze-file-items
+/// walk/rows.rs `(EXTERN_BLOCK, ABI)`), relative to the block's start (rule 71). A range outside
+/// the text is [`ItemsRecordError::Range`]; a written ABI that is not one quoted string (a raw
+/// string, an escape) is [`ItemsRecordError::ForeignAbi`], never read as "C" (rule 3).
+///
+/// The one home of the reading (rule 30): the solved names' `extern_abi` (blaze-ladder
+/// front2/source.rs) calls it on the same outline, so the two sources answer alike.
+pub fn foreign_abi<'t>(text: &'t str, outline: &blaze_file_items::Outline<'_>, entry: &blaze_surface::Item, item: ItemKey, krate: CrateItemKey) -> Result<Option<&'t str>, ItemsRecordError> {
+    let Some(parent) = entry.parent else { return Ok(None) };
+    let block = outline.item(parent);
+    let ItemDetail::ExternBlock { abi } = block.detail else { return Ok(None) };
+    let Some(r) = abi else { return Ok(Some("C")) };
+    let (start, end) = (block.range.start.saturating_add(r.start), block.range.start.saturating_add(r.end));
+    let written = text.get(start as usize..end as usize).ok_or(ItemsRecordError::Range { krate, start, len: end.saturating_sub(start) })?;
+    let written = written.trim();
+    let written = written.strip_prefix("extern").map_or(written, str::trim_start);
+    if written.is_empty() {
+        return Ok(Some("C"));
+    }
+    match written.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+        Some(abi) if !abi.contains(['"', '\\']) => Ok(Some(abi)),
+        _ => Err(ItemsRecordError::ForeignAbi { item }),
+    }
 }
 
 fn body_holds_items(detail: ItemDetail) -> bool {
@@ -713,11 +754,12 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
     let mut item_rows = RecordBytes::new_in(alloc);
     for key in items.iter() {
         let (it, at) = &tables.texts[key];
-        let detail = names
-            .outline_at(*at)
-            .and_then(|(_, outline)| outline.items().get(it.item.0 as usize))
-            .map(|entry| entry.detail)
-            .ok_or(ItemsRecordError::NoOutline { item: *key })?;
+        let (whole, outline) = names.outline_at(*at).ok_or(ItemsRecordError::NoOutline { item: *key })?;
+        let entry = outline.items().get(it.item.0 as usize).ok_or(ItemsRecordError::NoOutline { item: *key })?;
+        let detail = entry.detail;
+        // The block's ABI, a fact of the item, from the outline the solve made of its text
+        // (a file's, or an expansion's: the names task outlines each expansion once).
+        let foreign = foreign_abi(whole, outline, entry, *key, names.key)?;
         let (code, start, len) = place(Some(*at), it.text);
         let (name, mut flags) = match it.name {
             Some(n) => (strings.put(n)?, NAMED),
@@ -729,6 +771,13 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
         if tables.ctors.contains_key(key) {
             flags |= CTOR_OR_WRITTEN_BY;
         }
+        let abi = match foreign {
+            Some(abi) => {
+                flags |= FOREIGN;
+                strings.put(abi)?
+            }
+            None => (0, 0),
+        };
         // The header's place in the same text; `NONE` for no impl (or a header out of it).
         let header = match it.impl_header {
             Some(h) if code != NONE => text_of(*at).and_then(|(_, base)| span_in(base, h)).unwrap_or((NONE, 0)),
@@ -740,7 +789,7 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
         }
         put16(&mut item_rows, u16::try_from(name.1).map_err(|_| ItemsRecordError::TooBig { what: "an item's name" })?);
         item_rows.extend_from_slice(&[detail.kind().byte(), flags]);
-        for n in [header.0, header.1, impl_row_of.get(key).copied().unwrap_or(NONE)] {
+        for n in [header.0, header.1, impl_row_of.get(key).copied().unwrap_or(NONE), abi.0, abi.1] {
             put32(&mut item_rows, n);
         }
     }
@@ -979,7 +1028,7 @@ pub struct ExpansionRow {
 
 /// An item with text: of a file or of an expansion.
 ///
-/// Row, 72 bytes, sorted by key (found by binary search in place): key 32; module u32, a module
+/// Row, 80 bytes, sorted by key (found by binary search in place): key 32; module u32, a module
 /// row (question 8: the module its names are read in); at u32 (a file index, or bit 31 and an
 /// expansion row; `u32::MAX`: no place), start u32, length u32 (7: where its whole text is,
 /// attributes included; the attributes the front end reads, `repr`, `lang`, `rustc_*`,
@@ -987,7 +1036,9 @@ pub struct ExpansionRow {
 /// (10: its `Place`); name at u32, name length u16 (9: asked without the text); kind u8 (11:
 /// `ItemKind`'s byte); flags u8 (named; body holds items: 11; a tuple or unit struct, its own
 /// constructor: 12); impl header start u32 and length u32 in the same text (14: an impl's
-/// header for a message; `u32::MAX`: none); impl row u32 (14: its row among the impls).
+/// header for a message; `u32::MAX`: none); impl row u32 (14: its row among the impls); the
+/// ABI of the `extern` block that declares it at u32, length u32 (10c: set when flag
+/// [`FOREIGN`] is, else zero).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ItemRow<'a> {
     pub key: ItemKey,
@@ -1001,6 +1052,11 @@ pub struct ItemRow<'a> {
     pub ctor: bool,
     pub impl_header: Option<TextSpan>,
     pub impl_row: Option<u32>,
+    /// `Some(abi)`: an `extern` block declares it (a foreign fn or static), and `abi` is the
+    /// block's string unquoted as written, `"C"` for a bare `extern`; `None`: no block does.
+    /// Written by the names task from the outline of the text the item is in, a file's or an
+    /// expansion's alike, so a reader never outlines a text again to ask it.
+    pub foreign: Option<&'a str>,
 }
 
 /// A member of a trait or an impl.
@@ -1418,6 +1474,7 @@ impl<'a> ItemsRecord<'a> {
             ctor: flags & CTOR_OR_WRITTEN_BY != 0,
             impl_header: if header_start == NONE { None } else { self.span(code, header_start, le32(b, r + 64))? },
             impl_row: (impl_row != NONE).then_some(impl_row),
+            foreign: if flags & FOREIGN != 0 { Some(self.str_at("an item's block ABI", le32(b, r + 72), le32(b, r + 76))?) } else { None },
         }))
     }
 

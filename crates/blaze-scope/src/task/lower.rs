@@ -1384,6 +1384,70 @@ impl Walked for Tree<'_, '_> {
     }
 }
 
+/// What [`walk`] reads of one module's own text to make its children: one row per `mod` item
+/// it follows, in text order (one cfg'd out, or whose `#[path = m!()]` does not read, is none).
+/// A one-group solve compares a member's rows with the module tree record's
+/// ([`crate::tree_record`]): equal rows, and an unchanged file set, make the same children.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct WalkRow<'t> {
+    pub name: &'t str,
+    pub inline: bool,
+    /// Its `#[no_implicit_prelude]`.
+    pub no_implicit_prelude: bool,
+    /// Its `#[path]`, read.
+    pub path: Option<&'t str>,
+}
+
+/// The [`WalkRow`]s of module `item` of the file (`None`: the file's own items) and, for a
+/// file's own items, its inner `#![cfg]`'s verdict and `#![no_implicit_prelude]`: what the walk
+/// read of this text alone.
+pub fn walk_rows<'t, 'a: 't>(
+    cfg: &Cfg<'_, '_>,
+    o: &Outline<'_>,
+    text: &'t str,
+    item: Option<ItemIndex>,
+    edition: Edition,
+    out: &mut AVec<'a, WalkRow<'t>>,
+    alloc: Alloc<'a>,
+) -> Option<(bool, bool)> {
+    for (_, child) in o.children(item) {
+        let ItemDetail::Mod { inline, .. } = child.detail else { continue };
+        let mut attrs = item_attrs(cfg, o, child, text, alloc);
+        if !attrs.cfg_ok {
+            continue;
+        }
+        let Some(name) = child.name.map(|r| unraw(child.text(text, r))) else { continue };
+        if let Some(call) = attrs.path_call.take() {
+            match read_call(call, edition, alloc) {
+                Ok(path) => attrs.path = Some(path),
+                Err(_) => continue,
+            }
+        }
+        out.push(WalkRow { name, inline, no_implicit_prelude: attrs.no_implicit_prelude, path: attrs.path });
+    }
+    item.is_none().then(|| {
+        let f = file_attrs(cfg, o, text, alloc);
+        (f.cfg_ok, f.no_implicit_prelude)
+    })
+}
+
+/// Where the inline module `name` of module `parent` of the file stands in the file's outline
+/// now: the first child the walk keeps ([`walk_rows`]: a `mod` item on under the cfg) of that
+/// name that is inline. A position moves with every item added before it in the file, so the
+/// module tree record keeps a module's name, and a reader of the record finds it here.
+pub fn inline_child(cfg: &Cfg<'_, '_>, o: &Outline<'_>, text: &str, parent: Option<ItemIndex>, name: &str, alloc: Alloc<'_>) -> Option<ItemIndex> {
+    for (at, child) in o.children(parent) {
+        let ItemDetail::Mod { inline: true, .. } = child.detail else { continue };
+        if child.name.map(|r| unraw(child.text(text, r))) != Some(name) {
+            continue;
+        }
+        if item_attrs(cfg, o, child, text, alloc).cfg_ok {
+            return Some(at);
+        }
+    }
+    None
+}
+
 /// The most modules one walk makes.
 pub const MOST_MODULES: usize = 1_000_000;
 

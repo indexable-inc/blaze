@@ -133,6 +133,8 @@ mod lent;
 mod verified;
 
 #[cfg(test)]
+mod aligned_tests;
+#[cfg(test)]
 mod lazy_tests;
 #[cfg(test)]
 mod phase_commit_tests;
@@ -147,7 +149,7 @@ pub use self::core::{
     Batch, CACHEDIR_SIGNATURE, CACHEDIR_TAG, Committed, Found, GRACE_NS, Got, Lost, POINTER_LEN, POINTER_TAG, Placed, Plain, PlainConfig, Probe, Probes, PutError,
     ROOT_TAG, Report, SEGMENTS_MOST, SLICE_BYTES, Scrubbed, Sliced, TAGS, WINDOW,
 };
-pub use self::lent::{Lend, Lent, LentCounts, LentError, first_difference};
+pub use self::lent::{Aligned16, Lend, Lent, LentCounts, LentError, Misaligned, NotInPlace, first_difference};
 pub use self::driven::{Driven, LocalDir, Opened, lower_this_thread};
 pub use self::format::{Described, Entry, FORMAT, SEGMENT_FORMAT, Segment, check_segment, describe, find_many, record_crc, seal_segment};
 pub use self::handle::{LANES_MOST, LaneId, PlainStore};

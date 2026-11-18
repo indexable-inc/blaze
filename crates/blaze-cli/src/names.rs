@@ -69,10 +69,12 @@ pub(crate) mod sections;
 // section of names record version 1, without the failed calls; "7": form 4, without the link
 // table; "8": form 5, without the cell table; "9": a cell table without the names section's
 // whole row; "10": a cell table without the `MemberOf`, `VariantOf` and `Beginning` rows, whose
-// readers would read those cells absent) are under other names, never found, made again.
+// readers would read those cells absent; "11": an items record of version 8, whose item rows
+// hold no `extern` block ABI, and `Item` cells that do not cover it) are under other names,
+// never found, made again.
 // The subject's domain is blaze-drive key.rs `CRATE_SCOPE_DOMAIN` (the name's one home,
 // `crate_scope_name`): bump it there with this one.
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 11";
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 12";
 /// The out: the names record AND the checkout files the crate holds ([`crate_out`]). "1" was
 /// the names record alone, but a body's check reads its crate's items record to find which
 /// crate owns its file (body_types.rs `prepare`): a module file created gave a new record at
@@ -259,10 +261,12 @@ impl core::fmt::Display for Unwritten {
 /// The record of the crate `crate_name` resolved as `done`; `alloc` is the allocator `done` was
 /// made in (its task's frame), which the link table is written into before its copy into the
 /// payload.
-fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, alloc: Alloc<'a>) -> Result<ScopeRecord, Unwritten> {
+/// `quiet`: the names the crate calls its failed dependencies by (names/scope.rs
+/// `resolve_metered`), whose paths are counted, not found (plan row A8).
+fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, quiet: &[&str], alloc: Alloc<'a>) -> Result<ScopeRecord, Unwritten> {
     let unwritten = |section: &'static str, why: std::string::String| Unwritten { crate_name: crate_name.into(), section, why };
     let mut findings = blaze_own::Vec::new_in(Global);
-    let unresolved = done.names.notes.len() as u32 + unresolved(done.names, &mut findings);
+    let unresolved = done.names.notes.len() as u32 + unresolved(done.names, quiet, &mut findings);
     // The names and items records, filed in the same record (drive.md, "End state", piece
     // 3): a body is checked by reading them, never by solving the crate graph again.
     // Scratch copied into the payload below: in the task's frame, as the link table is.
@@ -364,8 +368,11 @@ fn find_word(text: &str, word: &str, from: usize) -> Option<usize> {
 
 /// Every `use` and macro path of crate `c` that resolved to nothing. The project's own (a
 /// checkout file, `/0/`) are findings in `own`, sorted; the number of the others (a fetched or
-/// toolchain crate's: not the project's to fix) is returned, counted in one note.
-fn unresolved(c: &blaze_scope::resolve::CrateNames<'_>, own: &mut blaze_own::Vec<Unresolved, Global>) -> u32 {
+/// toolchain crate's: not the project's to fix) is returned, counted in one note. A path into a
+/// failed dependency (its first segment one of `quiet`, the names the crate calls such crates
+/// by, failing past it) is counted too, never a finding: that crate's failure is reported once,
+/// at it (plan row A8, rule 19).
+fn unresolved(c: &blaze_scope::resolve::CrateNames<'_>, quiet: &[&str], own: &mut blaze_own::Vec<Unresolved, Global>) -> u32 {
     use blaze_surface::{PathKind, ScopeError};
     let project = c.files.iter().any(|file| file.path.starts_with("/0/"));
     let mut elsewhere = 0u32;
@@ -379,7 +386,8 @@ fn unresolved(c: &blaze_scope::resolve::CrateNames<'_>, own: &mut blaze_own::Vec
                 ScopeError::Macro { call, path, segment, .. } => (c.tables.calls.get(call).map(|src| src.loc), path, *segment as usize),
                 _ => continue,
             };
-            if !project {
+            let into_failed = segment > 0 && matches!(path.kind, PathKind::Plain | PathKind::Abs) && path.segments.first().is_some_and(|first| quiet.contains(first));
+            if !project || into_failed {
                 elsewhere += 1;
                 continue;
             }

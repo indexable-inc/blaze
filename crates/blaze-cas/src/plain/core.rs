@@ -292,6 +292,9 @@ pub(crate) enum Plant {
     FlipBeforeSync,
     /// Each new entry's offset is one unit past its payload.
     IndexOffByOne,
+    /// A commit's layout lays each payload right after the last, not at the next multiple of
+    /// [`ALIGN`]: a record no longer starts aligned (aligned_tests).
+    Unpadded,
     /// The flip builds on the generation this process saw last, not the head it holds the
     /// lock over: a lost update when another process flipped in between.
     StaleBase,
@@ -1287,7 +1290,8 @@ impl Plain {
                     return Err(StoreError::TooLong { tag: entry.tag, key: entry.key, len: end });
                 }
                 bytes.extend_from_slice(payload);
-                bytes.resize((aligned(end) - HEADER as u64) as usize, 0);
+                let padded = if self.plant() == Plant::Unpadded { end } else { aligned(end) };
+                bytes.resize((padded - HEADER as u64) as usize, 0);
                 let mut placed = entry;
                 placed.at = at;
                 if self.plant() == Plant::IndexOffByOne {

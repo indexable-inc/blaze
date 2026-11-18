@@ -246,8 +246,11 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b>(
         let words = bstd::mem::format_in!(held, "crate `{}`: {why}", names.world.crates[at].input.name);
         return Ok(Prepared::Answer(Did::FailedSaying(refused("a crate the toolchain shelf cannot build"), held_str(words.as_str(), held))));
     }
-    // Any need that failed this command (a dependency's names, a file's surface whose outline
-    // failed): this crate fails `Waited` on it, alone (rule 20); asking again would loop.
+    // A need that failed this command and that no answer can stand for: the crate's own build
+    // script (its cfgs and environment unknown, so a resolution without them would be a
+    // fallback, rule 3). This crate fails `Waited` on it, alone (rule 20); asking again would
+    // loop. A dependency whose names failed is no such need: it is handed by its failed out and
+    // read as an error crate below (plan row A8, engine_names.rs `run_phase`).
     if let Some(failed) = task.failed.first() {
         return Ok(Prepared::Answer(Did::Failed(TaskFailure { name, why: Why::Waited { on: *failed } })));
     }
@@ -296,6 +299,24 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b>(
     let mut deps: blaze_own::Vec<&'j [u8], &'j Frame> = blaze_own::Vec::with_capacity_in(local.len(), round.frame);
     for (place, g) in local.iter().enumerate() {
         let handed = have(names, task, *g).ok_or(CliError::Text { what: "a crate's input, checked above, is gone" })?;
+        // A dependency that failed this command (no record of its names): its error record,
+        // a function of its key, name and edition, so every path into it is unknown and quiet
+        // and only its own failure is reported (plan row A8). Its read stays the failed out
+        // (`answer`), so its fix moves it and this crate is solved again (rule 21). Never put in
+        // `round.exports`: a failed dependency is handed under no key of its own.
+        if handed.out == crate::work::failed_out() {
+            let dep = &crates[*g].input;
+            match blaze_scope::crate_scope::error_record(dep.key, dep.name, dep.edition, round.alloc) {
+                Ok(record) => {
+                    deps.push(blaze_scope::resolve::aligned(&record, round.alloc));
+                    continue;
+                }
+                Err(error) => {
+                    let words = bstd::mem::format_in!(held, "crate `{}`: the error record of its failed dependency `{}`: {error:?}", input.name, dep.name);
+                    return Ok(Prepared::Answer(Did::FailedSaying(refused("a failed dependency's error record"), held_str(words.as_str(), held))));
+                }
+            }
+        }
         let by_place = round.by_place;
         if let Some((_, _, bytes)) = round.exports.iter().find(|(key, at, _)| if by_place { *at == place } else { *key == handed.at }) {
             deps.push(bytes);
@@ -433,8 +454,12 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         Ok(done) => crate::names::failed_call::findings(done.names, alloc),
         Err(_) => blaze_own::Vec::new_in(Global),
     };
+    // The names this crate calls its failed dependencies by (each handed as an error record,
+    // `prepare`): a path into one is counted, never a finding (plan row A8, rule 19).
+    let mut quiet: blaze_own::Vec<&str, Global> = blaze_own::Vec::new_in(Global);
+    quiet.extend(job.input.deps.iter().filter(|(_, at)| job.deps.get(*at).is_some_and(|bytes| blaze_scope::crate_scope::is_error_record(bytes))).map(|(name, _)| *name));
     let (out, payload, findings, failed, ok, unresolved, test_marks) = match done {
-        Ok(done) => match scope_record(&done, crate_name, alloc) {
+        Ok(done) => match scope_record(&done, crate_name, &quiet, alloc) {
             Ok(record) => {
                 // Both records (rule 21): a dependent reads the exports, but the crate's own
                 // bodies read its inner names (front_load.rs), so an out over the exports alone

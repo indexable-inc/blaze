@@ -17,6 +17,7 @@
 //! ([`PathSelf`], [`Homes::local`]). The check loop lowers the candidates' headers ([`Buckets::trait_wants`]),
 //! then [`Buckets::answer`] keeps those whose lowered header matches, and the answer is kept.
 
+use core::cell::{Ref, RefCell, RefMut};
 use std::alloc::Global;
 use std::boxed::Box;
 use std::format;
@@ -35,6 +36,7 @@ use blaze_typeck::{AssocItem, AssocKind, ItemKey, Mutbl, Name, PNode, PTy, PTys,
 use super::heads::{Store, lower};
 use super::index::Index;
 use super::keys::{Keys, checker_of};
+use super::rows::Rows;
 use super::source::NamesSource;
 use super::types::{PRIMS, children, path_texts};
 use crate::resolve::{Kind, Ns, ResolveError};
@@ -1049,7 +1051,32 @@ fn push<K: core::hash::Hash + Eq, V>(m: &mut HashMap<K, Vec<V, Global>, Global>,
 /// read list; a set's iteration order reaches nothing but such a list, so no answer depends on
 /// the order impls were filed in ([`Buckets::bucket_lookups`] and the test
 /// tests/front2_buckets_order.rs).
+///
+/// FILLED THROUGH `&self` (lane RA1, plan row A1): a seeded body's world answers an impl
+/// question on the spot (world_items.rs `BodyWorld::impl_question`) while the check holds
+/// answers borrowed from here (`World::impls_of` hands out `&[ItemKey]`, `World::inherent`
+/// `&[AssocItem]`). So the four answer tables are [`Rows`] (a row filed never moves; a reader's
+/// slice stays), and every other field is in ONE [`BucketIndex`] behind one `RefCell`, borrowed
+/// only through [`Buckets::index_mut`] (its comment says what may not be called inside the
+/// borrow) or [`Buckets::index`], and never across a return to the world. The lowering path
+/// (between rounds, `&mut Buckets`) reaches the index through [`Buckets::index_get_mut`], which
+/// takes no runtime borrow. No `unsafe`.
 pub struct Buckets {
+    answers: Rows<(ItemKey, Shape), Vec<ItemKey, Global>>,
+    /// Per answered trait question, the least-keyed candidate whose header failed: the
+    /// question's gap. Only a question that HAS such a candidate is a gap of the body asking it,
+    /// so a body's outcome never depends on which other bodies or rounds lowered what first.
+    answer_failed: Rows<(ItemKey, Shape), LibKey>,
+    inherent: Rows<(Shape, Name), Vec<AssocItem, Global>>,
+    /// The answered inherent questions (a shape and a name), each with its least-keyed failed
+    /// candidate, if any: only an impl that declares a member of the name is a candidate.
+    inherent_done: Rows<(Shape, Name), Option<LibKey>>,
+    index: RefCell<BucketIndex>,
+}
+
+/// What [`Buckets`] files impls in and counts: every field but the answers, mutated through
+/// one `RefCell` ([`Buckets`]'s docs).
+pub struct BucketIndex {
     by_shape: HashMap<(ItemKey, Shape), Vec<LibKey, Global>, Global>,
     any: HashMap<ItemKey, Vec<LibKey, Global>, Global>,
     /// Every unread impl ([`Buckets::is_unread`]).
@@ -1065,15 +1092,6 @@ pub struct Buckets {
     inherent_by_shape: HashMap<Shape, Vec<LibKey, Global>, Global>,
     /// Inherent impls whose self type's shape was not read ([`Buckets::is_unsure`]).
     inherent_any: HashSet<LibKey, Global>,
-    answers: HashMap<(ItemKey, Shape), Vec<ItemKey, Global>, Global>,
-    /// Per answered trait question, the least-keyed candidate whose header failed: the
-    /// question's gap. Only a question that HAS such a candidate is a gap of the body asking it,
-    /// so a body's outcome never depends on which other bodies or rounds lowered what first.
-    answer_failed: HashMap<(ItemKey, Shape), LibKey, Global>,
-    inherent: HashMap<(Shape, Name), Vec<AssocItem, Global>, Global>,
-    /// The answered inherent questions (a shape and a name), each with its least-keyed failed
-    /// candidate, if any: only an impl that declares a member of the name is a candidate.
-    inherent_done: HashMap<(Shape, Name), Option<LibKey>, Global>,
     /// How many impl headers the questions made the store lower.
     pub lowered: u32,
     /// Impls on a self type the checker has no type for (blaze's `i80`), filed nowhere.
@@ -1131,9 +1149,230 @@ pub struct Buckets {
 }
 
 impl Buckets {
-    /// No impl filed, no crate known.
-    fn empty() -> Buckets {
+    /// No impl filed, no crate known, no question answered.
+    fn of(index: BucketIndex) -> Buckets {
         Buckets {
+            answers: Rows::new_in(Global),
+            answer_failed: Rows::new_in(Global),
+            inherent: Rows::new_in(Global),
+            inherent_done: Rows::new_in(Global),
+            index: RefCell::new(index),
+        }
+    }
+
+    /// The impl index the names source `names` is answered from: over the solved names every
+    /// impl filed now ([`Buckets::new`]), over records none ([`Buckets::lazy`]). The one maker
+    /// both paths call: check.rs `make_once` on the first impl fill, and `check_rounds_as`
+    /// before round 0 of a seeded body.
+    pub fn for_source<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>) -> Buckets {
+        match names.solved() {
+            Some(solved) => Buckets::new(solved, index),
+            None => Buckets::lazy(names),
+        }
+    }
+
+    /// Files every impl of `index` by its header as written.
+    pub fn new(names: &Names<'_>, index: &Index<'_>) -> Buckets {
+        let mut b = BucketIndex::empty();
+        b.krates.extend(index.impls.iter().map(|at| (at.key, at.krate)));
+        // `#![feature(rustc_attrs)]` is an inner attribute of the crate root, the first file
+        // read; a mention anywhere in that text keeps the crate on the wide side.
+        b.incoherent.extend(names.crates().iter().map(|c| c.files.first().is_none_or(|f| f.text.contains("rustc_attrs") || f.text.contains("rustc_coherence_is_core"))));
+        b.file_all(names, &index.impls);
+        Buckets::of(b)
+    }
+
+    /// The front end over records: no impl is filed when this is made. Before each question,
+    /// [`Buckets::admit`] files the impls of the crates the question's home admits, from the
+    /// source's impl rows ([`NamesSource::each_impl`]); a crate is filed once.
+    pub fn lazy<'n, S: NamesSource<'n>>(names: S) -> Buckets {
+        let mut b = BucketIndex::empty();
+        let crates = names.crate_count();
+        // Unknown until asked ([`Buckets::admit`]): the wide side, as `admits` reads a crate
+        // with no row.
+        b.incoherent.resize(crates, true);
+        b.lazy_filed.resize(crates, false);
+        Buckets::of(b)
+    }
+
+    /// The index, read: a shared borrow of the one cell, held by the caller only while it
+    /// reads (never across a call that files: that would be [`Buckets::index_mut`] inside it,
+    /// a panic by `RefCell`'s rule, which no path here takes).
+    pub fn index(&self) -> Ref<'_, BucketIndex> {
+        self.index.borrow()
+    }
+
+    /// The index, to file in, through a shared borrow of the buckets: THE ONE MUTABLE BORROW of
+    /// the cell. Each caller holds it over straight-line code that files or counts and calls
+    /// only the index's own methods, the names source (`NamesSource`: the task's recorder and
+    /// the records, which never reach a body's buckets) and the impl tables' lookups; NEVER the
+    /// world (a `World` method), the store's seeding (`HeadSeed::seed`) or any other method of
+    /// these buckets, any of which could ask for the cell again and panic. No caller returns the
+    /// guard or holds it across a head being made.
+    fn index_mut(&self) -> RefMut<'_, BucketIndex> {
+        self.index.borrow_mut()
+    }
+
+    /// The index through `&mut self`: no runtime borrow (the lowering path between rounds, and
+    /// tests that file by hand).
+    pub fn index_get_mut(&mut self) -> &mut BucketIndex {
+        self.index.get_mut()
+    }
+
+    /// THE CAUSE REMOVED, for tests/front2_records.rs only ([`BucketIndex::plant_no_rows`]).
+    #[doc(hidden)]
+    pub fn plant_no_rows(&mut self) {
+        self.index_get_mut().plant_no_rows();
+    }
+
+    /// [`BucketIndex::admit`], through `&mut self`.
+    pub fn admit<'n, S: NamesSource<'n>>(&mut self, names: S, home: Homes) -> usize {
+        self.index_get_mut().admit(names, home)
+    }
+
+    /// [`BucketIndex::admit_asked`], through `&mut self`.
+    pub fn admit_asked<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask) -> usize {
+        self.index_get_mut().admit_asked(names, keys, home, ask)
+    }
+
+    /// [`BucketIndex::admit_tables`], through `&mut self`.
+    pub fn admit_tables<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask, tables: &TableSet<'_>) -> Result<usize, TablesReadError> {
+        self.index_get_mut().admit_tables(names, keys, home, ask, tables)
+    }
+
+    /// Files what `ask` at `home` is answered from, through `&self` (the on-the-spot path and
+    /// the lowering path both; check.rs `trait_question`, `inherent_question`): from the impl tables when the names
+    /// source holds them (buckets/records.rs), else whole crates by their rows and the items
+    /// records' bucket section. One borrow of the index ([`Buckets::index_mut`]) over the
+    /// admit: inside it only the names source and the tables are called. The bucket cells read
+    /// are recorded inside `admit_tables` (`names.impls_read`), on either path.
+    pub fn admit_shared<'n, S: NamesSource<'n>>(&self, names: S, keys: &Keys, home: Homes, ask: Ask) -> Result<usize, TablesReadError> {
+        let mut ix = self.index_mut();
+        match names.impl_tables() {
+            Some(tables) => ix.admit_tables(names, keys, home, ask, tables),
+            None => {
+                let whole = ix.admit(names, home);
+                Ok(whole + ix.admit_asked(names, keys, home, ask))
+            }
+        }
+    }
+
+    pub fn is_lazy(&self) -> bool {
+        self.index().is_lazy()
+    }
+
+    pub fn trait_candidates(&self, trait_: ItemKey, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
+        self.index().trait_candidates(trait_, shape, home)
+    }
+
+    pub fn negative_of(&self, trait_: ItemKey, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
+        self.index().negative_of(trait_, shape, home)
+    }
+
+    pub fn inherent_candidates(&self, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
+        self.index().inherent_candidates(shape, home)
+    }
+
+    pub fn admits(&self, home: Home, krate: usize) -> bool {
+        self.index().admits(home, krate)
+    }
+
+    pub fn krate(&self, k: LibKey) -> Option<usize> {
+        self.index().krate(k)
+    }
+
+    pub fn home_of(&self, trait_: ItemKey, shape: Shape) -> Homes {
+        self.index().home_of(trait_, shape)
+    }
+
+    pub fn is_unread(&self, k: LibKey) -> bool {
+        self.index().is_unread(k)
+    }
+
+    pub fn is_unsure(&self, k: LibKey) -> bool {
+        self.index().is_unsure(k)
+    }
+
+    pub fn has_failed(&self, k: LibKey) -> bool {
+        self.index().has_failed(k)
+    }
+
+    /// Records an unread candidate whose header failed ([`BucketIndex::fail`]).
+    pub fn fail(&self, k: LibKey, why: Box<str>) {
+        self.index_mut().fail(k, why);
+    }
+
+    /// Counts one impl header a question made the store lower (or import).
+    pub fn count_lowered(&self) {
+        self.index_mut().lowered += 1;
+    }
+
+    pub fn filed(&self) -> [usize; 5] {
+        self.index().filed()
+    }
+
+    pub(crate) fn trait_buckets(&self) -> usize {
+        self.index().trait_buckets()
+    }
+
+    /// [`BucketIndex::each_trait_bucket`]; `each` must not reach these buckets' filing (the
+    /// index is borrowed while it runs).
+    pub(crate) fn each_trait_bucket(&self, each: impl FnMut(ItemKey, Shape)) {
+        self.index().each_trait_bucket(each);
+    }
+
+    pub(crate) fn each_unread_shape(&self, each: impl FnMut(Shape)) {
+        self.index().each_unread_shape(each);
+    }
+
+    /// The unread impls filed at no shape ([`BucketIndex::shapeless_unread`]), in filing order.
+    pub(crate) fn shapeless_unread(&self) -> Vec<LibKey, Global> {
+        let mut out = Vec::new_in(Global);
+        out.extend(self.index().shapeless_unread());
+        out
+    }
+
+    pub fn trait_reads(&self, trait_: ItemKey, shape: Shape) -> Ref<'_, [BucketRead]> {
+        Ref::map(self.index(), |ix| ix.trait_reads(trait_, shape))
+    }
+
+    pub fn inherent_reads(&self, shape: Shape) -> Ref<'_, [BucketRead]> {
+        Ref::map(self.index(), |ix| ix.inherent_reads(shape))
+    }
+
+    pub fn asked(&self) -> Vec<Ask, Global> {
+        self.index().asked()
+    }
+
+    pub fn filed_from_index(&self) -> u32 {
+        self.index().filed_from_index()
+    }
+
+    pub fn bucket_lookups(&self) -> u32 {
+        self.index().bucket_lookups()
+    }
+
+    pub fn bucket_asks(&self) -> u32 {
+        self.index().bucket_asks()
+    }
+
+    pub fn crates_asked(&self) -> usize {
+        self.index().crates_asked()
+    }
+
+    pub fn crates_asked_sorted(&self) -> blaze_own::Vec<usize, Global> {
+        self.index().crates_asked_sorted()
+    }
+
+    pub fn not_filed(&self) -> [(&'static str, u32); 10] {
+        self.index().not_filed()
+    }
+}
+
+impl BucketIndex {
+    /// No impl filed, no crate known.
+    fn empty() -> BucketIndex {
+        BucketIndex {
             by_shape: HashMap::new_in(Global),
             any: HashMap::new_in(Global),
             unread: HashSet::new_in(Global),
@@ -1142,10 +1381,6 @@ impl Buckets {
             unread_blind: Vec::new_in(Global),
             inherent_by_shape: HashMap::new_in(Global),
             inherent_any: HashSet::new_in(Global),
-            answers: HashMap::new_in(Global),
-            answer_failed: HashMap::new_in(Global),
-            inherent: HashMap::new_in(Global),
-            inherent_done: HashMap::new_in(Global),
             lowered: 0,
             no_checker_type: 0,
             failed: Vec::new_in(Global),
@@ -1173,30 +1408,6 @@ impl Buckets {
     #[doc(hidden)]
     pub fn plant_no_rows(&mut self) {
         self.no_rows = true;
-    }
-
-    /// Files every impl of `index` by its header as written.
-    pub fn new(names: &Names<'_>, index: &Index<'_>) -> Buckets {
-        let mut b = Buckets::empty();
-        b.krates.extend(index.impls.iter().map(|at| (at.key, at.krate)));
-        // `#![feature(rustc_attrs)]` is an inner attribute of the crate root, the first file
-        // read; a mention anywhere in that text keeps the crate on the wide side.
-        b.incoherent.extend(names.crates().iter().map(|c| c.files.first().is_none_or(|f| f.text.contains("rustc_attrs") || f.text.contains("rustc_coherence_is_core"))));
-        b.file_all(names, &index.impls);
-        b
-    }
-
-    /// The front end over records: no impl is filed when this is made. Before each question,
-    /// [`Buckets::admit`] files the impls of the crates the question's home admits, from the
-    /// source's impl rows ([`NamesSource::each_impl`]); a crate is filed once.
-    pub fn lazy<'n, S: NamesSource<'n>>(names: S) -> Buckets {
-        let mut b = Buckets::empty();
-        let crates = names.crate_count();
-        // Unknown until asked ([`Buckets::admit`]): the wide side, as `admits` reads a crate
-        // with no row.
-        b.incoherent.resize(crates, true);
-        b.lazy_filed.resize(crates, false);
-        b
     }
 
     /// Whether this was made by [`Buckets::lazy`] (a caller then calls [`Buckets::admit`]
@@ -1481,10 +1692,30 @@ impl Buckets {
         self.failed.binary_search_by_key(&k, |f| f.0).is_ok()
     }
 
+    /// How the impls were filed: (under a trait and a shape, under a trait's "any", inherent
+    /// by shape, inherent "any", unread).
+    pub fn filed(&self) -> [usize; 5] {
+        let shaped = self.by_shape.iter().filter(|((_, s), _)| !matches!(s, Shape::AnyInt | Shape::AnyFloat)).map(|(_, v)| v.len()).sum();
+        let any = self.any.values().map(|v| v.len()).sum();
+        let inherent = self.inherent_by_shape.values().map(|v| v.len()).sum();
+        [shaped, any, inherent, self.inherent_any.len(), self.unread.len()]
+    }
+
+    /// The failed candidate `k` with why (owned: the list it is in grows through `&self` of
+    /// the buckets, so no borrow of it leaves the index).
+    fn failed_why(&self, k: LibKey) -> Option<(LibKey, Box<str>)> {
+        let at = self.failed.binary_search_by_key(&k, |f| f.0).ok()?;
+        Some((k, self.failed[at].1.clone()))
+    }
+}
+
+impl Buckets {
     /// Answers `trait_` at `shape` from its candidates' headers, which `store` must hold. A
     /// question is answered once a run, as [`Buckets::answer_inherent`] is: every body that
     /// reads it reads the first answer, its home and its gap (rule 21: one key, one answer).
-    pub fn answer(&mut self, store: &Store<'_>, trait_: ItemKey, shape: Shape, home: Homes) -> Result<(), Unfilled> {
+    /// Through `&self`: the answer is a new row ([`Rows`]), so a slice an earlier answer handed
+    /// out stays where it is.
+    pub fn answer(&self, store: &Store<'_>, trait_: ItemKey, shape: Shape, home: Homes) -> Result<(), Unfilled> {
         if self.answers.contains_key(&(trait_, shape)) {
             return Ok(());
         }
@@ -1492,35 +1723,41 @@ impl Buckets {
         let mut got = Vec::new_in(Global);
         // Candidates come sorted, so the first failed one is the least key.
         let mut first_failed = None;
-        self.homes.insert((trait_, shape), home);
-        // The negative impls are candidates too: the solver reads their polarity (a negative
-        // impl decides an auto trait's structural rule and never meets a positive goal).
-        let mut candidates = self.trait_candidates(trait_, shape, home);
-        candidates.extend_from_slice(&self.negative_of(trait_, shape, home));
-        candidates.sort_unstable();
-        candidates.dedup();
-        for k in candidates {
-            if self.has_failed(k) {
-                first_failed = first_failed.or(Some(k));
-                continue;
-            }
-            let h = store.impls.get(&checker_of(k)).ok_or(Unfilled::Impl(k))?;
-            // A header built WITHOUT the trait its text names answers nothing: it is the
-            // question's gap, never an impl left out of the answer unseen.
-            if h.trait_.is_none() && self.by_text.contains(&k) {
-                self.fail(k, Box::from("its header's text names a trait; the header as lowered holds none"));
-                first_failed = first_failed.or(Some(k));
-                continue;
-            }
-            if h.trait_ == Some(trait_) && fits(shape_of(view, h.self_ty), shape) {
-                got.push(checker_of(k));
+        {
+            // The index borrowed once (`Buckets::index_mut`): inside, only the index's own
+            // methods and reads of `store`'s rows.
+            let mut ix = self.index_mut();
+            ix.homes.insert((trait_, shape), home);
+            // The negative impls are candidates too: the solver reads their polarity (a negative
+            // impl decides an auto trait's structural rule and never meets a positive goal).
+            let mut candidates = ix.trait_candidates(trait_, shape, home);
+            candidates.extend_from_slice(&ix.negative_of(trait_, shape, home));
+            candidates.sort_unstable();
+            candidates.dedup();
+            for k in candidates {
+                if ix.has_failed(k) {
+                    first_failed = first_failed.or(Some(k));
+                    continue;
+                }
+                let h = store.impls.get(&checker_of(k)).ok_or(Unfilled::Impl(k))?;
+                // A header built WITHOUT the trait its text names answers nothing: it is the
+                // question's gap, never an impl left out of the answer unseen.
+                if h.trait_.is_none() && ix.by_text.contains(&k) {
+                    ix.fail(k, Box::from("its header's text names a trait; the header as lowered holds none"));
+                    first_failed = first_failed.or(Some(k));
+                    continue;
+                }
+                if h.trait_ == Some(trait_) && fits(shape_of(view, h.self_ty), shape) {
+                    got.push(checker_of(k));
+                }
             }
         }
         got.sort_unstable();
-        self.answers.insert((trait_, shape), got);
+        // The gap first: a reader asks `trait_gap` before `impls_of`.
         if let Some(k) = first_failed {
             self.answer_failed.insert((trait_, shape), k);
         }
+        self.answers.insert((trait_, shape), got);
         Ok(())
     }
 
@@ -1530,7 +1767,7 @@ impl Buckets {
     /// hold: no fn's signature is made or read (brief 14). An impl that declares no member of
     /// the name is no candidate, so its header (and the anonymous constants in it) is never
     /// needed for the answer, nor its refusal a gap of it.
-    pub fn answer_inherent(&mut self, store: &Store<'_>, shape: Shape, name: Name, candidates: &[LibKey]) -> Result<(), Unfilled> {
+    pub fn answer_inherent(&self, store: &Store<'_>, shape: Shape, name: Name, candidates: &[LibKey]) -> Result<(), Unfilled> {
         if self.inherent_done.contains_key(&(shape, name)) {
             return Ok(());
         }
@@ -1566,18 +1803,11 @@ impl Buckets {
             }
         }
         got.sort_unstable_by_key(|a| a.item);
+        // The items before the question is marked answered: a reader asks `inherent` only
+        // of an answered question.
         self.inherent.insert((shape, name), got);
         self.inherent_done.insert((shape, name), first_failed);
         Ok(())
-    }
-
-    /// How the impls were filed: (under a trait and a shape, under a trait's "any", inherent
-    /// by shape, inherent "any", unread).
-    pub fn filed(&self) -> [usize; 5] {
-        let shaped = self.by_shape.iter().filter(|((_, s), _)| !matches!(s, Shape::AnyInt | Shape::AnyFloat)).map(|(_, v)| v.len()).sum();
-        let any = self.any.values().map(|v| v.len()).sum();
-        let inherent = self.inherent_by_shape.values().map(|v| v.len()).sum();
-        [shaped, any, inherent, self.inherent_any.len(), self.unread.len()]
     }
 
     /// Every trait question answered so far, with its answer, in a stable order (for a work
@@ -1596,19 +1826,16 @@ impl Buckets {
 
     /// The failed candidate (the least key, with why) of the answered trait question, if any:
     /// its answer may miss that impl, so asking it is a gap, never an answer.
-    pub fn trait_gap(&self, trait_: ItemKey, shape: Shape) -> Option<(LibKey, &str)> {
-        self.answer_failed.get(&(trait_, shape)).and_then(|&k| self.failed_why(k))
+    pub fn trait_gap(&self, trait_: ItemKey, shape: Shape) -> Option<(LibKey, Box<str>)> {
+        let k = *self.answer_failed.get(&(trait_, shape))?;
+        self.index().failed_why(k)
     }
 
     /// The failed candidate (the least key, with why) of the answered inherent question
     /// (`shape`, `name`), if any: a refused impl that declares no member of the name is none.
-    pub fn inherent_gap(&self, shape: Shape, name: Name) -> Option<(LibKey, &str)> {
-        self.inherent_done.get(&(shape, name)).copied().flatten().and_then(|k| self.failed_why(k))
-    }
-
-    fn failed_why(&self, k: LibKey) -> Option<(LibKey, &str)> {
-        let at = self.failed.binary_search_by_key(&k, |f| f.0).ok()?;
-        Some((k, &*self.failed[at].1))
+    pub fn inherent_gap(&self, shape: Shape, name: Name) -> Option<(LibKey, Box<str>)> {
+        let k = self.inherent_done.get(&(shape, name)).copied().flatten()?;
+        self.index().failed_why(k)
     }
 
     /// The inherent items of `shape` named `name`, once that question is answered.

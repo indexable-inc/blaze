@@ -313,7 +313,7 @@ impl<'a, S: SourceTexts<'a>> Ctx<'_, 'a, S> {
         }
         for _ in 0..MOST_ROUNDS {
             if !self.held[k].borrow().walked() {
-                let (r, wants) = self.solve(k, &OnDemandPar { members: Some(Members { members: &[], records: &demanded[k] }) });
+                let (r, wants) = self.solve(k, &OnDemandPar { members: Some(Members { members: &[], records: &demanded[k], tree: None }) });
                 if !wants.is_empty() {
                     for w in wants.iter() {
                         self.satisfy(demanded, w, depth + 1)?;
@@ -340,7 +340,7 @@ impl<'a, S: SourceTexts<'a>> Ctx<'_, 'a, S> {
                     out.extend(c.groups.iter().cloned());
                     Ok(out)
                 };
-                let mut solver = OneGroup { solve_crate, alloc: self.alloc };
+                let mut solver = OneGroup { solve_crate, alloc: self.alloc, tree: None };
                 demand(&modules, &mut solver, &mut demanded[k], self.alloc)
             };
             self.held[k].borrow_mut().hold(&demanded[k], self.alloc)?;

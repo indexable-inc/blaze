@@ -182,7 +182,7 @@ fn scope_traits_and_buckets_read_only_what_may_answer() {
             Err(other @ CheckFail::Head { .. }) => format!("refused {other:?}"),
             Err(other) => format!("{other:?}"),
         };
-        let made = buckets.as_ref().map_or(0, |b| b.lowered);
+        let made = buckets.as_ref().map_or(0, |b| b.index().lowered);
         let ok = match want {
             Says::Clean => said == "clean",
             Says::Refused(holds) => said.starts_with("refused") && said.contains(holds),

@@ -6,9 +6,9 @@
 use blaze_id::ItemKey as LibKey;
 use blaze_typeck::{ItemKey, Shape};
 
-use super::Buckets;
+use super::BucketIndex;
 
-impl Buckets {
+impl BucketIndex {
     /// How many `(trait, shape)` buckets are filed: an index a caller builds from
     /// [`Buckets::each_trait_bucket`] is whole while this is unchanged (over [`Buckets::new`]
     /// every impl is filed when the buckets are made; over [`Buckets::lazy`] a question's

@@ -1,5 +1,5 @@
 //! The items declared in the blocks of ONE body-like text (a `fn`, `const` or `static` item's
-//! whole text), found by tokens: no tree, no lowering, no recursion.
+//! whole text), found by tokens: no tree, no lowering.
 //!
 //! The Reference, "Statements", "Item declarations": "An item declaration statement has a
 //! syntactic form identical to an item declaration within a module. Declaring an item within a
@@ -12,8 +12,11 @@
 //! A statement starts after a block's `{`, after a `;` and after a `}` directly in a brace
 //! group. An item is a statement that starts (after outer attributes and a visibility) with an
 //! item's keywords; it ends at its first `;` outside brackets or, for the forms with a body,
-//! at the `}` closing its first `{` outside brackets. Nothing inside an item is read: its own
-//! bodies are other texts, scanned when they are lowered. A word inside a string or a comment
+//! at the `}` closing its first `{` outside brackets. Nothing inside an item is listed: its own
+//! bodies are other texts, scanned when they are lowered. One bit is read from a local `fn`'s,
+//! `const`'s or `static`'s own text, scanned the same way: whether it writes a block
+//! ([`NestedItem::body_writes`]), since then the names library must make the item a module's
+//! item to give its body's blocks modules. A word inside a string or a comment
 //! is one token, and the tokens of a macro call's arguments are skipped whole, so `impl`
 //! there is never an item; a call in statement position is listed ([`Nested::calls`]): it may
 //! write items, and only its expansion can say.
@@ -71,7 +74,32 @@ pub struct NestedItem {
     pub block: u32,
     pub kind: NestedKind,
     pub range: Range,
+    /// For a `fn`, `const` or `static`: whether its own text, scanned the same way, writes a
+    /// block ([`Nested::writes`]): an item that makes a module, a statement call, or such an
+    /// item in turn, at any depth. std's `sys::pal::unix::init` declares `unsafe fn
+    /// reset_sigpipe(..)`, whose `#[cfg(..)]` block declares `mod sigpipe { pub const DEFAULT:
+    /// u8 = 0; .. }` and matches on `sigpipe::DEFAULT`. The Reference, "Statements", "Item
+    /// declarations": the `mod`'s scope is that block, whatever item's body holds it; so the
+    /// fn's block is written too ([`NestedItem::writes`]), the fn is an item of that block's
+    /// module with the library's key, and its own body's blocks are modules under it.
+    /// `false` for every other kind.
+    pub body_writes: bool,
 }
+
+impl NestedItem {
+    /// Whether this item makes the block it is in written as a module of the names library:
+    /// it makes one itself ([`NestedKind::makes_module`]), or it is a `fn`, `const` or
+    /// `static` whose own body writes a block ([`NestedItem::body_writes`]).
+    pub fn writes(&self) -> bool {
+        self.kind.makes_module() || self.body_writes
+    }
+}
+
+/// How many item bodies deep [`scan`] reads a `fn`'s, `const`'s or `static`'s own text for
+/// [`NestedItem::body_writes`]. An item deeper than this is taken to write its block: the
+/// names library then writes the blocks down to its own depth limit and files a note there
+/// (blaze-scope resolve.rs `MAX_BLOCK_DEPTH`, `MadeNote::TooMany`), never drops a module.
+const MAX_BODY_DEPTH: u16 = 64;
 
 /// A macro call in statement position: its block, the range of its path (`a::b` of
 /// `a::b!(..)`, with the outer attributes written before it) and the range of the whole call
@@ -114,6 +142,13 @@ impl Nested<'_> {
     /// ([`NestedKind::makes_module`]).
     pub fn makes_module(&self) -> bool {
         self.items.iter().any(|i| i.kind.makes_module())
+    }
+
+    /// Whether any block of the body is written as a module of the names library: one holds
+    /// an item that writes it ([`NestedItem::writes`]: an item that makes a module, or a
+    /// local `fn`, `const` or `static` whose own body writes one) or a statement call.
+    pub fn writes(&self) -> bool {
+        !self.calls.is_empty() || self.items.iter().any(NestedItem::writes)
     }
 }
 
@@ -229,7 +264,33 @@ fn offset(at: usize) -> u32 {
 
 /// The blocks of `text` (one item's whole text) and the item statements in them.
 pub fn scan<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
-    let mut out = Nested { blocks: AVec::new_in(alloc), items: AVec::new_in(alloc), calls: AVec::new_in(alloc), end: NestedEnd::Whole };
+    scan_at(text, 0, alloc)
+}
+
+/// [`scan`] of a text `depth` item bodies deep: then each `fn`, `const` and `static` found is
+/// scanned in turn for [`NestedItem::body_writes`] (its own text is a body-like text too).
+fn scan_at<'a>(text: &str, depth: u16, alloc: Alloc<'a>) -> Nested<'a> {
+    let mut out = scan_one(text, alloc);
+    if out.end == NestedEnd::Unbalanced {
+        return out;
+    }
+    for item in out.items.iter_mut() {
+        if !matches!(item.kind, NestedKind::Fn | NestedKind::Const | NestedKind::Static) {
+            continue;
+        }
+        let Some(own) = text.get(item.range.start as usize..item.range.end as usize) else { continue };
+        // A body with no brace group has no block to write (`const K: u8 = 1;`).
+        if !own.contains('{') {
+            continue;
+        }
+        item.body_writes = depth >= MAX_BODY_DEPTH || scan_at(own, depth + 1, alloc).writes();
+    }
+    out
+}
+
+/// One text's scan, its items' own bodies not read ([`NestedItem::body_writes`] all `false`).
+fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
+    let mut out =Nested { blocks: AVec::new_in(alloc), items: AVec::new_in(alloc), calls: AVec::new_in(alloc), end: NestedEnd::Whole };
     let mut stack: AVec<'a, Open> = AVec::new_in(alloc);
     // How many of the open brackets are a macro call's arguments.
     let mut in_call = 0u32;
@@ -275,7 +336,7 @@ pub fn scan<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                 }
                 let done = *s;
                 skip = None;
-                out.items.push(NestedItem { block: done.block, kind: done.kind, range: Range { start: done.start, end } });
+                out.items.push(NestedItem { block: done.block, kind: done.kind, range: Range { start: done.start, end }, body_writes: false });
                 fresh = true;
                 // This token starts the next statement (or closes the block): read below.
             } else if is_open {
@@ -296,7 +357,7 @@ pub fn scan<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                 if kind == TokenKind::Semi && s.depth == 0 {
                     let done = *s;
                     skip = None;
-                    out.items.push(NestedItem { block: done.block, kind: done.kind, range: Range { start: done.start, end: offset(at) } });
+                    out.items.push(NestedItem { block: done.block, kind: done.kind, range: Range { start: done.start, end: offset(at) }, body_writes: false });
                     fresh = true;
                 }
                 continue;
@@ -672,5 +733,26 @@ mod tests {
         let kinds: std::vec::Vec<NestedKind> = items(write_fmt).iter().map(|i| i.0).collect();
         assert_eq!(kinds, [NestedKind::Trait, NestedKind::Impl]);
         assert!(!scan("fn f() { fn g() {} g() }", blaze_own::testing::heap().alloc()).makes_module());
+    }
+
+    /// A local fn whose own body declares a `mod` (std's `init` > `reset_sigpipe` >
+    /// `#[cfg(..)] { mod sigpipe { .. } }`) writes its block: the fn is then an item of that
+    /// block's module. Two deep too; a local fn whose body writes nothing, and a `const`
+    /// without a brace group, do not.
+    #[test]
+    fn a_local_fn_whose_body_writes_writes_its_block() {
+        let heap = blaze_own::testing::heap();
+        let init = "unsafe fn init(s: u8) { reset(s); unsafe fn reset(s: u8) { #[cfg(all())] { mod sigpipe { pub const DEFAULT: u8 = 0; } match s { sigpipe::DEFAULT => {} _ => {} } } } }";
+        let n = scan(init, heap.alloc());
+        assert_eq!(n.end, NestedEnd::Whole);
+        assert!(!n.makes_module(), "the mod is the local fn's, not init's");
+        assert_eq!(n.items.len(), 1);
+        assert!(n.items[0].body_writes && n.items[0].writes(), "a local fn's block mod does not write its block");
+        assert!(n.writes());
+        let deep = "fn a() { fn b() { fn c() { m!(); } } }";
+        assert!(scan(deep, heap.alloc()).writes(), "a statement call two bodies deep writes nothing");
+        let plain = "fn a() { fn b() -> u8 { 1 } const K: u8 = 1; b() + K }";
+        let n = scan(plain, heap.alloc());
+        assert!(!n.writes() && n.items.iter().all(|i| !i.body_writes));
     }
 }

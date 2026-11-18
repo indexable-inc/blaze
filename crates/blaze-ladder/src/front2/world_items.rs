@@ -314,6 +314,44 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
         self.fill(Fill::Store(w))
     }
 
+    /// An impl question (`fill`, `Fill::Impls` or `Fill::Inherent`) the body's buckets hold no
+    /// answer to: the one seam between the two ways a body's check meets it (rule 78, chosen by
+    /// `Store::seeds` as [`Self::store_want`]'s is; the cost test runs both and asserts equal
+    /// answers and read lists):
+    /// - ON THE SPOT: over a seeded store with the body's buckets made (check.rs
+    ///   `check_rounds_as` makes them before round 0), the question is answered now through
+    ///   shared borrows, by the same body `make_once` runs between rounds (check.rs
+    ///   `trait_question` / `inherent_question` over `Importing`: the trait's head and the
+    ///   candidates' headers imported from their frozen records, the impls filed through the
+    ///   buckets' one index borrow, which records the bucket cells read, `names.impls_read`, as
+    ///   between rounds; the answer filed as a new row). `Store::imported` counts it, so
+    ///   [`Self::again`] asks at once and reads the filed answer.
+    /// - NEXT ROUND: over a lowering store, or where the on-the-spot path leaves it (a head its
+    ///   seed does not file through a shared borrow, `check::NotHere`; or a refusal: a table
+    ///   read, a candidate without its header), the fill `make_once` makes between rounds,
+    ///   which meets the same seed or refusal and names it there (rule 3: nothing is dropped;
+    ///   the fill repeats the work through `&mut`, where the refusal is kept).
+    fn impl_question<T>(&self, fill: Fill) -> Fetch<T> {
+        let (Some(seeds), Some(b)) = (self.store.seeds, self.buckets) else { return self.fill(fill) };
+        use super::check::{BuildOrder, Importing, Made, inherent_question, trait_question};
+        let mut heads = Importing { keys: self.keys, store: self.store, seeds };
+        // The order a question's candidate headers are imported in: an answer depends on none
+        // (each is a function of its own record), and the check's `BuildOrder` is the round
+        // loop's, which a body answered in one round never reaches.
+        let made = match fill {
+            Fill::Impls(trait_, shape) => trait_question(self.names, &mut heads, b, trait_, shape, BuildOrder::AsAsked),
+            Fill::Inherent(shape, name) => inherent_question(self.names, &mut heads, b, shape, name, BuildOrder::AsAsked),
+            Fill::Store(_) => return self.fill(fill),
+        };
+        match made {
+            Ok(Made::Made) => {
+                self.store.imported.set(self.store.imported.get() + 1);
+                Err(Missing)
+            }
+            Ok(Made::Later(_)) | Err(_) => self.fill(fill),
+        }
+    }
+
     /// `ask` answered, asked again after each head it imported ([`Self::store_want`]). Each
     /// import files a cell not filed before (`want_unmade` asks only an unmade want), so the
     /// asks are bounded by the cells the question reads; past [`MOST_IMPORTS_A_QUESTION`] the
@@ -583,11 +621,11 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 Some(lib) => format!("the impls of the trait {lib:x} at {shape:?}"),
                 None => format!("the impls of the trait {trait_:?} at {shape:?}"),
             };
-            return self.gap(self.failed_impl(k, why, &asked));
+            return self.gap(self.failed_impl(k, &why, &asked));
         }
         match self.buckets.and_then(|b| b.impls_of(trait_, shape)) {
             Some(v) => Ok(v),
-            None => self.fill(Fill::Impls(trait_, shape)),
+            None => self.impl_question(Fill::Impls(trait_, shape)),
         }
     }
 
@@ -611,11 +649,11 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
 
     fn inherent_once(&self, shape: Shape, name: Name) -> Fetch<&[AssocItem]> {
         if let Some((k, why)) = self.buckets.and_then(|b| b.inherent_gap(shape, name)) {
-            return self.gap(self.failed_impl(k, why, &format!("the inherent items of {shape:?} named {name:?}")));
+            return self.gap(self.failed_impl(k, &why, &format!("the inherent items of {shape:?} named {name:?}")));
         }
         match self.buckets.and_then(|b| b.inherent(shape, name)) {
             Some(v) => Ok(v),
-            None => self.fill(Fill::Inherent(shape, name)),
+            None => self.impl_question(Fill::Inherent(shape, name)),
         }
     }
 

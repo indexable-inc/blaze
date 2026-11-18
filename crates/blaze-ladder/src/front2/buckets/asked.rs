@@ -151,7 +151,7 @@ fn heads_of<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Opti
     Some(out)
 }
 
-impl Buckets {
+impl BucketIndex {
     /// Files what the question `ask` at `home` can be answered from, by bucket (module docs);
     /// nothing over the solved names, over a source with no bucket index, or with the rows
     /// planted off ([`Buckets::admit`] then files whole crates). Call it after

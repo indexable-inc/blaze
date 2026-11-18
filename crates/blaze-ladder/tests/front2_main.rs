@@ -386,7 +386,7 @@ impl<'n> WalkHooks<'n> for HisMain<'n> {
                 let kids: Vec<u32> = kids.iter().map(|k| k.0).collect();
                 out.push_str(&format!("  NODE {id} = {:?} over {kids:?}\n", tys.node(blaze_typeck::PTy(id))));
             }
-            for (k, why) in b.failed.iter().take(20) {
+            for (k, why) in b.index().failed.iter().take(20) {
                 out.push_str(&format!("FAILED HEADER {}: {why}\n", shown(names, crate_names, *k)));
             }
         }
@@ -423,14 +423,14 @@ impl<'n> WalkHooks<'n> for HisMain<'n> {
                 other => out.push_str(&format!("T::X rule: core's ChangeOutputType not asked by this check ({:?})\n", other.map(|o| o.0.is_some()))),
             }
         }
-        let lowered = records.buckets.as_ref().map_or(0, |b| b.lowered);
+        let lowered = records.buckets.as_ref().map_or(0, |b| b.index().lowered);
         let filed = records.buckets.as_ref().map(|b| b.filed());
-        out.push_str(&format!("impls on a builtin the checker has no type for (filed nowhere): {:?}\n", records.buckets.as_ref().map(|b| b.no_checker_type)));
+        out.push_str(&format!("impls on a builtin the checker has no type for (filed nowhere): {:?}\n", records.buckets.as_ref().map(|b| b.index().no_checker_type)));
         out.push_str(&format!("impl headers lowered by the check: {lowered} of the program's {}; filed (trait+shape, trait any, inherent, inherent any, unread): {filed:?}\n", records.index.impls.len()));
         // The unread impls by class: a count and samples from different crates.
         if let Some(b) = records.buckets.as_ref() {
             let mut classes: Vec<(String, usize, Vec<String>)> = Vec::new();
-            for (k, why) in b.unread_why.iter() {
+            for (k, why) in b.index().unread_why.iter() {
                 let class = why.class();
                 let krate = names.crate_of(*k).and_then(|c| crate_names.get(c).copied()).unwrap_or("?");
                 let sample = format!("[{krate}] {} : {why:?}", shown(names, crate_names, *k));
@@ -447,8 +447,8 @@ impl<'n> WalkHooks<'n> for HisMain<'n> {
             classes.sort_by(|a, b| b.1.cmp(&a.1));
             // By crate and path as written: the reductions to send to the names library's lane.
             let mut by_path: Vec<(String, usize)> = Vec::new();
-            for (k, why) in b.unread_why.iter() {
-                let krate = names.crate_of(*k).and_then(|c| crate_names.get(c).copied()).unwrap_or("?");
+            for (k, why) in b.index().unread_why.iter() {
+                let krate =names.crate_of(*k).and_then(|c| crate_names.get(c).copied()).unwrap_or("?");
                 let path = match why {
                     blaze_ladder::front2::buckets::Unread::Resolve { path, .. } | blaze_ladder::front2::buckets::Unread::NotATrait { path, .. } => &**path,
                     _ => "",

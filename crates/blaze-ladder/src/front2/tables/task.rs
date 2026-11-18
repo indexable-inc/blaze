@@ -58,8 +58,6 @@ use super::view::Tables;
 const OUT_DOMAIN: &str = "blaze-ladder front2 body task out 1";
 /// The one cell a body's record offers its readers: its verdict (`out`).
 pub const VERDICT_CELL: Cell = Cell([0; 16]);
-/// The cell of a crate's lang rows in its `CrateScope` record.
-pub const LANG_CELL: Cell = Cell([0xfd; 16]);
 
 /// What a body task is asked to make inline and what the engine knows: the digest a cell holds
 /// today. A cell an earlier phase made is the engine's (`View::cell`); one no phase has made
@@ -388,7 +386,7 @@ fn fact_read<'n>(names: &'n Records<'n>, keys: &Keys, kind: FactKind, key: u128)
     }
 }
 
-/// A read as the engine names it (recorder.rs [`ReadOf`]): a names or lang read is a cell of
+/// A read as the engine names it (recorder.rs [`ReadOf`]): a names read (the lang rows too) is a cell of
 /// its crate's `CrateScope` record, a head read a cell of the item's `Signature`, an impl read
 /// a cell of its crate's `ImplBucket` table (all zero: the fact of the whole graph).
 pub fn cell_id(view: Tables<'_, '_>, read: TableRead) -> Result<Option<CellId>, TaskError> {
@@ -398,7 +396,7 @@ pub fn cell_id(view: Tables<'_, '_>, read: TableRead) -> Result<Option<CellId>, 
         // A builtin type's cell (`u32`'s item) is the language's, in no crate's record: the
         // toolchain every key covers fixes it, so no edit moves it.
         ReadOf::Names { krate } if krate == blaze_scope::BUILTIN_PREFIX => return Ok(None),
-        ReadOf::Names { krate } | ReadOf::Lang { krate } => {
+        ReadOf::Names { krate } => {
             // The crate's names task by its one name (blaze-drive key.rs): before, the raw key
             // was the subject, a name no task defines, so a names edit dirtied no body.
             let key = crate_by(&|key| key[..8] == krate).ok_or(TaskError::NoCrate { prefix: krate })?;
@@ -413,9 +411,5 @@ pub fn cell_id(view: Tables<'_, '_>, read: TableRead) -> Result<Option<CellId>, 
             impl_tables_name(key)
         }
     };
-    let cell = match read {
-        TableRead::Lang { .. } => LANG_CELL,
-        _ => Cell(read.cell()),
-    };
-    Ok(Some(CellId { of, cell }))
+    Ok(Some(CellId { of, cell: Cell(read.cell()) }))
 }

@@ -423,10 +423,11 @@ impl<'n> Locals<'n> {
         let parent = Self::parent(crate_key, at);
         let frame = self.frame;
         // The body's blocks as the names library made them modules: the same scan of the same
-        // text, so the same keys (`blaze_scope::blocks::block_modules`). None when the body
-        // is not an item or member of the library (a local item's own body).
+        // text, so the same keys (`blaze_scope::blocks::block_modules`). A local fn's, const's
+        // or static's own body is the library's item of its block's module when its blocks
+        // are written (`Self::library_twin`). None when the library has no such body.
         let nested = blaze_file_items::nested::scan(at.text, alloc);
-        let modules = match Self::library_body(names, at) {
+        let modules = match self.library_body(names, at.item, at.text) {
             Some(body) if nested.end == blaze_file_items::nested::NestedEnd::Whole => Some(blaze_scope::blocks::block_modules(crate_key, body, &nested, alloc)),
             _ => None,
         };
@@ -624,23 +625,50 @@ impl<'n> Locals<'n> {
         Ok(())
     }
 
-    /// The library's key of the body `at` when it is an item or a member of the names
-    /// library: the item whose text is the body's text itself (the same slice), or the member
-    /// of `at.item` (a member's body is kept under its container) whose text is. `None`: a
-    /// body the library does not list under `at.item` (a local item's own body).
-    fn library_body<S: NamesSource<'n>>(names: S, at: Enclosing<'_>) -> Option<LibKey> {
-        let same = |t: &str| core::ptr::eq(t.as_ptr(), at.text.as_ptr()) && t.len() == at.text.len();
-        if names.text_of(at.item).is_some_and(|it| same(it.text)) {
-            return Some(at.item);
+    /// The library's key of the body of `item` lowered from `text`, when the names library
+    /// has the body as an item's or a member's: the item whose text is the body's text itself
+    /// (the same slice); the member of `item` (a member's body is kept under its container)
+    /// whose text is; or, for a local `fn`, `const` or `static` ([`Self::library_twin`]), the
+    /// item its block's module declares for it. `None`: a body whose blocks the library made
+    /// no modules for. The one answer for every reader of a body's block modules
+    /// (`Locals::keep`, glob_uses.rs `PatternBlocks::of`).
+    pub(super) fn library_body<S: NamesSource<'n>>(&self, names: S, item: LibKey, text: &str) -> Option<LibKey> {
+        let same = |t: &str| core::ptr::eq(t.as_ptr(), text.as_ptr()) && t.len() == text.len();
+        if names.text_of(item).is_some_and(|it| same(it.text)) {
+            return Some(item);
+        }
+        if let Some(h) = self.heads.get(&checker_of(item)) {
+            return self.library_twin(names, h, text);
         }
         // The first member whose text is the body's, in declaration order.
         let mut found = None;
-        names.each_member(at.item, &mut |m| {
+        names.each_member(item, &mut |m| {
             if found.is_none() && same(m.text) {
                 found = Some(m.key);
             }
         });
         found
+    }
+
+    /// The names library's item for the local `fn`, `const` or `static` `h` whose text is
+    /// `text`: the item of the same name its block's module ([`LocalHead::names_at`]) declares
+    /// itself, with the same text. The library writes a block holding such an item as a module
+    /// when the item's own body writes a block (blaze-file-items nested.rs
+    /// `NestedItem::body_writes`: std's `init` > `fn reset_sigpipe` > `mod sigpipe`), and then
+    /// makes that body's blocks modules under the item's key, which
+    /// `blaze_scope::blocks::block_modules` derives from it. `None` when the block is no
+    /// module of the library or the module's item of that name is another text (one of two
+    /// `cfg`'d fns of one name: the other's).
+    fn library_twin<S: NamesSource<'n>>(&self, names: S, h: &LocalHead<'n>, text: &str) -> Option<LibKey> {
+        if !matches!(h.kind, LocalKind::Fn | LocalKind::Const | LocalKind::Static) {
+            return None;
+        }
+        let name = self.bodies.get(&h.enclosing)?.rows.iter().find(|r| r.key == h.lib)?.name;
+        let segments = [name];
+        let written = blaze_scope::names::Written { kind: blaze_surface::PathKind::Plain, segments: &segments };
+        let found = names.walk(h.names_at, blaze_surface::Namespace::Values, written).ok()?.whole(1)?;
+        let it = names.text_of(found.key)?;
+        (it.module == h.names_at && it.text == text).then_some(found.key)
     }
 
     /// The local item `name` names in `ns`, written in block `scope` of the body `owner`: the

@@ -316,7 +316,7 @@ fn a_primitive_self_impl_outside_core_answers_its_goal() {
         b.admit_asked(records, &keys, Homes::ANY, Ask::Trait(checker_of(mul), shape));
         let candidates = b.trait_candidates(checker_of(mul), shape, Homes::ANY);
         let held = candidates.contains(&row.key);
-        println!("STAGE candidate {}: {} (filed_from_rows {}, {} candidates)", case.body, if held { "yes" } else { "NO" }, b.filed_from_rows, candidates.len());
+        println!("STAGE candidate {}: {} (filed_from_rows {}, {} candidates)", case.body, if held { "yes" } else { "NO" }, b.index().filed_from_rows, candidates.len());
         if !held {
             wrong.push(format!("candidate {}", case.body));
         }

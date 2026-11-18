@@ -96,7 +96,15 @@ pub(crate) fn crate_records<'n>(name: Name, payload: &[u8], key: CrateItemKey, a
     let parts = sections::sections(payload).map_err(|error| LoadError::Sections { name, error })?;
     let names = blaze_scope::resolve::aligned(parts.names, alloc);
     let items = blaze_scope::resolve::aligned(parts.items, alloc);
-    let expansions = ExpansionTexts::open(blaze_scope::resolve::aligned(parts.expansions, alloc)).map_err(|error| LoadError::Expansions { name, error })?;
+    let expansions = blaze_scope::resolve::aligned(parts.expansions, alloc);
+    checked_records(name, key, names, items, expansions, alloc)
+}
+
+/// A crate's three sections, each 16-aligned where it lies (copied by [`crate_records`], or in
+/// a segment's mapping, engine_records.rs), checked once as `key`'s (rule 74): the one check of
+/// both readers (rule 30).
+pub(crate) fn checked_records<'n>(name: Name, key: CrateItemKey, names: &'n [u8], items: &'n [u8], expansions: &'n [u8], alloc: Alloc<'n>) -> Result<CrateRecords<'n>, LoadError> {
+    let expansions = ExpansionTexts::open(expansions).map_err(|error| LoadError::Expansions { name, error })?;
     let names_proof = Verified::check(names).map_err(|error| LoadError::Names { name, error })?;
     let found = names_proof.key();
     if found != key {
@@ -385,6 +393,46 @@ mod tests {
             Err(LoadError::OtherCrate { asked, found, which: "names", .. }) => assert_eq!((asked, found), (keys[0], keys[1])),
             other => panic!("lib's record under app's key was {other:?}"),
         }
+    }
+
+    /// THE TWO ROUTES OPEN ONE RECORD (engine_records.rs, rule 78), AND A COPY IS COUNTED: each
+    /// crate's whole `CrateScope` record laid at a multiple of sixteen, as a segment lays it, and
+    /// opened in place and by the copying route: the same sections' bytes; in place, each section
+    /// borrowed from inside the record and 0 bytes counted copied; copying, from outside it, every
+    /// section byte counted. The control for `engine_check_reads_records_in_place`'s 0. Prints
+    /// `engine records: N crates opened in place (B bytes, 0 copied) and by copying (C copied)`.
+    #[test]
+    fn the_copying_route_counts_every_byte_it_copies() {
+        use crate::engine_records::{Copying, InPlace, ReadCounts, open_record};
+        use blaze_cas::plain::Aligned16;
+        let names = solved();
+        let keys: std::vec::Vec<CrateItemKey> = names.crates().iter().map(|c| c.key).collect();
+        let payloads = payloads(&names);
+        let g = Alloc::global();
+        let (mut in_place, mut copying) = (ReadCounts::default(), ReadCounts::default());
+        for (key, payload) in keys.iter().zip(payloads.iter()) {
+            let name = scope_name(*key);
+            let head = blaze_drive::record::write_plain_head(name, ContentId::of("blaze-cli engine records test", b"source"), ContentId::of("blaze-cli engine records test", b"out"), &[], payload.len(), g);
+            let mut whole = std::vec::Vec::new();
+            whole.extend_from_slice(&head);
+            whole.extend_from_slice(payload);
+            let laid: &'static [u8] = blaze_scope::resolve::aligned(&whole, g);
+            let record = Aligned16::new(laid).unwrap_or_else(|e| panic!("the laid record: {e}"));
+            let read = open_record::<InPlace>(name, record, *key, &mut in_place, g).unwrap_or_else(|e| panic!("in place: {e}"));
+            let copied = open_record::<Copying>(name, record, *key, &mut copying, g).unwrap_or_else(|e| panic!("copying: {e}"));
+            assert_eq!((read.names, read.items), (copied.names, copied.items), "the two routes read other bytes");
+            let inside = laid.as_ptr_range();
+            assert!(inside.contains(&read.names.as_ptr()) && inside.contains(&read.items.as_ptr()), "in place: a section not borrowed from its record");
+            assert!(!inside.contains(&copied.names.as_ptr()) && !inside.contains(&copied.items.as_ptr()), "copying: a section borrowed, not copied");
+        }
+        let sections: usize = payloads.iter().map(|payload| {
+            let parts = sections::sections(payload).unwrap_or_else(|e| panic!("{e}"));
+            parts.names.len() + parts.items.len() + parts.expansions.len()
+        }).sum();
+        assert_eq!(in_place.records, keys.len() as u64);
+        assert_eq!(in_place.copied, 0, "in place: a byte counted copied");
+        assert_eq!(copying.copied, sections as u64, "CONTROL: the copying route's copy is counted, every section byte");
+        println!("engine records: {} crates opened in place ({} bytes, 0 copied) and by copying ({} copied)", keys.len(), in_place.bytes, copying.copied);
     }
 
     /// A store without the record: "not in the store", naming the key; nothing is made here.

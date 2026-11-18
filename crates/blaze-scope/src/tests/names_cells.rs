@@ -424,3 +424,117 @@ fn the_items_search_cells_agree_with_the_record() {
     assert!(variants >= 2, "`E`'s variants are not `VariantOf` rows: {variants}");
     assert!(beginnings > 0 && absent > 0, "no beginning found ({beginnings}) or none absent ({absent})");
 }
+
+/// Foreign items written every way std and libc write them: by a macro call's expansion
+/// (`decl!`), through a nested macro inside a `mod` (`outer!` calls `decl_static!`), by hand
+/// with `extern "system"`, and by hand with a bare `extern`.
+const FOREIGN: &str = r#"#![no_core]
+macro_rules! decl { () => { extern "C" { fn abs(x: i32) -> i32; } } }
+decl!();
+macro_rules! decl_static { () => { extern { static environ: u8; } } }
+macro_rules! outer { () => { decl_static!(); } }
+pub mod m {
+    outer!();
+}
+extern "system" { fn sys(); }
+extern { fn bare(); }
+pub fn own() {}
+"#;
+
+/// [`FOREIGN`] with the hand-written `extern "system"` block's string edited, nothing else.
+const FOREIGN_EDITED: &str = r#"#![no_core]
+macro_rules! decl { () => { extern "C" { fn abs(x: i32) -> i32; } } }
+decl!();
+macro_rules! decl_static { () => { extern { static environ: u8; } } }
+macro_rules! outer { () => { decl_static!(); } }
+pub mod m {
+    outer!();
+}
+extern "C-unwind" { fn sys(); }
+extern { fn bare(); }
+pub fn own() {}
+"#;
+
+static FOREIGN_BEFORE: Texts = Texts(&[&[("/k0/lib.rs", FOREIGN)]]);
+static FOREIGN_AFTER: Texts = Texts(&[&[("/k0/lib.rs", FOREIGN_EDITED)]]);
+
+/// One crate solved: its names record's bytes and its items record's bytes.
+fn foreign_side(texts: &'static Texts) -> (&'static [u8], &'static [u8]) {
+    let g = blaze_own::testing::heap().alloc();
+    let inputs = [input("k0", "/k0/lib.rs", &[])];
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let s = &solved[0];
+    assert!(s.names.notes.is_empty(), "notes {:?}", s.names.notes);
+    let names = aligned(&encode(s.names, g).unwrap_or_else(|e| panic!("encode: {e:?}")), g);
+    let items = aligned(&items_encode(s.names, g).unwrap_or_else(|e| panic!("items encode: {e:?}")), g);
+    (names, items)
+}
+
+/// Each named item row of the record: (name, key, its text's place is an expansion, `foreign`).
+fn foreign_rows(items: &ItemsRecord<'static>) -> Vec<(&'static str, ItemKey, bool, Option<&'static str>)> {
+    let mut rows = Vec::new();
+    for i in 0..items.items() {
+        let row = items.item_at(i).unwrap_or_else(|e| panic!("item row {i}: {e:?}")).unwrap_or_else(|| panic!("item row {i} is absent"));
+        if let Some(name) = row.name {
+            let in_expansion = matches!(row.text.map(|t| t.at), Some(crate::resolve::At::Expansion(_)));
+            rows.push((name, row.key, in_expansion, row.foreign));
+        }
+    }
+    rows
+}
+
+/// THE RULE (F1, 2026-11-17): what a foreign item's ABI is, is a fact of the item, written once
+/// by the names task into its items row, whoever wrote the item. Over records `extern_abi` was
+/// refused for a bodiless fn or static an expansion wrote ("the expansion's outline is not made
+/// again over records"), which stopped std's hello world.
+///
+/// Shows: (a) `abs`, written by `decl!`'s expansion, holds "C" and its text is the expansion's;
+/// (b) `environ`, written two macros deep inside `mod m`, holds "C" (a bare `extern`) and is
+/// an expansion's too, a static; (c) `sys` holds "system" and `bare` "C"; `own` (a fn with a
+/// body, in no block) holds none. (e) the control: editing `sys`'s block string moves `sys`'s
+/// `Item` cell and leaves `own`'s alone, and the row then holds "C-unwind".
+///
+/// A writer that read the ABI only from a file's outline fails (a) and (b); one that wrote
+/// "C" for every block fails (c); an `Item` digest that left the field out fails (e).
+#[test]
+fn a_foreign_items_block_abi_is_in_its_row() {
+    let g = blaze_own::testing::heap().alloc();
+    let (names_before, items_before) = foreign_side(&FOREIGN_BEFORE);
+    let (names_after, items_after) = foreign_side(&FOREIGN_AFTER);
+    let before = ItemsRecord::open(items_before, g).unwrap_or_else(|e| panic!("items record: {e:?}"));
+    let after = ItemsRecord::open(items_after, g).unwrap_or_else(|e| panic!("items record: {e:?}"));
+    let rows = foreign_rows(&before);
+    let find = |rows: &[(&'static str, ItemKey, bool, Option<&'static str>)], name: &str| -> (ItemKey, bool, Option<&'static str>) {
+        rows.iter().find(|r| r.0 == name).map(|r| (r.1, r.2, r.3)).unwrap_or_else(|| panic!("no item row named `{name}` among {rows:?}"))
+    };
+    let (_, abs_in_expansion, abs) = find(&rows, "abs");
+    assert!(abs_in_expansion, "`abs` is not placed in `decl!`'s expansion");
+    assert_eq!(abs, Some("C"), "`abs` (an expansion's `extern \"C\"`)");
+    let (_, environ_in_expansion, environ) = find(&rows, "environ");
+    assert!(environ_in_expansion, "`environ` is not placed in `decl_static!`'s expansion");
+    assert_eq!(environ, Some("C"), "`environ` (a bare `extern` two macros deep in `mod m`)");
+    let (sys_key, _, sys) = find(&rows, "sys");
+    assert_eq!(sys, Some("system"), "`sys` (a hand-written `extern \"system\"`)");
+    assert_eq!(find(&rows, "bare").2, Some("C"), "`bare` (a hand-written bare `extern`)");
+    let (own_key, _, own) = find(&rows, "own");
+    assert_eq!(own, None, "`own` is in no `extern` block");
+
+    // (e) The edit of the block's string, at the cell level.
+    let rows_after = foreign_rows(&after);
+    let (sys_key_after, _, sys_after) = find(&rows_after, "sys");
+    assert_eq!(sys_after, Some("C-unwind"), "`sys` after its block's string was edited");
+    let (own_key_after, ..) = find(&rows_after, "own");
+    let digest = |names: &'static [u8], items_bytes: &'static [u8], text: &'static str, key: ItemKey| -> Option<ContentId> {
+        let items = ItemsRecord::open(items_bytes, g).unwrap_or_else(|e| panic!("items record: {e:?}"));
+        let record = NamesRecord::open(Verified::check(names).unwrap_or_else(|e| panic!("a record does not check: {e:?}")));
+        let read = move |of: TextOf<'_>| -> Option<&'static str> { matches!(of, TextOf::File { index: 0, .. }).then_some(text) };
+        let wholes = [(Section::Items, items_bytes)];
+        seen_by_record(&record, Some((&items, &read)), &wholes, NameCell::Item { key }).unwrap_or_else(|e| panic!("the `Item` cell of {key:?}: {e:?}"))
+    };
+    let sys_was = digest(names_before, items_before, FOREIGN, sys_key);
+    let sys_now = digest(names_after, items_after, FOREIGN_EDITED, sys_key_after);
+    assert!(sys_was.is_some() && sys_now.is_some(), "`sys` has no `Item` cell");
+    assert_ne!(sys_was, sys_now, "editing `sys`'s block ABI did not move its `Item` cell");
+    assert_eq!(digest(names_before, items_before, FOREIGN, own_key), digest(names_after, items_after, FOREIGN_EDITED, own_key_after), "an edit of another item's block moved `own`'s `Item` cell");
+    std::println!("FOREIGN ROWS: abs {abs:?} (expansion), environ {environ:?} (nested expansion), sys {sys:?} then {sys_after:?}, own {own:?}; sys key same across the edit: {}", sys_key == sys_key_after);
+}

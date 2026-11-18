@@ -249,6 +249,71 @@ fn blocks_expand_a_statement_call_named_by_textual_scope() {
     assert!(all.len() >= 2, "{all:?}");
 }
 
+/// A body's macro call read at its block's module (front2 scoped.rs `ScopedBy::resolve`, the
+/// reader after the names are done): Rust's order, textual scope first. The Reference, "Macros
+/// by example", "Textual scope": a `macro_rules!` written before the fn in its module is in
+/// scope in the fn's body, so `seven` read at the body's block names the module's definition
+/// (the regression of 2026-11-17: core's `argument_new!` in `Argument::new_debug`, "segment 0:
+/// not found", because the body's outermost block has no `mod` line in its module and the walk
+/// read none of the module's sequence); at an inner block too (its outer block is unmarked in
+/// the module, and marks the inner one); a block's own `macro_rules! seven` shadows the
+/// module's; a name nothing defines is not found (the control).
+const BY_BODY_TEXTUAL: &str = "#![no_core]
+macro_rules! seven { () => {} }
+pub fn by_module() { seven!(); }
+pub fn by_block() { macro_rules! seven { () => {} } seven!(); }
+pub fn by_nested() { { seven!(); } }
+pub fn by_nothing() { nothing_binds!(); }
+";
+
+static BY_BODY_TEXTUAL_TEXTS: Texts = Texts(&[&[("/user/lib.rs", BY_BODY_TEXTUAL)]]);
+
+#[test]
+fn a_block_reads_the_macro_rules_of_its_module_first() {
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &BY_BODY_TEXTUAL_TEXTS);
+    let krate = names.krate(0);
+    let root = names.root(0);
+    let module_seven = krate
+        .done
+        .get(&root)
+        .and_then(|r| r.scope.textual.iter().find(|d| d.name == "seven").map(|d| d.def))
+        .unwrap_or_else(|| panic!("the module's `macro_rules! seven`"));
+    // Every block's module of the crate, by its chain; in key order, so the run is one order.
+    let mut blocks: Vec<(blaze_id::ItemKey, usize)> =
+        krate.chains.iter().filter(|(k, _)| crate::names::World::anonymous(&names, **k)).map(|(k, c)| (*k, c.len())).collect();
+    blocks.sort_unstable();
+    assert_eq!(blocks.len(), 5, "one block each for by_module, by_block, by_nothing, two for by_nested: {blocks:?}");
+    let read = |module: blaze_id::ItemKey, name: &'static str| {
+        let segments: &'static [&'static str] = match name {
+            "seven" => &["seven"],
+            _ => &["nothing_binds"],
+        };
+        names.item_at(module, Namespace::Macros, Written { kind: PathKind::Plain, segments }, Alloc::global()).map(|at| at.def.key)
+    };
+    let (mut by_module, mut by_own, mut inner) = (0, 0, 0);
+    for &(block, depth) in blocks.iter() {
+        let own = krate.done.get(&block).and_then(|r| r.scope.textual.iter().find(|d| d.name == "seven").map(|d| d.def));
+        let got = read(block, "seven").unwrap_or_else(|e| panic!("`seven` at block {block:x} (chain {depth}): {e}"));
+        match own {
+            Some(def) => {
+                assert_eq!(got, def, "a block's own `macro_rules! seven` shadows the module's");
+                by_own += 1;
+            }
+            None => {
+                assert_eq!(got, module_seven, "the module's `macro_rules! seven` at block {block:x} (chain {depth})");
+                by_module += 1;
+                if depth > 2 {
+                    inner += 1;
+                }
+            }
+        }
+        let none = read(block, "nothing_binds");
+        assert!(none.is_err(), "a name nothing defines is not found at block {block:x}: {none:?}");
+    }
+    assert_eq!((by_module, by_own, inner), (4, 1, 1), "four blocks read the module's (one an inner block), one its own");
+}
+
 /// A trait declared in a block: the shape of core's `Write::write_fmt` (library/core/src/fmt/
 /// mod.rs: `trait SpecWriteFmt { .. }` and `impl<W: Write + ?Sized> SpecWriteFmt for &mut W`
 /// in the fn's body), and a block whose only item is a trait. The Reference, "Statements",

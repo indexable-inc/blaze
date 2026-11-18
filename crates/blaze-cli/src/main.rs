@@ -96,6 +96,7 @@ mod engine_why;
 mod engine_names;
 mod engine_times;
 mod engine_pool;
+mod engine_records;
 mod engine_scripts;
 mod engine_store;
 mod engine_tasks;

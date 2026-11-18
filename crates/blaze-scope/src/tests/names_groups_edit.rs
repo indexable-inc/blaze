@@ -95,7 +95,8 @@ fn drive_marked(before: &Groups, after: &Groups, texts: &'static Texts, moved: &
         Ok(groups)
     };
     mark(marks, String::from("driver.re_solve"));
-    let edited = re_solve_planted(edit, &mut OneGroup { solve_crate, alloc }, plant, alloc)?;
+    // The module tree record as the records were written: the solve reads its members' files.
+    let edited = re_solve_planted(edit, &mut OneGroup { solve_crate, alloc, tree: Some(before.tree) }, plant, alloc)?;
     mark(marks, String::from("driver.paths"));
     let path = |k: &ItemKey| {
         before.groups.iter().chain(after.groups.iter()).find_map(|(paths, g)| g.members.iter().position(|m| m == k).map(|i| paths[i].clone())).unwrap_or_else(|| std::format!("{k:?}"))
@@ -251,6 +252,90 @@ fn names_groups_edit_control_a_skipped_reader_is_caught() {
     let (edited, entered) = drive(&b, &a, &USE_ADDED_T, &[], EditPlant::SkipOneReader);
     assert_eq!(entered, std::vec![one("k0::a")], "the plant did not skip `r`");
     assert!(!equal(&edited, &a), "the oracle did not catch the reader left out");
+}
+
+/// A fresh solve's records, by module: what the differential test answers outside modules by.
+struct FreshRecords<'g>(&'g Groups);
+
+impl crate::cells::GroupRecords for FreshRecords<'_> {
+    fn group_of(&self, module: ItemKey) -> Option<crate::cells::GroupRef<'_>> {
+        self.0.groups.iter().find(|(_, g)| g.members.contains(&module)).map(|(_, g)| crate::cells::GroupRef::of(g))
+    }
+}
+
+/// The one-group solve of `paths` in `texts` with `records` outside, from `tree` (or walking).
+fn solve_alone(texts: &'static Texts, records: &Groups, paths: &[&str], tree: Option<&[u8]>) -> Vec<NameGroup<'static>> {
+    let mut members: Vec<ItemKey> = records.groups.iter().flat_map(|(ps, g)| ps.iter().zip(g.members.iter()).filter(|(p, _)| paths.contains(&p.as_str())).map(|(_, k)| *k)).collect();
+    members.sort();
+    let g = blaze_own::testing::heap().alloc();
+    let members = Members { members: &members, records: &FreshRecords(records), tree };
+    resolve_members(&input("k0", "/k0/lib.rs", &[]), &[], Sysroot::default(), texts, 0, &Serial, members, g).unwrap_or_else(|e| panic!("solve alone: {e:?}")).iter().cloned().collect()
+}
+
+/// Where two answers of one solve differ: groups, members, then each list's first unequal row.
+fn first_differences(walk: &[NameGroup<'static>], record: &[NameGroup<'static>]) -> Vec<String> {
+    let mut out = Vec::new();
+    if walk.len() != record.len() {
+        out.push(std::format!("{} groups walking, {} from the record: walking {:?}, record {:?}", walk.len(), record.len(), walk.iter().map(|g| &g.members[..]).collect::<Vec<_>>(), record.iter().map(|g| &g.members[..]).collect::<Vec<_>>()));
+    }
+    for (w, r) in walk.iter().zip(record) {
+        if w.members[..] != r.members[..] {
+            out.push(std::format!("members {:?} / {:?}", &w.members[..], &r.members[..]));
+        }
+        if w.own[..] != r.own[..] {
+            out.push(std::format!("own {:?} / {:?}", &w.own[..], &r.own[..]));
+        }
+        let only = |a: &[GroupRead], b: &[GroupRead]| a.iter().filter(|x| !b.contains(x)).copied().collect::<Vec<_>>();
+        if w.reads[..] != r.reads[..] {
+            out.push(std::format!("reads walking only {:?}; record only {:?}", only(&w.reads, &r.reads), only(&r.reads, &w.reads)));
+        }
+        if w.defines[..] != r.defines[..] {
+            let a: Vec<_> = w.defines.iter().filter(|x| !r.defines.contains(x)).collect();
+            let b: Vec<_> = r.defines.iter().filter(|x| !w.defines.contains(x)).collect();
+            out.push(std::format!("defines walking only {a:?}; record only {b:?}"));
+        }
+        if w.cells_read[..] != r.cells_read[..] {
+            let a: Vec<_> = w.cells_read.iter().filter(|x| !r.cells_read.contains(x)).collect();
+            let b: Vec<_> = r.cells_read.iter().filter(|x| !w.cells_read.contains(x)).collect();
+            out.push(std::format!("cells read walking only {a:?}; record only {b:?}"));
+        }
+        if w.bytes[..] != r.bytes[..] {
+            let at = w.bytes.iter().zip(r.bytes.iter()).position(|(x, y)| x != y).unwrap_or(w.bytes.len().min(r.bytes.len()));
+            out.push(std::format!("bytes differ at {at} of {} / {}", w.bytes.len(), r.bytes.len()));
+        }
+    }
+    out
+}
+
+/// The differential (CM's step B): one group solved alone walking every file and from the module
+/// tree record, with the same records outside, writes the same group.
+#[test]
+fn names_groups_edit_the_tree_record_answers_as_the_walk() {
+    let (b, a) = (Groups::solve(&USE_T), Groups::solve(&USE_ADDED_T));
+    std::println!("TREE DIFF: tree records of USE and USE_ADDED equal: {}", b.tree == a.tree);
+    let mut wrong = Vec::new();
+    for (name, texts, records, paths, tree) in [
+        ("r of USE_ADDED, its tree", &USE_ADDED_T, &a, &["k0::r"][..], a.tree),
+        ("r of USE_ADDED, USE's tree", &USE_ADDED_T, &a, &["k0::r"][..], b.tree),
+        ("a of USE_ADDED, USE's tree", &USE_ADDED_T, &b, &["k0::a"][..], b.tree),
+    ] {
+        let walk = solve_alone(texts, records, paths, None);
+        let record = solve_alone(texts, records, paths, Some(tree));
+        let d = first_differences(&walk, &record);
+        std::println!("TREE DIFF: {name}: {d:?}");
+        if !d.is_empty() {
+            wrong.push(std::format!("{name}: {d:?}"));
+        }
+    }
+    let (cb, ca) = (Groups::solve(&CUT_T), Groups::solve(&RECUT_T));
+    let walk = solve_alone(&RECUT_T, &cb, &["k0::a"], None);
+    let record = solve_alone(&RECUT_T, &cb, &["k0::a"], Some(cb.tree));
+    let d = first_differences(&walk, &record);
+    std::println!("TREE DIFF: a of RECUT, CUT's tree: {d:?}; fresh groups {}", ca.groups.len());
+    if !d.is_empty() {
+        wrong.push(std::format!("a of RECUT: {d:?}"));
+    }
+    assert!(wrong.is_empty(), "the tree record answers other than the walk: {wrong:#?}");
 }
 
 /// The engine's expansion cells that moved between two solves: each call's made text, as the
@@ -486,8 +571,10 @@ fn names_groups_edit_cost_of_one_module_in_two_thousand() {
     let (edited, entered) = drive_marked(&b, &a, after_t, &[], EditPlant::None, &marks).unwrap_or_else(|e| panic!("edit: {e:?}"));
     let one = start.elapsed().as_secs_f64();
     std::println!("NAMES EDIT COST PARTS (us): {}", parts(&marks));
+    // The edits whose one-group solve found the tree record's inputs moved and walked again.
+    let again = usize::from(marks.borrow().iter().any(|(p, _)| p == ".TreeAgain"));
     std::println!(
-        "NAMES EDIT COST: {MODULES} modules, {} groups: whole solve {whole:.3} s; one-module edit {one:.3} s, entered {} group(s) ({} module(s)); ratio whole/edit {:.1}",
+        "NAMES EDIT COST: {MODULES} modules, {} groups: whole solve {whole:.3} s; one-module edit {one:.3} s, entered {} group(s) ({} module(s)); ratio whole/edit {:.1}; tree walked again: {again} of 1 edits",
         a.groups.len(),
         entered.len(),
         entered.iter().map(|g| g.len()).sum::<usize>(),
@@ -496,6 +583,49 @@ fn names_groups_edit_cost_of_one_module_in_two_thousand() {
     let wrong = differ(&edited, &a);
     assert!(wrong.is_empty(), "the edit's records are not a fresh solve's: {wrong:?}");
     assert_eq!(entered.len(), 1, "floor 1: the edited module's group alone: {entered:?}");
+}
+
+// `m` globs `b`, which globs `a`: both outside `m`'s group, each filled from its record on
+// first read, the second step from the first's glob edge.
+const GLOB_CHAIN: &str = "#![no_core]
+pub mod a {
+    pub struct S;
+}
+pub mod b {
+    pub use crate::a::*;
+    pub struct T;
+}
+pub mod m {
+    use crate::b::*;
+    pub use self::S as U;
+    pub use self::T as V;
+}
+";
+const GLOB_CHAIN_M: &str = "#![no_core]
+pub mod a {
+    pub struct S;
+}
+pub mod b {
+    pub use crate::a::*;
+    pub struct T;
+}
+pub mod m {
+    use crate::b::*;
+    pub use self::S as U;
+    pub use self::T as V;
+    fn added() {}
+}
+";
+static GLOB_CHAIN_T: Texts = Texts(&[&[("/k0/lib.rs", GLOB_CHAIN)]]);
+static GLOB_CHAIN_M_T: Texts = Texts(&[&[("/k0/lib.rs", GLOB_CHAIN_M)]]);
+
+/// CK's missing fixture: a member's glob reaches through an outside module's glob into another
+/// outside module (two steps, both filled lazily from their records): `m`'s group alone,
+/// byte-equal.
+#[test]
+fn names_groups_edit_a_two_step_glob_chain_outside_comes_from_records() {
+    let (_, entered) = case("a two-step glob chain outside the group", &GLOB_CHAIN_T, &GLOB_CHAIN_M_T);
+    assert_eq!(entered, std::vec![one("k0::m")], "floor 1: `m`'s group alone");
 }
 
 /// A crate of `CHAIN` modules each re-exporting the one before (`m0` defines `S`) and `REST`

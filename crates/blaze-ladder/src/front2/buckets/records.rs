@@ -915,7 +915,7 @@ fn filing_of<'n, S: NamesSource<'n>>(names: S, row: &surface::ImplRow) -> Result
     Ok(Filing { key: row.impl_, filed, blanket, by_text, unread_bare, path_self })
 }
 
-impl Buckets {
+impl BucketIndex {
     /// Files what the question `ask` at `home` can be answered from, from the impl tables
     /// `tables` (module docs): the crates `home` admits, as [`Buckets::admit_asked`] chooses
     /// them, each asked through blaze-impls' lookups at every shape `ask`'s stands for. A

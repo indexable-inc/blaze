@@ -126,6 +126,10 @@ pub struct Checked<'m> {
 pub struct Held<'m> {
     pub bytes: &'m [u8],
     pub proof: Checked<'m>,
+    /// The same bytes as a segment's mapping, aligned, for a reader that reads them in place
+    /// (engine_records.rs); or why they are not: this command's own put, the arena's copy
+    /// (blaze-cas lent.rs `Lend::in_place`).
+    pub place: Result<blaze_cas::plain::Aligned16<'m>, blaze_cas::plain::NotInPlace>,
 }
 
 /// A planted bug of the tests (`plain_place_tests.rs`): each one the oracle must catch.
@@ -186,7 +190,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// record of the first namespace read that holds it. `None`: absent.
     pub fn get(&self, key: Key) -> Result<Option<Held<'m>>, PlaceError> {
         let lent: &'m Lent<D, Global> = self.lent;
-        Ok(lent.get(&CasKey(key.0))?.map(|lend| Held { bytes: lend.bytes, proof: Checked { _private: PhantomData } }))
+        Ok(lent.get(&CasKey(key.0))?.map(|lend| Held { bytes: lend.bytes, proof: Checked { _private: PhantomData }, place: lend.in_place() }))
     }
 
     /// `bytes` under `key`, copied once into the arena. A key held with equal bytes is left as

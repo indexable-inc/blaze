@@ -1,0 +1,15 @@
+{
+ "id": "write-only-lane-without-grep-tool",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RB3",
+ "where": "LANES-1810.md (a write-only lane uses Read, Grep, Glob, Edit, Write only)",
+ "what": "the lane's session had no Grep or Glob tool; the harness said to search with grep through Bash, which the lane rules forbid. Read-only grep and ls through Bash were used to find definitions; no build, test or write ran through the shell.",
+ "cost": "none beyond the doubt; a lane that obeys the letter cannot find a definition in a 4,000-line file",
+ "cause": "the lane brief names tools the session was not given",
+ "whys": "the rules were written for a session with Grep and Glob",
+ "class": "a rule naming a tool the session lacks",
+ "prevention": "say in LANES-1810.md that read-only grep/ls through Bash stand in for Grep/Glob when those are absent, or give lanes the Grep tool",
+ "annoyance": "the brief named crates/blaze-cli/src/engine_records.rs as in the tree; it is only in lane RC3's directory",
+ "workaround": "read RC3's copy for its form; wrote nothing against it",
+ "state": "open"
+}

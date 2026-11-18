@@ -209,11 +209,46 @@ pub struct OriginsView<'s> {
     pub column: OriginsRef<'s>,
 }
 
+/// Origins `bytes` cut where the column starts: the CALL part before it (where the call stands
+/// in its calling text: a function of the call's place, so two calls of equal input have two),
+/// the COLUMN after it (a function of the expansion alone: its tokens' places in the text and
+/// their origins, input tokens by index, rule 71; so two calls of equal input have one). The
+/// expansion records keep the column with the text and the call part in the crate's directory
+/// (expansion_records.rs); [`OriginsView::open_parts`] reads the two where they lie.
+pub fn split(bytes: &[u8]) -> Result<(&[u8], &[u8]), OriginsError> {
+    let at = call_len(bytes)?;
+    Ok(bytes.split_at(at))
+}
+
+/// The length of the call part that begins `bytes`: the fixed words and the macro's path,
+/// padded to 4.
+fn call_len(bytes: &[u8]) -> Result<usize, OriginsError> {
+    if bytes.len() < FIXED {
+        return Err(OriginsError::Short { len: bytes.len(), want: FIXED });
+    }
+    // The path's length is the sixth word after the 40 bytes of tag, file and calling call.
+    let column_at = FIXED + pad4(u32_at(bytes, 40 + 4 * 5) as usize);
+    if bytes.len() < column_at {
+        return Err(OriginsError::Short { len: bytes.len(), want: column_at });
+    }
+    Ok(column_at)
+}
+
 impl<'s> OriginsView<'s> {
     pub fn open(bytes: &'s [u8]) -> Result<OriginsView<'s>, OriginsError> {
-        if bytes.len() < FIXED {
-            return Err(OriginsError::Short { len: bytes.len(), want: FIXED });
+        let (call, column) = split(bytes)?;
+        OriginsView::open_parts(call, column)
+    }
+
+    /// The origins whose call part is `call` and whose column is `column`, each read where it
+    /// lies (an expansion record's column, its crate directory's call part): equal to
+    /// [`OriginsView::open`] of the two joined.
+    pub fn open_parts(call: &'s [u8], column: &'s [u8]) -> Result<OriginsView<'s>, OriginsError> {
+        let at = call_len(call)?;
+        if at != call.len() {
+            return Err(OriginsError::Head { what: "call part's length (not its path's padded end)", word: u32::try_from(call.len()).unwrap_or(u32::MAX) });
         }
+        let bytes = call;
         let mut key = [0u8; 32];
         key.copy_from_slice(&bytes[8..40]);
         let text = match u32_at(bytes, 0) {
@@ -228,14 +263,9 @@ impl<'s> OriginsView<'s> {
             1 => true,
             w => return Err(OriginsError::Head { what: "implicit flag", word: w }),
         };
-        let name_len = word(5) as usize;
-        let name_end = FIXED + name_len;
-        let column_at = FIXED + pad4(name_len);
-        if bytes.len() < column_at {
-            return Err(OriginsError::Short { len: bytes.len(), want: column_at });
-        }
+        let name_end = FIXED + word(5) as usize;
         let macro_name = core::str::from_utf8(&bytes[FIXED..name_end]).map_err(|_| OriginsError::Head { what: "macro path (not UTF-8)", word: word(5) })?;
-        let (column, _) = OriginsRef::open(&bytes[column_at..]).map_err(|error| OriginsError::Column { call: None, error })?;
+        let (column, _) = OriginsRef::open(column).map_err(|error| OriginsError::Column { call: None, error })?;
         Ok(OriginsView { text, item: ItemIndex(word(0)), input_start: word(1), input_len: word(2), shape, implicit, macro_name, column })
     }
 }

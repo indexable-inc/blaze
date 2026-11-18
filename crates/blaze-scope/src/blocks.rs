@@ -13,7 +13,12 @@
 //!
 //! Only a block on the way to an item that makes a module (`NestedKind::makes_module`) or to
 //! a macro call in statement position is written (a body with neither makes nothing: a
-//! block's `fn`, `const`, `static` and `use` are resolved by the body's own lowering), with
+//! block's `fn`, `const`, `static` and `use` are resolved by the body's own lowering), or to
+//! a `fn`, `const` or `static` whose own body writes a block
+//! ([`blaze_file_items::nested::NestedItem::body_writes`]: std's `init` declares `fn
+//! reset_sigpipe` whose `#[cfg(..)]` block declares `mod sigpipe`; the fn is then an item of
+//! its block's module, and its body's blocks are modules under that item's key, as any
+//! module item's body's are: a `mod` in a block is a module like any other), with
 //! EVERY item statement of it, in text order (a `macro_rules!` before its uses). A struct,
 //! enum, union or alias of a block is so an item of the block's module: its head is made by
 //! the ordinary code, in a scope without the enclosing function's generics and locals (the
@@ -179,6 +184,18 @@ mod tests {
         assert_eq!(made, [outer, inner]);
         // The `if`'s block and the struct literal's braces are not written.
         assert_eq!(keys.iter().filter(|k| k.is_none()).count(), keys.len() - 2);
+    }
+
+    /// A local fn whose own body declares a `mod` makes its block a module holding the fn
+    /// (std's `init` > `reset_sigpipe` > `mod sigpipe`): the fn is that module's item, and its
+    /// body is the names library's to write its own blocks for. Without
+    /// `NestedItem::body_writes` in `written` nothing is written.
+    #[test]
+    fn a_local_fn_with_a_block_mod_is_a_module_item() {
+        assert_eq!(
+            made("fn init() { fn reset() -> u8 { { mod m { pub const A: u8 = 3; } m::A } } reset(); }"),
+            "mod __blaze_block_0 {\nuse super::*;\nfn reset() -> u8 { { mod m { pub const A: u8 = 3; } m::A } }\n}\n"
+        );
     }
 
     #[test]

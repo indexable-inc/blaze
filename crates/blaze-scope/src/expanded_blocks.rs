@@ -112,14 +112,16 @@ pub fn expansion_block_name<'a>(call: ItemKey, ordinal: u32, alloc: Alloc<'a>) -
     name
 }
 
-/// Which blocks of `nested` are written as modules: one that holds an item that makes a module
-/// ([`blaze_file_items::nested::NestedKind::makes_module`]) or a macro call in statement
-/// position, and every block around it.
+/// Which blocks of `nested` are written as modules: one that holds an item that writes it
+/// ([`blaze_file_items::nested::NestedItem::writes`]: an item that makes a module, or a `fn`,
+/// `const` or `static` whose own body writes a block, so that item is the block module's and
+/// its body's blocks are modules under it) or a macro call in statement position, and every
+/// block around it.
 pub(crate) fn written<'a>(nested: &Nested<'_>, alloc: Alloc<'a>) -> AVec<'a, bool> {
     let blocks = &nested.blocks;
     let mut written: AVec<'a, bool> = AVec::new_in(alloc);
     written.resize(blocks.len(), false);
-    let items = nested.items.iter().filter(|i| i.kind.makes_module()).map(|i| i.block);
+    let items = nested.items.iter().filter(|i| i.writes()).map(|i| i.block);
     let calls = nested.calls.iter().map(|c| c.block);
     for start in items.chain(calls) {
         let mut at = Some(start);

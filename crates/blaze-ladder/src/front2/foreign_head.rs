@@ -26,8 +26,9 @@
 //!   a `...` on one is then refused by heads.rs's variadic rule;
 //! - any other string: refused by name (`aapcs`, `stdcall`, ..: none is written in a block on
 //!   the hosts blaze builds for).
-//! An item whose block the source did not answer (over records, until the items row holds its
-//! `foreign` field) is refused by name: a fn is never taken for a Rust fn by a missing answer.
+//! An item whose block the source did not answer (over records: its items row, whose `foreign`
+//! field holds the block's ABI, did not read) is refused by name: a fn is never taken for a Rust
+//! fn by a missing answer.
 
 use blaze_id::ItemKey as LibKey;
 use blaze_lower::machine::sig;

@@ -87,6 +87,10 @@ impl<'r> GroupRef<'r> {
 pub struct Members<'r> {
     pub members: &'r [ItemKey],
     pub records: &'r dyn GroupRecords,
+    /// The crate's module tree record ([`crate::tree_record`]) as the records were written
+    /// with: the solve then reads, outlines and lowers the members' files alone. `None`: the
+    /// caller holds none, and the solve walks and lowers every file to make the tree.
+    pub tree: Option<&'r [u8]>,
 }
 
 impl Members<'_> {
@@ -119,6 +123,10 @@ pub enum MemberRefusal {
     GlobSource { module: ItemKey, source: ItemKey },
     /// D116's check re-decides the whole crate: never asked with members.
     DecideCheck,
+    /// The module tree record handed in did not read.
+    TreeRecord { error: crate::tree_record::TreeRecordError },
+    /// The tree record's crate root did not read.
+    TreeCrateRoot,
 }
 
 impl MemberRefusal {
@@ -133,7 +141,7 @@ impl MemberRefusal {
             | MemberRefusal::MacroExports { module }
             | MemberRefusal::Ambiguous { module }
             | MemberRefusal::GlobSource { module, .. } => Some(module),
-            MemberRefusal::DecideCheck => None,
+            MemberRefusal::DecideCheck | MemberRefusal::TreeRecord { .. } | MemberRefusal::TreeCrateRoot => None,
         }
     }
 }
@@ -147,6 +155,8 @@ impl MemberRefusal {
 pub struct OneGroup<'a, F> {
     pub solve_crate: F,
     pub alloc: Alloc<'a>,
+    /// The crate's module tree record, handed to each crate solve ([`Members::tree`]).
+    pub tree: Option<&'a [u8]>,
 }
 
 /// Why [`OneGroup`] did not solve a group alone.
@@ -169,7 +179,7 @@ impl<'a, R: core::fmt::Debug, F: FnMut(Members<'_>) -> Result<AVec<'a, NameGroup
         asked.sort_unstable();
         asked.dedup();
         for _ in 0..MOST_WIDENINGS {
-            let got = (self.solve_crate)(Members { members: &asked, records }).map_err(OneGroupRefusal::Crate)?;
+            let got = (self.solve_crate)(Members { members: &asked, records, tree: self.tree }).map_err(OneGroupRefusal::Crate)?;
             let more = closing(&asked, &got, records, self.alloc);
             if more.is_empty() {
                 return Ok(got);

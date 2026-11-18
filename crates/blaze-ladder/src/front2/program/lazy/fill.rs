@@ -287,6 +287,15 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         // as written), or a row of a body named by the body's key (a `use`: the body whose
         // rows hold it, and its text as written, read below from its file).
         let Some((gap, others)) = local else {
+            // A diagnostic: its words and its `file:line` (rule 19: the checker's range is
+            // relative to the body's own item, rule 71; a body of an item declared in a body is
+            // placed through the items around it, as a gap is below).
+            if let CheckFail::Diags { owner, diags, .. } = &error
+                && let Some((code, range, about)) = diags.first()
+                && let Some((at, _)) = self.file_line(*owner, range.start, range.end.saturating_sub(range.start))
+            {
+                return LazyRefusal::Diagnostic { function: Box::from(function), code: code.code(), about: about.clone(), at: at.into_boxed_str(), others: diags.len() - 1 };
+            }
             return LazyRefusal::Check { function: Box::from(function), error };
         };
         let head = self.store.locals.head(crate::front2::keys::checker_of(gap.item)).copied();
@@ -299,33 +308,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             (None, Some((body, row))) => (body, None, Some(row)),
             (None, None) => return LazyRefusal::Check { function: Box::from(function), error },
         };
-        let names = self.front.names;
-        let keys = &self.front.keys;
-        // `file:line` of the gap's first byte, and the file's text there: its range is relative
-        // to its enclosing item (rule 71); an enclosing item itself declared in a body is at its
-        // own range in ITS enclosing one, out to a module's item, whose file the source names.
-        // Each step out leaves one local item: at most as many steps as there are.
-        let found = (|| {
-            let (mut outer, mut start) = (enclosing_key, gap.range.start);
-            for _ in 0..=self.store.locals.kept() {
-                let Some(up) = self.store.locals.head(outer) else { break };
-                start = start.checked_add(up.range.start)?;
-                outer = up.enclosing;
-            }
-            let lib = keys.library_in(names, outer)?;
-            let place = names.place_of(lib)?;
-            let blaze_scope::resolve::At::File(i) = place.at else { return None };
-            let shown = names.file_shown(place.krate, i)?;
-            let (line, _) = super::seam_rules::source_position(names, keys, outer, start).ok()?;
-            // The text written at the range, when the range is the file's own (an expansion's
-            // row is at its outermost call: the call's text).
-            let written = names.item_start(lib).and_then(|(_, item_start)| {
-                let from = item_start.checked_add(start)? as usize;
-                let to = from.checked_add((gap.range.end - gap.range.start) as usize)?;
-                names.file_text(place.krate, i)?.get(from..to)
-            });
-            Some((format!("{shown}:{line}"), written))
-        })();
+        let found = self.file_line(enclosing_key, gap.range.start, gap.range.end - gap.range.start);
         let (at, written) = match found {
             Some((at, written)) => (at, written),
             None => (format!("at {}..{} of its enclosing item, which is in no file the source answers", gap.range.start, gap.range.end), None),
@@ -363,6 +346,35 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             None => self.refused_shown(enclosing_key),
         };
         LazyRefusal::LocalNotBuilt { function: Box::from(function), enclosing, form: gap.form, head: words, at: at.into_boxed_str(), others }
+    }
+
+    /// `file:line` of byte `start` of the item `outer`'s text (a range relative to its item,
+    /// rule 71), and the file's `len` bytes there: an item declared in a body is at its own
+    /// range in ITS enclosing one, out to a module's item, whose file the source names. Each
+    /// step out leaves one local item: at most as many steps as there are. `None`: an item in
+    /// no file the source answers (an expansion's text keeps only its outermost call's file).
+    fn file_line(&self, outer: ItemKey, start: u32, len: u32) -> Option<(String, Option<&'n str>)> {
+        let names = self.front.names;
+        let keys = &self.front.keys;
+        let (mut outer, mut start) = (outer, start);
+        for _ in 0..=self.store.locals.kept() {
+            let Some(up) = self.store.locals.head(outer) else { break };
+            start = start.checked_add(up.range.start)?;
+            outer = up.enclosing;
+        }
+        let lib = keys.library_in(names, outer)?;
+        let place = names.place_of(lib)?;
+        let blaze_scope::resolve::At::File(i) = place.at else { return None };
+        let shown = names.file_shown(place.krate, i)?;
+        let (line, _) = super::seam_rules::source_position(names, keys, outer, start).ok()?;
+        // The text written at the range, when the range is the file's own (an expansion's row
+        // is at its outermost call: the call's text).
+        let written = names.item_start(lib).and_then(|(_, item_start)| {
+            let from = item_start.checked_add(start)? as usize;
+            let to = from.checked_add(len as usize)?;
+            names.file_text(place.krate, i)?.get(from..to)
+        });
+        Some((format!("{shown}:{line}"), written))
     }
 
     pub(super) fn shown(&self, k: ItemKey) -> String {

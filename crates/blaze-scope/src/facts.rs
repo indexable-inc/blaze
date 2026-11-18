@@ -53,6 +53,14 @@ pub trait ScopeFacts {
         let _ = out;
         Err(NotBuilt { method: "derive_helpers", item: derive }.into())
     }
+
+    /// The module's `mod` lines (each child, and whether it is `#[macro_use]`) pushed to `out`
+    /// when the facts hold them without its text: a one-group solve's module tree record
+    /// ([`crate::tree_record`]). `false`: they are its [`ScopeFacts::decls`]' `mods`.
+    fn mod_lines(&self, module: ItemKey, out: &mut AVec<'_, (ItemKey, bool)>) -> bool {
+        let _ = (module, out);
+        false
+    }
 }
 
 /// [`ScopeFacts`] over the records an [`Items`] reads: names are the records' string-table

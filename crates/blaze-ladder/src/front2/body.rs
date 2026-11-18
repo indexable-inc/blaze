@@ -185,7 +185,8 @@ impl<'n, S: NamesSource<'n>> blaze_lower::ValueNames for ModuleValues<'n, '_, S>
         let (names, krate, item, text) = (self.names, self.krate, self.item, self.text);
         let planted = self.store.locals.planted();
         let alloc = self.store.tys.alloc();
-        let blocks = self.blocks.get_or_insert_with(|| super::glob_uses::PatternBlocks::of(names, krate, item, text, alloc));
+        let kept = &self.store.locals;
+        let blocks = self.blocks.get_or_insert_with(|| super::glob_uses::PatternBlocks::of(names, kept, krate, item, text, alloc));
         let target = match super::glob_uses::by_uses(&Paths { names }, self.module, item, blocks, view, name, uses, locals, planted, alloc) {
             Ok(Some(target)) => target,
             Ok(None) => return None,

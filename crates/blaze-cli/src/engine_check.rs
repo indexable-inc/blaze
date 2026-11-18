@@ -469,6 +469,10 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     phases.mark_in("plan (the scripts, and the crates' names at their depths)", frame);
     // The bodies (engine_bodies.rs): one task a body part of each outline.
     planned.extend(crate::engine_bodies::plan(&outlined, alloc));
+    // The heads (engine_heads.rs `plan_items`): one task an outline entry with a head.
+    if names.is_some() {
+        planned.extend(crate::engine_heads::plan_items(&outlined, alloc));
+    }
     let mut bodies = crate::engine_bodies::BodiesStage::new();
     let mut heads = crate::engine_heads::HeadsStage::new();
     let graph = discovered.get(Name::unit_graph()).and_then(|one| one.made.as_ref().ok().map(|record| blaze_drive::Input { name: one.name, at: tools.key(one.name, &one.source), out: record.out }));
@@ -535,6 +539,9 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     let mut puts = 0u32;
     // What each stage's records cost this process (engine_store.rs `Ledger`).
     let mut ledger = crate::engine_store::Ledger::new();
+    // The Heads and Bodies stages' reader of the crates' records, in place in the store's
+    // mapping for the store's borrow (engine_records.rs): dropped with the store, never in a stage.
+    let mut read = crate::engine_records::EngineRecords::new();
     // Each phase's wall, its tasks' times, its merge and its put (engine_times.rs).
     let clock = &env.clock;
     let mut times = crate::engine_times::Times::new();
@@ -570,7 +577,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
                 if let Some(stage) = names.as_ref() {
                     heads.read_back += crate::engine_heads::complete(cx, &mut store, stage, &mut bodies.shelf, &|name| records.get(&name).copied(), engine.view(), frame)?;
                 }
-                bodies.run_phase(cx, &mut store, &handles, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame)?;
+                bodies.run_phase(cx, &mut store, &mut read, &handles, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame)?;
             }
             Stage::Scripts => match names.as_mut() {
                 Some(stage) => scripts.run_phase(cx, &mut store, &handles, stage, &entered, &mut buffers[0], &mut times, alloc, frame)?,
@@ -579,7 +586,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
             Stage::Heads => {
                 let handles = crate::engine_bodies::Handles { root, env: &env, graph, names: names.as_ref(), outlined: &outlined, workers, clock: phases.clock() };
                 let crate::engine_bodies::BodiesStage { kept, shelf, .. } = &mut bodies;
-                heads.run_phase(cx, &mut store, &handles, kept, shelf, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame)?;
+                heads.run_phase(cx, &mut store, &mut read, &handles, kept, shelf, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame)?;
             }
         }
         let wall = clock.now().since(began).map_or(0, crate::engine_times::ns);
@@ -655,6 +662,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
             ledger.released(phase.stage, freed);
         }
         ledger.merged(phase.stage, crate::store::Store::kept(&store));
+        ledger.read(phase.stage, read.counts());
         // What later phases read each entry by (a failed one its driver marked failed).
         for (name, made) in marks.drain(..) {
             match phase.stage {
@@ -801,6 +809,8 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     phases.mark_in("answer stored", frame);
     // The store's one commit, after the answer, as `check`'s (main.rs).
     crate::store::Store::after_answer(&mut store, cx, &mut blaze_drive::profile::Profile::default())?;
+    // Nothing read in place outlives the store's borrow of its `Lent` (engine_records.rs).
+    drop(read);
     drop(store);
     crate::store::after_answer_printed(cx, opened.lent, false, phases.clock(), err)?;
     phases.mark_in("store committed", frame);

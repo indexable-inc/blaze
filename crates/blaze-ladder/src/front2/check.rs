@@ -19,7 +19,7 @@ use blaze_scope::resolve::Names;
 use blaze_typeck as tc;
 use blaze_typeck::{BodyView, InferCtx, ItemKey, Name, Needs, Outcome, Question};
 
-use super::buckets::{Ask, BucketSource, Buckets, TablesReadError, Unfilled, inherent_home, trait_home};
+use super::buckets::{Ask, Buckets, TablesReadError, Unfilled, inherent_home, trait_home};
 use super::heads::{HeadError, Store, Want};
 use super::index::Index;
 use super::keys::{Keys, Origin, checker_of};
@@ -226,6 +226,13 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     let mut leaks = r.store.hidden.new_leaks();
     // The body task's meter (front2 tables/cost.rs): a measurement only.
     let meter = r.store.cost;
+    // A seeded store answers impl questions on the spot (world_items.rs
+    // `BodyWorld::impl_question`), so the body's impl index is made before round 0, the one
+    // maker `make_once` calls too (`Buckets::for_source`); over a lowering store the first impl
+    // fill makes it, as before.
+    if r.store.seeds.is_some() && r.buckets.is_none() {
+        *r.buckets = Some(Buckets::for_source(r.names, r.index));
+    }
     for round in 0..MOST_ROUNDS {
         r.store.hidden.set_leaking(&leaks);
         // Heads imported on the spot this round (world_items.rs `BodyWorld::store_want`).
@@ -975,7 +982,7 @@ fn shown_args(v: tc::PTys<'_>, args: tc::List) -> Box<str> {
 }
 
 /// A fill's failure, before the loop names the body.
-enum MakeFail {
+pub(super) enum MakeFail {
     Head(HeadError),
     Buckets(Unfilled),
     Tables(TablesReadError),
@@ -1152,114 +1159,211 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
     match fill {
         Fill::Store(want) => r.store.ensure(r.names, r.keys, want).map_err(MakeFail::Head),
         Fill::Impls(trait_, shape) => {
-            // `trait_home` reads the trait's head when one is made (whether each parameter
-            // defaults to `Self`) and the text's count when none is. A head made only after a
-            // question's first answer gave a later answer of the same question another home,
-            // other candidates and another gap, so two checks of one body read two answers
-            // under one key (rule 21; census 7: k256's `<impl ProjectivePoint>::GENERATOR`).
-            // So the head is made first, and the home is the head's whenever it can be made. A
-            // head its text refuses (`TransmuteFrom`'s const parameter) is refused at every
-            // ask, so its question's home is the text's at every ask; one that waits on a
-            // constant goes up as any head's wait does (`make` evaluates it and asks again).
-            if let Some(lib) = r.keys.library_in(r.names, trait_) {
-                match r.store.ensure(r.names, r.keys, Want::Head(lib)) {
-                    Ok(()) => {}
-                    Err(wait @ HeadError::Item(_, Why::NeedConst(..))) => return Err(MakeFail::Head(wait)),
-                    Err(_refused_by_its_text) => {}
-                }
+            let (names, index, order) = (r.names, r.index, r.order);
+            let b = &*r.buckets.get_or_insert_with(|| Buckets::for_source(names, index));
+            let mut heads = Lowering { names, keys: &mut *r.keys, store: &mut *r.store };
+            match trait_question(names, &mut heads, b, trait_, shape, order)? {
+                Made::Made => Ok(()),
+                Made::Later(never) => match never {},
             }
-            let _cost = super::tables::cost::Cost::enter(r.store.cost, super::tables::cost::Part::Impls);
-            // Only impls written where the orphan rules allow (`trait_home`) are candidates.
-            let home = trait_home(r.names, r.keys, r.store, trait_, shape);
-            let b = buckets_for(r.buckets, r.names, r.index, home);
-            // Over a bucket index: this question's buckets of the crates `home` admits.
-            admit_one(b, r.names, r.keys, home, Ask::Trait(trait_, shape))?;
-            let mut candidates = b.trait_candidates(trait_, shape, home);
-            // A negative impl is a candidate of its trait's questions (`Buckets::answer`): it
-            // decides an auto trait's structural rule, and the solver matches it to no positive
-            // goal; its refused header is the question's gap, never a wrong `yes`.
-            candidates.extend_from_slice(&b.negative_of(trait_, shape, home));
-            candidates.sort_unstable();
-            candidates.dedup();
-            lower_heads(r.names, r.keys, r.store, b, candidates, r.order)?;
-            b.answer(r.store, trait_, shape, home).map_err(MakeFail::Buckets)
         }
         Fill::Inherent(shape, name) => {
-            let _cost = super::tables::cost::Cost::enter(r.store.cost, super::tables::cost::Part::Impls);
-            // Only impls written in the type's own crate (`inherent_home`) are candidates.
-            let home = inherent_home(r.names, r.keys, shape);
-            let names = r.names;
-            let b = buckets_for(r.buckets, names, r.index, home);
-            admit_one(b, names, r.keys, home, Ask::Inherent(shape))?;
-            // The name filters first, from the impls' member rows (no header made): an impl
-            // that declares no member of the name is never the answer, so its header is not
-            // lowered for it. rustc finds an inherent item by name before it unifies self
-            // types; without this filter `<U1792>::LIMBS` in the header of crypto-bigint's
-            // `impl Uint<{ <U1792>::LIMBS / 2 }> { fn concat .. }` made that very header
-            // (census 7: "an array length names: Nested", 169 fns).
-            let mut candidates = b.inherent_candidates(shape, home);
-            candidates.retain(|&k| super::member_names::may_declare(names, k, name));
-            lower_heads(names, r.keys, r.store, b, candidates.clone(), r.order)?;
-            b.answer_inherent(r.store, shape, name, &candidates).map_err(MakeFail::Buckets)
+            let (names, index, order) = (r.names, r.index, r.order);
+            let b = &*r.buckets.get_or_insert_with(|| Buckets::for_source(names, index));
+            let mut heads = Lowering { names, keys: &mut *r.keys, store: &mut *r.store };
+            match inherent_question(names, &mut heads, b, shape, name, order)? {
+                Made::Made => Ok(()),
+                Made::Later(never) => match never {},
+            }
         }
     }
 }
 
-/// The impl index a question at `home` reads. Over the solved names every impl is filed when it
-/// is first made (`Buckets::new`); over records none is (`Buckets::lazy`), and the crates
-/// `home` admits are filed here, once each, before the question (`Buckets::admit`: nothing over
-/// the solved names).
-fn buckets_for<'b, 'n, S: NamesSource<'n>>(buckets: &'b mut Option<Buckets>, names: S, index: &Index<'n>, home: super::buckets::Homes) -> &'b mut Buckets {
-    let b = buckets.get_or_insert_with(|| match names.solved() {
-        Some(solved) => Buckets::new(solved, index),
-        None => Buckets::lazy(names),
-    });
-    // Over the impl tables a question files only its own buckets (`admit_one`): no crate is
-    // filed whole.
-    if names.impl_tables().is_none() {
-        b.admit(names, home);
-    }
-    b
+/// What making a head, or answering an impl question, came to: made, or left to a later
+/// maker for the reason `L` (an [`ImplHeads`] that is never left is `L = Infallible`).
+pub(super) enum Made<L> {
+    Made,
+    Later(L),
 }
 
-/// Files what `ask` at `home` is answered from: from the impl tables when the names source
-/// holds them (front2 buckets/records.rs, E3), else from the items records' bucket section.
-fn admit_one<'n, S: NamesSource<'n>>(b: &mut Buckets, names: S, keys: &Keys, home: super::buckets::Homes, ask: Ask) -> Result<(), MakeFail> {
-    match names.impl_tables() {
-        Some(tables) => tables.admit(b, names, keys, home, ask).map(|_| ()).map_err(MakeFail::Tables),
-        None => {
-            b.admit_asked(names, keys, home, ask);
-            Ok(())
+/// A head a seeded store could not file through shared borrows ([`Importing`]): its seed
+/// asked for it to be lowered (`Seeded::Lower`: the cell being made up the seeding stack), or
+/// failed. The question is left to its fill, which `make_once` makes between rounds over
+/// `&mut`, meeting the same seed there and its refusal by name (`HeadError::Seed`, the task's
+/// `TaskError::Seed`), never a different answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct NotHere;
+
+/// How an impl question's heads are made (rule 78: the choice is the one seam `Store::seeds`,
+/// as `BodyWorld::store_want`'s is; both instantiations run in the cost test, answers and read
+/// lists asserted equal):
+/// - [`Lowering`]: between rounds, through `&mut` (`Store::ensure`), every store;
+/// - [`Importing`]: on the spot, mid-check, through shared borrows from the frozen records of
+///   a seeded store (`HeadSeed::seed`), as `store_want` imports a head.
+pub(super) trait ImplHeads<'n> {
+    /// Why a head can be left to a later maker.
+    type Later;
+    fn store(&self) -> &Store<'n>;
+    fn keys(&self) -> &Keys;
+    /// `want` made; `Later` when it cannot be made here; `Err` refused.
+    fn make(&mut self, want: Want) -> Result<Made<Self::Later>, HeadError>;
+}
+
+/// Heads lowered (or seeded) between rounds, through `&mut` ([`ImplHeads`]).
+pub(super) struct Lowering<'a, 'n, S> {
+    pub names: S,
+    pub keys: &'a mut Keys,
+    pub store: &'a mut Store<'n>,
+}
+
+impl<'n, S: NamesSource<'n>> ImplHeads<'n> for Lowering<'_, 'n, S> {
+    type Later = core::convert::Infallible;
+
+    fn store(&self) -> &Store<'n> {
+        &*self.store
+    }
+
+    fn keys(&self) -> &Keys {
+        &*self.keys
+    }
+
+    fn make(&mut self, want: Want) -> Result<Made<core::convert::Infallible>, HeadError> {
+        self.store.ensure(self.names, self.keys, want).map(|()| Made::Made)
+    }
+}
+
+/// Heads imported on the spot from a seeded store's frozen records, through shared borrows
+/// ([`ImplHeads`]; world_items.rs `BodyWorld::impl_question`). Each head filed counts in
+/// `Store::imported`, as `store_want`'s does.
+pub(super) struct Importing<'a, 'n> {
+    pub keys: &'a Keys,
+    pub store: &'a Store<'n>,
+    pub seeds: &'n dyn super::tables::seeds::HeadSeed<'n>,
+}
+
+impl<'n> ImplHeads<'n> for Importing<'_, 'n> {
+    type Later = NotHere;
+
+    fn store(&self) -> &Store<'n> {
+        self.store
+    }
+
+    fn keys(&self) -> &Keys {
+        self.keys
+    }
+
+    fn make(&mut self, want: Want) -> Result<Made<NotHere>, HeadError> {
+        // As `Store::ensure` over a seeded store: a made want is made (its record filed it whole).
+        if self.store.made(want) {
+            return Ok(Made::Made);
+        }
+        let _cost = super::tables::cost::Cost::enter_want(self.store.cost, want);
+        let filed = self.seeds.seed(self.store, self.keys, want, self.store.tys.alloc());
+        if matches!(filed, Ok(super::heads::Seeded::Filed)) && self.store.made(want) {
+            self.store.imported.set(self.store.imported.get() + 1);
+            return Ok(Made::Made);
+        }
+        // A seed that files nothing, asks to lower, or refuses: `ensure` meets it between
+        // rounds and keeps its refusal (`Store::seed_error`), which a shared borrow cannot.
+        Ok(Made::Later(NotHere))
+    }
+}
+
+/// Answers `ImplsOf(trait_, shape)` into `b`, its heads made by `heads`: the ONE body of this
+/// question for both paths (`make_once` between rounds, `BodyWorld::impl_question` on the
+/// spot). `Later` leaves `b` with the question unanswered (what was filed and imported stays;
+/// filing twice is a no-op), so the fill made after it answers as one call would.
+pub(super) fn trait_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H, b: &Buckets, trait_: ItemKey, shape: tc::Shape, order: BuildOrder) -> Result<Made<H::Later>, MakeFail> {
+    // `trait_home` reads the trait's head when one is made (whether each parameter
+    // defaults to `Self`) and the text's count when none is. A head made only after a
+    // question's first answer gave a later answer of the same question another home,
+    // other candidates and another gap, so two checks of one body read two answers
+    // under one key (rule 21; census 7: k256's `<impl ProjectivePoint>::GENERATOR`).
+    // So the head is made first, and the home is the head's whenever it can be made. A
+    // head its text refuses (`TransmuteFrom`'s const parameter) is refused at every
+    // ask, so its question's home is the text's at every ask; one that waits on a
+    // constant goes up as any head's wait does (`make` evaluates it and asks again).
+    if let Some(lib) = heads.keys().library_in(names, trait_) {
+        match heads.make(Want::Head(lib)) {
+            Ok(Made::Made) => {}
+            Ok(Made::Later(why)) => return Ok(Made::Later(why)),
+            Err(wait @ HeadError::Item(_, Why::NeedConst(..))) => return Err(MakeFail::Head(wait)),
+            Err(_refused_by_its_text) => {}
         }
     }
+    let _cost = super::tables::cost::Cost::enter(heads.store().cost, super::tables::cost::Part::Impls);
+    // Only impls written where the orphan rules allow (`trait_home`) are candidates.
+    let home = trait_home(names, heads.keys(), heads.store(), trait_, shape);
+    // Over a bucket index: this question's buckets of the crates `home` admits.
+    b.admit_shared(names, heads.keys(), home, Ask::Trait(trait_, shape)).map_err(MakeFail::Tables)?;
+    let mut candidates = b.trait_candidates(trait_, shape, home);
+    // A negative impl is a candidate of its trait's questions (`Buckets::answer`): it
+    // decides an auto trait's structural rule, and the solver matches it to no positive
+    // goal; its refused header is the question's gap, never a wrong `yes`.
+    candidates.extend_from_slice(&b.negative_of(trait_, shape, home));
+    candidates.sort_unstable();
+    candidates.dedup();
+    if let Made::Later(why) = lower_heads(names, heads, b, candidates, order)? {
+        return Ok(Made::Later(why));
+    }
+    b.answer(heads.store(), trait_, shape, home).map_err(MakeFail::Buckets)?;
+    Ok(Made::Made)
 }
 
-/// Lowers the headers of `candidates` the store does not hold yet, counting them.
-fn lower_heads<'n, S: NamesSource<'n>>(names: S, keys: &mut Keys, store: &mut Store<'n>, b: &mut Buckets, mut candidates: Vec<LibKey, Global>, order: BuildOrder) -> Result<(), MakeFail> {
+/// Answers `Inherent(shape, name)` into `b`, as [`trait_question`] answers a trait's.
+pub(super) fn inherent_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H, b: &Buckets, shape: tc::Shape, name: Name, order: BuildOrder) -> Result<Made<H::Later>, MakeFail> {
+    let _cost = super::tables::cost::Cost::enter(heads.store().cost, super::tables::cost::Part::Impls);
+    // Only impls written in the type's own crate (`inherent_home`) are candidates.
+    let home = inherent_home(names, heads.keys(), shape);
+    b.admit_shared(names, heads.keys(), home, Ask::Inherent(shape)).map_err(MakeFail::Tables)?;
+    // The name filters first, from the impls' member rows (no header made): an impl
+    // that declares no member of the name is never the answer, so its header is not
+    // lowered for it. rustc finds an inherent item by name before it unifies self
+    // types; without this filter `<U1792>::LIMBS` in the header of crypto-bigint's
+    // `impl Uint<{ <U1792>::LIMBS / 2 }> { fn concat .. }` made that very header
+    // (census 7: "an array length names: Nested", 169 fns).
+    let mut candidates = b.inherent_candidates(shape, home);
+    candidates.retain(|&k| super::member_names::may_declare(names, k, name));
+    if let Made::Later(why) = lower_heads(names, heads, b, candidates.clone(), order)? {
+        return Ok(Made::Later(why));
+    }
+    b.answer_inherent(heads.store(), shape, name, &candidates).map_err(MakeFail::Buckets)?;
+    Ok(Made::Made)
+}
+
+/// Makes the headers of `candidates` the store does not hold yet, counting them. `Later` at
+/// the first `heads` leaves (the candidates before it are made and stay; it and those after
+/// are counted by the maker that makes them).
+fn lower_heads<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H, b: &Buckets, mut candidates: Vec<LibKey, Global>, order: BuildOrder) -> Result<Made<H::Later>, MakeFail> {
     if order == BuildOrder::Reversed {
         candidates.reverse();
     }
     let mut refused = None;
     for k in candidates {
-        if !store.impls.contains_key(&checker_of(k)) && !b.has_failed(k) {
-            b.lowered += 1;
-            match store.ensure(names, keys, Want::Impl(k)) {
-                Ok(()) => {}
-                // A constant the header needs is evaluated by `make`, then the header is retried.
-                Err(e @ HeadError::Item(_, Why::NeedConst(..))) => {
-                    if refused.as_ref().is_none_or(|(at, _)| k < *at) {
-                        refused = Some((k, e));
-                    }
+        if heads.store().impls.contains_key(&checker_of(k)) || b.has_failed(k) {
+            continue;
+        }
+        let made = heads.make(Want::Impl(k));
+        if !matches!(made, Ok(Made::Later(_))) {
+            b.count_lowered();
+        }
+        match made {
+            Ok(Made::Made) => {}
+            Ok(Made::Later(why)) => return Ok(Made::Later(why)),
+            // A constant the header needs is evaluated by `make`, then the header is retried.
+            Err(e @ HeadError::Item(_, Why::NeedConst(..))) => {
+                if refused.as_ref().is_none_or(|(at, _)| k < *at) {
+                    refused = Some((k, e));
                 }
-                // A refused candidate is a named gap of the questions it is a candidate of
-                // (`Gap::RefusedImpl`, `Gap::UnreadImpl`), never left out of their answers and
-                // never the end of a body that asks none of them.
-                Err(e) => b.fail(k, super::header_written::head_failed(names, k, &e)),
             }
+            // A refused candidate is a named gap of the questions it is a candidate of
+            // (`Gap::RefusedImpl`, `Gap::UnreadImpl`), never left out of their answers and
+            // never the end of a body that asks none of them.
+            Err(e) => b.fail(k, super::header_written::head_failed(names, k, &e)),
         }
     }
     match refused {
         Some((_, e)) => Err(MakeFail::Head(e)),
-        None => Ok(()),
+        None => Ok(Made::Made),
     }
 }

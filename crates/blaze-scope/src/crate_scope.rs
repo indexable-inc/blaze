@@ -151,6 +151,9 @@ pub struct DepScope<'a> {
     pub chains: HashMap<ItemKey, AVec<'a, ItemKey>, Alloc<'a>>,
     pub enums: HashMap<ItemKey, AVec<'a, Variant<&'a str>>, Alloc<'a>>,
     pub macros: HashMap<ItemKey, MacroSrc<'a>, Alloc<'a>>,
+    /// An error crate's record ([`error_record`]): the crate failed (its build script, its own
+    /// names), and every name read in it is unknown.
+    pub errored: bool,
 }
 
 /// Why a `CrateScope` record was not read.
@@ -271,7 +274,14 @@ pub fn read_record<'a>(bytes: &'a [u8], alloc: Alloc<'a>) -> Result<DepScope<'a>
     let mut r = Reader::starting_at(bytes, at).map_err(short)?;
     let edition = Edition::from_byte(r.u8().map_err(short)?).ok_or(RecordRead::BadByte { at, what: "edition" })?;
     let has_proc = r.u8().map_err(short)?;
-    r.skip(2).map_err(short)?;
+    let at_flag = bytes.len() - r.take_rest().len();
+    let mut r = Reader::starting_at(bytes, at_flag).map_err(short)?;
+    let errored = match r.u8().map_err(short)? {
+        0 => false,
+        ERRORED => true,
+        _ => return Err(RecordRead::BadByte { at: at_flag, what: "errored flag" }),
+    };
+    r.skip(1).map_err(short)?;
     let proc = CrateItemKey(key(&mut r)?.0);
     let name = r.str_u32().map_err(short)?;
     let count = r.u32().map_err(short)? as usize;
@@ -349,7 +359,54 @@ pub fn read_record<'a>(bytes: &'a [u8], alloc: Alloc<'a>) -> Result<DepScope<'a>
         let view = ScopeView::read(part).map_err(|error| RecordRead::Scope { module, error })?;
         scopes.insert(module, ScopeBuilder::from(&view, alloc));
     }
-    Ok(DepScope { name, key: krate, root, edition, proc_key: (has_proc != 0).then_some(proc), reaches, scopes, chains, enums, macros })
+    Ok(DepScope { name, key: krate, root, edition, proc_key: (has_proc != 0).then_some(proc), reaches, scopes, chains, enums, macros, errored })
+}
+
+/// The first pad byte of an error crate's record (read 0 in every other record, so the layout
+/// and [`VERSION`] stay).
+const ERRORED: u8 = 1;
+
+/// The exports record of a crate that failed this command, so no record of its names exists
+/// (its build script failed, or its own names could not be resolved): its key, its root (an
+/// empty scope), no reaches, enums or macros, and the errored flag. A dependent is solved
+/// against it as against any record: a path into the crate finds nothing there, and its
+/// reporter, seeing the flag ([`is_error_record`]), counts it without a finding, so only the
+/// failure itself is reported, once, at its cause (rule 19). Plan row A8: an error stops only
+/// what reads it. The bytes are a function of `key`, `name` and `edition` alone (rule 25).
+pub fn error_record<'b>(key: CrateItemKey, name: &str, edition: Edition, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, BuildError> {
+    let root = crate::task::root_key(key);
+    let scope = ScopeBuilder::<'_, &str>::new_in(root, alloc).write(alloc)?;
+    let mut out = Out { bytes: RecordBytes::new_in(alloc) };
+    out.bytes.extend_from_slice(&MAGIC);
+    out.u32(VERSION as usize, "version")?;
+    out.key(key.0);
+    out.key(root.0);
+    out.u8(edition.byte());
+    out.u8(0);
+    out.u8(ERRORED);
+    out.u8(0);
+    out.key(ContentId([0; 32]));
+    out.str(name)?;
+    out.u32(0, "CrateScope reaches")?;
+    out.u32(1, "CrateScope modules")?;
+    out.key(root.0);
+    out.u32(0, "CrateScope blob")?;
+    out.u32(scope.len(), "CrateScope blob")?;
+    out.u32(NO_CHAIN as usize, "CrateScope chain")?;
+    out.u32(0, "CrateScope enums")?;
+    out.u32(0, "CrateScope macros")?;
+    out.pad();
+    out.bytes.extend_from_slice(&scope);
+    Ok(out.bytes)
+}
+
+/// Where the errored flag sits: magic, version, crate key, root key, edition, has-proc.
+const ERRORED_AT: usize = 4 + 4 + 32 + 32 + 1 + 1;
+
+/// Whether `bytes`, a `CrateScope` record of this version, is an [`error_record`]: its head
+/// read in place, nothing decoded. A record of another magic or version is none.
+pub fn is_error_record(bytes: &[u8]) -> bool {
+    bytes.get(..4) == Some(&MAGIC[..]) && bytes.get(4..8) == Some(&VERSION.to_le_bytes()[..]) && bytes.get(ERRORED_AT) == Some(&ERRORED)
 }
 
 /// A reporter's reading of a failed import, asked only once a lookup failed, never on the

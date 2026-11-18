@@ -504,12 +504,10 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
         // An item with no place is declared by no block: as `program::placed` answered.
         let Some(Place { krate, at, item }) = self.place(key) else { return Some(None) };
         let Some((text, outline)) = self.outline_at(krate, at) else { return Some(None) };
-        let Some(parent) = outline.item(item).parent else { return Some(None) };
-        let block = outline.item(parent);
-        let ItemDetail::ExternBlock { abi } = block.detail else { return Some(None) };
-        let Some(r) = abi else { return Some(Some("C")) };
-        let written = text.get((block.range.start + r.start) as usize..(block.range.start + r.end) as usize)?;
-        Some(Some(crate::front::unquote(written.trim().strip_prefix("extern").unwrap_or(written))))
+        // The one reading of a block's ABI, the items record writer's (`foreign_abi`): an ABI
+        // it cannot read is not answered (`None`), as over records the record is not written.
+        let crate_key = self.crates().get(krate)?.key;
+        blaze_scope::items_record::foreign_abi(text, outline, outline.item(item), key, crate_key).ok()
     }
 
     fn kind_of_item(self, key: ItemKey) -> Option<ItemKind> {
@@ -818,9 +816,8 @@ pub struct Records<'n> {
     incoherent: Cell<Option<(&'n [usize], blaze_id::ContentId)>>,
     /// A test's planted bug: the item whose row is withheld ([`Records::plant_no_item`]).
     no_item: Cell<Option<ItemKey>>,
-    /// Each file's outline as it is now, by (crate, file), made the first time
-    /// [`NamesSource::extern_abi`] asks about a bodiless fn or a static in it (what an
-    /// `extern` block's parent entry is read from): at most [`MOST_OUTLINES`].
+    /// Each changed file's outline as it is now, by (crate, file), made the first time a
+    /// member of it is read at item grain (source/item_grain.rs): at most [`MOST_OUTLINES`].
     outlines: RefCell<HashMap<(usize, u32), blaze_file_items::Outline<'n>, Alloc<'n>>>,
     /// The allocator the records were opened with, the caller's: a walk's and a digest's
     /// scratch too.
@@ -1056,72 +1053,25 @@ impl<'n> Records<'n> {
     }
 
     /// [`NamesSource::extern_abi`] of the free fn or static `key` (not a member): the abi of
-    /// the `extern` block that declares it, as the solved names read it from the outline
-    /// (`Some(None)`: no block does). `None` with the reason filed.
+    /// the `extern` block that declares it (`Some(None)`: no block does), as its items row
+    /// holds it (`ItemRow::foreign`, written by the names task from the outline of the text the
+    /// item is in, a file's or a macro call's expansion's alike). `None` with the reason filed.
     ///
-    /// A fn whose text ends in its body's `}` is declared by no block (the Reference,
-    /// [items.extern.fn.body]: "Functions within external blocks ... must not have a body"):
-    /// answered from its own text, no outline made. Otherwise (a bodiless fn: a foreign one, or
-    /// a `#[rustc_intrinsic]` one; a static) its file is outlined as it is now, once per file
-    /// ([`Records::outlines`]), and its entry's parent read, as `Solved::extern_abi` reads it.
-    /// An item written by a macro call's expansion is refused by name: the expansion's outline
-    /// is the solve's (a token outline), not made again here.
+    /// No text is read and nothing is outlined: the row is the whole answer, and its `Item`
+    /// cell's digest covers it (blaze-scope names_cells.rs `item_digest`). A row whose file
+    /// changed is answered at item grain (`row_now`): the block's ABI is in the record's
+    /// `Surface` reads (blaze-file-items names_digest.rs, `ExternBlock`: its ABI's text), so a
+    /// row found by its chain holds it; a row whose chain is gone is refused by name.
     fn block_abi(&'n self, key: ItemKey) -> Option<Option<&'n str>> {
         let krate = self.items.crate_of(key)?;
         // No record: the loader filed `NoRecord` the one time it was asked.
-        let record = self.items_of(krate)?;
+        self.items_of(krate)?;
         let now = self.row_now(krate, key)?;
-        let Some(span) = now.row.text else {
-            self.log.put(SourceError::Items { krate, name: self.log.name(krate), error: ItemsRecordError::NoPlace { key } });
-            return None;
-        };
-        if now.row.kind == ItemKind::Function && self.span_now(krate, &now, span)?.trim_end().ends_with('}') {
-            return Some(None);
-        }
-        let blaze_scope::resolve::At::File(file) = span.at else {
-            self.gap("extern_abi: a bodiless fn or a static written by a macro call's expansion (the expansion's outline is not made again over records)", Some(key));
-            return None;
-        };
-        // Today's text of the file: the item-grain answer's when the file changed, else the
-        // text the record's digest proves.
-        let whole: &'n str = match now.today {
-            Some(text) => text,
-            None => self.read(krate, self.items.whole(krate, span.at))?,
-        };
-        let mut outlines = self.outlines.borrow_mut();
-        if outlines.get(&(krate, file)).is_none() {
-            if outlines.len() >= MOST_OUTLINES {
-                drop(outlines);
-                self.gap("extern_abi: more files outlined than the most one command keeps (source.rs `MOST_OUTLINES`)", Some(key));
-                return None;
-            }
-            outlines.insert((krate, file), blaze_file_items::outline(whole, record.edition(), self.alloc));
-        }
-        let outline = outlines.get(&(krate, file))?;
-        let Some(entry) = outline.items().get(now.row.outline.0 as usize) else {
-            drop(outlines);
-            self.log.put(SourceError::Items { krate, name: self.log.name(krate), error: ItemsRecordError::NoOutline { item: key } });
-            return None;
-        };
-        let Some(parent) = entry.parent else { return Some(None) };
-        let block = outline.item(parent);
-        let ItemDetail::ExternBlock { abi } = block.detail else { return Some(None) };
-        let Some(r) = abi else { return Some(Some("C")) };
-        let (start, end) = (block.range.start + r.start, block.range.start + r.end);
-        drop(outlines);
-        let Some(written) = whole.get(start as usize..end as usize) else {
-            let error = match self.keys.get(krate) {
-                Some(crate_key) => ItemsRecordError::Range { krate: *crate_key, start, len: end.saturating_sub(start) },
-                None => ItemsRecordError::Short { what: "a crate with an items record", at: krate },
-            };
-            self.log.put(SourceError::Items { krate, name: self.log.name(krate), error });
-            return None;
-        };
-        Some(Some(crate::front::unquote(written.trim().strip_prefix("extern").unwrap_or(written))))
+        Some(now.row.foreign)
     }
 }
 
-/// The most files one command outlines to answer [`NamesSource::extern_abi`] (rule 18).
+/// The most changed files one command outlines to read their members at item grain (rule 18).
 pub const MOST_OUTLINES: usize = 4096;
 
 /// A library key's first 16 bytes: what `keys::checker_of` keeps of it.
@@ -1405,9 +1355,8 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
             return Some(None);
         }
         match self.kind_of_item(key)? {
-            // Only a fn or a static can be a foreign item: its text, or its file's outline
-            // (`Records::block_abi`). The end form is the items row's own `foreign` field
-            // (NAMES runner 20), which needs no text read.
+            // Only a fn or a static can be a foreign item: its items row's `foreign` field
+            // (`Records::block_abi`), which needs no text read.
             ItemKind::Function | ItemKind::Static => self.block_abi(key),
             _ => Some(None),
         }

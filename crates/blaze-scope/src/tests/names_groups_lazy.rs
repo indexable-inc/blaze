@@ -99,7 +99,7 @@ fn on_demand(texts: &'static Texts, order: &[&[ItemKey]]) -> Demanded<'static> {
         out.extend(solved[0].names.groups.iter().cloned());
         Ok(out)
     };
-    let mut solver = OneGroup { solve_crate, alloc };
+    let mut solver = OneGroup { solve_crate, alloc, tree: None };
     let mut into = Demanded::new(DemandedOpts { alloc });
     for asked in order {
         demand(asked, &mut solver, &mut into, alloc).unwrap_or_else(|e| panic!("demand of {asked:?}: {e:?}"));

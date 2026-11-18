@@ -286,17 +286,15 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.text_marks(krate, call)
     }
 
-    /// The item's cell; for a fn without a body or a static, WHOLE items too: the answer is
-    /// read from its file's outline (the `extern` block around it), which its cell does not
-    /// hold.
+    /// The item's cell alone, for an item of a file and of a macro call's expansion alike: the
+    /// answer is its items row's `foreign` field (the block's ABI, written by the names task),
+    /// which the `Item` cell's digest covers (blaze-scope names_cells.rs `item_digest`).
     fn extern_abi(self, key: ItemKey) -> Option<Option<&'n str>> {
         self.item(key);
         // Whether it is a member, and of which owner: its `MemberOf` cell on both paths.
         self.cell(NameCell::MemberOf { member: key });
         if let Some((owner, _)) = self.records.member_owner(key) {
             self.cell(NameCell::Members { owner });
-        } else if matches!(self.records.kind_of_item(key), Some(ItemKind::Function | ItemKind::Static)) && !self.records.text_of(key).is_some_and(|t| t.text.trim_end().ends_with('}')) {
-            self.whole_of(key, Section::Items);
         }
         self.records.extern_abi(key)
     }
@@ -374,10 +372,10 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.impl_with_header(krate, key, module)
     }
 
-    /// The crate's lang rows, whole (one table a crate).
+    /// The crate's lang rows: one names cell a crate ([`NameCell::Lang`]).
     fn each_lang(self, krate: usize, each: &mut dyn FnMut(&'n str, ItemKey)) {
         if let Some(prefix) = self.prefix(krate) {
-            self.reads.read(TableRead::Lang { krate: prefix });
+            self.reads.read(TableRead::Names(NameCell::Lang { krate: prefix }));
         }
         self.records.each_lang(krate, each)
     }

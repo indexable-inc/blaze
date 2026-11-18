@@ -756,7 +756,9 @@ fn cost_of_one_body() {
         {
             use blaze_ladder::front2::tables::cost::Part;
             let label = NamesSource::name_of(task_records, *key).unwrap_or("?").to_string();
-            per_body.push((spent.rounds, spent.entries[Part::Heads as usize], spent.entries[Part::Impls as usize], label));
+            let (heads, impls) = (spent.entries[Part::Heads as usize], spent.entries[Part::Impls as usize]);
+            say!("SEEDED BODY `{label}`: rounds {} heads asked {heads} impl questions {impls}", spent.rounds);
+            per_body.push((spent.rounds, heads, impls, label));
         }
         if out.bytes.as_slice() == bytes.as_slice() {
             equal_sum.add(&spent);
@@ -817,6 +819,16 @@ fn cost_of_one_body() {
     let fixed: Vec<&&str> = KNOWN_WRONG.iter().filter(|k| !seeded_wrong.iter().any(|w| w == *k)).collect();
     assert!(new_wrong.is_empty(), "a body seeded from the frozen table answered otherwise than lowering it: {new_wrong:?}");
     assert!(fixed.is_empty(), "known wrong seeded answers now right: remove them from KNOWN_WRONG: {fixed:?}");
+    // A SEEDED BODY IS CHECKED IN ONE ROUND (plan row A1, lane RA1): a head it lacks is imported
+    // on the spot (world_items.rs `BodyWorld::store_want`) and an impl question answered on the
+    // spot (`BodyWorld::impl_question`), so no check restarts from the body's first line. No
+    // kind of question is excluded: one the world leaves to a fill (check.rs `NotHere`, or a
+    // refusal met on the spot) is a body named here.
+    // One body of the 58 runs no round at all (an unnamed body that is refused before its first round: the
+    // first admitted run printed `{0: 1, 1: 57}`); what is asserted is that none takes a SECOND round.
+    let over: Vec<String> = per_body.iter().filter(|b| b.0 > 1).map(|b| format!("`{}` {} rounds {} heads {} impl questions", b.3, b.0, b.1, b.2)).collect();
+    assert!(!per_body.is_empty(), "no seeded body was checked");
+    assert!(over.is_empty(), "{} of {} seeded bodies took other than one round: {over:?}", over.len(), per_body.len());
     let errors: Vec<String> = task_records.errors().iter().map(|e| e.to_string()).collect();
     say!("RECORD ERRORS: {errors:?}");
     let out = std::env::temp_dir().join("front2_tables_cost.out");

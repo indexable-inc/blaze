@@ -1,0 +1,15 @@
+{
+ "id": "block-mod-in-a-local-fns-body",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane TQ",
+ "where": "crates/blaze-file-items/src/nested.rs (scan), crates/blaze-scope/src/expanded_blocks.rs written, crates/blaze-ladder/src/front2/locals.rs library_body",
+ "what": "std-hello stopped at `init::reset_sigpipe`: `mod sigpipe` in a #[cfg] block 'that a macro call wrote or that is in a local item's body'. The refusal's words name two causes; the real one was the second: reset_sigpipe is a fn declared inside `init`'s body, and the names library never wrote block modules for a local fn's body (the scan does not read inside items, and front2's library_body gave None for any local item).",
+ "cost": "about fifteen minutes to see that the fn is local (the refusal names `init::reset_sigpipe` as if it were a module item)",
+ "cause": "a block was written as a module only for items that make one or statement calls directly in it; a local fn whose own body needs modules left nothing for it",
+ "whys": "the library keyed block modules by the library item whose body it is; a local fn had no library key, so its body could have none",
+ "class": "any struct, enum, union, alias, trait, mod, extern crate, impl or statement call in the body of a fn, const or static that is itself declared in a body",
+ "prevention": "done: NestedItem::body_writes (the scan reads one bit from a local item's own text, recursively), so its block is written and the fn is a module item with the library's key; front2 Locals::library_twin finds that key; one library_body for Locals::keep and PatternBlocks::of",
+ "annoyance": "the refusal 'a mod in a block that a macro call wrote or that is in a local item's body' names two causes and the path `init::reset_sigpipe` hides that the fn is local",
+ "workaround": "read the pinned std source at the line the refusal names",
+ "state": "fixed"
+}

@@ -94,6 +94,69 @@ const _: () = {
 };
 ";
 
+/// The textual scope of a body's macro call (the regression of 2026-11-17: 557 functions of the
+/// 1,100-crate run, core's `Argument::new_debug` calling `argument_new!` among them, refused
+/// with "segment 0: not found" once a call was read at its innermost block). The Reference,
+/// "Macros by example", "Textual scope": a `macro_rules!` is in scope from its definition "to
+/// the end of the enclosing module or block", and a one-segment call is looked up there first,
+/// then as a path from the innermost block outward ("Path-based scope").
+const MACROS: &str = "#![no_std]
+pub struct T;
+pub trait Tr {
+    fn f(&self) -> u32;
+}
+macro_rules! seven {
+    () => { 7 };
+}
+macro_rules! shadowed {
+    () => { false };
+}
+pub fn by_module() -> u32 {
+    seven!()
+}
+pub fn in_nested_block() -> u32 {
+    let x = { seven!() };
+    x
+}
+pub fn in_closure() -> u32 {
+    let _f = || { seven!() };
+    7
+}
+pub fn by_block_shadow() -> u32 {
+    macro_rules! shadowed {
+        () => { 7 };
+    }
+    shadowed!()
+}
+pub fn by_block_use() -> u32 {
+    use mdep::from_dep;
+    from_dep!()
+}
+const _: () = {
+    extern crate mdep as _mdep;
+    _mdep::marker!();
+    impl Tr for T {
+        fn f(&self) -> u32 {
+            seven!()
+        }
+    }
+};
+pub fn by_nothing() -> u32 {
+    nothing_binds!()
+}
+";
+
+const MDEP: &str = "#![no_std]
+#[macro_export]
+macro_rules! from_dep {
+    () => { 7 };
+}
+#[macro_export]
+macro_rules! marker {
+    () => {};
+}
+";
+
 const APP_AT: usize = 0;
 const DEP_AT: usize = 1;
 const CORE_AT: usize = 2;
@@ -107,6 +170,8 @@ impl SourceTexts<'static> for Texts {
             (APP_AT, "/app/lib.rs") => Some(APP),
             (DEP_AT, "/dep/lib.rs") => Some(DEP),
             (CORE_AT, "/core/lib.rs") => Some(CORE),
+            (APP_AT, "/macros/lib.rs") => Some(MACROS),
+            (DEP_AT, "/mdep/lib.rs") => Some(MDEP),
             _ => None,
         }
     }
@@ -163,13 +228,18 @@ impl Load<'static> for Kept {
 }
 
 fn kept() -> &'static Kept {
-    let crates = [
+    kept_of(&[
         input("app", "/app/lib.rs", &[("dep", DEP_AT), ("core", CORE_AT)]),
         input("dep", "/dep/lib.rs", &[("core", CORE_AT)]),
         input("core", "/core/lib.rs", &[]),
-    ];
+    ])
+}
+
+/// The records of `crates` (an app at [`APP_AT`], its dependency at [`DEP_AT`], core at
+/// [`CORE_AT`]), solved and encoded as the command keeps them.
+fn kept_of(crates: &[CrateInput<'static>]) -> &'static Kept {
     let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, bstd: None };
-    let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(&crates, sysroot, &Texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))));
+    let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, &Texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))));
     let g = a();
     let mut kept = Kept { names: Vec::new(), items: Vec::new(), files: Vec::new(), expansions: Vec::new(), keys: Vec::new(), crate_names: Vec::new() };
     for c in names.crates().iter() {
@@ -273,4 +343,53 @@ fn a_call_through_a_blocks_extern_crate_is_checked() {
     assert_eq!(e0308, 1, "the planted type error is reported once: {lines:#?}");
     let errors: Vec<String> = records.errors().iter().map(|e| e.to_string()).collect();
     assert!(errors.is_empty(), "the records filed {errors:?}");
+}
+
+/// [`MACROS`]: every body calling a `macro_rules!` written above it in the module is checked
+/// (at the body's block, an inner block, a closure's block, an impl's fn inside a derive's
+/// `const _` block), the block's own `macro_rules! shadowed` is the one expanded (`7`; the
+/// module's `false` would be E0308 in a `u32` fn), the block's `use mdep::from_dep` names the
+/// dependency's macro, the derive's `_mdep::marker!()` reads the block's `extern crate`, each
+/// body answering over the view as today's path does; the control `nothing_binds!()` is the
+/// one body refused, and its refusal names the call.
+#[test]
+fn a_body_reads_the_textual_scope_of_its_module_first() {
+    let kept = kept_of(&[
+        input("macros", "/macros/lib.rs", &[("mdep", DEP_AT), ("core", CORE_AT)]),
+        input("mdep", "/mdep/lib.rs", &[("core", CORE_AT)]),
+        input("core", "/core/lib.rs", &[]),
+    ]);
+    let records = reader(kept);
+    let list = bodies(records);
+    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("today's frame")));
+    let mut today = ProjectWorld::from_records(records, frame, LANG, a()).unwrap_or_else(|e| panic!("the world did not start: {e}"));
+    let mut lines = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
+    let mut e0308 = 0;
+    for (key, body) in list.iter() {
+        let (verdict, borrows) = today.check_borrows(*body, a());
+        let want = verdict_bytes(&verdict, &borrows, Facts::Digest, a()).expect("today's bytes");
+        let got = run(records, *key);
+        for said in got.said.iter() {
+            match &said.what {
+                SaidWhat::NotChecked { cause } => refused.push(format!("{key:x} {body:?} NOT CHECKED {cause}: {}", said.words)),
+                SaidWhat::Type { code } => {
+                    if *code == "E0308" {
+                        e0308 += 1;
+                    }
+                    lines.push(format!("{key:x} {body:?} {code}: {}", said.words));
+                }
+                other => lines.push(format!("{key:x} {body:?} {other:?}: {}", said.words)),
+            }
+        }
+        assert_eq!(String::from_utf8_lossy(&got.bytes), String::from_utf8_lossy(&want), "the body {key:x} {body:?} answers otherwise over the view");
+    }
+    println!("{}\n{}", refused.join("\n"), lines.join("\n"));
+    assert!(list.len() >= 8, "the six fns, the impl's fn and the constant's initializer are listed: {list:?}");
+    // A trait's fn with no body is still listed as a body and answers "no body" (a known hole of the
+    // body list, not of macro paths: the coordinator's log of 2026-11-17); it is set aside here by its words.
+    refused.retain(|line| !line.contains("NOT CHECKED no body"));
+    assert_eq!(refused.len(), 1, "only the control is refused: {refused:#?}");
+    assert!(refused[0].contains("nothing_binds"), "the control's refusal names its call: {refused:#?}");
+    assert_eq!(e0308, 0, "the block's own `shadowed` is expanded, not the module's: {lines:#?}");
 }

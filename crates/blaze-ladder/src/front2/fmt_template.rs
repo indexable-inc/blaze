@@ -143,7 +143,7 @@ pub(crate) fn argument_new<'n, S: super::source::NamesSource<'n>>(r: &mut super:
     let (shape, n) = (blaze_typeck::Shape::Adt(k), blaze_typeck::Name::of(name));
     super::check::make_for(r, super::world_items::Fill::Inherent(shape, n), owner).map_err(|error| ArgumentNewFail::Fill { name, error })?;
     if let Some((impl_, why)) = r.buckets.as_ref().and_then(|b| b.inherent_gap(shape, n)) {
-        return Err(ArgumentNewFail::RefusedImpl { name, impl_, why: Box::from(why) });
+        return Err(ArgumentNewFail::RefusedImpl { name, impl_, why });
     }
     let found = argument_fns(r.buckets.as_ref(), shape, n);
     match found {

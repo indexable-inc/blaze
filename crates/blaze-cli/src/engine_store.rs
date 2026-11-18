@@ -165,6 +165,24 @@ impl core::fmt::Display for RecordLine {
     }
 }
 
+/// The records one stage read of earlier stages' as the profile prints them: "records read
+/// (Bodies): N, B bytes; copied into the heap: C bytes" (runtime.md C3: C is 0 on the engine's
+/// path, engine_records.rs).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct ReadLine {
+    pub(crate) records: u64,
+    pub(crate) bytes: u64,
+    pub(crate) copied: u64,
+    /// Asks answered by a record the request opened before (no read).
+    pub(crate) again: u64,
+}
+
+impl core::fmt::Display for ReadLine {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}, {} bytes; copied into the heap: {} bytes; asked again: {}", self.records, self.bytes, self.copied, self.again)
+    }
+}
+
 /// What the engine's records cost this process, stage by stage (rules 50, 51, 53): counted at
 /// the seams, never by a scan: a put taken ([`Ledger::put`], its payload still in its result), a
 /// copy made (the store's, read from [`Store::kept`] at the merge: the put path itself joins
@@ -173,16 +191,38 @@ impl core::fmt::Display for RecordLine {
 /// bytes (rule 25).
 pub(crate) struct Ledger {
     pub(crate) lines: [RecordLine; STAGES],
+    /// What each stage read of earlier stages' records, counted where each was opened
+    /// (engine_records.rs `EngineRecords::records`).
+    pub(crate) reads: [ReadLine; STAGES],
     /// Payload bytes each stage's results hold after their put.
     results: [u64; STAGES],
     /// The store's counts at the last merge.
     seen: crate::store::StoreKept,
+    /// The reader's counts at the last merge.
+    seen_read: crate::engine_records::ReadCounts,
     digest: blaze_ids::Hasher,
 }
 
 impl Ledger {
     pub(crate) fn new() -> Ledger {
-        Ledger { lines: [RecordLine::default(); STAGES], results: [0; STAGES], seen: crate::store::StoreKept::default(), digest: blaze_ids::Hasher::new(PUTS_DIGEST) }
+        Ledger {
+            lines: [RecordLine::default(); STAGES],
+            reads: [ReadLine::default(); STAGES],
+            results: [0; STAGES],
+            seen: crate::store::StoreKept::default(),
+            seen_read: crate::engine_records::ReadCounts::default(),
+            digest: blaze_ids::Hasher::new(PUTS_DIGEST),
+        }
+    }
+
+    /// A phase of `stage` merged: the reader's reads since the last merge are this stage's.
+    pub(crate) fn read(&mut self, stage: Stage, now: crate::engine_records::ReadCounts) {
+        let line = &mut self.reads[stage.index()];
+        line.records += now.records.saturating_sub(self.seen_read.records);
+        line.bytes += now.bytes.saturating_sub(self.seen_read.bytes);
+        line.copied += now.copied.saturating_sub(self.seen_read.copied);
+        line.again += now.hits.saturating_sub(self.seen_read.hits);
+        self.seen_read = now;
     }
 
     /// A record of `stage` put under `key`, its bytes the concatenation of `parts`, its payload
@@ -227,6 +267,10 @@ impl Ledger {
             let line = self.lines[stage.index()];
             if line.puts > 0 {
                 let _ = writeln!(text, "records ({stage:?}): {line}");
+            }
+            let read = self.reads[stage.index()];
+            if read.records + read.again > 0 {
+                let _ = writeln!(text, "records read ({stage:?}): {read}");
             }
         }
     }

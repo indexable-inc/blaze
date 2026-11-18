@@ -139,7 +139,11 @@ impl<'d, 'n: 'd, S: NamesSource<'n>> MacroNames<'d> for ScopedBy<'d, 'n, S> {
         // body's text is read in the innermost written block around the call: an `extern
         // crate .. as` or `use` there binds its first segment (serde's derive writes
         // `extern crate serde as _serde; _serde::__require_serde_not_serde_core!();` in its
-        // `const _` block). Every cell of that walk is the block module's (rule 21).
+        // `const _` block). Every cell of that walk is the block module's (rule 21). Rust's
+        // order is the walk's own (blaze-scope names.rs `lexical`): a one-segment name is read
+        // first in textual scope, the block's `macro_rules!` and then each enclosing module's
+        // (the body's module whole: a body's block has no `mod` line there), and only then as a
+        // path from the block outward (its items, its `use super::*`, the preludes).
         let at_call = site.dollar_crate.is_none() && !matches!(at.mark, Some(m) if m.transparency == blaze_expand::Transparency::Opaque);
         let module = match at.written {
             Some(call) if at_call => block_module(self.blocks, call, site.module),

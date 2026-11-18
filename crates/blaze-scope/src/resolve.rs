@@ -62,6 +62,8 @@ use crate::task::{
 };
 use crate::task::{joined, pop_dir};
 use crate::task::ExpandPart;
+use crate::task::{Attrs, inline_child, walk_rows};
+use crate::tree_record::{TreeModule, TreeRecord};
 use crate::task::{ProcAttr, ProcDecls, ProcExport};
 use blaze_surface::ProcKind;
 use crate::{ExpandRequest, NameAnswer, Node, Passed, Resolved, ScopeFacts};
@@ -501,6 +503,8 @@ pub enum NamesError<'a> {
     DepNotFinished { krate: &'a str, name: &'a str, dep: &'a str },
     /// The cell core, the names records' writer, refused the crate.
     Cells { krate: &'a str, error: crate::cells::Unwritten },
+    /// The module tree record was not written.
+    TreeRecord { krate: &'a str, error: crate::tree_record::TreeRecordError },
 }
 
 impl fmt::Display for NamesError<'_> {
@@ -520,6 +524,7 @@ impl fmt::Display for NamesError<'_> {
                 write!(f, "crate `{krate}`: its dependency `{name}` (crate `{dep}`) is not finished before it")
             }
             NamesError::Cells { krate, error } => write!(f, "crate `{krate}`: {error}"),
+            NamesError::TreeRecord { krate, error } => write!(f, "crate `{krate}`: its module tree record: {error:?}"),
         }
     }
 }
@@ -540,6 +545,9 @@ pub struct CrateNames<'a> {
     /// Every file read, by index (a [`Loc`]'s and an [`At::File`]'s).
     pub files: AVec<'a, &'a SourceFile<'a>>,
     pub tree: Tree<'a, 'a>,
+    /// The module tree record ([`crate::tree_record`]): what a one-group solve of this crate
+    /// reads instead of walking and lowering every file.
+    pub tree_record: &'a [u8],
     /// The root module.
     pub root: ItemKey,
     /// Each walked module's place and declarations, read back from its record.
@@ -1116,8 +1124,10 @@ pub fn aligned<'a>(bytes: &[u8], alloc: Alloc<'a>) -> &'a [u8] {
 
 /// What the lowering of the walked modules gives.
 struct Lowering<'a> {
-    /// By module index: what each module's record is written from.
+    /// What each lowered module's record is written from, by its place in `at`.
     decls: AVec<'a, DeclsBuilder<'a, &'a str>>,
+    /// The index in the tree of each module lowered, ascending (the root's first when it is).
+    at: AVec<'a, usize>,
     tables: Tables<'a>,
     prelude: Option<PreludeImport<'a, 'a>>,
     macro_use: AVec<'a, &'a str>,
@@ -1150,90 +1160,32 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     let cfg = Cfg::from_atoms(input.cfg, alloc);
     let mut notes: AVec<'a, NamesNote<'a>> = AVec::new_in(alloc);
 
-    // The files: the root's, then each the walk names, until it names no file not read.
-    par.stage(crate::task::Stage::Files);
-    let root_text = sources.read(index, input.root).ok_or(NamesError::RootNotRead { krate: input.name, path: input.root })?;
-    let mut set = FileSet::new_in(alloc);
-    let root_file = set.add(file_of(input.root, root_text, outline(root_text, edition, alloc), input.shown_from, alloc));
-    let mut root_dir = AString::from_str_in(input.root, alloc);
-    pop_dir(&mut root_dir);
-    let mut tried: HashMap<&'a str, (), Alloc<'a>> = HashMap::new_in(alloc);
-    let mut walked = None;
-    for _ in 0..MOST_WALKS {
-        par.names_part(crate::task::NamesPart::Walk);
-        let tree = walk(&set, &cfg, input.key, input.name, root_file, &root_dir, edition, alloc);
-        par.names_part(crate::task::NamesPart::Outline);
-        let mut read: AVec<'a, (&'a str, &'a str)> = AVec::new_in(alloc);
-        for path in tree.missing.iter() {
-            if set.find(path).is_some() || tried.contains_key(path.as_str()) {
-                continue;
-            }
-            let path = keep(path, alloc);
-            tried.insert(path, ());
-            if let Some(text) = sources.read(index, path) {
-                read.push((path, text));
-            }
-        }
-        if read.is_empty() {
-            walked = Some(tree);
-            break;
-        }
-        let mut outlines = AVec::with_capacity_in(read.len(), alloc);
-        par.map(read.len(), |at| outline(read[at].1, edition, alloc), &mut outlines);
-        for (&(path, text), outlined) in read.iter().zip(outlines) {
-            set.add(file_of(path, text, outlined, input.shown_from, alloc));
-        }
-    }
-    let tree = walked.ok_or(NamesError::WalkUnbounded { krate: input.name })?;
-
-    // Each walked module's own text, lowered.
-    par.stage(crate::task::Stage::Lower);
-    let listed = if input.implicit.proc_macro { sources.proc_exports(index) } else { None };
-    // The root's attributes first: its `#![register_tool]`s are the crate's tools, which every
-    // module's lowering reads to know an item's taker (names-attr-3).
-    let root = set.files[root_file as usize];
-    let attrs = file_attrs(&cfg, &root.outline, root.text, alloc);
-    let tools = crate_tools(&attrs, alloc);
-    let mut low = lower_modules(input.key, input.implicit.entry, edition, &cfg, &tools, &set, &tree, listed, &mut notes, par, alloc);
-    let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
-    let plan = root_plan(graph, id, root_attrs, built, &mut notes, alloc)?;
-    // From 2018 the injected item's name is def-site (rustc's `std_inject`: `ident_span = if
-    // edition >= Edition2018 { span } else { call_site }`, `span` with the pass's def-site
-    // context): a name the root writes itself is a different name and stands, no duplicate.
-    // alloy 2.5.0 under `#![no_std]` (a host unit's features, tempo's precompiles-macros):
-    // `pub use alloy_core as core; pub use self::core::primitives;` bound `self::core` to the
-    // injected `core` (an item beside an import wins, made.rs), so `alloy::primitives` was not
-    // there. The written name is read from the root's own text; one a root macro call writes
-    // is not seen (stated gap).
-    if let Some(name) = plan.injected.filter(|name| edition == Edition::E2015 || !root_binds_type(&low.decls[0], name)) {
-        low.decls[0].extern_crates.push(ExternCrateDecl { target: ExternTarget::Dep(name), rename: Rename::Same, vis: WrittenVis::Private });
-    }
-    let root_input = RootInput {
-        krate: input.key,
-        root_file: root.id,
-        edition,
-        attrs: &attrs,
-        tree: &tree,
-        prelude_import: low.prelude.as_ref(),
-        extern_crates: &low.decls[0].extern_crates,
-        macro_use: &low.macro_use,
-        macro_exports: &low.macro_exports,
+    // A one-group solve handed the module tree record reads, outlines and lowers its members'
+    // files alone (tree_record.rs); every other solve walks the files from the root.
+    let held_tree = par.names_members().and_then(|m| m.tree.map(|b| (m, aligned(b, alloc))));
+    // A member that moved the tree (its walk rows, `mod` lines or exports are not the record's,
+    // or it is in no row) makes the tree again from the files, as the record's inputs moved:
+    // the solve's `tree_record` is then the new one.
+    let from_record = match held_tree {
+        Some((members, bytes)) => from_tree_record(graph, input, id, index, edition, &cfg, built, sources, par, members, bytes, &mut notes, alloc)?,
+        None => None,
     };
-    let mut root_notes = AVec::new_in(alloc);
-    let cr = crate_root(&root_input, &plan, &mut root_notes, alloc);
-    notes.extend(root_notes.into_iter().map(NamesNote::Root));
+    if held_tree.is_some() && from_record.is_none() {
+        par.names_part(crate::task::NamesPart::TreeAgain);
+    }
+    let prepared = match from_record {
+        Some(prepared) => prepared,
+        None => walked_files(graph, input, id, index, edition, &cfg, built, sources, par, &mut notes, alloc)?,
+    };
+    let Prepared { set, tree, low, listed, root_attrs, root_bytes, record } = prepared;
 
     // The records, written and read back: what the fill and later crates read.
     par.stage(crate::task::Stage::Decls);
     let mut decls = HashMap::new_in(alloc);
-    for (i, m) in tree.modules.iter().enumerate() {
-        let info = ModuleInfo {
-            krate: input.key,
-            parent: m.parent.map(|p| tree.modules[p].key),
-            name: m.name,
-            no_implicit_prelude: m.no_implicit_prelude,
-        };
-        let bytes = match low.decls[i].write(m.key, &info, alloc) {
+    for (&i, d) in low.at.iter().zip(low.decls.iter()) {
+        let m = &tree.modules[i];
+        let info = module_info(input.key, &tree, i);
+        let bytes = match d.write(m.key, &info, alloc) {
             Ok(bytes) => aligned(&bytes, alloc),
             Err(error) => {
                 notes.push(NamesNote::DeclsRecord { module: m.key, error: RecordError::Refused(error) });
@@ -1248,9 +1200,17 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         }
     }
     let root_record = |error| NamesError::RootRecord { krate: input.name, error };
-    let bytes = aligned(&cr.write(alloc).map_err(|e| root_record(RecordError::Refused(e)))?, alloc);
-    let view = CrateRootView::read(bytes).map_err(|e| root_record(RecordError::NotRead(e)))?;
+    let view = CrateRootView::read(root_bytes).map_err(|e| root_record(RecordError::NotRead(e)))?;
     let mut crate_root_record = CrateRootBuilder::from(&view, alloc);
+    // The module tree record: held in (its members matched their rows), or written from this
+    // walk.
+    let tree_record: &'a [u8] = match &record {
+        Some((bytes, _)) => bytes,
+        None => {
+            let written = tree_record_of(&set, &tree, &decls, &low.tables.macros, &cfg, edition, &crate_root_record.tools, root_attrs, root_bytes, alloc);
+            aligned(&written.map_err(|error| NamesError::TreeRecord { krate: input.name, error })?, alloc)
+        }
+    };
     let mut chains: HashMap<ItemKey, AVec<'a, ItemKey>, Alloc<'a>> = HashMap::new_in(alloc);
     let mut by_index: AVec<'a, AVec<'a, ItemKey>> = AVec::with_capacity_in(tree.modules.len(), alloc);
     for m in tree.modules.iter() {
@@ -1289,6 +1249,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
             decls: &decls,
             root: &crate_root_record,
             chains: &chains,
+            record: record.as_ref().map(|r| &r.1),
             built,
             sources,
             listed: listed.is_some(),
@@ -1368,6 +1329,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         files,
         root: tree.modules[0].key,
         tree,
+        tree_record,
         decls,
         crate_root: crate_root_record,
         chains,
@@ -1391,6 +1353,370 @@ fn held<T>(value: LockResult<T>, what: &str) -> T {
     }
 }
 
+/// What a crate's names are solved over: the files read, the module tree, the modules lowered,
+/// and the crate root's record before the cells run.
+struct Prepared<'a> {
+    set: FileSet<'a>,
+    tree: Tree<'a, 'a>,
+    low: Lowering<'a>,
+    listed: Option<&'a [ProcExport<'a>]>,
+    root_attrs: RootAttrs,
+    /// The crate root's `CrateRoot` record, aligned.
+    root_bytes: &'a [u8],
+    /// The module tree record handed in (its bytes, read); `None`: it is written from the walk.
+    record: Option<(&'a [u8], TreeRecord<'a>)>,
+}
+
+/// Module `i`'s place, as its `ModuleDecls` record's head holds it.
+fn module_info<'a>(krate: CrateItemKey, tree: &Tree<'a, 'a>, i: usize) -> ModuleInfo<&'a str> {
+    let m = &tree.modules[i];
+    ModuleInfo { krate, parent: m.parent.map(|p| tree.modules[p].key), name: m.name, no_implicit_prelude: m.no_implicit_prelude }
+}
+
+/// The files read from the root, each the walk names, until it names no file not read; every
+/// module lowered; the crate root made.
+#[allow(clippy::too_many_arguments, reason = "one crate's inputs, named")]
+fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
+    graph: &CrateGraph<'a, &'a str>,
+    input: &CrateInput<'a>,
+    id: CrateId,
+    index: usize,
+    edition: Edition,
+    cfg: &Cfg<'a, 'a>,
+    built: &Built<'_, 'a>,
+    sources: &S,
+    par: &P,
+    notes: &mut AVec<'a, NamesNote<'a>>,
+    alloc: Alloc<'a>,
+) -> Result<Prepared<'a>, NamesError<'a>> {
+    par.stage(crate::task::Stage::Files);
+    let root_text = sources.read(index, input.root).ok_or(NamesError::RootNotRead { krate: input.name, path: input.root })?;
+    let mut set = FileSet::new_in(alloc);
+    let root_file = set.add(file_of(input.root, root_text, outline(root_text, edition, alloc), input.shown_from, alloc));
+    let mut root_dir = AString::from_str_in(input.root, alloc);
+    pop_dir(&mut root_dir);
+    let mut tried: HashMap<&'a str, (), Alloc<'a>> = HashMap::new_in(alloc);
+    let mut walked = None;
+    for _ in 0..MOST_WALKS {
+        par.names_part(crate::task::NamesPart::Walk);
+        let tree = walk(&set, cfg, input.key, input.name, root_file, &root_dir, edition, alloc);
+        par.names_part(crate::task::NamesPart::Outline);
+        let mut read: AVec<'a, (&'a str, &'a str)> = AVec::new_in(alloc);
+        for path in tree.missing.iter() {
+            if set.find(path).is_some() || tried.contains_key(path.as_str()) {
+                continue;
+            }
+            let path = keep(path, alloc);
+            tried.insert(path, ());
+            if let Some(text) = sources.read(index, path) {
+                read.push((path, text));
+            }
+        }
+        if read.is_empty() {
+            walked = Some(tree);
+            break;
+        }
+        let mut outlines = AVec::with_capacity_in(read.len(), alloc);
+        par.map(read.len(), |at| outline(read[at].1, edition, alloc), &mut outlines);
+        for (&(path, text), outlined) in read.iter().zip(outlines) {
+            set.add(file_of(path, text, outlined, input.shown_from, alloc));
+        }
+    }
+    let tree = walked.ok_or(NamesError::WalkUnbounded { krate: input.name })?;
+
+    // Each walked module's own text, lowered.
+    par.stage(crate::task::Stage::Lower);
+    let listed = if input.implicit.proc_macro { sources.proc_exports(index) } else { None };
+    // The root's attributes first: its `#![register_tool]`s are the crate's tools, which every
+    // module's lowering reads to know an item's taker (names-attr-3).
+    let root = set.files[root_file as usize];
+    let attrs = file_attrs(cfg, &root.outline, root.text, alloc);
+    let tools = crate_tools(&attrs, alloc);
+    let mut low = lower_modules(input.key, input.implicit.entry, edition, cfg, &tools, &set, &tree, listed, notes, par, None, alloc);
+    let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
+    let macro_exports = core::mem::replace(&mut low.macro_exports, AVec::new_in(alloc));
+    let root_bytes = root_record_of(graph, input, id, root.id, &attrs, &tree, &mut low, &macro_exports, built, notes, alloc)?;
+    Ok(Prepared { set, tree, low, listed, root_attrs, root_bytes, record: None })
+}
+
+/// The crate root's record from the root's lowering (`low.at[0]` is the root) and the crate's
+/// `#[macro_export]` macros, aligned.
+#[allow(clippy::too_many_arguments, reason = "the root's inputs, named")]
+fn root_record_of<'a>(
+    graph: &CrateGraph<'a, &'a str>,
+    input: &CrateInput<'a>,
+    id: CrateId,
+    root_file: ContentId,
+    attrs: &Attrs<'a, 'a>,
+    tree: &Tree<'a, 'a>,
+    low: &mut Lowering<'a>,
+    macro_exports: &[(&'a str, ItemKey, MacroShapes)],
+    built: &Built<'_, 'a>,
+    notes: &mut AVec<'a, NamesNote<'a>>,
+    alloc: Alloc<'a>,
+) -> Result<&'a [u8], NamesError<'a>> {
+    let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
+    let plan = root_plan(graph, id, root_attrs, built, notes, alloc)?;
+    // From 2018 the injected item's name is def-site (rustc's `std_inject`: `ident_span = if
+    // edition >= Edition2018 { span } else { call_site }`, `span` with the pass's def-site
+    // context): a name the root writes itself is a different name and stands, no duplicate.
+    // alloy 2.5.0 under `#![no_std]` (a host unit's features, tempo's precompiles-macros):
+    // `pub use alloy_core as core; pub use self::core::primitives;` bound `self::core` to the
+    // injected `core` (an item beside an import wins, made.rs), so `alloy::primitives` was not
+    // there. The written name is read from the root's own text; one a root macro call writes
+    // is not seen (stated gap).
+    if let Some(name) = plan.injected.filter(|name| input.edition == Edition::E2015 || !root_binds_type(&low.decls[0], name)) {
+        low.decls[0].extern_crates.push(ExternCrateDecl { target: ExternTarget::Dep(name), rename: Rename::Same, vis: WrittenVis::Private });
+    }
+    let root_input = RootInput {
+        krate: input.key,
+        root_file,
+        edition: input.edition,
+        attrs,
+        tree,
+        prelude_import: low.prelude.as_ref(),
+        extern_crates: &low.decls[0].extern_crates,
+        macro_use: &low.macro_use,
+        macro_exports,
+    };
+    let mut root_notes = AVec::new_in(alloc);
+    let cr = crate_root(&root_input, &plan, &mut root_notes, alloc);
+    notes.extend(root_notes.into_iter().map(NamesNote::Root));
+    let bytes = cr.write(alloc).map_err(|e| NamesError::RootRecord { krate: input.name, error: RecordError::Refused(e) })?;
+    Ok(aligned(&bytes, alloc))
+}
+
+/// A one-group solve's files and tree from the module tree record `bytes`: the tree is the
+/// record's rows; the members' files alone are read and outlined, and the members alone
+/// lowered, each checked against what the walk read of it; the crate root is the record's, or
+/// made again when the root is a member (its own text's parts, the crate's exports the
+/// record's).
+#[allow(clippy::too_many_arguments, reason = "one crate's inputs, named")]
+fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
+    graph: &CrateGraph<'a, &'a str>,
+    input: &CrateInput<'a>,
+    id: CrateId,
+    index: usize,
+    edition: Edition,
+    cfg: &Cfg<'a, 'a>,
+    built: &Built<'_, 'a>,
+    sources: &S,
+    par: &P,
+    members: crate::cells::Members<'_>,
+    bytes: &'a [u8],
+    notes: &mut AVec<'a, NamesNote<'a>>,
+    alloc: Alloc<'a>,
+) -> Result<Option<Prepared<'a>>, NamesError<'a>> {
+    use crate::cells::MemberRefusal;
+    let refuse = |r: MemberRefusal| NamesError::Cells { krate: input.name, error: crate::cells::Unwritten::Member(r) };
+    par.stage(crate::task::Stage::Files);
+    let record = TreeRecord::read(bytes, alloc).map_err(|error| refuse(MemberRefusal::TreeRecord { error }))?;
+    par.names_part(crate::task::NamesPart::Outline);
+    let n = record.modules.len();
+    // A member in no row: a module the record's walk did not make (one just added).
+    if members.members.iter().any(|k| !record.modules.iter().any(|m| m.key == *k)) {
+        return Ok(None);
+    }
+    let mut set = FileSet::new_in(alloc);
+    let mut tree = Tree { modules: AVec::with_capacity_in(n, alloc), by_key: HashMap::with_capacity_in(n, alloc), notes: AVec::new_in(alloc), missing: AVec::new_in(alloc) };
+    let mut at: AVec<'a, usize> = AVec::new_in(alloc);
+    // The modules outside the members that define macros: lowered for the crate's macro table
+    // alone (a member's call, and `shadowed`, read every macro of the crate by its text now).
+    let mut defining: AVec<'a, usize> = AVec::new_in(alloc);
+    for (i, m) in record.modules.iter().enumerate() {
+        let member = members.holds(m.key);
+        if member {
+            at.push(i);
+        } else if m.macros > 0 {
+            defining.push(i);
+        }
+        if member || m.macros > 0 {
+            if set.find(m.file).is_none() {
+                // A file gone: the file set moved under the record.
+                let Some(text) = sources.read(index, m.file) else { return Ok(None) };
+                set.add(file_of(m.file, text, outline(text, edition, alloc), input.shown_from, alloc));
+            }
+        }
+    }
+    for (i, m) in record.modules.iter().enumerate() {
+        // A module whose text is not read has no file here: nothing of this solve reads one.
+        let file = set.find(m.file).unwrap_or(u32::MAX);
+        // An inline module of a file read here is found in the file's outline as it is now, by
+        // its name under its parent (in the same file, found before it): the record's position
+        // moves with every item added before it (the edit to `a` of USE_ADDED moved `r`'s, and
+        // `r` was lowered from `b`'s place).
+        let item = match (m.item, m.parent) {
+            (Some(_), Some(p)) if file != u32::MAX => {
+                let f = set.files[file as usize];
+                let parent = tree.modules[p as usize].item;
+                let Some(name) = m.name else { return Ok(None) };
+                let Some(found) = inline_child(cfg, &f.outline, f.text, parent, name, alloc) else { return Ok(None) };
+                Some(found)
+            }
+            (item, _) => item.map(ItemIndex),
+        };
+        tree.by_key.insert(m.key, i);
+        tree.modules.push(crate::task::Module {
+            key: m.key,
+            parent: m.parent.map(|p| p as usize),
+            name: m.name,
+            file,
+            item,
+            dir: AString::from_str_in(m.dir, alloc),
+            path_dir: AString::from_str_in(m.path_dir, alloc),
+            no_implicit_prelude: m.no_implicit_prelude,
+            path: AString::from_str_in(m.path, alloc),
+        });
+    }
+    // Each member's text as the walk reads it: equal to its row, the walk makes the same
+    // children of it.
+    par.names_part(crate::task::NamesPart::Walk);
+    let mut rows = AVec::new_in(alloc);
+    for &i in at.iter() {
+        let m = &tree.modules[i];
+        let f = set.files[m.file as usize];
+        rows.clear();
+        let file_attrs = walk_rows(cfg, &f.outline, f.text, m.item, edition, &mut rows, alloc);
+        let row = &record.modules[i];
+        if rows[..] != row.rows[..] || file_attrs != row.file_attrs {
+            return Ok(None);
+        }
+    }
+
+    par.stage(crate::task::Stage::Lower);
+    let listed = if input.implicit.proc_macro { sources.proc_exports(index) } else { None };
+    let root_member = at.first() == Some(&0);
+    let stored = aligned(record.crate_root, alloc);
+    let (tools, attrs) = if root_member {
+        let root = set.files[tree.modules[0].file as usize];
+        let attrs = file_attrs(cfg, &root.outline, root.text, alloc);
+        (crate_tools(&attrs, alloc), Some((root.id, attrs)))
+    } else {
+        (AVec::from_slice_in(&record.tools, alloc), None)
+    };
+    // The members' notes are kept only when the record holds: a tree made again notes its own.
+    let mut own_notes = AVec::new_in(alloc);
+    let mut low = lower_modules(input.key, input.implicit.entry, edition, cfg, &tools, &set, &tree, listed, &mut own_notes, par, Some(at), alloc);
+    let stored_view = CrateRootView::read(stored).map_err(|_| refuse(MemberRefusal::TreeCrateRoot))?;
+    if members_moved(input.key, &tree, &low, &record, &stored_view, alloc) {
+        return Ok(None);
+    }
+    if !defining.is_empty() {
+        // Their macro table rows alone: their scopes, notes and calls are their records'.
+        let mut dropped = AVec::new_in(alloc);
+        let outside = lower_modules(input.key, input.implicit.entry, edition, cfg, &tools, &set, &tree, listed, &mut dropped, par, Some(defining), alloc);
+        let found = macros_by_module(&outside.tables.macros, alloc);
+        if outside.at.iter().any(|&i| found.get(&tree.modules[i].key).copied().unwrap_or(0) != record.modules[i].macros) {
+            // A module's macros moved under the record: its inputs moved.
+            return Ok(None);
+        }
+        low.tables.macros.extend(outside.tables.macros);
+    }
+    let notes = {
+        notes.extend(own_notes);
+        notes
+    };
+    let (root_attrs, root_bytes) = match attrs {
+        None => (RootAttrs { no_std: record.no_std, no_core: record.no_core, arbitrary_ints: record.arbitrary_ints }, stored),
+        Some((root_file, attrs)) => {
+            let exports: AVec<'a, (&'a str, ItemKey, MacroShapes)> = AVec::from_iter_in(stored_view.macro_exports(), alloc);
+            let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
+            (root_attrs, root_record_of(graph, input, id, root_file, &attrs, &tree, &mut low, &exports, built, notes, alloc)?)
+        }
+    };
+    Ok(Some(Prepared { set, tree, low, listed, root_attrs, root_bytes, record: Some((bytes, record)) }))
+}
+
+/// Whether a member's `mod` lines or `#[macro_export]` macros (its record written and read
+/// back, the form the tree record's lines were taken in) are not the tree record's row and
+/// crate root's: the record's inputs moved.
+fn members_moved<'a>(krate: CrateItemKey, tree: &Tree<'a, 'a>, low: &Lowering<'a>, record: &TreeRecord<'a>, root: &CrateRootView<'_>, alloc: Alloc<'a>) -> bool {
+    for (&i, d) in low.at.iter().zip(low.decls.iter()) {
+        let key = tree.modules[i].key;
+        let row = &record.modules[i];
+        let Ok(bytes) = d.write(key, &module_info(krate, tree, i), alloc) else { return true };
+        let Ok(view) = ModuleDeclsView::read(aligned(&bytes, alloc)) else { return true };
+        let d = DeclsBuilder::from(&view, alloc);
+        if d.mods.len() != row.lines.len() || d.mods.iter().zip(row.lines.iter()).any(|(c, l)| (c.module, c.macro_use) != *l) {
+            return true;
+        }
+        let mut exports = 0u32;
+        for r in d.macro_rules.iter().filter(|r| r.export) {
+            exports += 1;
+            if !root.macro_exports().any(|(name, def, shapes)| name == r.name && def == r.def && shapes == r.shapes) {
+                return true;
+            }
+        }
+        if exports != row.exports {
+            return true;
+        }
+    }
+    let defined = macros_by_module(&low.tables.macros, alloc);
+    low.at.iter().any(|&i| defined.get(&tree.modules[i].key).copied().unwrap_or(0) != record.modules[i].macros)
+}
+
+/// How many macros each module's own text defines, by the lowered macro table.
+fn macros_by_module<'a>(macros: &HashMap<ItemKey, MacroSrc<'a>, Alloc<'a>>, alloc: Alloc<'a>) -> HashMap<ItemKey, u32, Alloc<'a>> {
+    let mut defined: HashMap<ItemKey, u32, Alloc<'a>> = HashMap::new_in(alloc);
+    for m in macros.values() {
+        *defined.entry(m.module).or_insert(0) += 1;
+    }
+    defined
+}
+
+/// The module tree record of a walked crate, written: each module's place and file, its `mod`
+/// lines and exports from its record read back, what the walk read of its text.
+#[allow(clippy::too_many_arguments, reason = "the record's parts, named")]
+fn tree_record_of<'a>(
+    set: &FileSet<'a>,
+    tree: &Tree<'a, 'a>,
+    decls: &HashMap<ItemKey, (ModuleInfo<&'a str>, DeclsBuilder<'a, &'a str>), Alloc<'a>>,
+    macros: &HashMap<ItemKey, MacroSrc<'a>, Alloc<'a>>,
+    cfg: &Cfg<'a, 'a>,
+    edition: Edition,
+    tools: &[&'a str],
+    root_attrs: RootAttrs,
+    crate_root: &'a [u8],
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, u8>, crate::tree_record::TreeRecordError> {
+    let defined = macros_by_module(macros, alloc);
+    let mut modules = AVec::with_capacity_in(tree.modules.len(), alloc);
+    for m in tree.modules.iter() {
+        let f = set.files[m.file as usize];
+        let mut rows = AVec::new_in(alloc);
+        let file_attrs = walk_rows(cfg, &f.outline, f.text, m.item, edition, &mut rows, alloc);
+        let (lines, exports) = match decls.get(&m.key) {
+            Some((_, d)) => (AVec::from_iter_in(d.mods.iter().map(|c| (c.module, c.macro_use)), alloc), d.macro_rules.iter().filter(|r| r.export).count()),
+            None => (AVec::new_in(alloc), 0),
+        };
+        modules.push(TreeModule {
+            key: m.key,
+            parent: m.parent.map(|p| p as u32),
+            name: m.name,
+            file: f.path,
+            item: m.item.map(|it| it.0),
+            dir: m.dir.as_str(),
+            path_dir: m.path_dir.as_str(),
+            no_implicit_prelude: m.no_implicit_prelude,
+            path: m.path.as_str(),
+            lines,
+            rows,
+            file_attrs,
+            exports: exports as u32,
+            macros: defined.get(&m.key).copied().unwrap_or(0),
+        });
+    }
+    let record = TreeRecord {
+        modules,
+        tools: AVec::from_slice_in(tools, alloc),
+        no_std: root_attrs.no_std,
+        no_core: root_attrs.no_core,
+        arbitrary_ints: root_attrs.arbitrary_ints,
+        crate_root,
+    };
+    record.write(alloc)
+}
+
 fn lower_modules<'a, P: Par>(
     krate: CrateItemKey,
     entry: bool,
@@ -1402,12 +1728,16 @@ fn lower_modules<'a, P: Par>(
     listed: Option<&'a [ProcExport<'a>]>,
     notes: &mut AVec<'a, NamesNote<'a>>,
     par: &P,
+    only: Option<AVec<'a, usize>>,
     alloc: Alloc<'a>,
 ) -> Lowering<'a> {
-    let mut parts = AVec::with_capacity_in(tree.modules.len(), alloc);
+    // The modules lowered, ascending: every one, or a one-group solve's members.
+    let at: AVec<'a, usize> = only.unwrap_or_else(|| AVec::from_iter_in(0..tree.modules.len(), alloc));
+    let mut parts = AVec::with_capacity_in(at.len(), alloc);
     par.map(
-        tree.modules.len(),
-        |i| {
+        at.len(),
+        |j| {
+            let i = at[j];
             let m = &tree.modules[i];
             let file = set.files[m.file as usize];
             let fragment = Fragment {
@@ -1437,13 +1767,14 @@ fn lower_modules<'a, P: Par>(
     );
     let mut out = Lowering {
         decls: AVec::with_capacity_in(parts.len(), alloc),
+        at: AVec::new_in(alloc),
         tables: Tables::new_in(alloc),
         prelude: None,
         macro_use: AVec::new_in(alloc),
         macro_exports: AVec::new_in(alloc),
         bodies: AVec::new_in(alloc),
     };
-    for (i, mut part) in parts.into_iter().enumerate() {
+    for (&i, mut part) in at.iter().zip(parts) {
         let m = &tree.modules[i];
         out.bodies.extend(part.bodies.iter().copied());
         for rules in part.decls.macro_rules.iter() {
@@ -1463,6 +1794,7 @@ fn lower_modules<'a, P: Par>(
         notes.extend(lowered.into_iter().map(NamesNote::Lower));
         out.decls.push(decls);
     }
+    out.at = at;
     out
 }
 
@@ -1564,6 +1896,9 @@ struct Base<'r, 'a, S> {
     decls: &'r HashMap<ItemKey, (ModuleInfo<&'a str>, DeclsBuilder<'a, &'a str>), Alloc<'a>>,
     root: &'r CrateRootBuilder<'a, &'a str>,
     chains: &'r HashMap<ItemKey, AVec<'a, ItemKey>, Alloc<'a>>,
+    /// A one-group solve's module tree record: the place and `mod` lines of every module
+    /// whose text it does not lower.
+    record: Option<&'r TreeRecord<'a>>,
     built: &'r Built<'r, 'a>,
     sources: &'r S,
     /// A macro crate whose module's list declared its macros: an expansion declares none.
@@ -1664,6 +1999,10 @@ impl<'a, S> ScopeFacts for Facts<'_, 'a, S> {
         if let Some(it) = self.base.decls.get(&module) {
             return Ok(it.0);
         }
+        // A module a one-group solve does not lower: its place is the tree record's.
+        if let (Some(_), Some(&i)) = (self.base.record, self.base.tree.by_key.get(&module)) {
+            return Ok(module_info(self.base.key, self.base.tree, i));
+        }
         held(self.run.made.read(), "made modules")
             .get(&module)
             .map(|it| it.info)
@@ -1707,6 +2046,21 @@ impl<'a, S> ScopeFacts for Facts<'_, 'a, S> {
                 Ok(())
             }
             MacroBody::Rules(_) | MacroBody::Macro2 { .. } | MacroBody::BuiltinFn(_) | MacroBody::BuiltinOther(_) | MacroBody::Proc { .. } => Ok(()),
+        }
+    }
+
+    /// A module a one-group solve does not lower: its `mod` lines are the tree record's.
+    fn mod_lines(&self, module: ItemKey, out: &mut AVec<'_, (ItemKey, bool)>) -> bool {
+        let Some(record) = self.base.record else { return false };
+        if self.base.decls.contains_key(&module) {
+            return false;
+        }
+        match self.base.tree.by_key.get(&module) {
+            Some(&i) => {
+                out.extend_from_slice(&record.modules[i].lines);
+                true
+            }
+            None => false,
         }
     }
 }
@@ -1771,6 +2125,9 @@ impl<'r, 'a, S: SourceTexts<'a>> FillEnv<&'a str> for FillCx<'r, 'a, S> {
     fn parent(&self, module: ItemKey) -> Option<Option<ItemKey>> {
         if let Some(it) = self.base.decls.get(&module) {
             return Some(it.0.parent);
+        }
+        if let (Some(_), Some(&i)) = (self.base.record, self.base.tree.by_key.get(&module)) {
+            return Some(self.base.tree.modules[i].parent.map(|p| self.base.tree.modules[p].key));
         }
         held(self.run.made.read(), "made modules").get(&module).map(|it| it.info.parent)
     }
@@ -2820,8 +3177,10 @@ fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bo
         // A block is a module when it holds an item that makes one (its head is made in the
         // block's module by the ordinary code; front2's `Locals::keep` derives the same module
         // key with `blocks::block_modules`) or a statement call (what it declares is known
-        // once it is expanded: crate::expanded_blocks).
-        if nested.end != blaze_file_items::nested::NestedEnd::Whole || (!nested.makes_module() && nested.calls.is_empty()) {
+        // once it is expanded: crate::expanded_blocks), or a local fn, const or static whose
+        // own body writes a block (`NestedItem::body_writes`: the item is then the block
+        // module's, and its body comes back to this loop with the module's items' bodies).
+        if nested.end != blaze_file_items::nested::NestedEnd::Whole || !nested.writes() {
             continue;
         }
         if body.depth >= MAX_BLOCK_DEPTH {

@@ -28,6 +28,9 @@ pub trait ScopeRead<'w, N>: Copy {
     /// The latest `macro_rules!` named `name` visible at the end of its textual scope (`None`)
     /// or at the `mod` line of `child`: the definition and its call shapes.
     fn textual(self, child: Option<ItemKey>, name: N) -> Option<(ItemKey, MacroShapes)>;
+    /// Whether it marks a place in its textual sequence for `child`: a `mod` line of it. A
+    /// body's outermost written block has none (blocks.rs: its `mod` is dropped).
+    fn marked(self, child: ItemKey) -> bool;
     /// Each trait it binds in the type namespace and each `use .. as _` import's trait.
     fn each_trait(self, each: &mut dyn FnMut(ItemKey));
 }
@@ -79,6 +82,10 @@ impl<'w, N: Name> ScopeRead<'w, N> for &'w ScopeBuilder<'w, N> {
         self.textual[..end.min(self.textual.len())].iter().rev().find(|d| d.name == name).map(|d| (d.def, d.shapes))
     }
 
+    fn marked(self, child: ItemKey) -> bool {
+        ScopeBuilder::mark(self, child).is_some()
+    }
+
     fn each_trait(self, each: &mut dyn FnMut(ItemKey)) {
         for entry in self.bindings.iter() {
             if entry.ns == Namespace::Types && entry.binding.def.kind == DefKind::Trait {
@@ -106,6 +113,10 @@ impl<'w, N: Name> ScopeRead<'w, N> for ScopeView<'w> {
 
     fn textual(self, child: Option<ItemKey>, name: N) -> Option<(ItemKey, MacroShapes)> {
         self.textual_before(child, name.as_ref()).map(|d| (d.def, d.shapes))
+    }
+
+    fn marked(self, child: ItemKey) -> bool {
+        ScopeView::mark(&self, child).is_some()
     }
 
     fn each_trait(self, each: &mut dyn FnMut(ItemKey)) {

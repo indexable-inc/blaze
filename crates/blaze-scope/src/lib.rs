@@ -53,6 +53,7 @@ pub mod blocks;
 pub mod call_refusal;
 pub mod expanded_blocks;
 pub mod expansion_origins;
+pub mod expansion_records;
 pub mod nested_input;
 pub mod crate_roots;
 mod builtin;
@@ -90,6 +91,7 @@ mod resolver;
 mod scope;
 pub mod task;
 pub mod tests_record;
+pub mod tree_record;
 pub mod units;
 mod work;
 

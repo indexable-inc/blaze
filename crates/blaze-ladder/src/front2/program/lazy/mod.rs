@@ -68,6 +68,10 @@ pub enum LazyRefusal {
     /// `file:line` (rule 71: computed only here, from the item-relative range). `others`: the
     /// check's other gaps, counted.
     LocalNotBuilt { function: Box<str>, enclosing: Box<str>, form: &'static str, head: Box<str>, at: Box<str>, others: usize },
+    /// The body's check found a diagnostic, printed as a user reads it (rule 19): its code, its
+    /// words and its `file:line` (rule 71: computed only here, from the item-relative range).
+    /// `others`: the check's other diagnostics, counted.
+    Diagnostic { function: Box<str>, code: &'static str, about: Box<str>, at: Box<str>, others: usize },
     /// A row the build asks for (the fn's own, or a callee's head) is refused, as
     /// `program/tabled.rs` `row` refuses it.
     Row { function: Box<str>, refusal: Box<Front2Refusal> },
@@ -116,6 +120,13 @@ impl core::fmt::Display for LazyRefusal {
                 match others {
                     0 => Ok(()),
                     n => write!(f, " (and {n} other gaps)"),
+                }
+            }
+            LazyRefusal::Diagnostic { function, code, about, at, others } => {
+                write!(f, "front2 (lazy): `{function}` did not check: error[{code}]: {about} ({at})")?;
+                match others {
+                    0 => Ok(()),
+                    n => write!(f, " (and {n} other diagnostics)"),
                 }
             }
             LazyRefusal::Row { refusal, .. } => write!(f, "front2 (lazy): {refusal}"),

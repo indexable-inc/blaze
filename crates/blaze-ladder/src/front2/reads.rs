@@ -387,12 +387,13 @@ pub fn facts_with_buckets<'a>(
     for (i, &q) in questions.iter().enumerate() {
         let answer = answers.and_then(|all| all.get(i).copied());
         rows.push(Read { fact: fact_of(q, module, paths, segments)?, answer });
+        // A shared borrow of the buckets' index, held over this question's rows only.
         let read = match (buckets, q) {
-            (Some(b), Question::ImplsOf(trait_, shape)) => b.trait_reads(trait_, shape),
-            (Some(b), Question::Inherent(shape, _)) => b.inherent_reads(shape),
-            _ => &[],
+            (Some(b), Question::ImplsOf(trait_, shape)) => Some(b.trait_reads(trait_, shape)),
+            (Some(b), Question::Inherent(shape, _)) => Some(b.inherent_reads(shape)),
+            _ => None,
         };
-        for bucket in read {
+        for bucket in read.as_deref().unwrap_or(&[]) {
             rows.push(Read { fact: Fact { kind: FactKind::CrateBucket, key: bucket.krate, detail: bucket.bucket }, answer: Some(bucket.answer) });
         }
     }
