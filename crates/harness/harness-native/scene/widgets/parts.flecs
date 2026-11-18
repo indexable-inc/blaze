@@ -33,7 +33,11 @@ hn {
     HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: $radius_control}
     Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
     Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $group_h, min: 0, max: 0}}
+    // Not shown: which machine this is and how it is connected is plumbing, and the sidebar is for what a person
+    // is learning and doing. The row stays (the host keeps its words and a refused link still says so under the tree),
+    // folded to no height and clipped.
+    Clip
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
     Padding: {l: $label_inset, r: $tree_pad_r, t: 0, b: 0}
     disclosure : ui.Symbol, Faint {
       Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
@@ -120,6 +124,74 @@ hn {
     }
     detail : ui.Words, Muted {
       TextStyle: {size: $size_menu_meta, line: $line_menu, role: 0, bold: 0}
+    }
+  }
+}
+
+// The composer bar's parts (hn.ChatPane's foot.card.bar, scene/widgets/chat.flecs), here because a prefab must be
+// declared before the prefab that holds it; Learn's field uses the send disc too.
+@tree ChildOf
+hn {
+  // A control on the composer's bar: a quiet pill hugging its words, a wash under the pointer.
+  prefab ChatBarControl : ui.Row {
+    Cursor: {shape: Arrow}
+    Fill: $tone_clear
+    Shape: {radius: $chat_pick_radius, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
+    Padding: {l: $chat_pick_pad_x, r: $chat_pick_pad_x, t: 0, b: 0}
+  }
+  prefab ChatBarWord : ui.Line {
+    Fill: $tone_ink_muted
+    FixedSize: {h: true, v: false}
+    TextStyle: {size: $size_chrome, line: $line_chrome, role: 0, bold: 0, weight: $weight_row}
+  }
+
+  // The composer's one button, a disc chat_send across at the bar's trailing edge. hn.ChatSend: there is a draft, so
+  // it is lit (the strong ink, its arrow in the ground's) and a press sends. hn.ChatSendOff: nothing to send, a faint
+  // disc that takes no press. hn.ChatSendStop: a turn runs, so it is a square to press to stop it.
+  prefab ChatSendLook : ui.Row {
+    Cursor: {shape: Arrow}
+    Shape: {radius: $chat_send / 2, n: 2, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fixed, value: $chat_send, min: 0, max: 0}, h: {kind: Fixed, value: $chat_send, min: 0, max: 0}}
+  }
+  prefab ChatSend : hn.ChatSendLook {
+    Pressable
+    Action: {name: ""}
+    Tooltip: {text: "Send"}
+    Fill: $tone_ink_strong
+    PressLook: {dark: $tone_ink.dark, light: $tone_ink.light}
+    arrow : ui.Node {
+      Fill: $tone_clear
+      Stroke: {dark: $tone_ground.dark, light: $tone_ground.light}
+      Size: {w: {kind: Fixed, value: $chat_send_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_send_icon, min: 0, max: 0}}
+      Vector: {d: "M8 13 V3.5 M3.75 7.5 L8 3.25 L12.25 7.5", view_x: 0, view_y: 0, view_w: 16, view_h: 16,
+        inset_l: 0, inset_t: 0, inset_r: 0, inset_b: 0, stroke_w: $chat_send_stroke}
+    }
+  }
+  prefab ChatSendOff : hn.ChatSendLook {
+    Fill: $tone_wash
+    arrow : ui.Node {
+      Fill: $tone_clear
+      Stroke: {dark: $tone_ink_faint.dark, light: $tone_ink_faint.light}
+      Size: {w: {kind: Fixed, value: $chat_send_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_send_icon, min: 0, max: 0}}
+      Vector: {d: "M8 13 V3.5 M3.75 7.5 L8 3.25 L12.25 7.5", view_x: 0, view_y: 0, view_w: 16, view_h: 16,
+        inset_l: 0, inset_t: 0, inset_r: 0, inset_b: 0, stroke_w: $chat_send_stroke}
+    }
+  }
+  prefab ChatSendStop : hn.ChatSendLook {
+    Pressable
+    Action: {name: ""}
+    Tooltip: {text: "Stop"}
+    Fill: $tone_ink_strong
+    PressLook: {dark: $tone_ink.dark, light: $tone_ink.light}
+    square : ui.Node {
+      Fill: $tone_ground
+      Shape: {radius: 2, n: 4, border: 0, feather: 0}
+      Size: {w: {kind: Fixed, value: $chat_send_stop, min: 0, max: 0}, h: {kind: Fixed, value: $chat_send_stop, min: 0, max: 0}}
     }
   }
 }

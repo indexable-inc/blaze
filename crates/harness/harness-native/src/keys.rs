@@ -90,6 +90,7 @@ pub const TREE: &str = "ctx::Tree";
 pub const PALETTE: &str = "ctx::Palette";
 pub const PICKER: &str = "ctx::Picker";
 pub const ARCHIVE: &str = "ctx::Archive";
+pub const LEARN: &str = "ctx::Learn";
 pub const CHAT: &str = "ctx::Chat";
 pub const BROWSER: &str = "ctx::Browser";
 

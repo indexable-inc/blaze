@@ -1,0 +1,744 @@
+// Learn, the app's home (src/app/learn.rs): what the main card shows when no session is selected. A person says what
+// they want to learn, a tutor (an agent) writes a course of short lessons, and a lesson is walked one screen at a time:
+// a small idea, then questions on it, each marked and explained at once, a missed one coming back later. What was
+// learned is remembered and comes due again (crates/harness/harness-learn).
+//
+// One screen holds one thing. `page` is filled with exactly one of: hn.LearnHome (the question, the courses),
+// hn.LearnMaking (a tutor is writing), hn.LearnStep (a lesson's screen), hn.LearnDone (how the run went).
+
+@tree ChildOf
+hn {
+  // The start page and lessons: one web page (crates/harness/web) drawn by the harness browser, filling the pane edge
+  // to edge (the page lays out its own column).
+  prefab LearnPane : hn.Pane {
+    Fill: $tone_ground
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    page : ui.List {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    }
+  }
+  prefab LearnWeb : ui.Browser {
+    Fill: $tone_ground
+    Shape: {radius: 0, n: 4, border: 0, feather: 0}
+  }
+
+  // ---- shared parts ----
+
+  // The screen's one question or headline.
+  prefab LearnDisplay : ui.Words, Strong {
+    TextStyle: {size: $size_learn_display, line: $line_learn_display, role: 0, bold: 1, weight: $weight_learn_display}
+  }
+  prefab LearnTitle : ui.Words, Strong {
+    TextStyle: {size: $size_learn_title, line: $line_learn_title, role: 0, bold: 1, weight: $weight_label}
+  }
+  prefab LearnBody : ui.Words, Ink {
+    TextStyle: {size: $size_learn, line: $line_learn, role: 0, bold: 0}
+  }
+  prefab LearnSmall : ui.Words, Muted {
+    TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
+  }
+  // A small label over a group: quiet, semibold.
+  prefab LearnLabel : ui.Line, Faint {
+    TextStyle: {size: $size_label, line: 14, role: 0, bold: 1, weight: $weight_label}
+  }
+  // Air between two parts of a column.
+  prefab LearnAir : ui.Node {
+    Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $learn_section, min: 0, max: 0}}
+  }
+  prefab LearnAirSmall : ui.Node {
+    Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $learn_gap, min: 0, max: 0}}
+  }
+  // The room over a centred screen's content: a share of the pane, so the content sits a little above the middle.
+  prefab LearnTop : ui.Node {
+    Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Percent, value: $learn_top, min: 0, max: 0}}
+  }
+
+  // The one primary button of a screen: a pill in the strong ink, its words in the ground's. hn.LearnButtonOff is the
+  // same pill when there is nothing to do yet (no answer in hand): faint, and it takes no press.
+  prefab LearnButton : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Fill: $tone_ink_strong
+    PressLook: {dark: $tone_ink.dark, light: $tone_ink.light}
+    Shape: {radius: $learn_button_h / 2, n: 2, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 8, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $learn_button_h, min: 0, max: 0}}
+    Padding: {l: $learn_button_pad, r: $learn_button_pad, t: 0, b: 0}
+    label : ui.Line {
+      Fill: $tone_ground
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_chat, line: 18, role: 0, bold: 1, weight: $weight_label}
+    }
+  }
+  prefab LearnButtonOff : ui.Row {
+    Fill: $tone_wash
+    Shape: {radius: $learn_button_h / 2, n: 2, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 8, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $learn_button_h, min: 0, max: 0}}
+    Padding: {l: $learn_button_pad, r: $learn_button_pad, t: 0, b: 0}
+    label : ui.Line {
+      Fill: $tone_ink_faint
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_chat, line: 18, role: 0, bold: 1, weight: $weight_label}
+    }
+  }
+  // A quiet button beside the primary one: words alone, a wash under the pointer.
+  prefab LearnQuiet : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Fill: $tone_clear
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+    Shape: {radius: $learn_button_h / 2, n: 2, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 8, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $learn_button_h, min: 0, max: 0}}
+    Padding: {l: $learn_button_pad, r: $learn_button_pad, t: 0, b: 0}
+    label : ui.Line, Muted {
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_chat, line: 18, role: 0, bold: 0, weight: $weight_row}
+    }
+  }
+
+  // A meter: a thin track and how much of it is filled (the host sets `fill`'s Percent width).
+  prefab LearnMeter : ui.Row {
+    Fill: $tone_wash
+    Shape: {radius: $learn_meter_h / 2, n: 2, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $learn_meter_h, min: 0, max: 0}}
+    fill : ui.Node {
+      Fill: $tone_ink_strong
+      Shape: {radius: $learn_meter_h / 2, n: 2, border: 0, feather: 0}
+      Size: {w: {kind: Percent, value: 0, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    }
+  }
+
+  // A field's plate: where the words typed show (the host sets `text`; `hint` shows while it is empty).
+  prefab LearnField : ui.Row {
+    Fill: $tone_card
+    Edge: {dark: $tone_line_strong.dark, light: $tone_line_strong.light}
+    Shape: {radius: $learn_radius, n: 4, border: 1, feather: 0}
+    Cursor: {shape: Text}
+    Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $learn_field_h, min: 0, max: 0}}
+    Padding: {l: 18, r: 12, t: 0, b: 0}
+    // The words, with the text primitive's own caret (TextEdit: at the end of what was typed, blinking as every field's
+    // does), never a bar drawn beside them.
+    text : ui.Line, Strong {
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_learn, line: 22, role: 0, bold: 0}
+      TextEdit: {caret: 0, anchor: 0, mark_lo: 0, mark_hi: 0, focused: true,
+        caret_dark: $tone_ink_strong.dark, caret_light: $tone_ink_strong.light}
+    }
+    hint : ui.Lead, Faint {
+      TextStyle: {size: $size_learn, line: 22, role: 0, bold: 0}
+    }
+    spacer : ui.Spacer {}
+    go : ui.Row {}
+  }
+
+  // Code a step shows: a sunk block in the code face.
+  prefab LearnCode : ui.Column {
+    Fill: $tone_well
+    Edge: {dark: $tone_line.dark, light: $tone_line.light}
+    Shape: {radius: $radius_card, n: 4, border: 1, feather: 0}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $learn_code_pad, r: $learn_code_pad, t: $learn_code_pad, b: $learn_code_pad}
+    text : ui.Words {
+      Fill: $tone_code_ink
+      TextStyle: {size: $size_body, line: 20, role: 9, bold: 0}
+    }
+  }
+
+  // ---- home ----
+
+  prefab LearnHome : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    top : hn.LearnTop {}
+    ask : hn.LearnDisplay { Text: {s: "What’s on your mind?"} }
+    a1 : hn.LearnAirSmall {}
+    sub : hn.LearnSmall {
+      Text: {s: "Ask for anything. Ask to understand something and you get a short lesson that asks you back."}
+      TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+    }
+    a2 : hn.LearnAir {}
+    field : hn.LearnField {}
+    a3 : hn.LearnAirSmall {}
+    // Why the last course could not be made, in the error ink; empty and without room else.
+    note : ui.Words {
+      Fill: $tone_error
+      TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
+    }
+    a4 : hn.LearnAir {}
+    label : hn.LearnLabel {}
+    a5 : hn.LearnAirSmall {}
+    courses : ui.List {
+      Flex: {axis: Column, gap: $learn_gap, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+    rest : ui.Spacer {}
+    streak : ui.Line, Faint {
+      TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
+    }
+  }
+
+  // A course on the home: its title, where the person is in it, how much is learned, and what is due. A press
+  // continues it.
+  prefab LearnCourse : ui.Column {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Fill: $tone_card
+    Edge: {dark: $tone_line.dark, light: $tone_line.light}
+    Shape: {radius: $learn_radius, n: 4, border: 1, feather: 0}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+    Flex: {axis: Column, gap: 10, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $learn_course_pad, r: $learn_course_pad, t: 14, b: 16}
+    head : ui.Row {
+      Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      title : ui.Lead, Strong {
+        TextStyle: {size: $size_chat_h3, line: 22, role: 0, bold: 1, weight: $weight_label}
+      }
+      spacer : ui.Spacer {}
+      due : ui.Line, Muted {
+        FixedSize: {h: true, v: false}
+        TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
+      }
+    }
+    next : ui.Lead, Muted {
+      TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
+    }
+    meter : hn.LearnMeter {}
+  }
+
+  // ---- a tutor is writing ----
+
+  // A lesson that is not written yet, as its place on the path: a disc and two bars where its title and idea will be.
+  // Still: the one thing that breathes on the screen is the ring beside the words.
+  prefab LearnGhost : ui.Row {
+    Flex: {axis: Row, gap: 14, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $learn_option_h, min: 0, max: 0}}
+    Padding: {l: 10, r: $learn_option_pad, t: 0, b: 0}
+    disc : ui.Node {
+      Fill: $tone_wash
+      Shape: {radius: $learn_disc / 2, n: 2, border: 0, feather: 0}
+      Size: {w: {kind: Fixed, value: $learn_disc, min: 0, max: 0}, h: {kind: Fixed, value: $learn_disc, min: 0, max: 0}}
+    }
+    bars : ui.Column {
+      Flex: {axis: Column, gap: 8, align: Start, justify: Center, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      title : ui.Node {
+        Fill: $tone_wash
+        Shape: {radius: 4, n: 4, border: 0, feather: 0}
+        Size: {w: {kind: Percent, value: 0.34, min: 0, max: 0}, h: {kind: Fixed, value: 10, min: 0, max: 0}}
+      }
+      about : ui.Node {
+        Fill: $tone_hover
+        Shape: {radius: 4, n: 4, border: 0, feather: 0}
+        Size: {w: {kind: Percent, value: 0.62, min: 0, max: 0}, h: {kind: Fixed, value: 8, min: 0, max: 0}}
+      }
+    }
+  }
+  prefab LearnGhostShort : hn.LearnGhost {
+    bars {
+      title { Size: {w: {kind: Percent, value: 0.24, min: 0, max: 0}, h: {kind: Fixed, value: 10, min: 0, max: 0}} }
+      about { Size: {w: {kind: Percent, value: 0.48, min: 0, max: 0}, h: {kind: Fixed, value: 8, min: 0, max: 0}} }
+    }
+  }
+  prefab LearnGhostLong : hn.LearnGhost {
+    bars {
+      title { Size: {w: {kind: Percent, value: 0.42, min: 0, max: 0}, h: {kind: Fixed, value: 10, min: 0, max: 0}} }
+      about { Size: {w: {kind: Percent, value: 0.7, min: 0, max: 0}, h: {kind: Fixed, value: 8, min: 0, max: 0}} }
+    }
+  }
+
+  // While a tutor writes (src/app/learn.rs Screen::Making): what is being made, named large (the topic, or the lesson),
+  // one quiet line saying what is happening beside the breathing ring, and the shape of what is coming: the course's
+  // path as it will be, its lessons still blank. So the wait shows where it is going, not an empty page.
+  prefab LearnMaking : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    top : hn.LearnTop {}
+    kicker : hn.LearnLabel {}
+    a0 : hn.LearnAirSmall {}
+    title : hn.LearnDisplay {}
+    a1 : hn.LearnAirSmall {}
+    status : ui.Row {
+      Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      ring : hn.ChatWorking {
+        Tooltip: {text: "Working"}
+      }
+      sub : ui.Line, Muted {
+        TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+      }
+    }
+    a2 : hn.LearnAir {}
+    ghosts : ui.Column {
+      Flex: {axis: Column, gap: 4, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      g1 : hn.LearnGhost {}
+      g2 : hn.LearnGhostLong {}
+      g3 : hn.LearnGhostShort {}
+      g4 : hn.LearnGhost {}
+      g5 : hn.LearnGhostLong {}
+    }
+    rest : ui.Spacer {}
+    row : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      hint : ui.Line, Faint {
+        Text: {s: "esc"}
+        TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
+        Padding: {l: 0, r: 8, t: 0, b: 0}
+      }
+      cancel : hn.LearnQuiet {
+        Action: {name: "learn:back"}
+        Fill: $tone_wash
+        label { Text: {s: "Cancel"} }
+      }
+    }
+  }
+
+  // ---- a lesson's screen ----
+
+  prefab LearnStep : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    // How far along the run is, and the way out.
+    head : ui.Row {
+      Flex: {axis: Row, gap: 12, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $learn_head_h, min: 0, max: 0}}
+      back : ui.IconButton {
+        Action: {name: "learn:back"}
+        AlignSelf: {align: Center}
+        Tooltip: {text: "Leave  esc"}
+        icon : ui.Node {
+          Fill: $tone_clear
+          Stroke: {dark: $tone_ink_muted.dark, light: $tone_ink_muted.light}
+          Size: {w: {kind: Fixed, value: $tree_icon, min: 0, max: 0}, h: {kind: Fixed, value: $tree_icon, min: 0, max: 0}}
+          Vector: {d: "M10 3 L5 8 L10 13", view_x: 0, view_y: 0, view_w: 16, view_h: 16,
+            inset_l: 0, inset_t: 0, inset_r: 0, inset_b: 0, stroke_w: 1.4}
+        }
+      }
+      bar : hn.LearnMeter {
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $learn_bar_h, min: 0, max: 0}}
+        Shape: {radius: $learn_bar_radius, n: 2, border: 0, feather: 0}
+        fill { Shape: {radius: $learn_bar_radius, n: 2, border: 0, feather: 0} }
+      }
+    }
+    // The step itself: what is told or asked, and the answers. It takes the room between the bar and the foot and
+    // scrolls inside it when a window is too short for it (src/app/learn.rs learn_wheel), so nothing ever lies over
+    // anything else.
+    content : ui.Scroll {
+      // The scroll's physics are the text areas' (harness_native_ui_view::field::FieldScroll), which read this.
+      CaretScroll: {margin: $library_pad, omega: $textarea_glide_omega, zeta: $textarea_glide_zeta}
+      ClipFade: {len: $chat_fade_len}
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+      Padding: {l: 0, r: 0, t: $learn_section, b: $learn_gap}
+      // Where it is from (the lesson's title; "Again" on a check that came back).
+      kicker : hn.LearnLabel {}
+      a1 : hn.LearnAirSmall {}
+      // A read step's title, or a check's question.
+      title : hn.LearnTitle {}
+      a2 : hn.LearnAirSmall {}
+      body : hn.LearnBody {}
+      code : ui.List {
+        Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        Padding: {l: 0, r: 0, t: $learn_gap, b: 0}
+      }
+      a3 : hn.LearnAirSmall {}
+      // A choice's options, an order's items, or a fill's field.
+      answers : ui.List {
+        Flex: {axis: Column, gap: 8, align: Stretch, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
+    }
+    // The foot, always in view: once the check is marked, what it was and why (hn.LearnSaid, in `said`), then the one
+    // button.
+    foot : ui.Column {
+      Flex: {axis: Column, gap: $learn_gap, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: 0, r: 0, t: $learn_gap, b: 0}
+      said : ui.List {
+        Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
+      row : ui.Row {
+        Flex: {axis: Row, gap: 8, align: Center, justify: End, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        hint : ui.Line, Faint {
+          TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
+          Padding: {l: 0, r: 8, t: 0, b: 0}
+        }
+        go : ui.Row {}
+      }
+    }
+  }
+
+  // What a marked check says, docked over the button: whether it was right (in the state's ink, the one place a
+  // lesson uses colour for words) and why the right answer is right. hn.LearnSaidRight and hn.LearnSaidWrong.
+  prefab LearnSaid : ui.Column {
+    Fill: $tone_card
+    Shape: {radius: $learn_radius, n: 4, border: 0, feather: 0}
+    Flex: {axis: Column, gap: 4, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $learn_course_pad, r: $learn_course_pad, t: 14, b: 16}
+    verdict : ui.Line {
+      Fill: $tone_ink_strong
+      TextStyle: {size: $size_chat, line: 20, role: 0, bold: 1, weight: $weight_label}
+    }
+    why : ui.Words, Ink {
+      TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+    }
+  }
+  prefab LearnSaidRight : hn.LearnSaid {
+    Fill: $tone_success_wash
+    verdict { Fill: $tone_success }
+  }
+  prefab LearnSaidWrong : hn.LearnSaid {
+    Fill: $tone_error_wash
+    verdict { Fill: $tone_error }
+  }
+
+  // An option of a choice: its key, its words. hn.LearnOption at rest; the host swaps in the others as it is picked
+  // and marked: picked (ringed in the strong ink), right (the success ink), wrong (the error ink), and dim (an option
+  // that was neither, once the check is marked).
+  prefab LearnOptionLook : ui.Row {
+    Fill: $tone_card
+    Edge: {dark: $tone_line.dark, light: $tone_line.light}
+    Shape: {radius: $learn_radius, n: 4, border: 1, feather: 0}
+    Flex: {axis: Row, gap: 14, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: $learn_option_h, max: 0}}
+    Padding: {l: $learn_option_pad, r: $learn_option_pad, t: 10, b: 10}
+    key : ui.Row {
+      Fill: $tone_wash
+      Shape: {radius: 6, n: 4, border: 0, feather: 0}
+      Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+      Size: {w: {kind: Fixed, value: $learn_key, min: 0, max: 0}, h: {kind: Fixed, value: $learn_key, min: 0, max: 0}}
+      label : ui.Line, Muted {
+        FixedSize: {h: true, v: false}
+        TextStyle: {size: $size_caption, line: 14, role: 0, bold: 1, weight: $weight_label}
+      }
+    }
+    words : ui.Words, Ink {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      TextStyle: {size: $size_chat_h3, line: 22, role: 0, bold: 0}
+    }
+  }
+  prefab LearnOption : hn.LearnOptionLook {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+  }
+  prefab LearnOptionPicked : hn.LearnOption {
+    Fill: $tone_selection_focus
+    Edge: {dark: $tone_ink_strong.dark, light: $tone_ink_strong.light}
+    words { Fill: $tone_ink_strong }
+  }
+  prefab LearnOptionRight : hn.LearnOptionLook {
+    Fill: $tone_success_wash
+    Edge: {dark: $tone_success.dark, light: $tone_success.light}
+    words { Fill: $tone_ink_strong }
+  }
+  prefab LearnOptionWrong : hn.LearnOptionLook {
+    Fill: $tone_error_wash
+    Edge: {dark: $tone_error.dark, light: $tone_error.light}
+    words { Fill: $tone_ink_strong }
+  }
+  prefab LearnOptionDim : hn.LearnOptionLook {
+    Fill: $tone_clear
+    words { Fill: $tone_ink_faint }
+  }
+
+  // An item of an order check: its place, its words, and the two buttons that move it up and down.
+  prefab LearnItem : hn.LearnOptionLook {
+    spacer : ui.Spacer {
+      Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    up : ui.IconButton {
+      AlignSelf: {align: Center}
+      Tooltip: {text: "Move up"}
+      icon : ui.Symbol {
+        Size: {w: {kind: Fixed, value: $tree_icon, min: 0, max: 0}, h: {kind: Fixed, value: $tree_icon, min: 0, max: 0}}
+        Icon: {glyph: ""}
+      }
+    }
+    down : ui.IconButton {
+      AlignSelf: {align: Center}
+      Tooltip: {text: "Move down"}
+      icon : ui.Symbol {
+        Size: {w: {kind: Fixed, value: $tree_icon, min: 0, max: 0}, h: {kind: Fixed, value: $tree_icon, min: 0, max: 0}}
+        Icon: {glyph: ""}
+      }
+    }
+  }
+  // The item the arrow keys are on (up and down move the highlight, shift with them moves the item).
+  prefab LearnItemPicked : hn.LearnItem {
+    Fill: $tone_selection_focus
+    Edge: {dark: $tone_ink_strong.dark, light: $tone_ink_strong.light}
+    words { Fill: $tone_ink_strong }
+  }
+  prefab LearnItemRight : hn.LearnOptionRight {}
+  prefab LearnItemWrong : hn.LearnOptionWrong {}
+
+  // ---- a run is over ----
+
+  prefab LearnDone : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    top : hn.LearnTop {}
+    kicker : hn.LearnLabel {}
+    a1 : hn.LearnAirSmall {}
+    title : hn.LearnDisplay {}
+    a2 : hn.LearnAirSmall {}
+    score : hn.LearnBody {}
+    a3 : hn.LearnAirSmall {}
+    next : hn.LearnSmall {
+      TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+    }
+    a4 : hn.LearnAir {}
+    row : ui.Row {
+      Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      go : ui.Row {}
+      home : hn.LearnQuiet {
+        Action: {name: "learn:home"}
+        label { Text: {s: "Back"} }
+      }
+    }
+  }
+}
+
+// The sidebar's way home: beside the Archive button, a small house. Pressed, no session is selected and the main card
+// shows Learn.
+@tree ChildOf
+hn {
+  prefab LearnHomeButton : ui.IconButton {
+    Action: {name: "learn:show"}
+    Tooltip: {text: "Start"}
+    icon : ui.Node {
+      Fill: $tone_clear
+      Stroke: {dark: $tone_ink_muted.dark, light: $tone_ink_muted.light}
+      Size: {w: {kind: Fixed, value: $tree_icon, min: 0, max: 0}, h: {kind: Fixed, value: $tree_icon, min: 0, max: 0}}
+      Vector: {d: "M2.5 7.5 L8 2.5 L13.5 7.5 M4 6.5 V13 H12 V6.5", view_x: 0, view_y: 0, view_w: 16, view_h: 16,
+        inset_l: 0, inset_t: 0, inset_r: 0, inset_b: 0, stroke_w: 1.3}
+    }
+  }
+}
+
+// The sidebar's head: New (cmd+N, the start page), then what the person is learning, as plain rows on the tree's grid
+// (src/app/learn.rs fill_side_courses). One list: courses and chats read alike, no section, no header.
+@tree ChildOf
+hn {
+  prefab SideNew : ui.Column {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $side_inset, r: 0, t: 0, b: 0}
+    row : ui.Row {
+      Pressable
+      Action: {name: "chat:new"}
+      Cursor: {shape: Arrow}
+      Fill: $tone_clear
+      Shape: {radius: $radius_row, n: 4, border: 0, feather: 0}
+      HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+      PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+      Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
+      Padding: {l: $label_inset - $side_inset, r: $tree_pad_r, t: 0, b: 0}
+      // A pencil on a page: write something new.
+      mark : ui.Node {
+        Fill: $tone_clear
+        Stroke: {dark: $tone_ink.dark, light: $tone_ink.light}
+        Size: {w: {kind: Fixed, value: $tree_kind, min: 0, max: 0}, h: {kind: Fixed, value: $tree_kind, min: 0, max: 0}}
+        Vector: {d: "M7 3 H4 A1.5 1.5 0 0 0 2.5 4.5 V12 A1.5 1.5 0 0 0 4 13.5 H11.5 A1.5 1.5 0 0 0 13 12 V9 M6.5 9.5 L7 7.5 L12.5 2 L14 3.5 L8.5 9 Z",
+          view_x: 0, view_y: 0, view_w: 16, view_h: 16, inset_l: 0, inset_t: 0, inset_r: 0, inset_b: 0, stroke_w: 1.3}
+      }
+      label : ui.Lead, Strong {
+        Text: {s: "New"}
+        TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree}
+      }
+      spacer : ui.Spacer {}
+      keys : ui.Line, Faint {
+        Text: {s: "⌘N"}
+        FixedSize: {h: true, v: false}
+        TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+        HoverShow: {row: 0, keep: false}
+      }
+    }
+    gap : ui.Node {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 10, min: 0, max: 0}}
+    }
+    courses : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+
+  // A course in the sidebar: a row like a chat's, its title and, trailing, what is due today. Pressed: its path.
+  prefab SideCourse : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Fill: $tone_clear
+    Shape: {radius: $radius_row, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
+    Padding: {l: $label_inset - $side_inset + $tree_kind + 6, r: $tree_pad_r, t: 0, b: 0}
+    title : ui.Lead, Ink {
+      TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree}
+    }
+    due : ui.Line, Faint {
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+  // The course in front: the selection's plate under it, as a selected chat's row.
+  prefab SideCourseOn : hn.SideCourse {
+    Fill: $tone_selection
+  }
+}
+
+// ---- a course's path ----
+// What a press on a course shows (src/app/learn.rs Screen::Course): where the course goes and where the person is on
+// it, at a glance. Its lessons are a short list of titles, one line each: finished ones quiet with how well they are
+// held, later ones faint. Only the lesson to do now is opened out, as a card: its title, the one idea it teaches in
+// full, and the button that starts it. So the screen has one thing to read and one thing to press.
+@tree ChildOf
+hn {
+  prefab LearnPath : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    head : ui.Row {
+      Flex: {axis: Row, gap: 12, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $learn_head_h, min: 0, max: 0}}
+      back : ui.IconButton {
+        Action: {name: "learn:back"}
+        AlignSelf: {align: Center}
+        Tooltip: {text: "Back  esc"}
+        icon : ui.Node {
+          Fill: $tone_clear
+          Stroke: {dark: $tone_ink_muted.dark, light: $tone_ink_muted.light}
+          Size: {w: {kind: Fixed, value: $tree_icon, min: 0, max: 0}, h: {kind: Fixed, value: $tree_icon, min: 0, max: 0}}
+          Vector: {d: "M10 3 L5 8 L10 13", view_x: 0, view_y: 0, view_w: 16, view_h: 16,
+            inset_l: 0, inset_t: 0, inset_r: 0, inset_b: 0, stroke_w: 1.4}
+        }
+      }
+    }
+    top : ui.Node {
+      Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 0.04, min: 0, max: 0}}
+    }
+    // Where the person is: "Lesson 3 of 7", or that it is all done.
+    kicker : hn.LearnLabel {}
+    a1 : hn.LearnAirSmall {}
+    title : hn.LearnDisplay {}
+    a2 : hn.LearnAirSmall {}
+    goal : hn.LearnSmall {
+      TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+    }
+    a3 : hn.LearnAir {}
+    lessons : ui.List {
+      Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+
+  // A lesson's number on the path.
+  prefab LearnDisc : ui.Row {
+    Fill: $tone_wash
+    Shape: {radius: $learn_disc / 2, n: 2, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fixed, value: $learn_disc, min: 0, max: 0}, h: {kind: Fixed, value: $learn_disc, min: 0, max: 0}}
+    label : ui.Line, Muted {
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 1, weight: $weight_label}
+    }
+  }
+
+  // A lesson as one line: its number and title, and trailing how well it is held (a finished one).
+  // hn.LearnLesson: finished, so a press walks it again. hn.LearnLessonLater: not reached, faint, no press.
+  prefab LearnLessonLook : ui.Row {
+    Fill: $tone_clear
+    Shape: {radius: $radius_row, n: 4, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 12, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $learn_lesson_h, min: 0, max: 0}}
+    Padding: {l: $learn_course_pad, r: $learn_course_pad, t: 0, b: 0}
+    disc : hn.LearnDisc {}
+    title : ui.Lead, Ink {
+      TextStyle: {size: $size_chat, line: 20, role: 0, bold: 0}
+    }
+    spacer : ui.Spacer {}
+    state : ui.Line, Faint {
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
+    }
+  }
+  prefab LearnLesson : hn.LearnLessonLook {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+  }
+  prefab LearnLessonLater : hn.LearnLessonLook {
+    disc {
+      Fill: $tone_hover
+      label { Fill: $tone_ink_faint }
+    }
+    title { Fill: $tone_ink_faint }
+  }
+
+  // The lesson to do now, opened out: a card with its number lit, its title, the one idea it teaches (all of it, wrapped),
+  // and the button that starts it.
+  prefab LearnLessonNext : ui.Column {
+    Fill: $tone_card
+    Edge: {dark: $tone_line.dark, light: $tone_line.light}
+    Shape: {radius: $learn_radius, n: 4, border: 1, feather: 0}
+    Flex: {axis: Column, gap: 10, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $learn_course_pad, r: $learn_course_pad, t: 16, b: 18}
+    head : ui.Row {
+      Flex: {axis: Row, gap: 12, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      disc : hn.LearnDisc {
+        Fill: $tone_ink_strong
+        label { Fill: $tone_ground }
+      }
+      title : ui.Words, Strong {
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        TextStyle: {size: $size_chat_h2, line: $line_chat_h2, role: 0, bold: 1, weight: $weight_label}
+      }
+    }
+    // In line with the title (past the disc), as the button under it is.
+    body : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: $learn_disc + 12, r: 0, t: 0, b: 0}
+      about : ui.Words, Ink {
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+      }
+    }
+    foot : ui.Row {
+      Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: $learn_disc + 12, r: 0, t: 6, b: 0}
+      go : ui.Row {}
+      hint : ui.Line, Faint {
+        Text: {s: "return"}
+        TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
+      }
+    }
+  }
+}

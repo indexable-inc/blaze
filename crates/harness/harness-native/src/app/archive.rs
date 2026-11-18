@@ -499,13 +499,16 @@ impl App {
                     ("still running".to_owned(), looks.accent, looks.clear)
                 }
                 ("running", _) => ("running".to_owned(), looks.accent, looks.clear),
-                ("killed", _) => ("killed".to_owned(), looks.failed, looks.failed_wash),
-                ("lost", _) => ("lost".to_owned(), looks.lost, looks.clear),
-                (_, Some(c)) if c != 0 => (format!("exit {c}"), looks.failed, looks.failed_wash),
+                // How it ended is said in quiet words, never a badge: stopped by hand or lost with its daemon is not a
+                // failure, so it is faint; only an exit that failed is in the error ink, and on no plate. An ordinary
+                // end says nothing at all, so a list of finished things is a list of names.
+                ("killed", _) => ("stopped".to_owned(), looks.faint, looks.clear),
+                ("lost", _) => ("lost".to_owned(), looks.faint, looks.clear),
+                (_, Some(c)) if c != 0 => (format!("exit {c}"), looks.failed, looks.clear),
                 ("pending" | "skipped", _) => {
                     (self.status_of(e).to_owned(), looks.faint, looks.clear)
                 }
-                _ => ("done".to_owned(), looks.faint, looks.clear),
+                _ => (String::new(), looks.faint, looks.clear),
             };
             if let Some(t) = b.part("code") {
                 t.text(&text);

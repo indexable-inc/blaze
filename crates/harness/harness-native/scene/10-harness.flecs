@@ -14,6 +14,7 @@ include widgets/panes
 include widgets/archive
 include widgets/chat_status
 include widgets/chat
+include widgets/learn
 include widgets/context_plate
 include widgets/context
 include widgets/peek

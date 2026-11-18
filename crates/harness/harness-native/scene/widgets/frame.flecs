@@ -116,9 +116,12 @@ hn {
     }
   }
 
+  // The plan's meter is not shown: how much of an account is used is plumbing, not something a person comes here for.
+  // Folded to nothing and clipped (src/app.rs still fills it, for the chat pane's own use of the windows).
   prefab SidePlan : ui.Row {
+    Clip
     Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
-    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
   }
 
   // Over the Archive row: why the link is refused (src/link.rs `Refused`: a daemon that never answered the hello, or

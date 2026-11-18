@@ -10,10 +10,16 @@
 //    small status glyph's breath in a chat while something runs (it also keeps that time ticking).
 // The one exception to 1 and 2, asked for by name: the block on a running step's line (ui.Block): pixel art in its
 //    own colours, a game's item icon, that turns to a new face when the step changes and is still between turns.
-// 3. A plate only where something floats or is typed into: one hairline, no shadow, no glass, corners of 8. The one
+// 3. A plate only where something floats or is typed into: one hairline, no shadow, no glass. Corners come from one
+//    scale: 8 for a control or a row, 10 for a menu, 12 for a card, 14 for an overlay or a Learn plate, 18 for a chat
+//    bubble and the composer, and half its height for a pill (a button, the send disc). The one
 //    translucent surface, asked for by name: the sidebar (tone_sidebar), a tint over the system's blur of what is behind
 //    the window. Everything else is opaque.
 // 4. Type is the hierarchy: size, weight and ink before any box, rule or icon.
+// 5. One place per thing. How a chat runs (its model, effort, context) is on its composer, never on its sidebar row;
+//    a row is a title and at most one trailing word. One main action per surface (ui.ButtonPrimary), in the strong ink.
+// 6. Home is Learn (scene/widgets/learn.flecs): with no session selected the main card asks what to learn; a screen
+//    of a lesson holds one idea or one question.
 //
 // ---- The theme: the one place a colour is chosen ----
 // Every surface names one of these roles, never a colour: a widget's `Fill: $tone_card`, Rust's `look::tone(w, "card")`
@@ -49,7 +55,7 @@ export mut tone_line_strong: Fill = {dark: {0.149, 0.161, 0.188, 1}, light: {0.8
 // Inks: strong (titles, headings, a selected row, bold), the body, muted (secondary words, icons at rest), faint (meta,
 // markers, a placeholder, what has ended); --ink-1..4.
 export mut tone_ink_strong: Fill = {dark: {0.929, 0.937, 0.949, 1}, light: {0.086, 0.086, 0.090, 1}}
-export mut tone_ink: Fill = {dark: {0.761, 0.773, 0.8, 1}, light: {0.275, 0.275, 0.290, 1}}
+export mut tone_ink: Fill = {dark: {0.855, 0.863, 0.882, 1}, light: {0.275, 0.275, 0.290, 1}}
 export mut tone_ink_muted: Fill = {dark: {0.545, 0.565, 0.6, 1}, light: {0.420, 0.416, 0.431, 1}}
 export mut tone_ink_faint: Fill = {dark: {0.353, 0.373, 0.412, 1}, light: {0.635, 0.631, 0.616, 1}}
 // Washes: the strong ink at an alpha, so they read on any ground. Hover (a row's, a button's), wash (a resting plate,
@@ -128,7 +134,7 @@ export const weight_label = 600
 
 // The Archive's rows (hn.Arch*): 24 tall, children indented indent_step a level (the tree's step too), icons 14 in a 16
 // box, its disclosure slot disclose_w wide with a chevron_box chevron. The sidebar's tree has its own (tree_* below).
-export const row_h = 24
+export const row_h = 30
 export const indent_step = 12
 export const icon_box = 16
 export const chevron_box = 12
@@ -141,7 +147,7 @@ export const disclose_w = 18
 // about 7.5 tall), shown in tone_ink_faint where the row has rows under it (folded, it holds what finished). tree_icon is
 // the Archive button's glyph box. Folded with work under it, a session's row shows a faint dot (tree_under_dot)
 // tree_under_gap before how many.
-export const tree_row_h = 28
+export const tree_row_h = 30
 export const tree_run_h = 22
 export const tree_gutter = 12
 export const tree_icon = 16
@@ -169,7 +175,7 @@ export const line_row = 16
 // The selection pill and the hover wash hug the row pill_inset in from its frame (4 points of air between neighbours),
 // corners radius_row.
 export const pill_inset = 2
-export const radius_row = 6
+export const radius_row = 8
 // The work bar (frame.flecs hn.WorkBar): work_bar_h tall, its band work_bar_share of the window long, crossing in
 // work_bar_period seconds.
 export const work_bar_h = 2
@@ -297,9 +303,12 @@ export const spring_pose_zeta = 1
 
 // The Archive pane: its title, search line, filter chips, day headings and the right-hand columns (duration, time).
 export const size_title = 15
-export const field_h = 30
-export const chip_h = 24
-export const chip_radius = 12
+export const field_h = 32
+// Buttons (ui.ButtonPrimary, ui.ButtonQuiet): pills button_h tall, their label button_pad in from each end.
+export const button_h = 30
+export const button_pad = 14
+export const chip_h = 26
+export const chip_radius = 13
 export const section_h = 30
 export const arch_took_w = 56
 export const arch_time_w = 84
@@ -314,8 +323,8 @@ export const archive_done_after_s = 3600
 
 // Overlays over the window: the command palette (cmd+K) and the new-object picker (cmd+N), each a card on a scrim
 // (hn.Scrim, hn.OverlayCard in scene/widgets/palette.flecs), there at once and gone at once.
-export const overlay_radius = 8
-export const overlay_pad = 6
+export const overlay_radius = 14
+export const overlay_pad = 8
 
 // Menus (prims.flecs ui.Menu and its parts), macOS NSMenu's: a plate menu_radius round that hugs its widest item (at
 // least menu_min_w, at most menu_max_w), menu_pad in from its edge, hung menu_gap off what opened it, its shadow
@@ -325,7 +334,7 @@ export const overlay_pad = 6
 // label), so every label starts at menu_label_x whether ticked or not. Its trailing words (a model's line, a key) are
 // muted, at least menu_trail_gap after the label. A section's head is size_menu_head, muted; a separator is a hairline
 // menu_sep_pad above and below.
-export const menu_radius = 8
+export const menu_radius = 10
 export const menu_pad = 5
 export const menu_gap = 6
 export const menu_min_w = 120
@@ -333,8 +342,8 @@ export const menu_max_w = 380
 export const menu_lift_blur = 18
 export const menu_lift_alpha = 0.28
 export const menu_lift_dy = 6
-export const menu_item_h = 22
-export const menu_item_radius = 5
+export const menu_item_h = 26
+export const menu_item_radius = 6
 export const menu_item_pad_r = 10
 export const menu_gutter_l = 6
 export const menu_check = 11
@@ -376,10 +385,10 @@ export const size_menu = 13
 export const line_menu = 16
 export const size_menu_head = 11
 // The palette: a wide card near the window's top, its query line, its entries.
-export const palette_w = 560
+export const palette_w = 640
 export const palette_top = 96
-export const palette_query_h = 38
-export const palette_row_h = 32
+export const palette_query_h = 48
+export const palette_row_h = 36
 // The picker: a narrow card a little above the window's middle (picker_rise lifts it), a quiet label over one row a
 // kind (its mark in a picker_mark box, its name, its shortcut, the key that picks it in a keycap).
 export const picker_w = 300
@@ -394,8 +403,8 @@ export const keycap_radius = 4
 export const size_keycap = 11
 export const line_keycap = 13
 
-export const radius_control = 6
-export const radius_card = 8
+export const radius_control = 8
+export const radius_card = 12
 // ui.Bubble: its corners and the most it widens to before its words wrap (about 65 characters of body text).
 export const radius_bubble = 8
 export const bubble_max_w = 480
@@ -409,8 +418,8 @@ export const spring_press_omega = 38
 export const spring_press_zeta = 0.62
 
 // A kind's icon and the brand marks (hn.Kind): ink only, so they turn with the appearance; no brand's colour.
-export mut tone_kind_claude: Fill = {dark: {0.88, 0.52, 0.36, 1}, light: {0.69, 0.31, 0.18, 1}}
-export mut tone_kind_codex: Fill = {dark: {0.55, 0.77, 0.68, 1}, light: {0.17, 0.46, 0.37, 1}}
+export mut tone_kind_claude: Fill = $tone_ink_muted
+export mut tone_kind_codex: Fill = $tone_ink_muted
 export const model_icon_size = 14
 export const model_icon_stroke = 1.25
 export mut tone_kind_cursor: Fill = $tone_ink_muted
@@ -545,13 +554,13 @@ export const chat_pace_most = 2
 // half a line, so a short reply reads as a few small paragraphs of one thought, not a document's), the person's message
 // chat_gap_turn below the reply before it and chat_gap_reply above the reply to it (a message sits with its answer).
 export const chat_gap_block = 10
-export const chat_gap_turn = 28
-export const chat_gap_reply = 14
+export const chat_gap_turn = 32
+export const chat_gap_reply = 16
 export const chat_block_half = $chat_gap_block / 2
 // The person's bubble: its words' inset (even to the eye: the line's own leading adds to the vertical), its line, and the
 // least room it leaves at the leading edge.
-export const chat_bubble_pad_x = 12
-export const chat_bubble_pad_y = 7
+export const chat_bubble_pad_x = 14
+export const chat_bubble_pad_y = 8
 export const line_chat_bubble = 20
 export const chat_bubble_lead = 48
 // Body text: 14 on a 21 line (1.5).
@@ -587,7 +596,7 @@ export const chat_item_gap = 3
 export const chat_item_half = $chat_item_gap / 2
 export const size_chat_bullet = 10
 export const line_chat_code = 17
-export const chat_bubble_radius = 8
+export const chat_bubble_radius = 18
 // The widest a user's bubble gets before its words wrap: about three quarters of the column, as iMessage and ChatGPT do.
 export const chat_bubble_max_w = $chat_w * 0.8
 // The composer (hn.ChatPane's foot.card): one card holding the words, centred in the reading column (chat_w wide at
@@ -596,9 +605,9 @@ export const chat_bubble_max_w = $chat_w * 0.8
 // chat_composer_radius round, chat_composer_pad in from its sides; the words sit a further
 // chat_composer_text_inset in (so they start where the status bar's model control's words do), chat_composer_pad_t under
 // its top and chat_composer_pad_b over its bottom.
-export const chat_foot_pad_t = 6
-export const chat_foot_pad_b = 8
-export const chat_composer_radius = 8
+export const chat_foot_pad_t = 8
+export const chat_foot_pad_b = 16
+export const chat_composer_radius = 18
 // What runs for a chat, over its composer (hn.ChatActivityItem): items chat_activity_h tall, chat_activity_gap apart,
 // chat_activity_radius round, chat_activity_pad in, a glyph chat_activity_icon across chat_activity_icon_gap before
 // its words, at most chat_activity_max_w wide (the words cut first); chat_activity_below of air under the strip.
@@ -640,10 +649,10 @@ export const chat_attach_icon = 10
 export const chat_attach_inset = 4
 export const chat_sent_h = 120
 export const chat_composer_pad = 8
-export const chat_composer_pad_t = 12
-export const chat_composer_pad_b = 10
-export const chat_composer_text_inset = 6
-export const chat_composer_gap = 6
+export const chat_composer_pad_t = 14
+export const chat_composer_pad_b = 8
+export const chat_composer_text_inset = 8
+export const chat_composer_gap = 10
 // The space under the pasted pictures' strip, over the words: the card's own gap between its parts.
 export const chat_attach_below = $chat_composer_gap
 // An aside's answer (hn.ChatAside, src/app/chat.rs fill_chat_aside): a card over the composer, chat_aside_gap above it,
@@ -678,6 +687,13 @@ export const size_chat_status = 12
 export const line_chat_status = 15
 export const chat_status_t = 4
 export const chat_bar_h = 24
+// The composer's bar (hn.ChatPane's foot.card.bar): its one button is a disc chat_send across, its arrow chat_send_icon
+// across in a chat_send_stroke line, its stop square chat_send_stop; the context ring sits chat_bar_trail before it.
+export const chat_send = 28
+export const chat_send_icon = 14
+export const chat_send_stroke = 1.6
+export const chat_send_stop = 10
+export const chat_bar_trail = 8
 export const chat_bar_gap = 2
 export const chat_plan_lead = 4
 export const chat_plan_trail = 2
@@ -733,7 +749,7 @@ export const chat_pick_commit_secs = 0.35
 export const chat_pick_word_secs = 1.2
 // What the chat pane shows around the composer's words besides the transcript (the foot's insets, the card's insets,
 // nothing else): the words grow to textarea_grow_share of the pane less it.
-export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_composer_pad_t + $chat_composer_pad_b
+export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_composer_pad_t + $chat_composer_pad_b + $chat_composer_gap + $chat_send
 // The meter's popover while the pointer is on it (scene/widgets/context.flecs hn.ChatContextPop, src/app/chat/context.rs):
 // a menu plate (ui.Menu's place over what opened it, its lift and motion) chat_ctx_w wide, chat_ctx_pad in, its lines
 // chat_ctx_gap apart: a head, the window as a donut chat_ctx_pie across with how full it is in its middle (size_ctx_pct;
@@ -1091,3 +1107,40 @@ export const question_action_gap = 10
 export const question_receipt_gap = 4
 
 export const question_max_w = 660
+
+// ---- Learn (hn.LearnPane, scene/widgets/learn.flecs, src/app/learn.rs): the app's home ----
+// One column learn_w wide, centred, learn_pad clear of the pane's edges. Type is the hierarchy: a display line
+// (size_learn_display) for the one question a screen asks, a title (size_learn_title) for a step's idea, the body
+// (size_learn) on a generous line. A screen holds one thing; what can be pressed is a plate learn_radius round,
+// learn_option_h tall at least, one hairline; the one primary button is a pill in the strong ink.
+export const learn_w = 600
+export const learn_pad = 32
+export const learn_top = 0.16
+export const size_learn_display = 28
+export const line_learn_display = 34
+export const weight_learn_display = 620
+export const size_learn_title = 22
+export const line_learn_title = 28
+export const size_learn = 16
+export const line_learn = 25
+export const size_learn_small = 13
+export const line_learn_small = 18
+export const learn_radius = 14
+export const learn_gap = 12
+export const learn_section = 28
+export const learn_field_h = 52
+export const learn_option_h = 46
+export const learn_option_pad = 16
+export const learn_key = 22
+export const learn_bar_h = 6
+export const learn_bar_radius = 3
+export const learn_head_h = 44
+export const learn_button_h = 40
+export const learn_button_pad = 22
+export const learn_course_pad = 18
+export const learn_meter_h = 4
+export const learn_code_pad = 14
+// A lesson's numbered disc on a course's path (hn.LearnLessonLook).
+export const learn_disc = 26
+// A lesson's one line on the path.
+export const learn_lesson_h = 40

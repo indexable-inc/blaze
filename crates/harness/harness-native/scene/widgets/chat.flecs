@@ -70,7 +70,7 @@ hn {
       // (src/app/chat.rs sets its Fill and Edge from hn.Theme.aside and aside_line).
       card : ui.Column {
         Fill: $tone_card
-        Edge: {dark: $tone_line.dark, light: $tone_line.light}
+        Edge: {dark: $tone_line_strong.dark, light: $tone_line_strong.light}
         Shape: {radius: $chat_composer_radius, n: 4, border: 1, feather: 0}
         Cursor: {shape: Text}
         Pressable
@@ -97,6 +97,36 @@ hn {
           area : ui.field.GrowingTextArea {
             GrowLimit: {share: $textarea_grow_share, keep: $chat_input_keep}
           }
+        }
+        // The composer's own bar (src/app/chat/pick.rs fill_composer_bar): everything that says how this chat runs sits
+        // with the words it will run on, never on a sidebar row. Leading, the model (its mark and family; pressed, the
+        // model menu) and the effort it thinks with (a small meter; pressed or swiped, the effort menu); trailing, how
+        // full its context is (a ring; pressed, its breakdown) and the one round button: send while there is a draft,
+        // stop while a turn runs.
+        bar : ui.Row {
+          Cursor: {shape: Arrow}
+          Flex: {axis: Row, gap: $chat_bar_gap, align: Center, justify: Start, wrap: false}
+          Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_send, min: 0, max: 0}}
+          // The model's family in words alone: no mark beside it.
+          label : hn.ChatBarControl {
+            text : hn.ChatBarWord {}
+          }
+          effort : hn.ChatBarControl {
+            Size: {w: {kind: Fixed, value: $tree_effort_w, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
+            Padding: {l: 0, r: 0, t: 0, b: 0}
+          }
+          spacer : ui.Spacer {}
+          // What was done here, as a lesson: a press makes a short course in Learn out of this conversation, so work an
+          // agent did is something the person comes to understand, not only something that happened. Shown once there
+          // is an answer to understand (src/app/chat/pick.rs sets its words and action; empty, it takes no room).
+          understand : ui.Row {
+            Padding: {l: 0, r: $chat_bar_trail, t: 0, b: 0}
+          }
+          context : ui.Row {
+            Padding: {l: 0, r: $chat_bar_trail, t: 0, b: 0}
+          }
+          context_pop : ui.Node { Overlay }
+          send : ui.Row {}
         }
       }
     }
@@ -342,7 +372,7 @@ hn {
       Size: {w: {kind: Fit, value: 0, min: 0, max: $chat_bubble_max_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       text : ui.Words {
         Cursor: {shape: Text}
-        Fill: $tone_ink
+        Fill: $tone_ink_strong
         TextStyle: {size: $size_chat, line: $line_chat_bubble, role: 0, bold: 0}
       }
     }
@@ -802,8 +832,9 @@ hn {
     Background
     Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
     Padding: {l: $chat_guide_x, r: 0, t: 0, b: 0}
+    // No rule is drawn: what a line opened is set in from it, and the indent alone says it belongs to it.
     line : ui.Node {
-      Fill: $tone_line
+      Fill: $tone_clear
       Size: {w: {kind: Fixed, value: $chat_guide_w, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     }
   }

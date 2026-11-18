@@ -72,6 +72,8 @@ impl App {
     pub fn scroll_wheel(&mut self, ev: Wheel, m: KeyMods) {
         // An overlay owns wheels even when its content has reached an edge; never scroll the chat underneath it.
         if self.library_wheel(&ev) { return; }
+        // Over a lesson's step: it scrolls (app/learn.rs).
+        if self.learn_wheel(&ev) { return; }
         // Over a live browser page: the page scrolls (app/browser.rs).
         if self.browser_wheel(&ev, m) {
             return;

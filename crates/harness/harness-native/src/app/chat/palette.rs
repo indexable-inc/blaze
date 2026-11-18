@@ -31,16 +31,7 @@ impl App {
     }
 
     pub(in crate::app) fn palette_edit(&mut self, op: &str) {
-        let (select, name) = op.strip_prefix("select_").map_or((false, op), |n| (true, n));
-        self.palette_draft(|d| {
-            if let Some(m) = Move::named(name) {
-                let to = d.target(m).unwrap_or(match m { Move::Up | Move::LineStart => 0, _ => d.text.len() });
-                d.go(m, to, select);
-            } else if let Some(m) = Move::erasing(op) {
-                let to = d.target(m).unwrap_or(0);
-                d.erase(to);
-            }
-        });
+        self.palette_draft(|d| _ = d.edit_line(op));
     }
 
     pub(in crate::app) fn palette_copy(&self) -> Option<Option<(String, Copied)>> {

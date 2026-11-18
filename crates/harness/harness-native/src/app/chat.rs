@@ -307,6 +307,27 @@ impl Draft {
     }
 
     /// Erase the selection, or from the caret to `to`.
+    /// One edit of a single-line field (`EditOp` names: a move, `select_` and a move, or an erase), with the editor's
+    /// byte-boundary and selection rules; the palette's query and the start page's and a lesson's fields all edit by
+    /// it. Whether `op` was one.
+    pub(in crate::app) fn edit_line(&mut self, op: &str) -> bool {
+        let (select, name) = op.strip_prefix("select_").map_or((false, op), |n| (true, n));
+        if let Some(m) = Move::named(name) {
+            let to = self.target(m).unwrap_or(match m {
+                Move::Up | Move::LineStart | Move::DocStart => 0,
+                _ => self.text.len(),
+            });
+            self.go(m, to, select);
+            return true;
+        }
+        if let Some(m) = Move::erasing(op) {
+            let to = self.target(m).unwrap_or(0);
+            self.erase(to);
+            return true;
+        }
+        false
+    }
+
     fn erase(&mut self, to: usize) {
         if self.anchor == self.caret {
             self.anchor = to;
@@ -1959,7 +1980,17 @@ impl App {
                 sky.set(on);
             }
         }
-        // Its status bar is the sidebar's (hn.SideChat): the chat in front fills it.
+        // The composer's bar: its model, effort, context and the send button, for this chat.
+        if let Some(bar) = composer(pv).and_then(|c| c.part("bar")) {
+            let o = w.entity_from_id(e);
+            let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
+            let can_send = !st.draft.text.trim().is_empty() || !st.images.is_empty();
+            self.fill_composer_bar(
+                bar, sid, t, model::kind_name(o), &mut st.effort, (listed.s.as_str(), listed.effort.as_str()), ended, true,
+                st.ctx_open, st.pick.is_some(), can_send, o.try_cloned::<&model::AgentContext>(),
+            );
+        }
+        // The model and effort menus hang off the bar's controls; hn.SideChat hosts them outside every clip.
         if let Some(bar) = (self.focused_pane() == Some(pv.id())).then(|| View::of(w.entity_from_id(self.ids.side_chat))) {
             let o = w.entity_from_id(e);
             // The model and the effort it runs with, as den's picker (chat/pick.rs `Label`), the daemon's listing its last
@@ -2495,6 +2526,10 @@ impl App {
         if self.renaming() {
             return self.rename_draft(f);
         }
+        // The start page's field, or a lesson's (src/app/learn.rs).
+        if self.learn_editing() {
+            return self.learn_draft(f);
+        }
         if self.focused_chat().is_some_and(|(_, _, sid)| self.external_session(sid).is_some()) {
             return true;
         }
@@ -2518,6 +2553,23 @@ impl App {
         }
         if self.chat.borrow().get(&sid).is_some_and(|st| is_aside(&st.draft)) {
             return self.chat_ask_aside(sid);
+        }
+        // A chat's first message asking to understand something ("explain bloom filters") is not answered with a wall
+        // of words: it becomes a lesson (short steps, questions, what is missed coming back), and the draft is spent on
+        // that. Later in a chat, the conversation is the agent's (its Quiz me button makes one a lesson).
+        let topic = if self.sent(sid) {
+            None
+        } else {
+            self.chat.borrow().get(&sid).filter(|st| st.images.is_empty()).and_then(|st| match harness_learn::intent::of(&st.draft.text) {
+                harness_learn::Intent::Learn { topic } => Some(topic),
+                harness_learn::Intent::Do => None,
+            })
+        };
+        if let Some(topic) = topic {
+            if let Some(st) = self.chat.borrow_mut().get_mut(&sid) {
+                st.draft.take_wire();
+            }
+            return self.learn_teach(&topic);
         }
         let (text, images) = {
             let mut states = self.chat.borrow_mut();
@@ -2600,6 +2652,9 @@ impl App {
         // A name being renamed has the keys before anything in the pane (chat/rename.rs).
         if self.renaming() {
             return self.rename_edit(op);
+        }
+        if self.learn_editing() {
+            return self.learn_edit(op);
         }
         if self.focused_chat().is_some_and(|(_, _, sid)| self.external_session(sid).is_some()) {
             // Its text remains selectable and copyable; there is no agent or draft here to edit or interrupt.
@@ -2820,6 +2875,9 @@ impl App {
         if let Some(r) = &self.rename {
             return Some(r.marked());
         }
+        if let Some(m) = self.learn_marked() {
+            return Some(m);
+        }
         if self.focused_chat().is_some_and(|(_, _, sid)| self.external_session(sid).is_some()) {
             return Some(None);
         }
@@ -2838,6 +2896,9 @@ impl App {
     pub(super) fn chat_copy(&self) -> Option<Option<(String, Copied)>> {
         if self.palette_editing() { return self.palette_copy(); }
         if let Some(c) = self.rename_copy() {
+            return Some(c);
+        }
+        if let Some(c) = self.learn_copy() {
             return Some(c);
         }
         if !self.focused_chat().is_some_and(|(_, _, sid)| self.external_session(sid).is_some())
@@ -2960,7 +3021,7 @@ impl App {
     /// took it.
     pub(super) fn chat_select_all(&mut self) -> bool {
         if self.palette_editing() { return self.palette_draft(|d| (d.anchor, d.caret) = (0, d.text.len())); }
-        if self.renaming() {
+        if self.renaming() || self.learn_editing() {
             return self.with_draft(|d| (d.anchor, d.caret) = (0, d.text.len()));
         }
         let Some((_, _, sid)) = self.focused_chat() else { return false };
@@ -3483,8 +3544,9 @@ fn turn_chip(t: &Transcript, now: u64) -> Chip {
                         let bash = ["bash", "shell", "exec", "command"].iter().any(|k| name.to_ascii_lowercase().contains(k));
                         words = match (bash, arg.is_empty()) {
                             (true, false) => super::short_cmd(&arg),
-                            (false, false) => format!("{}: {arg}", name.rsplit("__").next().unwrap_or(name)),
-                            (_, true) => name.rsplit("__").next().unwrap_or(name).to_owned(),
+                            // What it works on, never the tool's name ("ts", "exec"): a name says nothing to a person.
+                            (false, false) => arg,
+                            (_, true) => "Working".to_owned(),
                         };
                     }
                 }
@@ -3511,7 +3573,9 @@ fn turn_chip(t: &Transcript, now: u64) -> Chip {
         PopLine::Step(kind, _) => Some(*kind),
         _ => None,
     });
-    let mut pop = vec![PopLine::Item(kind.unwrap_or("think")), PopLine::Head(words.clone()), PopLine::Meta(meta(&["This turn", &running_for(&turn)]))];
+    // Words only: what it is on and for how long, then its steps. No picture of the step over them.
+    let _ = kind;
+    let mut pop = vec![PopLine::Head(words.clone()), PopLine::Meta(meta(&["This turn", &running_for(&turn)]))];
     pop.extend(steps);
     Chip { key: "step".to_owned(), state: "running", words, took, action: String::new(), pop }
 }

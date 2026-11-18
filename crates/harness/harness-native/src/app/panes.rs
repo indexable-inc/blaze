@@ -19,7 +19,7 @@ fn pane_prefab(kind: Option<PaneKind>) -> &'static str {
         Some(PaneKind::Archive) => "hn.ArchivePane",
         Some(PaneKind::Chat) => "hn.ChatPane",
         Some(_) => "hn.TermPane",
-        None => "hn.EmptyPane",
+        None => "hn.LearnPane",
     }
 }
 
@@ -183,7 +183,7 @@ impl App {
                 Some((e, PaneKind::Run)) => self.fill_run_pane(pane, e),
                 Some((_, PaneKind::Archive)) => self.fill_archive_pane(pane),
                 Some((e, PaneKind::Chat)) => self.fill_chat_pane(pane, e),
-                None => self.fill_empty_pane(pane),
+                None => self.fill_learn_pane(pane),
                 _ => {}
             }
         }
@@ -1074,6 +1074,12 @@ impl App {
                 }
                 return;
             }
+            if self.learn_focused() {
+                if !k.mods.cmd && !k.mods.ctrl {
+                    self.learn_text(k.text);
+                }
+                return;
+            }
             if self.tree_focus && !k.mods.cmd && !k.mods.ctrl {
                 self.tree_focus = false;
             }
@@ -1122,7 +1128,7 @@ impl App {
             self.palette_type(text);
             return;
         }
-        if self.archive_text(text) || self.chat_type(text) {
+        if self.archive_text(text) || self.learn_text(text) || self.chat_type(text) {
             return;
         }
         self.typed();
@@ -1263,7 +1269,7 @@ impl App {
             self.palette_type(&text.replace(['\n', '\r', '\t'], " "));
             return;
         }
-        if self.archive_text(text) || self.chat_type(text) {
+        if self.archive_text(text) || self.learn_text(text) || self.chat_type(text) {
             return;
         }
         let Some(t) = self.focused_term() else { return };

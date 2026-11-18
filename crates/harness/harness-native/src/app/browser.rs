@@ -26,6 +26,13 @@
 //! link and a chat's link or chip (a pull request, an issue, a page) open that page in the pane as a view of its own
 //! ([`App::open_target`]), and so does a file a chat or a cell names, as a `file://` page; Option-pressed, either opens
 //! outside (the system's browser, the file's own app).
+//!
+//! UI views. The app's own pages (crates/harness/web) are views too, opened by key ([`App::ui_view`]) with
+//! `AppUp::Open { ui: true }`: the app posts to a page ([`App::ui_post`]: its `window.harnessRecv`) and drains what the
+//! page posted ([`App::ui_messages`]: its `window.harnessPost`). A node showing one is drawn like the pane's page: the
+//! page is resized to the node's box, takes the pointer, and takes the keys once a press gave the node BrowserFocus. A
+//! link the page follows out of itself (`AppDown::Link`) opens in the pane. A lost host's UI views are opened again on
+//! the next link, under new numbers; the pane never picks a UI view as its page.
 use super::*;
 use harness_mach::iosurface::Surface as IoSurface;
 use harness_mach::{Msg, RecvPort, SendRight, Source};
@@ -45,7 +52,7 @@ mod drag;
 mod fileview;
 
 /// The `file://` URL of absolute path `path`: each byte outside the unreserved set and `/` percent-encoded.
-fn file_url(path: &str) -> String {
+pub(super) fn file_url(path: &str) -> String {
     let mut out = String::from("file://");
     for b in path.bytes() {
         if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
@@ -121,6 +128,25 @@ enum Opening {
     Pane,
     /// An extension's action popup.
     Popup,
+    /// The UI view of this key ([`App::ui_view`]).
+    Ui(String),
+}
+
+/// A UI view the app asked for ([`App::ui_view`]): a page of the app's own, which talks to it.
+struct UiView {
+    url: String,
+    state: UiState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum UiState {
+    /// To open, once the link is up.
+    Want,
+    /// `AppUp::Open { ui: true }` sent with this request id.
+    Opening(u64),
+    Open(u64),
+    /// The host refused it or closed it, saying why: it stays so until its url changes or the link is made again.
+    Failed(String),
 }
 
 pub(super) struct Browser {
@@ -178,6 +204,10 @@ pub(super) struct Browser {
     go: Option<String>,
     /// The pane's left edge while it is dragged (drag.rs).
     drag: Option<drag::Grab>,
+    /// The UI views, by the key the app named each with.
+    ui: HashMap<String, UiView>,
+    /// What UI views' pages posted (`AppDown::Message`) since the last [`App::ui_messages`].
+    ui_inbox: Vec<(u64, String)>, // alloc: the messages between two drains
 }
 
 impl Browser {
@@ -220,6 +250,21 @@ impl Browser {
             popup: None,
             go: None,
             drag: None,
+            ui: HashMap::new(),
+            ui_inbox: Vec::new(),
+        }
+    }
+
+    /// Whether `view` is one of the app's UI views, open now.
+    fn is_ui(&self, view: u64) -> bool {
+        self.ui.values().any(|u| u.state == UiState::Open(view))
+    }
+
+    /// Every UI view is to be opened again: the link that knew them is gone (or a new one is made), and with it the
+    /// host's numbers for them.
+    fn ui_reset(&mut self) {
+        for u in self.ui.values_mut() {
+            u.state = UiState::Want;
         }
     }
 
@@ -251,6 +296,7 @@ impl Browser {
         *self.host.borrow_mut() = None;
         self.watched.clear();
         self.sized.clear();
+        self.ui_reset();
         if again {
             self.reconnects.push(now);
             self.views.clear();
@@ -314,6 +360,7 @@ impl Browser {
         // would hold the pane (it opens nothing while one is) forever.
         self.opening.clear();
         self.ext_req = None;
+        self.ui_reset();
         host.send(&cbor::encode(&AppUp::Hello { schema: harness_proto::SCHEMA }), &[&mine])
             .map_err(|e| format!("sending hello to {service}: {e}"))?;
         *self.host.borrow_mut() = Some(host);
@@ -335,6 +382,7 @@ fn what(m: &AppUp) -> &'static str {
         AppUp::Latched { .. } => "latched",
         AppUp::Nav { .. } => "a navigation",
         AppUp::Open { .. } => "open",
+        AppUp::Post { .. } => "a post to a UI view",
         AppUp::Close { .. } => "close",
         AppUp::Manage { .. } => "manage",
         AppUp::Extensions { .. } => "extensions",
@@ -440,7 +488,8 @@ impl App {
             }
             let b = &self.browser;
             if s.view == 0 || b.closed.contains_key(&s.view) || (b.listed && !b.views.contains_key(&s.view)) {
-                s.view = self.browser.views.keys().copied().filter(|v| !self.browser.closed.contains_key(v)).max().unwrap_or(0);
+                // Never a UI view: those are the app's own pages, drawn where the app puts them.
+                s.view = b.views.values().filter(|i| !i.ui && !b.closed.contains_key(&i.view)).map(|i| i.view).max().unwrap_or(0);
             }
             self.set_web(s);
             self.web_focus_page();
@@ -527,7 +576,7 @@ impl App {
     }
 
     /// Give BrowserFocus to `node` (None: to nothing), telling the views that gain and lose the keyboard.
-    fn browser_focus(&mut self, node: Option<u64>) {
+    pub(super) fn browser_focus(&mut self, node: Option<u64>) {
         if self.browser.focus == node {
             return;
         }
@@ -656,6 +705,79 @@ impl App {
         self.poke();
     }
 
+    // ---- UI views (harness-browser's README, "UI views") -------------------------------------------------------------
+
+    /// The UI view for `key` at `url`: a page of the app's own (`file://`, or the dev server's `http://localhost`) that
+    /// talks to the app ([`App::ui_post`], [`App::ui_messages`]). Asked for once (the link is made if it is not up);
+    /// Some once the host has opened it, None before, and None while it is refused or closed ([`App::ui_failed`]
+    /// says why). A new `url` for the key (the dev server came or went) closes its view and opens one at the new url.
+    /// When the host is lost and the link made again, the view is opened again, under a new number.
+    pub(super) fn ui_view(&mut self, key: &str, url: &str) -> Option<u64> {
+        let b = &mut self.browser;
+        let old = match b.ui.get(key) {
+            Some(u) if u.url == url => None,
+            Some(u) => Some(u.state.clone()),
+            None => Some(UiState::Want),
+        };
+        let new = old.is_some();
+        if let Some(old) = old {
+            // The page moved: the view at the old url closes (an open still on its way is closed when it is answered).
+            if let UiState::Open(view) = old {
+                b.up(&AppUp::Close { view });
+            }
+            b.ui.insert(key.to_owned(), UiView { url: url.to_owned(), state: UiState::Want });
+        }
+        let state = b.ui.get(key).map(|u| u.state.clone());
+        match state {
+            Some(UiState::Open(view)) => Some(view),
+            Some(UiState::Want) if b.live() => {
+                let req = b.req();
+                b.opening.insert(req, Opening::Ui(key.to_owned()));
+                b.up(&AppUp::Open { req, url: url.to_owned(), ui: true });
+                if let Some(u) = b.ui.get_mut(key) {
+                    u.state = UiState::Opening(req);
+                }
+                self.poke();
+                None
+            }
+            _ => {
+                if new {
+                    // Not linked yet: the next frame asks for the link (`browser_frame_start`), and a later call opens it.
+                    self.poke();
+                }
+                None
+            }
+        }
+    }
+
+    /// Why the UI view for `key` is not there: the host refused or closed it (None: it is open, or on its way).
+    pub(super) fn ui_failed(&self, key: &str) -> Option<&str> {
+        match &self.browser.ui.get(key)?.state {
+            UiState::Failed(why) => Some(why.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Hand `msg` (JSON text) to UI view `view`'s page: its `window.harnessRecv(msg)`. A view that is not one of the
+    /// app's open UI views is refused here, naming it; with no link up the message goes nowhere, said so (the page
+    /// says `ready` again on the view a new link opens, and gets the state then).
+    pub(super) fn ui_post(&mut self, view: u64, msg: &str) {
+        if !self.browser.is_ui(view) {
+            eprintln!("harness-native: browser: a post to view {view}, which is not an open UI view, is not sent: {msg}");
+            return;
+        }
+        if !self.browser.live() {
+            eprintln!("harness-native: browser: a post to UI view {view} is not sent: the harness browser is not linked");
+            return;
+        }
+        self.browser.up(&AppUp::Post { view, msg: msg.to_owned() });
+    }
+
+    /// What UI views' pages posted (`window.harnessPost`) since the last call, in order: the view and the text.
+    pub(super) fn ui_messages(&mut self) -> Vec<(u64, String)> {
+        std::mem::take(&mut self.browser.ui_inbox)
+    }
+
     // ---- each frame -----------------------------------------------------------------------------------------------
 
     /// Before the world's progress: the link (asked, answered, its messages handled), the pane's fold, and every
@@ -668,7 +790,7 @@ impl App {
             let s = self.web();
             self.set_web(WebState { view: 0, ..s });
         }
-        let wanted = self.web().open || !nodes.is_empty();
+        let wanted = self.web().open || !nodes.is_empty() || !self.browser.ui.is_empty();
         if wanted && matches!(self.browser.conn, Conn::Idle) {
             self.browser.ask();
         }
@@ -711,7 +833,7 @@ impl App {
             if let Some(url) = url {
                 let req = self.browser.req();
                 self.browser.opening.insert(req, Opening::Pane);
-                self.browser.up(&AppUp::Open { req, url });
+                self.browser.up(&AppUp::Open { req, url, ui: false });
             }
         }
         for (e, bv) in nodes {
@@ -793,7 +915,7 @@ impl App {
             return;
         }
         let b = &self.browser;
-        match b.views.keys().copied().filter(|v| *v != view && !b.closed.contains_key(v)).max() {
+        match b.views.values().filter(|i| !i.ui && i.view != view && !b.closed.contains_key(&i.view)).map(|i| i.view).max() {
             Some(next) => self.set_web(WebState { view: next, ..s }),
             None => self.web_shut(WebState { view: 0, ..s }),
         }
@@ -877,9 +999,19 @@ impl App {
                     self.set_web(WebState { view, ..s });
                 }
                 Some(Opening::Popup) => b.popup = Some(view),
+                Some(Opening::Ui(key)) => match b.ui.get_mut(&key) {
+                    Some(u) if u.state == UiState::Opening(req) => u.state = UiState::Open(view),
+                    // Asked for at a url it no longer has (or no longer asked for at all): a newer open stands in for it.
+                    _ => b.up(&AppUp::Close { view }),
+                },
                 None => {}
             },
             AppDown::Closed { view, why } => {
+                if let Some((key, u)) = b.ui.iter_mut().find(|(_, u)| u.state == UiState::Open(view)) {
+                    let error = format!("the harness browser closed UI view {view} ({}) of {key}: {why}", u.url);
+                    eprintln!("harness-native: browser: {error}");
+                    u.state = UiState::Failed(error);
+                }
                 b.closed.insert(view, why);
                 b.watched.remove(&view);
                 b.sized.remove(&view);
@@ -896,11 +1028,22 @@ impl App {
                     b.extensions = Some(extensions);
                 }
             }
+            AppDown::Message { view, msg } => b.ui_inbox.push((view, msg)),
+            AppDown::Link { view, url } => {
+                // A UI view's page went for a link outside it: the link opens where a chat's would.
+                eprintln!("harness-native: browser: UI view {view} opens {url}");
+                self.open_target(&url, false);
+            }
             AppDown::Error { req, error } => {
                 eprintln!("harness-native: browser: the host refused: {error}");
-                match req.and_then(|r| b.opening.remove(&r)) {
-                    Some(Opening::Src(src)) => {
+                match req.and_then(|r| b.opening.remove(&r).map(|o| (r, o))) {
+                    Some((_, Opening::Src(src))) => {
                         b.refused.insert(src, error);
+                    }
+                    Some((r, Opening::Ui(key))) => {
+                        if let Some(u) = b.ui.get_mut(&key).filter(|u| u.state == UiState::Opening(r)) {
+                            u.state = UiState::Failed(error);
+                        }
                     }
                     _ => b.note = Some(error),
                 }
@@ -985,24 +1128,26 @@ impl App {
         {
             let req = self.browser.req();
             self.browser.opening.insert(req, Opening::Src(src.to_owned()));
-            self.browser.up(&AppUp::Open { req, url: src.to_owned() });
+            self.browser.up(&AppUp::Open { req, url: src.to_owned(), ui: false });
         }
         if view.is_some_and(|v| v == 0) {
             view = None;
         }
         let v = View::of(e);
-        let pane = Some(*e.id()) == self.web_page();
+        // The pane's page and a UI view's node draw the page at their own box (the page is resized to it, and takes
+        // the pointer); a card shows a page at the page's size, scaled to it.
+        let own = Some(*e.id()) == self.web_page() || view.is_some_and(|v| self.browser.is_ui(v));
         if let Some(pic) = v.part("pic") {
-            set_if(pic.entity(), Surface { key: view.map_or(0, mb::key), cover: i32::from(!pane) });
+            set_if(pic.entity(), Surface { key: view.map_or(0, mb::key), cover: i32::from(!own) });
             let shape = view.and_then(|v| self.browser.cursors.get(&v).copied()).unwrap_or(Pointer::Arrow);
-            set_if(pic.entity(), Cursor { shape: if pane || e.has(BrowserFocus::id()) { shape } else { Pointer::Arrow } });
+            set_if(pic.entity(), Cursor { shape: if own || e.has(BrowserFocus::id()) { shape } else { Pointer::Arrow } });
         }
         let words = self.plate_words(view, src);
         if let Some(t) = v.part("plate").and_then(|p| p.part("text")) {
             t.text(&words);
         }
         let info = view.and_then(|v| self.browser.views.get(&v));
-        if pane {
+        if own {
             return;
         }
         // A card (hn.GenBrowser): its shape follows the page's, its press opens the pane on it.
@@ -1141,7 +1286,8 @@ impl App {
         rows
     }
 
-    /// After the paint: which views are on screen (their rings kept, watched; the rest unwatched) and the pane's box.
+    /// After the paint: which views are on screen (their rings kept, watched; the rest unwatched), and the boxes of the
+    /// views drawn at their own size: the pane's, and each UI view's.
     pub(super) fn browser_frame_end(&mut self, d: &mut Draw, scale: f32) {
         if !self.browser.live() {
             return;
@@ -1150,7 +1296,7 @@ impl App {
         let pane_page = self.web_page();
         let open = self.web().open;
         let mut shown: BTreeSet<u64> = BTreeSet::new();
-        let mut pane_box: Option<(u64, Laid)> = None;
+        let mut boxes: Vec<(u64, Laid)> = Vec::new(); // alloc: this frame's sized views, the pane's and the UI views'
         let mut nodes = Vec::new();
         w.new_query::<&BrowserView>().each_entity(|e, _| nodes.push(*e.id()));
         for n in nodes {
@@ -1159,8 +1305,10 @@ impl App {
             let pane = Some(n) == pane_page;
             if d.surface_keys.contains(&mb::key(view)) || (pane && open) {
                 shown.insert(view);
-                if pane && let Some(l) = View::of(e).part("pic").and_then(|p| p.entity().try_cloned::<&Laid>()) {
-                    pane_box = Some((view, l));
+                if (pane || self.browser.is_ui(view))
+                    && let Some(l) = View::of(e).part("pic").and_then(|p| p.entity().try_cloned::<&Laid>())
+                {
+                    boxes.push((view, l));
                 }
             }
         }
@@ -1177,7 +1325,7 @@ impl App {
             self.browser.watched.insert(view);
             self.browser.up(&AppUp::Watch { view, on: true });
         }
-        if let Some((view, l)) = pane_box.filter(|(_, l)| l.w >= 1.0 && l.h >= 1.0) {
+        for (view, l) in boxes.into_iter().filter(|(_, l)| l.w >= 1.0 && l.h >= 1.0) {
             let at = (l.w.round() as u32, l.h.round() as u32, scale.to_bits());
             if self.browser.sized.get(&view) != Some(&at) {
                 self.browser.sized.insert(view, at);
@@ -1188,14 +1336,16 @@ impl App {
 
     // ---- input ----------------------------------------------------------------------------------------------------
 
-    /// The live browser node under the pointer (the pane's page, a popup's, or a node with BrowserFocus): the node, its
-    /// view and its picture's box.
+    /// The live browser node under the pointer (the pane's page, a popup's, a UI view's, or a node with BrowserFocus):
+    /// the node, its view and its picture's box.
     fn browser_under(&self) -> Option<(u64, u64, Laid)> {
         let w = self.world.world_ref();
         let hit = w.entity_named(APP).target(Hovered::id(), 0)?;
         let node = std::iter::successors(Some(hit), |n| n.parent()).take(4).find(|n| n.has(BrowserView::id()))?;
         let id = *node.id();
-        let live = Some(id) == self.web_page() || node.has(BrowserFocus::id()) || self.browser.popup.is_some_and(|p| self.node_view(node) == Some(p));
+        let live = Some(id) == self.web_page()
+            || node.has(BrowserFocus::id())
+            || self.node_view(node).is_some_and(|v| self.browser.popup == Some(v) || self.browser.is_ui(v));
         if !live {
             return None;
         }

@@ -1,0 +1,12 @@
+# blaze.lock: what blaze builds this workspace with besides the crates in Cargo.lock.
+# blaze writes it (`blaze lock`); commit it. docs/cargo.md, "Lock files".
+version = 1
+
+[index]
+newest = "2026-11-03T07:13:36Z"
+
+[git."https://github.com/indexable-inc/flecs"]
+ab8b8e051c6f8ac014557136c97847941bd3caa0 = "blake3:ad43591a7c954f5bc554b942424dffa4b5374e1d37397fb670e1d62cf559b396"
+
+[git."https://github.com/uzaaft/libghostty-rs"]
+575ed6b8ceb79ffaf247ecf7e34333876b0d5be4 = "blake3:7dce2db174f6a50543eafa33845c5fbf0ffc3385f584cd87a6889f105a25c512"

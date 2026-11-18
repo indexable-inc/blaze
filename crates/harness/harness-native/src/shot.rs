@@ -71,6 +71,11 @@ pub fn run(path: &str) -> Result<(), String> {
     if let Ok(t) = std::env::var("HARNESS_NATIVE_SHOT_OPEN") {
         app.open_target(&t, false);
     }
+    // HARNESS_NATIVE_SHOT_LEARN <screen>: Learn, the home, at one screen of its demo course (src/app/learn.rs
+    // shot_learn names them), with no session selected.
+    if let Ok(screen) = std::env::var("HARNESS_NATIVE_SHOT_LEARN") {
+        app.shot_learn(&screen)?;
+    }
     // HARNESS_NATIVE_SHOT_FIXTURE <json>: a recorded world (the daemon's list and runs, chats' events) instead of the
     // daemon's (App::shot_fixture); run with a private HARNESS_HOME and no daemon.
     if let Ok(f) = std::env::var("HARNESS_NATIVE_SHOT_FIXTURE") {

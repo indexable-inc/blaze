@@ -27,6 +27,8 @@ ctx {
   // The new-object picker (File > New…) while it is open.
   Picker {}
   Archive {}
+  // Learn, the home (no session selected), has the keyboard: Return checks or goes on, Escape leaves.
+  Learn {}
   // A chat pane has the keyboard: keys edit its input (macOS text editing), Return sends, Escape or Cmd+. interrupts.
   Chat {}
   // A harness browser view has the keyboard (the pane, or a card clicked into: BrowserFocus, src/app/browser.rs): keys
@@ -45,7 +47,7 @@ act {
 
   // cmd+N: a chat at once, no picker, of the agent kind a chat was last started with (native.json `chat_kind`, else
   // `new_kind` when that is an agent, else Claude); its model is changed afterwards from the chat's own model control.
-  NewChat { MenuItem: {bar: "File", title: "New Chat"} }
+  NewChat { MenuItem: {bar: "File", title: "New"} }
   OpenChat { MenuItem: {bar: "File", title: "Open Chat…"} }
   // The picker (File > New…, unbound): a row for each act.Spawn below with a `title`, in this order (the one picked last
   // is highlighted when it opens, native.json `new_kind`). A titled Spawn added in keys.flecs joins it.
@@ -132,6 +134,19 @@ act {
   SearchClear {}
   SearchErase {}
   ArchiveOpenFirst {}
+  // Learn (src/app/learn.rs): start the course typed, check the answer in hand or go on; leave; erase a character.
+  LearnNext {}
+  // Cmd+Return on the start page: what is typed becomes a course, not a question.
+  LearnCourse {}
+  // The right arrow: on to the next screen, only where nothing is left to answer.
+  LearnForward {}
+  // Up and down: the option picked (a choice), the item highlighted (an order); with shift, that item moves.
+  LearnUp {}
+  LearnDown {}
+  LearnMoveUp {}
+  LearnMoveDown {}
+  LearnBack {}
+  LearnErase {}
 
   // Natural text editing (iTerm2's and Ghostty's preset), whatever the program's keyboard mode. Bytes are in caret
   // notation: ^[ is escape, ^? is DEL, ^A..^_ are the control characters.
@@ -394,6 +409,37 @@ key {
   archive_enter { Keybind: {key: "enter"}
     (Does, act.ArchiveOpenFirst)
     (When, ctx.Archive) }
+
+  learn_return { Keybind: {key: "return"}
+    (Does, act.LearnNext)
+    (When, ctx.Learn) }
+  learn_course { Keybind: {key: "return", cmd: 1}
+    (Does, act.LearnCourse)
+    (When, ctx.Learn) }
+  learn_enter { Keybind: {key: "enter"}
+    (Does, act.LearnNext)
+    (When, ctx.Learn) }
+  learn_right { Keybind: {key: "right"}
+    (Does, act.LearnForward)
+    (When, ctx.Learn) }
+  learn_up { Keybind: {key: "up"}
+    (Does, act.LearnUp)
+    (When, ctx.Learn) }
+  learn_down { Keybind: {key: "down"}
+    (Does, act.LearnDown)
+    (When, ctx.Learn) }
+  learn_move_up { Keybind: {key: "up", shift: 1}
+    (Does, act.LearnMoveUp)
+    (When, ctx.Learn) }
+  learn_move_down { Keybind: {key: "down", shift: 1}
+    (Does, act.LearnMoveDown)
+    (When, ctx.Learn) }
+  learn_escape { Keybind: {key: "escape"}
+    (Does, act.LearnBack)
+    (When, ctx.Learn) }
+  learn_backspace { Keybind: {key: "backspace"}
+    (Does, act.LearnErase)
+    (When, ctx.Learn) }
 
   word_left { Keybind: {key: "left", opt: 1}
     (Does, act.WordLeft)

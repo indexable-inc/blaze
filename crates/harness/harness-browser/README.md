@@ -120,6 +120,36 @@ modifier bits), `Key` (the Mac key code, which the host maps to Windows' code as
 page gets a real composition), `Focus`, `Nav`. The host answers with `Cursor` (a shape name the app knows), `ImeRect`
 (where the candidate window goes) and `Views` whenever a url, title or loading state changes.
 
+## UI views
+
+A **UI view** is a page of the app's own (crates/harness/web: `dist/index.html` as `file://`, or the Vite dev server at
+`http://localhost:<port>`) that talks to the app. The app opens one with `AppUp::Open { ui: true }`; the host answers
+`Opened` as for any view. What differs (host.rs, `src/ui.rs`):
+
+- **The binding.** Its browser is made with no url. Its DevTools session (the host's own `SendDevToolsMessage`, ids
+  from the same table as the connections', with `Asker::Host`, so no answer reaches a connection) is sent
+  `Runtime.enable` and `Runtime.addBinding { name: "harnessPost" }`; the binding's answer loads the url. So every
+  document of the view has `window.harnessPost(string)` before its first script runs, and keeps it across reloads. A
+  failed enable or binding closes the view, saying which.
+- **Page to app.** Each `Runtime.bindingCalled` named `harnessPost` becomes `AppDown::Message { view, msg }`, `msg` the
+  page's string as it passed it. No other event of a UI view goes anywhere.
+- **App to page.** `AppUp::Post { view, msg }` runs `window.harnessRecv && window.harnessRecv(<msg>)` in the main frame
+  (`CefFrame::ExecuteJavaScript`); `msg` must be JSON text. A post to a view that is not a UI view, or of text that is
+  not JSON, is refused naming the view. A page still loading has no `harnessRecv` and gets nothing: it says `ready`
+  when it has one.
+- **The lock.** A UI view never leaves the origin of its first url: a `file://` page's is its own file (the path,
+  escapes decoded; query and fragment ignored), an `http`/`https` page's its scheme, host and port. Any other top-level
+  navigation (`OnBeforeBrowse` of the main frame: a link, a location change, a redirect), a new tab
+  (`OnOpenURLFromTab`) or a `window.open` (`OnBeforePopup`) is cancelled and sent as `AppDown::Link { view, url }`; the
+  app opens it in the pane. Frames inside the page navigate freely. A UI view at any other scheme is refused. Before
+  the host has loaded the page (the binding's answer), every navigation is cancelled and logged: none is the page's.
+- **The kernel.** Socket clients never see one: `Views` leaves them out, and `Attach`, `Cdp` and `Close` on one are
+  refused naming it. `ViewInfo.ui` marks them in the app's `Views` (and is never written for any other view).
+- **In the app** (`harness-native/src/app/browser.rs`): `ui_view(key, url)` opens one per key (closing and reopening
+  when the url changes, reopening after a host restart), `ui_post(view, msg)`, `ui_messages()` drains what pages
+  posted. A node showing a UI view is drawn like the pane's page: resized to its box, the pointer and (with
+  `BrowserFocus`) the keys go to it.
+
 ## In the app
 
 - **The primitive.** `harness-native-ui-browser-api` (components) and its prim in `harness-native-ui-prims/scene/` make a
@@ -186,7 +216,7 @@ sign in". Google may refuse sign-in in embedded browsers; if it does, that error
   `cef_initialize`, the message loop).
 - `src/host.rs` owns all state on the UI thread. Other threads `post` a command: a crossbeam channel plus one CEF task
   per command. No CEF call is made while the host is borrowed, because CEF calls back synchronously.
-- `src/cdp_ids.rs` and `src/keys.rs` are sans-IO cores with unit tests. `src/ring.rs` holds the Metal blits and the
+- `src/cdp_ids.rs`, `src/keys.rs` and `src/ui.rs` (a UI view's origin) are sans-IO cores with unit tests. `src/ring.rs` holds the Metal blits and the
   IOSurface lifetime rules.
 - A view the kernel opens renders at scale 1 until the app sends `Resize`. An extension's action popup opens at
   400x600 points.

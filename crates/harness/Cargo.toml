@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["harness", "harness-browser", "harness-chat", "harness-chat-library", "harness-mach", "harness-proto", "harness-ghostty-config", "harness-native*", "harness-video", "harness-vt"]
+members = ["harness", "harness-browser", "harness-chat", "harness-chat-library", "harness-learn", "harness-mach", "harness-proto", "harness-ghostty-config", "harness-native*", "harness-video", "harness-vt"]
 
 # cef-rs's sys crate with its build script replaced: the pinned CEF from scripts/cef.py's cache, no download, no cmake
 # (harness-browser/README.md).
@@ -17,4 +17,6 @@ version = "0.20261105.4"
 # whose build fetches Ghostty's zig packages: all network, which blaze's sandbox has none of. Until those come in as
 # pinned native inputs (docs/cargo.md, "Pinned native inputs": Ghostty's source and zig packages, and zig), it runs
 # outside the sandbox.
-unsandboxed-build-scripts = ["libghostty-vt-sys"]
+# harness-native-render's build script runs `xcrun metal`, which needs the Metal toolchain's mount and xcrun's cache
+# under /var/folders: neither is inside the sandbox.
+unsandboxed-build-scripts = ["libghostty-vt-sys", "harness-native-render"]
