@@ -892,6 +892,14 @@ impl App {
         self.sync_marks(up);
         let w = self.world.world_ref();
         let rows = model::tree(w);
+        // Learn's tutor is plumbing, never a row: a session by the name the app gives its tutor (app/learn.rs) is closed
+        // out of the tree, running or ended.
+        for (e, _) in &rows {
+            let o = w.entity_from_id(*e);
+            if !o.has(model::Closed::id()) && o.try_cloned::<&model::Name>().is_some_and(|n| n.s.as_str() == learn::TUTOR_NAME) {
+                o.add(model::Closed::id());
+            }
+        }
         // Once the daemon's first list is in: the object selected when the app last ran, if it is still there.
         if up && let Some(last) = self.restore.take() {
             // The app opens on Learn, its home: what was selected last is a press away in the sidebar.

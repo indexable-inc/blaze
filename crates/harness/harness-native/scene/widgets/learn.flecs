@@ -214,22 +214,88 @@ hn {
 
   // ---- a tutor is writing ----
 
+  // A lesson that is not written yet, as its place on the path: a disc and two bars where its title and idea will be.
+  // Still: the one thing that breathes on the screen is the ring beside the words.
+  prefab LearnGhost : ui.Row {
+    Flex: {axis: Row, gap: 14, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $learn_option_h, min: 0, max: 0}}
+    Padding: {l: 10, r: $learn_option_pad, t: 0, b: 0}
+    disc : ui.Node {
+      Fill: $tone_wash
+      Shape: {radius: $learn_disc / 2, n: 2, border: 0, feather: 0}
+      Size: {w: {kind: Fixed, value: $learn_disc, min: 0, max: 0}, h: {kind: Fixed, value: $learn_disc, min: 0, max: 0}}
+    }
+    bars : ui.Column {
+      Flex: {axis: Column, gap: 8, align: Start, justify: Center, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      title : ui.Node {
+        Fill: $tone_wash
+        Shape: {radius: 4, n: 4, border: 0, feather: 0}
+        Size: {w: {kind: Percent, value: 0.34, min: 0, max: 0}, h: {kind: Fixed, value: 10, min: 0, max: 0}}
+      }
+      about : ui.Node {
+        Fill: $tone_hover
+        Shape: {radius: 4, n: 4, border: 0, feather: 0}
+        Size: {w: {kind: Percent, value: 0.62, min: 0, max: 0}, h: {kind: Fixed, value: 8, min: 0, max: 0}}
+      }
+    }
+  }
+  prefab LearnGhostShort : hn.LearnGhost {
+    bars {
+      title { Size: {w: {kind: Percent, value: 0.24, min: 0, max: 0}, h: {kind: Fixed, value: 10, min: 0, max: 0}} }
+      about { Size: {w: {kind: Percent, value: 0.48, min: 0, max: 0}, h: {kind: Fixed, value: 8, min: 0, max: 0}} }
+    }
+  }
+  prefab LearnGhostLong : hn.LearnGhost {
+    bars {
+      title { Size: {w: {kind: Percent, value: 0.42, min: 0, max: 0}, h: {kind: Fixed, value: 10, min: 0, max: 0}} }
+      about { Size: {w: {kind: Percent, value: 0.7, min: 0, max: 0}, h: {kind: Fixed, value: 8, min: 0, max: 0}} }
+    }
+  }
+
+  // While a tutor writes (src/app/learn.rs Screen::Making): what is being made, named large (the topic, or the lesson),
+  // one quiet line saying what is happening beside the breathing ring, and the shape of what is coming: the course's
+  // path as it will be, its lessons still blank. So the wait shows where it is going, not an empty page.
   prefab LearnMaking : ui.Column {
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     top : hn.LearnTop {}
+    kicker : hn.LearnLabel {}
+    a0 : hn.LearnAirSmall {}
     title : hn.LearnDisplay {}
     a1 : hn.LearnAirSmall {}
-    sub : hn.LearnSmall {
-      TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+    status : ui.Row {
+      Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      ring : hn.ChatWorking {
+        Tooltip: {text: "Working"}
+      }
+      sub : ui.Line, Muted {
+        TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+      }
     }
     a2 : hn.LearnAir {}
-    row : ui.Row {
-      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    ghosts : ui.Column {
+      Flex: {axis: Column, gap: 4, align: Stretch, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      g1 : hn.LearnGhost {}
+      g2 : hn.LearnGhostLong {}
+      g3 : hn.LearnGhostShort {}
+      g4 : hn.LearnGhost {}
+      g5 : hn.LearnGhostLong {}
+    }
+    rest : ui.Spacer {}
+    row : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      hint : ui.Line, Faint {
+        Text: {s: "esc"}
+        TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
+        Padding: {l: 0, r: 8, t: 0, b: 0}
+      }
       cancel : hn.LearnQuiet {
         Action: {name: "learn:back"}
-        Padding: {l: 0, r: $learn_button_pad, t: 0, b: 0}
+        Fill: $tone_wash
         label { Text: {s: "Cancel"} }
       }
     }

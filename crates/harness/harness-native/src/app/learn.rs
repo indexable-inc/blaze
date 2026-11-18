@@ -10,6 +10,9 @@ use super::*;
 use harness_learn::{Course, Input, Lesson, Mark, Progress, Run, Step, tutor};
 use harness_native_ui_layout_api::{Size, SizeKind, Sizing};
 
+/// The name the app gives the tutor's session; a session by this name is never a sidebar row (src/app.rs).
+pub(super) const TUTOR_NAME: &str = "Tutor";
+
 /// A tutor's answer, or the session it runs in, come from the link's threads.
 enum Arrived {
     /// The tutor's session was started.
@@ -33,7 +36,7 @@ enum Screen {
     /// A course's path: its lessons, and where the person is on it.
     Course { course: String },
     /// A tutor is writing: what, in words.
-    Making { title: String, sub: String },
+    Making { kicker: String, title: String, sub: String },
     /// A lesson or a review is walked ([`Learn::run`]).
     Step,
     /// A run is over.
@@ -251,7 +254,7 @@ impl App {
                     l.started = Some(id);
                     l.saved.tutor = Some(id);
                     l.save();
-                    self.link.rename(id, "Tutor");
+                    self.link.rename(id, TUTOR_NAME);
                     self.learn_ask(&mut l);
                 }
                 Arrived::Outline { ask, answer } if ask == l.ask => {
@@ -360,7 +363,7 @@ impl App {
         let Some((ct, lt)) = l.course(course).and_then(|c| Some((c.title.clone(), c.lesson(lesson)?.title.clone()))) else { return };
         l.ask += 1;
         l.want = Some(Want::Steps { course: course.to_owned(), lesson: lesson.to_owned() });
-        l.screen = Screen::Making { title: format!("Writing \u{201c}{lt}\u{201d}"), sub: format!("{ct} \u{b7} a few short steps, mostly questions. About half a minute.") };
+        l.screen = Screen::Making { kicker: ct, title: lt, sub: "Writing this lesson: a few short steps, mostly questions".to_owned() };
         self.learn_ask(l);
     }
 
@@ -447,7 +450,8 @@ impl App {
                 l.want = Some(Want::Outline { topic: topic.clone() });
                 // The first line of what was asked, kept short: a long ask (a conversation to understand) is not echoed.
                 let named: String = topic.lines().next().unwrap_or("").chars().take(72).collect();
-                l.screen = Screen::Making { title: "Planning your course".to_owned(), sub: format!("{named} \u{b7} five to seven short lessons. About half a minute.") };
+                let named = named.trim_start_matches(|c: char| !c.is_alphanumeric()).to_owned();
+                l.screen = Screen::Making { kicker: "New course".to_owned(), title: named, sub: "Planning five to seven short lessons".to_owned() };
                 self.learn_ask(l);
             }
             Screen::Making { .. } => {}
@@ -624,9 +628,12 @@ not the transcript.\n\nThe conversation:\n{}",
         };
         view::for_each_of(page, [(key, prefab, ())], |v, (), _| match (&l.screen, &l.run) {
             (Screen::Step, Some(run)) => fill_step(v, l, run),
-            (Screen::Making { title, sub }, _) => {
+            (Screen::Making { kicker, title, sub }, _) => {
+                set_text(v, "kicker", kicker);
                 set_text(v, "title", title);
-                set_text(v, "sub", sub);
+                if let Some(status) = v.part("status") {
+                    set_text(status, "sub", sub);
+                }
             }
             (Screen::Course { course }, _) if l.course(course).is_some() => {
                 if let Some(c) = l.course(course) {
@@ -927,7 +934,7 @@ impl App {
                 }
                 l.draft = "how tcp congestion control works".to_owned();
             }
-            "making" => l.screen = Screen::Making { title: "Planning your course".into(), sub: "how tcp congestion control works \u{b7} five to seven short lessons. About half a minute.".into() },
+            "making" => l.screen = Screen::Making { kicker: "New course".into(), title: "How TCP congestion control works".into(), sub: "Planning five to seven short lessons".into() },
             "read" => {}
             "choice" => walk(&mut run, &mut p, &to_choice),
             "picked" => walk(&mut run, &mut p, &[Input::Next, Input::Choose(2)]),
