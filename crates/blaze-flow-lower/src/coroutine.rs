@@ -68,7 +68,7 @@ use blaze_flow::{BorrowKind, Flow, Local, Operand, Place, Proj, StmtKind};
 use blaze_typeck::{BodyView, CaptureKind, Checked, Expr, ExprId, Mutbl, PNode, PTy, PatId, PortableTys, Range};
 
 use crate::identity::{Identity, Role};
-use crate::{At, BodyOut, Facts, Form, Lower, MOST_POSITIONS, Refusal, Region, Task, TyD, range_of};
+use crate::{At, BodyOut, External, Facts, Form, Lower, MOST_POSITIONS, Refusal, Region, Task, TyD, range_of};
 
 /// An async block's body lowered as its own flow.
 pub struct LoweredAsync<A: Allocator + Clone> {
@@ -86,6 +86,18 @@ pub struct LoweredAsync<A: Allocator + Clone> {
     pub identity: Vec<crate::identity::Identity, A>,
     /// The block's item-relative range (what a refusal of [`interior`] names).
     pub range: Range,
+    /// What each placeholder of `flow` stands for in the flow that makes the block (lane B14,
+    /// the one mechanism of closure.rs [`crate::External`]): a capture's positions are the
+    /// future VALUE's (`External::Capture`, laid as `Lower::npos` of `PNode::Future` lays
+    /// them: each capture in row order, a capture by reference its reference first), the
+    /// output's are `External::Sig` (the future's type holds no position for them), and
+    /// `'static` is `External::Static`. An outlives result between two of the value's
+    /// positions (or `'static`) is then a requirement the maker proves at the block
+    /// expression ([`crate::requirement`], `Facts::closure_requirements` keyed by the block's
+    /// expression), as a closure's is. The root block of an `async fn` has its placeholders
+    /// laid by the signature (`async_fn_root`): its rows are made the same way and never read
+    /// (its outlives results are the fn's own findings).
+    pub externals: Vec<(blaze_flow::Origin, External), A>,
 }
 
 /// The body of async block `block` (an `Expr::AsyncBlock` of `body`) as its own flow.
@@ -104,7 +116,12 @@ pub fn lower_async<A: Allocator + Clone, F: Facts>(
     refuse_async_closures(body, block)?;
     let mut l = Lower::new(body, ck, facts, alloc.clone())?;
     l.async_root = Some(block);
-    l.run_async(block, inner)?;
+    let mut externals: Vec<(blaze_flow::Origin, External), A> = Vec::new_in(alloc.clone());
+    l.run_async(block, inner, &mut externals)?;
+    // `'static`, made when the walk first met it (`Lower::universal`), as closure.rs does.
+    if let Some(&(_, st)) = l.uni.iter().find(|(r, _)| *r == Region::Static) {
+        externals.push((st, External::Static));
+    }
     let flow = l.b.finish().map_err(|_| Refusal { form: Form::Builder, range })?;
     if l.local_ty.len() != flow.locals as usize {
         return Err(Refusal { form: Form::Malformed, range });
@@ -122,7 +139,7 @@ pub fn lower_async<A: Allocator + Clone, F: Facts>(
     if l.identity.len() != flow.locals as usize {
         return Err(Refusal { form: Form::Malformed, range });
     }
-    Ok(LoweredAsync { flow, local_ty, point_of: l.points, local_wrap, identity: l.identity, range })
+    Ok(LoweredAsync { flow, local_ty, point_of: l.points, local_wrap, identity: l.identity, range, externals })
 }
 
 /// A planted bug for the tests' controls.
@@ -316,8 +333,9 @@ fn refuse_async_closures(body: &BodyView<'_>, block: ExprId) -> Result<(), Refus
 
 impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
     /// The walk of an async block's body `inner`: as `run`, with the block's captures as the
-    /// arguments and its output as the return place.
-    fn run_async(&mut self, block: ExprId, inner: ExprId) -> Result<(), Refusal> {
+    /// arguments and its output as the return place. `externals` receives what each capture's
+    /// and the output's placeholder stands for in the block's maker ([`LoweredAsync::externals`]).
+    fn run_async(&mut self, block: ExprId, inner: ExprId, externals: &mut Vec<(blaze_flow::Origin, External), A>) -> Result<(), Refusal> {
         let ck = self.ck;
         // The block's captures, in row order: argument `1 + k` is row `k`.
         let mut rows: Vec<(PatId, CaptureKind), A> = Vec::new_in(self.alloc.clone());
@@ -338,6 +356,12 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
         self.ret_block = self.b.block();
         self.b.start(entry);
         self.scope_marks.push(0);
+        // The next position of the future value (`External::Capture`): a capture by reference
+        // is its reference then its variable's type's positions, one by value its type's, the
+        // order `Lower::npos` of `PNode::Future` counts and `closure_value` lays them in. An
+        // async block is polled through `Pin<&mut Self>` and owns its captures, so no capture
+        // is reached through a per-call environment reference (closure.rs `External::Env`).
+        let mut value_at = 0u32;
         for k in 0..rows.len() {
             let (p, kind) = rows[k];
             let t = match ck.local_ty.get(p.ix()) {
@@ -345,6 +369,7 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
                 None => return self.refuse_pat(Form::Malformed, p),
             };
             let l = Local(1 + k as u32);
+            let first = self.origs.len() as u32;
             match kind {
                 CaptureKind::ByValue => {
                     self.new_local_with(TyD::of(t), true, Some(l), block)?;
@@ -363,6 +388,11 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
                     self.upvar_places.push((p, place, TyD::of(t)));
                 }
             }
+            let made = self.origs.len() as u32;
+            for o in first..made {
+                externals.push((self.origs[o as usize], External::Capture(value_at + (o - first))));
+            }
+            value_at += made - first;
             self.vars.push(l);
         }
         // The return place: the block's output, its positions placeholders; every capture's
@@ -376,6 +406,12 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
         let upvar_origins = self.origs.len();
         self.new_local_with(TyD::of(out), true, Some(Local(0)), block)?;
         let all = self.origs.len();
+        // The output's positions: no position of the future value holds them (`npos` of
+        // `PNode::Future` counts the captures only), so a requirement naming one cannot be
+        // stated at the block expression ([`crate::requirement`] gives `None`: refused by name).
+        for o in upvar_origins..all {
+            externals.push((self.origs[o], External::Sig));
+        }
         if (all - upvar_origins) as u64 * upvar_origins as u64 > u64::from(MOST_POSITIONS) {
             return self.refuse(Form::Bound, block);
         }

@@ -16,7 +16,7 @@ use parser::{
 
 use crate::flags::Scan;
 use crate::Outline;
-use crate::digest::{By, Compress, Keyed, digest};
+use crate::digest::{By, Compress, Feed, Keyed, Lexed, digest};
 
 /// What an entry is before the walk closes it.
 const PLACEHOLDER: Item = Item {

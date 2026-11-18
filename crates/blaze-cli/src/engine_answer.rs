@@ -127,6 +127,10 @@ pub(crate) struct Facts {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) struct Printed {
     pub(crate) names: bool,
+    /// Every body's TYPES were checked to the end (engine_lines.rs `not_checked_whole`). Whether
+    /// their borrows were too is not kept here: it is a count of the lines record itself (its
+    /// `Class::Borrows` notes, `Tally::borrows`), which the certificate prints whole, so the
+    /// two can never disagree.
     pub(crate) bodies_whole: bool,
     pub(crate) replayable: bool,
 }

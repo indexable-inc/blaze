@@ -125,7 +125,9 @@ fn shared(names: Src, sized: Option<LibKey>, frame: &'static blaze_mem::Frame, o
     let lang = Recorder::new(RecorderOpts { alloc: g });
     let index = Index::from_source(eval_view.reading_into(&lang), LANG).unwrap_or_else(|_| panic!("the fixture's lang index"));
     let mut consts = Counted { names: eval_view, index: &index, alloc: g, asked: AVec::new_in(g) };
-    let mut source = SeededHeads::new(SeededHeadsOpts { names: view, sized, frame, scratch: g, alloc: g, consts: Some(&mut consts), known: None, owners: Some(&both) });
+    // No receiver pointers looked up (as `plain`'s): the lookup's names reads are a job's, not a
+    // cell's, and these runs compare cells' reads alone.
+    let mut source = SeededHeads::new(SeededHeadsOpts { names: view, sized, pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP, frame, scratch: g, alloc: g, consts: Some(&mut consts), known: None, owners: Some(&both) });
     for w in order.iter().copied() {
         both.enter(w);
         let made = head_task(view, &mut source, w, tool(), g);
@@ -176,7 +178,7 @@ fn plain(names: Src, sized: Option<LibKey>, frame: &'static blaze_mem::Frame, w:
     let eval_view = Tables::new(TablesOpts { records: names, impls: None, lang_crates: LANG, reads: &evals });
     let index = Index::from_source(eval_view, LANG).unwrap_or_else(|_| panic!("the fixture's lang index"));
     let mut consts = Counted { names: eval_view, index: &index, alloc: g, asked: AVec::new_in(g) };
-    let mut source = SeededHeads::new(SeededHeadsOpts { names: view, sized, frame, scratch: g, alloc: g, consts: Some(&mut consts), known: None, owners: None });
+    let mut source = SeededHeads::new(SeededHeadsOpts { names: view, sized, pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP, frame, scratch: g, alloc: g, consts: Some(&mut consts), known: None, owners: None });
     let made = head_task(view, &mut source, w, tool(), g);
     assert!(made.failed.is_none(), "{w:?} alone failed");
     drop(source);

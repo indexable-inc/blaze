@@ -18,17 +18,23 @@
 //! The digests are the same bytes whichever [`Compress`] runs ([`SideBySide`] or the twin
 //! [`OneByOne`]), and the same as the definition the tests recompute with one streaming hasher
 //! per digest.
+//!
+//! What a run of an entry's own text is fed as is the [`Feed`]'s (crate docs, "Identity"): its
+//! tokens ([`ByTokens`], what every outline runs), read from the columns of the one lex
+//! ([`Lexed`]) with no second pass over the text; or its bytes, for an entry a macro may read the
+//! layout of, and for every entry under the planted [`ByBytes`].
 
 use blaze_hash::{BuildKeyHasher, Map, MapOpts};
 use blaze_ids::{ContentId, Domain, Hasher};
 use blaze_own::{AVec, Alloc, Vec};
-use blaze_surface::{Item, ItemIndex, Range};
+use blaze_surface::{Item, ItemFlags, ItemIndex, Range};
 
 use crate::Outline;
 
-/// The domain of an unnamed entry's head: its signature's bytes from its first token outside
-/// its attributes, which stand for its name among its siblings.
-static HEAD: Domain = Domain::new("blaze v2 file item head 1");
+/// The domain of an unnamed entry's head: its signature's tokens from its first token outside
+/// its attributes, which stand for its name among its siblings. `2` since the heads are tokens
+/// (`1` hashed the bytes, so a re-spaced `impl` header renamed its members).
+static HEAD: Domain = Domain::new("blaze v2 file item head 2");
 
 /// The domain of a sibling group's key: the parent, the kind and the name (or head).
 static SIBLING: Domain = Domain::new("blaze v2 file item siblings 1");
@@ -46,6 +52,49 @@ static PART: Domain = Domain::new(crate::PART_DOMAIN);
 const BYTES: u8 = 0;
 /// The tag of a child entry's digest in its parent's.
 const CHILD: u8 = 1;
+/// The tag of a run of an entry's own tokens in its digest.
+const TOKENS: u8 = 2;
+
+/// The tokens of the text an outline is made of, as the walk's columns hold them (crate::walk::rows
+/// `Columns`, or the writer's `TokenColumns`): each token's word (its kind,
+/// `parser::word_kind`), its start and its end, in order. Whitespace and plain comments are no
+/// tokens; a doc comment is one. `words` may be longer than the others (the parser's pad).
+#[derive(Clone, Copy)]
+pub(crate) struct Lexed<'t> {
+    pub(crate) words: &'t [u32],
+    pub(crate) starts: &'t [u32],
+    pub(crate) ends: &'t [u32],
+}
+
+/// What an entry's own text is fed to its digests as: the one seam (AGENTS.md rule 78) between
+/// the outline's keys ([`ByTokens`]) and the control that puts trivia back in them ([`ByBytes`]).
+/// A head (an unnamed entry's sibling key) is its tokens under either: it names, it holds nothing.
+pub trait Feed {
+    /// Whether `item`'s own text is fed by its bytes.
+    fn by_bytes(item: &Item) -> bool;
+}
+
+/// Tokens, but where a macro may read the layout (crate docs, "Identity", rule 21): an entry whose
+/// own tokens call a macro or carry an attribute that is no inert built-in one
+/// ([`ItemFlags::MACRO_CALL`]) is fed by its bytes, since `stringify!`, `line!`, a proc macro's
+/// `Span::source_text` and its spans' lines read what tokens leave out.
+pub struct ByTokens;
+
+/// Every entry by its bytes: the planted control (tests/outline/token_keys.rs), the keys as they were
+/// before tokens, under which a comment in a body moves its entry's digests.
+pub struct ByBytes;
+
+impl Feed for ByTokens {
+    fn by_bytes(item: &Item) -> bool {
+        item.flags.contains(ItemFlags::MACRO_CALL)
+    }
+}
+
+impl Feed for ByBytes {
+    fn by_bytes(_: &Item) -> bool {
+        true
+    }
+}
 
 /// The inputs hashed in one call at most: enough that the lanes left idle at the end of a call
 /// (a lane waits for no other, `blaze_blake3::many`) are few beside the steps of the call.
@@ -105,7 +154,7 @@ pub(crate) enum By {
     Position,
     /// Its name's file range, `r#` left out, or none for an entry that has none.
     Name(Option<Range>),
-    /// Its head's file range, hashed in [`HEAD`]'s domain.
+    /// Its head's file range, its tokens hashed in [`HEAD`]'s domain.
     Head(Range),
 }
 
@@ -154,16 +203,18 @@ impl Keyed {
 }
 
 /// The digests of `out`, an outline of `text` in `edition` (its hash byte) whose walk is done
-/// and whose entries' `hash`es hold their [`Keyed`] makings: each entry's `disambiguator`,
-/// `hash` and `signature_hash` are set, and each top-level entry's sibling key is pushed onto
-/// its keys in order. Inputs are hashed side by side by `C` in fixed batches of [`BATCH`];
-/// besides them only `scratch`: the counts of the keys seen, and the messages of one batch.
-pub(crate) fn digest<C: Compress>(text: &str, edition: u8, out: &mut Outline<'_>, scratch: &mut Scratch<'_>) {
+/// and whose entries' `hash`es hold their [`Keyed`] makings, `lexed` its tokens: each entry's
+/// `disambiguator`, `hash` and `signature_hash` are set, and each top-level entry's sibling key
+/// is pushed onto its keys in order. Inputs are hashed side by side by `C` in fixed batches of
+/// [`BATCH`], each entry's text fed as `F` says; besides them only `scratch`: the counts of the
+/// keys seen, and the messages of one batch.
+pub(crate) fn digest<C: Compress, F: Feed>(text: &str, edition: u8, lexed: Lexed<'_>, out: &mut Outline<'_>, scratch: &mut Scratch<'_>) {
     let Scratch { bytes, siblings } = scratch;
     bytes.clear();
     siblings.clear();
-    sibling_keys::<C>(text, out, bytes, siblings);
-    entry_digests::<C>(text.as_bytes(), edition, &mut out.items, bytes);
+    let own = Own { bytes: text.as_bytes(), lexed };
+    sibling_keys::<C>(own, out, bytes, siblings);
+    entry_digests::<C, F>(own, edition, &mut out.items, bytes);
     // Last: an entry's names digest may take its `hash` or `signature_hash`.
     crate::names_digest::names_digests::<C>(text, edition, &out.items, &out.attrs, &mut out.names, bytes);
     out.file_names = crate::names_digest::file_names_digest(text, &out.attrs[out.file_attrs.to_usize()]);
@@ -187,7 +238,7 @@ impl<'a> Scratch<'a> {
 /// key. Entries with one key share a parent, so the count in the order of the entries is the
 /// count in source order.
 fn sibling_keys<C: Compress>(
-    text: &str,
+    own: Own<'_>,
     out: &mut Outline<'_>,
     scratch: &mut AVec<'_, u8>,
     siblings: &mut Map<ContentId, u32, BuildKeyHasher, Alloc<'_>>,
@@ -195,35 +246,45 @@ fn sibling_keys<C: Compress>(
     let mut from = 0;
     while from < out.items.len() {
         let to = (from + BATCH).min(out.items.len());
-        key_batch::<C>(text.as_bytes(), out, from..to, scratch, siblings);
+        key_batch::<C>(own, out, from..to, scratch, siblings);
         from = to;
     }
 }
 
-/// The sibling keys of entries `batch`: their heads hashed side by side, then their keys.
+/// The sibling keys of entries `batch`: their heads' tokens hashed side by side, then their keys.
 /// `siblings` counts the keys seen so far.
 fn key_batch<C: Compress>(
-    bytes: &[u8],
+    own: Own<'_>,
     out: &mut Outline<'_>,
     batch: core::ops::Range<usize>,
     scratch: &mut AVec<'_, u8>,
     siblings: &mut Map<ContentId, u32, BuildKeyHasher, Alloc<'_>>,
 ) {
+    let bytes = own.bytes;
     let mut keyed = [Keyed { tag: 0, by: By::Position }; BATCH];
     for (keyed, item) in keyed.iter_mut().zip(&out.items[batch.clone()]) {
         *keyed = Keyed::unstash(&item.hash);
     }
     let keyed = &keyed[..batch.len()];
-    let mut inputs: [&[u8]; BATCH] = [&[]; BATCH];
     let mut heads = [[0u8; 32]; BATCH];
-    let mut count = 0;
-    for keyed in keyed {
-        if let By::Head(head) = keyed.by {
-            inputs[count] = &bytes[head.to_usize()];
-            count += 1;
+    {
+        // Each head's message, its tokens (a head names: no layout is in it under any feed).
+        scratch.clear();
+        let mut cuts = [0usize; BATCH + 1];
+        let mut count = 0;
+        for keyed in keyed {
+            if let By::Head(head) = keyed.by {
+                tokens(scratch, own, head.start, head.end, head.end);
+                count += 1;
+                cuts[count] = scratch.len();
+            }
         }
+        let mut inputs: [&[u8]; BATCH] = [&[]; BATCH];
+        for (at, input) in inputs[..count].iter_mut().enumerate() {
+            *input = &scratch[cuts[at]..cuts[at + 1]];
+        }
+        C::derive_many(HEAD.context_key(), &inputs[..count], &mut heads[..count]);
     }
-    C::derive_many(HEAD.context_key(), &inputs[..count], &mut heads[..count]);
     scratch.clear();
     let mut cuts = [0usize; BATCH + 1];
     let mut head = heads.iter();
@@ -268,32 +329,39 @@ fn key_batch<C: Compress>(
 /// there has the batch hashed first. In the order taken an entry's descendants are the entries
 /// just before it, so the batch holds one exactly when the last entry put in it (the lowest
 /// index) is below the entry's end.
-fn entry_digests<C: Compress>(bytes: &[u8], edition: u8, items: &mut [Item], scratch: &mut AVec<'_, u8>) {
+fn entry_digests<C: Compress, F: Feed>(own: Own<'_>, edition: u8, items: &mut [Item], scratch: &mut AVec<'_, u8>) {
     scratch.clear();
     let mut batch = Batch { entries: [0; BATCH], cuts: [Cut { fed: 0, child: 0 }; BATCH], ends: [0; BATCH + 1], count: 0 };
     for at in (0..items.len()).rev() {
         if batch.count > 0 && wide(batch.entries[batch.count - 1]) < items[at].end.at() {
-            batch.hash::<C>(bytes, items, scratch);
+            batch.hash::<C, F>(own, items, scratch);
         }
         if items[at].range.len() > SHORT {
             let mut signature = Hasher::of(&SIGNATURE);
-            let cut = feed_signature(&mut signature, bytes, edition, items, at);
+            let cut = feed_signature::<F>(&mut signature, own, edition, items, at);
             let signature = signature.finish();
             let mut hash = Hasher::of(&ITEM);
-            feed_rest(&mut hash, bytes, items, at, &signature, cut);
+            feed_rest::<F>(&mut hash, own, items, at, &signature, cut);
             let item = &mut items[at];
             (item.hash, item.signature_hash) = (hash.finish(), signature);
             continue;
         }
-        batch.cuts[batch.count] = feed_signature(scratch, bytes, edition, items, at);
+        batch.cuts[batch.count] = feed_signature::<F>(scratch, own, edition, items, at);
         batch.entries[batch.count] = narrow(at);
         batch.count += 1;
         batch.ends[batch.count] = scratch.len();
         if batch.count == BATCH || scratch.len() >= BATCH_BYTES {
-            batch.hash::<C>(bytes, items, scratch);
+            batch.hash::<C, F>(own, items, scratch);
         }
     }
-    batch.hash::<C>(bytes, items, scratch);
+    batch.hash::<C, F>(own, items, scratch);
+}
+
+/// An outline's text as its digests read it: its bytes and its tokens.
+#[derive(Clone, Copy)]
+struct Own<'t> {
+    bytes: &'t [u8],
+    lexed: Lexed<'t>,
 }
 
 /// Short entries, none an ancestor of another, whose signatures' messages are copied, one after
@@ -310,7 +378,7 @@ impl Batch {
     /// The waiting entries' signature digests, from their messages in `scratch`, side by side;
     /// then their digests, each message the signature digest and the rest of the entry's, side
     /// by side; and both emptied.
-    fn hash<C: Compress>(&mut self, bytes: &[u8], items: &mut [Item], scratch: &mut AVec<'_, u8>) {
+    fn hash<C: Compress, F: Feed>(&mut self, own: Own<'_>, items: &mut [Item], scratch: &mut AVec<'_, u8>) {
         let count = self.count;
         let mut out = [[0u8; 32]; BATCH];
         {
@@ -324,7 +392,7 @@ impl Batch {
         for (at, &entry) in self.entries[..count].iter().enumerate() {
             let signature = ContentId(out[at]);
             items[wide(entry)].signature_hash = signature;
-            feed_rest(scratch, bytes, items, wide(entry), &signature, self.cuts[at]);
+            feed_rest::<F>(scratch, own, items, wide(entry), &signature, self.cuts[at]);
             self.ends[at + 1] = scratch.len();
         }
         let mut inputs: [&[u8]; BATCH] = [&[]; BATCH];
@@ -386,49 +454,108 @@ struct Cut {
 }
 
 /// The signature's message of entry `at` (crate docs, "Identity"): the edition, then the
-/// entry's own bytes up to where the signature ends as tagged, length-prefixed runs, with each
-/// direct child that starts before the cut as its digest where it stands.
-fn feed_signature(sink: &mut impl Sink, bytes: &[u8], edition: u8, items: &[Item], at: usize) -> Cut {
+/// entry's own text up to where the signature ends as tagged runs ([`run`]), with each direct
+/// child that starts before the cut as its digest where it stands.
+fn feed_signature<F: Feed>(sink: &mut impl Sink, own: Own<'_>, edition: u8, items: &[Item], at: usize) -> Cut {
     let item = &items[at];
+    let by_bytes = F::by_bytes(item);
     let signature_end = item.range.start + item.signature.end;
     sink.put(&[edition]);
     let mut fed = item.range.start;
     let mut child = at + 1;
     while child < item.end.at() && items[child].range.start < signature_end {
         let inner = &items[child];
-        run(sink, bytes, fed, inner.range.start);
+        run(sink, own, by_bytes, fed, inner.range.start, item.range.end);
         sink.put(&[CHILD]);
         sink.put(&inner.hash.0);
         fed = inner.range.end;
         child = inner.end.at();
     }
     assert!(fed <= signature_end, "an entry's signature ends outside its children");
-    run(sink, bytes, fed, signature_end);
+    run(sink, own, by_bytes, fed, signature_end, item.range.end);
     Cut { fed: signature_end, child }
 }
 
 /// The message of entry `at` past its signature's `cut`: the signature's digest, then the
-/// rest of the entry's own bytes as runs, with each remaining direct child as its digest.
-fn feed_rest(sink: &mut impl Sink, bytes: &[u8], items: &[Item], at: usize, signature: &ContentId, cut: Cut) {
+/// rest of the entry's own text as runs, with each remaining direct child as its digest.
+fn feed_rest<F: Feed>(sink: &mut impl Sink, own: Own<'_>, items: &[Item], at: usize, signature: &ContentId, cut: Cut) {
     let item = &items[at];
+    let by_bytes = F::by_bytes(item);
     sink.put(&signature.0);
     let (mut fed, mut child) = (cut.fed, cut.child);
     while child < item.end.at() {
         let inner = &items[child];
-        run(sink, bytes, fed, inner.range.start);
+        run(sink, own, by_bytes, fed, inner.range.start, item.range.end);
         sink.put(&[CHILD]);
         sink.put(&inner.hash.0);
         fed = inner.range.end;
         child = inner.end.at();
     }
-    run(sink, bytes, fed, item.range.end);
+    run(sink, own, by_bytes, fed, item.range.end, item.range.end);
 }
 
-/// A run of the file's bytes `from..to`: its tag, its length, its bytes (`Hasher::part`).
-fn run(sink: &mut impl Sink, bytes: &[u8], from: u32, to: u32) {
-    sink.put(&[BYTES]);
-    sink.put(&u64::from(to - from).to_le_bytes());
-    sink.put(&bytes[wide(from)..wide(to)]);
+/// A run of an entry's own text `from..to`, the entry ending at `limit`: its bytes
+/// (`by_bytes`: the tag 0, the length as a u64, the bytes: `Hasher::part`), or its tokens
+/// ([`tokens`]).
+fn run(sink: &mut impl Sink, own: Own<'_>, by_bytes: bool, from: u32, to: u32, limit: u32) {
+    if by_bytes {
+        sink.put(&[BYTES]);
+        sink.put(&u64::from(to - from).to_le_bytes());
+        sink.put(&own.bytes[wide(from)..wide(to)]);
+    } else {
+        tokens(sink, own, from, to, limit);
+    }
+}
+
+/// The tokens of the text `from..to` (crate docs, "Identity"): the tag 2, their count (LEB128),
+/// then per token its kind (`SyntaxKind` as a little-endian u16) with the top bit set when it is
+/// joined to the next token, and, unless it is punctuation (whose kind is its text), its
+/// lexeme's length (LEB128) and bytes. Whitespace and plain comments are no tokens; a doc comment
+/// is one. A token is joined as `parser::token_key` says (`joined`: punctuation written right
+/// against punctuation or a lifetime, what tells `&&` from `& &`), and only to a next token that
+/// ends by `limit`, the entry's end, so an entry's digest reads nothing past it. Panics when a
+/// token is cut by `from` or `to`: an entry's runs are cut between its tokens, and a token the
+/// columns do not hold whole (a body left unlexed) must never go unhashed.
+fn tokens(sink: &mut impl Sink, own: Own<'_>, from: u32, to: u32, limit: u32) {
+    let Lexed { words, starts, ends } = own.lexed;
+    let first = starts.partition_point(|&start| start < from);
+    let last = first + starts[first..].partition_point(|&start| start < to);
+    assert!(first == 0 || ends[first - 1] <= from, "a token holds byte {from}, where an entry's run is cut");
+    sink.put(&[TOKENS]);
+    leb128(sink, u64::from(narrow(last - first)));
+    for at in first..last {
+        let (start, end) = (starts[at], ends[at]);
+        assert!(end <= to, "a token from byte {start} to {end} holds byte {to}, where an entry's run is cut");
+        let kind = parser::word_kind(words[at]);
+        // An outline lexer's body in one token (`LexedStr::new_outline`) is a `{` to the parser
+        // and would be hashed as one `{`: what the body says must be its tokens, lexed.
+        assert!(
+            !(kind.is_punct() && end - start > 3),
+            "a {kind:?} from byte {start} to {end} is a body left in one token; an entry's digest is of its tokens, so the text is lexed whole for it"
+        );
+        let joined = at + 1 < starts.len()
+            && starts[at + 1] == end
+            && ends[at + 1] <= limit
+            && parser::token_key::joined(kind, parser::word_kind(words[at + 1]));
+        sink.put(&((kind as u16) | u16::from(joined) << 15).to_le_bytes());
+        if !kind.is_punct() {
+            leb128(sink, u64::from(end - start));
+            sink.put(&own.bytes[wide(start)..wide(end)]);
+        }
+    }
+}
+
+/// `value` as LEB128: seven bits a byte, low first, the top bit set on every byte but the last.
+fn leb128(sink: &mut impl Sink, mut value: u64) {
+    loop {
+        let low = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            sink.put(&[low]);
+            return;
+        }
+        sink.put(&[low | 0x80]);
+    }
 }
 
 /// The digest of each of `ranges` of `text` in [`PART_DOMAIN`](crate::PART_DOMAIN), into the

@@ -15,7 +15,7 @@ use blaze_id::ContentId;
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
 use blaze_ladder::front2::heads::Want;
-use blaze_ladder::front2::tables::head::{ConstRefused, FreezeError, HeadCells, SeededHeads, SeededHeadsOpts, StoreConsts, cell_of, const_value_digest};
+use blaze_ladder::front2::tables::head::{CellFailure, ConstRefused, FreezeError, HeadCells, SeededHeads, SeededHeadsOpts, StoreConsts, cell_of, const_value_digest};
 use blaze_ladder::refusal::SourceFile;
 use blaze_lower::scoped::Prepares;
 use blaze_own::Alloc;
@@ -46,13 +46,20 @@ fn frozen_a(text: &str, evaluate: bool) -> Result<(ContentId, u128), String> {
     let prepared = Prepares::new_in(alloc);
     let mut evaluator = StoreConsts { names: &names, index: &front.index, prepared };
     let consts: Option<&mut dyn blaze_ladder::front2::tables::head::ConstValues<'_>> = if evaluate { Some(&mut evaluator) } else { None };
-    let mut source = SeededHeads::new(SeededHeadsOpts { names: &names, sized: front.index.lang("sized"), frame: &frame, scratch: alloc, alloc, consts, known: None, owners: None });
+    let mut source = SeededHeads::new(SeededHeadsOpts { names: &names, sized: front.index.lang("sized"), pointers: blaze_ladder::front2::receiver::Pointers::NOT_LOOKED_UP, frame: &frame, scratch: alloc, alloc, consts, known: None, owners: None });
     let cell = cell_of(&names, Want::Head(a)).unwrap_or_else(|e| panic!("the cell of `A`: {e}"));
     let got = source.cell(cell).map(|(frozen, reads)| (frozen.meaning(), reads.consts.iter().find(|(k, _)| *k == n).map(|(_, b)| *b)));
     match got {
         Ok((meaning, Some(value))) => Ok((meaning, value)),
         Ok((_, None)) => panic!("`A`'s reads miss `N`'s value"),
-        Err(e @ FreezeError::Const { error: ConstRefused::NoEvaluator, .. }) => {
+        // Every ask of a failed cell names the cell (lane HF1); its own reason is kept by the
+        // source ([`SeededHeads::failure`]): here the constant with no evaluator.
+        Err(FreezeError::Again { want, failed }) => {
+            assert_eq!((want, failed), (cell, cell), "a cell that failed by itself names itself");
+            let e = match source.failure(cell) {
+                Some((CellFailure::Own(e @ FreezeError::Const { error: ConstRefused::NoEvaluator, .. }), _)) => e.to_string(),
+                other => panic!("`A`'s kept failure: {other:?}"),
+            };
             // A failed cell is made once: asked again, it is refused by name, with no attempt.
             let attempts = source.attempts;
             match source.cell(cell) {

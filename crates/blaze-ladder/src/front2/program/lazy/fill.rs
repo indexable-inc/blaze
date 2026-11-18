@@ -214,11 +214,15 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         let (at, foreign) = self.placed_of(key, lib, &path)?;
         let local = |why: crate::front2::panic_entry::Refused| Front2Refusal::Attrs { function: Box::from(path.as_str()), why: why.form().into() };
         let foreign = foreign.or_else(|| crate::front2::panic_entry::local_abi(&self.store, key));
+        if let Some(llvm) = seam_rules::llvm_row(foreign, symbols.link_name.as_deref(), &path).map_err(&refuse)? {
+            return Ok(self.push(key, llvm.kind, llvm.build, llvm.track_caller, at, &path, llvm.symbol, symbols.export.as_deref(), Some(llvm.intrinsic)));
+        }
         let declared_name = crate::front2::panic_entry::local_name(&self.store, key).map_err(local).map_err(&refuse)?;
         let alloc = self.store.tys.alloc();
         let panic_entry = crate::front2::panic_entry::declares(self.front.names, &self.store, key, alloc).map_err(local).map_err(&refuse)?;
         let alloc_shim = crate::front2::alloc_shim::declares(self.front.names, &self.store, key, alloc)
             .map_err(|why| refuse(Front2Refusal::Attrs { function: Box::from(path.as_str()), why: why.detail() }))?;
+        let bound = seam_rules::bound_decl_row(self.front.names, &self.store, key, panic_entry, alloc_shim, &path).map_err(&refuse)?;
         // A call of an allocator declaration is made with the ABI of the fn it runs (front_end.rs
         // `fn_abi`), which the builder asks at the call, before that fn is called: its head is
         // made here, with the declaration's row (no check of the caller made it: the caller
@@ -230,14 +234,14 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             let (_, want) = self.target_of(default)?;
             self.make_want(want, default)?;
         }
-        let (kind, symbol) = if panic_entry || alloc_shim.is_some() {
-            (FnKind::Free, Box::<str>::from(""))
+        let (kind, symbol) = if let Some(bound) = bound {
+            bound
         } else if foreign.is_some() && !in_container {
-            let symbol = symbols.link_name.clone().unwrap_or_else(|| declared_name.unwrap_or(row_path.ident()).into());
+            let symbol = symbols.link_name.as_deref().or(declared_name).unwrap_or(row_path.ident());
             (FnKind::Foreign, symbol)
         } else {
             let kind = seam_rules::rust_row_kind(of_trait, has_body || symbols.intrinsic, &path).map_err(&refuse)?;
-            (kind, Box::<str>::from(""))
+            (kind, "")
         };
         // A `#[rustc_intrinsic]` fn is built by the ONE rule (front2/intrinsic_rule.rs): the
         // table's row when the table names it; else, when its declaration has a fallback body
@@ -271,7 +275,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         let own = head_abi(self.front.names, &self.store, key, || Box::from(path.as_str())).map_err(&refuse)?;
         // `#[rustc_nounwind]` makes any fn nounwind (core/src/panicking.rs:88-92), as tabled.rs.
         let build = BuildAbi { abi: own.abi, nounwind: own.nounwind || symbols.nounwind };
-        Ok(self.push(key, kind, build, symbols.track_caller, at, &path, &symbol, symbols.export.as_deref(), intrinsic))
+        Ok(self.push(key, kind, build, symbols.track_caller, at, &path, symbol, symbols.export.as_deref(), intrinsic))
     }
 
     /// Fn `key`'s own `#[track_caller]` (program/seam_rules.rs `track_caller` asks it of the fn

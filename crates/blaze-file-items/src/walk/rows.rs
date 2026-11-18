@@ -342,7 +342,7 @@ impl<'a> Stacks<'a> {
 ///
 /// With [`Bodies::Parsed`] the grammar parses every body with the rest: the same rows, and the
 /// findings inside the bodies too.
-pub(crate) fn outline<'a, C: Compress>(
+pub(crate) fn outline<'a, C: Compress, F: Feed>(
     text: &str,
     edition: Edition,
     bodies: Bodies,
@@ -363,7 +363,9 @@ pub(crate) fn outline<'a, C: Compress>(
     });
     lexer_errors(&lexed, out);
     out.flags = out.items.iter().fold(out.own_flags, |flags, item| flags | item.flags);
-    digest::<C>(text, edition_byte(edition), out, &mut working.digest);
+    // The digests read the same columns: the one lex's tokens, no second pass over the text.
+    let tokens = Lexed { words, starts, ends };
+    digest::<C, F>(text, edition_byte(edition), tokens, out, &mut working.digest);
     out.copy_in(alloc)
 }
 
@@ -375,7 +377,7 @@ pub(crate) fn outline<'a, C: Compress>(
 ///
 /// It holds no finding of the lexer's: nothing was lexed, and tokens that came from a source
 /// text had their lexer's findings reported where that text was read.
-pub(crate) fn outline_tokens<'a, C: Compress>(
+pub(crate) fn outline_tokens<'a, C: Compress, F: Feed>(
     text: &str,
     tokens: &TokenColumns<'_>,
     edition: Edition,
@@ -388,7 +390,8 @@ pub(crate) fn outline_tokens<'a, C: Compress>(
     let seen = Seen { text, words, starts: &tokens.starts, ends: &tokens.ends, flags };
     sink_rows(seen, &mut working.rows, out, |tokens, rows| parser::source_file_into(tokens, true, rows));
     out.flags = out.items.iter().fold(out.own_flags, |flags, item| flags | item.flags);
-    digest::<C>(text, edition_byte(edition), out, &mut working.digest);
+    let lexed = Lexed { words, starts: &tokens.starts, ends: &tokens.ends };
+    digest::<C, F>(text, edition_byte(edition), lexed, out, &mut working.digest);
     Ok(out.copy_in(alloc))
 }
 

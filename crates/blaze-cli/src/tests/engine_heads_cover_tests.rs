@@ -11,7 +11,7 @@
 //! (2) THE RACE (rule 43, `blaze_sim`): two workers that both miss a cover and make it,
 //! interleaved every way the tape draws: one cover kept, the first's, each worker handed it;
 //! CONTROL: the planted "second write wins" (`OncePlant::SecondWins`) is caught; (3) THE SEAM:
-//! two members reading one dependency head (`core`'s `Option`) under their two units: ONE entry
+//! two members reading one dependency head (the fixture core's `FixtureCell`) under their two units: ONE entry
 //! of it, the answer a fresh check's, the table's counts adding up.
 
 use super::engine_check_tests::{engine_opts, entries, opts};
@@ -135,13 +135,17 @@ fn the_cover_race_oracle_catches_a_second_write_that_wins() {
 const WORKSPACE: &str = "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n";
 const A_MANIFEST: &str = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
 const B_MANIFEST: &str = "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\na = { path = \"../a\" }\n";
-const A_LIB: &str = "pub struct Point {\n    pub x: Option<u32>,\n}\n\npub fn get(p: Option<u32>) -> u32 {\n    match p {\n        Some(x) => x,\n        None => 0,\n    }\n}\n";
-const B_LIB: &str = "pub struct Holder {\n    pub p: a::Point,\n    pub q: Option<u32>,\n}\n\npub fn first(h: Option<u32>) -> Option<u32> {\n    h\n}\n";
+// The dependency head both members read is the fixture core's `FixtureCell` (blaze-world
+// fixture.rs `CORE`). Lane H9 found why this seam froze no dependency head before: that core
+// declares no `Option` and its prelude is empty, so `Option<u32>` resolved nowhere, every
+// member's head failed in the job's source and was frozen alone (`alone 4`), and no dependency
+// head reached the table. The members list was right: `core` is no member.
+const A_LIB: &str = "pub struct Point {\n    pub x: ::core::FixtureCell,\n}\n\npub fn get(p: ::core::FixtureCell) -> u8 {\n    p.0\n}\n";
+const B_LIB: &str = "pub struct Holder {\n    pub p: a::Point,\n    pub q: ::core::FixtureCell,\n}\n\npub fn first(h: ::core::FixtureCell) -> ::core::FixtureCell {\n    h\n}\n";
 
 /// Expected line: `heads cover seam: cells C (member M, dependency D), frozen F, twice T, found
 /// N, covers K, bytes held B; reads a head task: mean R, most X; ...`.
 #[test]
-#[ignore = "OPEN (first run, 2026-11-18 02:11): its PRECONDITION fails: cells 4 (member 4, dependency 0), frozen 4, covers 0: in this test world no head is a dependency's (`Option` of the sim's `core` is counted a member's, or is never frozen as its own cell), so nothing here shows a dependency read coarsened; the real workspace's `heads:` table line says whether `coarse` ever applies"]
 fn a_dependency_head_read_under_two_units_is_one_entry() {
     let io = Io::simulated(SimWorld::new(29, Limits::USUAL));
     write(&io, "Cargo.toml", WORKSPACE);
@@ -168,10 +172,14 @@ fn a_dependency_head_read_under_two_units_is_one_entry() {
         o.read_most,
         entries(&checked)
     );
-    assert!(o.dependencies > 0, "PRECONDITION: no dependency head was frozen (the test world's `core` holds no `Option`?): {o:?}");
+    assert!(o.dependencies > 0, "PRECONDITION: no dependency head was frozen (the fixture core's `FixtureCell`): {o:?}");
+    assert_eq!(o.alone, 0, "PRECONDITION: a member's head did not freeze in its job's source: {o:?}");
     assert_eq!(o.members + o.dependencies, o.cells, "ORACLE: the table's entries are not each a member's or a dependency's: {o:?}");
     // ONE entry a cell, whichever unit read it first: a second freeze only by a race, counted.
     assert_eq!(o.frozen, o.cells + o.twice, "ORACLE: a cell was frozen more than once outside a race (a dependency head kept once a reading unit?): {o:?}");
     assert_eq!(o.covers_unequal, 0, "ORACLE: two covers of one dependency head held other cells: {o:?}");
-    assert!(o.covers > 0, "ORACLE: a head read `Option` and no cover of it was made: {o:?}");
+    // `core` is CLOSED (lane H9, engine_seeds.rs `CrateAt::closed`): with the dependency finder
+    // set, its head is read as `core`'s `WHOLE` alone and found or frozen by key, no cover made;
+    // without it, by its cover.
+    assert!(o.covers + o.deps_found + o.deps_frozen > 0, "ORACLE: a head read `FixtureCell` and neither a cover nor its key was made: {o:?}");
 }

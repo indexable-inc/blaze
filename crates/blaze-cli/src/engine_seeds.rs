@@ -96,7 +96,7 @@ const ROOT_DOMAIN: &str = "blaze-cli engine dependency heads root 1";
 /// The domain of the digest of the heads frozen in one request ([`SeedCounts::fresh`]).
 const FRESH_DOMAIN: &str = "blaze-cli engine heads frozen now 1";
 /// The bytes of a names record key at the front of a dependency head's record.
-const KEY_BYTES: usize = 32;
+pub(crate) const KEY_BYTES: usize = 32;
 /// The bytes of a head task's cell in each run of its payload (engine_heads.rs `heads_of`).
 const CELL_BYTES: usize = 16;
 
@@ -141,24 +141,147 @@ fn cell_key(cell: Want) -> ContentId {
 #[derive(Clone, Copy)]
 pub(crate) struct CrateAt {
     /// Its key's first 8 bytes: what every item key of it begins with.
-    prefix: [u8; 8],
+    pub(crate) prefix: [u8; 8],
     /// Its key whole: what a worker's names name its crate by (`RequestHeads::publish`).
-    key: blaze_id::CrateItemKey,
+    pub(crate) key: blaze_id::CrateItemKey,
     /// Its names record's key this request (`None`: its names failed).
-    names_at: Option<Key>,
-    member: bool,
+    pub(crate) names_at: Option<Key>,
+    pub(crate) member: bool,
+    /// CLOSED (lane H9): no member is in it or in what it depends on, transitively. Its text is
+    /// then a fetched pack's (a registry crate's, a git commit's, the toolchain's: a member is a
+    /// crate whose root is in the checkout, blaze-world crate_list.rs `member`), named by its key
+    /// (blaze-world list.rs `unit_crate_key`: the lock's package, features, cfg and every
+    /// dependency's key; toolchain.rs: the pack's digest, features, cfg, the dependencies'
+    /// keys), so everything derived from it is valid by that key ([`dependency_key`]). A crate
+    /// that depends on a member is not: the member's text moves under an equal key.
+    pub(crate) closed: bool,
 }
 
 /// Every crate of `list` by its key's prefix, sorted, with its names record's key.
 pub(crate) fn crates_of(list: &CrateList<'static>, names: &NamesStage<'_>) -> std::vec::Vec<CrateAt, Global> {
     let mut crates = std::vec::Vec::with_capacity_in(CrateGraph::len(list), Global);
+    each_crate(list, names, &mut |one| crates.push(one));
+    close(list, &mut crates);
+    crates.sort_unstable_by_key(|one| one.prefix);
+    crates
+}
+
+/// [`crates_of`] in the caller's allocator (lane H9: the Heads stage's finder of dependency
+/// heads, engine_heads_once.rs `HeadsOnce::find_dependencies`).
+pub(crate) fn crates_in(list: &CrateList<'static>, names: &NamesStage<'_>, alloc: SharedAlloc<'static>) -> blaze_own::Vec<CrateAt, SharedAlloc<'static>> {
+    let mut crates: blaze_own::Vec<CrateAt, SharedAlloc<'static>> = blaze_own::Vec::new_in(alloc);
+    each_crate(list, names, &mut |one| crates.push(one));
+    close(list, &mut crates);
+    crates.sort_unstable_by_key(|one| one.prefix);
+    crates
+}
+
+/// Each crate of `list`, in its order (each closed but a member, until [`close`]).
+fn each_crate(list: &CrateList<'static>, names: &NamesStage<'_>, push: &mut dyn FnMut(CrateAt)) {
     for at in 0..CrateGraph::len(list) {
         let key = list.key(at);
         let names_at = names.input_of(blaze_drive::key::crate_scope_name(&key)).map(|input| input.at);
-        crates.push(CrateAt { prefix: key.prefix(), key, names_at, member: list.member(at) });
+        let member = list.member(at);
+        push(CrateAt { prefix: key.prefix(), key, names_at, member, closed: !member });
     }
-    crates.sort_unstable_by_key(|one| one.prefix);
-    crates
+}
+
+/// `crates` (the list's rows, in its order) each closed or open over the list's edges. Closed is
+/// a greatest fixed point: a member is open, and a crate with an open dependency is open; each
+/// round opens at least one crate or ends, so at most `len` rounds (rule 18).
+fn close(list: &CrateList<'static>, crates: &mut [CrateAt]) {
+    for _ in 0..CrateGraph::len(list) {
+        let mut opened = false;
+        for at in 0..crates.len() {
+            if crates[at].closed && CrateGraph::deps(list, at).any(|dep| crates.get(dep).is_none_or(|one| !one.closed)) {
+                crates[at].closed = false;
+                opened = true;
+            }
+        }
+        if !opened {
+            break;
+        }
+    }
+}
+
+/// The frozen head a dependency head's record holds, checked: the record begins with the names
+/// key its key was made of, and its bytes read as `cell`'s frozen head (rule 21). The one check
+/// of such a record (the Bodies stage's [`RequestTable`] and the Heads stage's finder).
+pub(crate) fn dependency_head(bytes: &[u8], names_at: Key, cell: Want) -> Result<&[u8], &'static str> {
+    if bytes.len() < KEY_BYTES || bytes[..KEY_BYTES] != names_at.0.0 {
+        return Err("a dependency head's record does not begin with the names key its key holds (engine_seeds.rs `dependency_key`)");
+    }
+    match FrozenHead::read(&bytes[KEY_BYTES..]) {
+        Ok(head) if head.want() == cell => Ok(&bytes[KEY_BYTES..]),
+        Ok(_) => Err("a dependency head's record holds another cell than its key names (engine_seeds.rs `dependency_key`)"),
+        Err(_) => Err("a dependency head's record does not read as a frozen head (engine_seeds.rs `dependency_head`)"),
+    }
+}
+
+/// Why the records a finder reads could not be read (the store's snapshot refused).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Unreadable;
+
+/// The records a dependency head is found in by its key (rule 78: one seam; the command's is the
+/// store's committed snapshot, read in place by every worker; a test's is a model store whose
+/// commit can be torn, engine_heads_found_tests.rs).
+pub(crate) trait HeadRecords: Sync {
+    /// The record under `key`, in place; `None` when there is none.
+    fn record(&self, key: Key) -> Result<Option<&[u8]>, Unreadable>;
+    /// The frozen head `bytes` holds when it is `cell`'s record made over `names_at`
+    /// ([`dependency_head`], the command's).
+    fn head<'b>(&self, bytes: &'b [u8], names_at: Key, cell: Want) -> Result<&'b [u8], &'static str> {
+        dependency_head(bytes, names_at, cell)
+    }
+}
+
+impl<A: core::alloc::Allocator + Send + Sync> HeadRecords for Snapshot<A> {
+    fn record(&self, key: Key) -> Result<Option<&[u8]>, Unreadable> {
+        self.get(&blaze_cas::Key(key.0)).map_err(|_| Unreadable)
+    }
+}
+
+/// How a cell's crate stands to the rule "a dependency head is valid by its key".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Keyed {
+    /// A CLOSED dependency's head ([`CrateAt::closed`]): its record's key, the names key it is
+    /// made of, and its crate's scope name (whose `WHOLE` cell is the one cell a reader reads).
+    Closed { key: Key, names_at: Key, scope: Name },
+    /// A member's head, or a dependency's whose closure holds a member: valid by its reads.
+    Open,
+    /// Its crate is none of the list, or has no names record this request: no key.
+    Unkeyed,
+}
+
+/// The Heads stage's finder of dependency heads by key (lane H9): the request's crates by
+/// prefix, the freezing tool, and the records (the snapshot taken before the phase, renewed
+/// after each commit: engine_heads_once.rs `HeadsOnce::committed`).
+pub(crate) struct DependencyFinder<R> {
+    pub(crate) records: R,
+    crates: blaze_own::Vec<CrateAt, SharedAlloc<'static>>,
+    tool: Tool,
+}
+
+impl<R: HeadRecords> DependencyFinder<R> {
+    /// `crates`: [`crates_in`]'s (sorted by prefix).
+    pub(crate) fn new(records: R, crates: blaze_own::Vec<CrateAt, SharedAlloc<'static>>, tool: Tool) -> DependencyFinder<R> {
+        DependencyFinder { records, crates, tool }
+    }
+
+    /// Cell `cell`'s standing (by its item key's crate prefix: unique in a list, blaze-surface
+    /// crate_graph.rs `PrefixClash`).
+    pub(crate) fn keyed(&self, cell: Want) -> Keyed {
+        let prefix = cell.key().crate_prefix();
+        let from = self.crates.partition_point(|one| one.prefix < prefix);
+        let Some(at) = self.crates.get(from).filter(|one| one.prefix == prefix) else { return Keyed::Unkeyed };
+        if !at.closed {
+            return Keyed::Open;
+        }
+        match at.names_at {
+            Some(names_at) => Keyed::Closed { key: dependency_key(names_at, cell, self.tool), names_at, scope: blaze_drive::key::crate_scope_name(&at.key) },
+            None => Keyed::Unkeyed,
+        }
+    }
 }
 
 /// The crate of the request's list whose key is `key` (the one a worker's names gave).
@@ -503,7 +626,9 @@ impl RequestTable {
     /// frozen by an earlier request, looked up under its key on the first ask. `None`: no
     /// record (or its crate is a member's, or has no names record today).
     fn dependency(&self, cell: Want, krate: blaze_id::CrateItemKey) -> Option<&[u8]> {
-        let at = crate_keyed(&self.crates, krate).filter(|one| !one.member)?;
+        // Only a CLOSED dependency's head is valid by its key (lane H9, [`CrateAt::closed`]): a
+        // crate that depends on a member has a head that moves with the member's text.
+        let at = crate_keyed(&self.crates, krate).filter(|one| one.closed)?;
         let names_at = at.names_at?;
         let key = dependency_key(names_at, cell, self.tool);
         let read = {
@@ -533,14 +658,19 @@ impl RequestTable {
             Ok(None) => return DependencyRead::Absent,
             Err(_) => return DependencyRead::Bad("the store's snapshot could not read a dependency head's record (engine_seeds.rs `RequestTable::read_dependency`)"),
         };
-        if bytes.len() < KEY_BYTES || bytes[..KEY_BYTES] != names_at.0.0 {
-            return DependencyRead::Bad("a dependency head's record does not begin with the names key its key holds (engine_seeds.rs `dependency_key`)");
+        match dependency_head(bytes, names_at, cell) {
+            Ok(_) => DependencyRead::Found,
+            Err(why) => DependencyRead::Bad(why),
         }
-        match FrozenHead::read(&bytes[KEY_BYTES..]) {
-            Ok(head) if head.want() == cell => DependencyRead::Found,
-            Ok(_) => DependencyRead::Bad("a dependency head's record holds another cell than its key names (engine_seeds.rs `dependency_key`)"),
-            Err(_) => DependencyRead::Bad("a dependency head's record does not read as a frozen head (engine_seeds.rs `RequestTable::read_dependency`)"),
-        }
+    }
+
+    /// Keys of dependency heads the Heads stage put this request (engine_heads_once.rs
+    /// `HeadsOnce::put_keys`): listed by the root with the rest at the merge, so the records
+    /// that stage put live as long as those this stage puts (lane H9).
+    pub(crate) fn list_too(&mut self, keys: &[Key]) {
+        self.listed.extend_from_slice(keys);
+        self.listed.sort_unstable();
+        self.listed.dedup();
     }
 
     /// Cell `cell`'s first failed freeze this request, by any worker's stretch (front2
@@ -630,7 +760,9 @@ impl RequestTable {
                 not_put.unlisted = not_put.unlisted.saturating_add(1);
                 continue;
             };
-            if krate.member {
+            // A member's, or a dependency's whose closure holds a member (lane H9: not valid by
+            // its key, [`CrateAt::closed`]): counted with the members'.
+            if !krate.closed {
                 not_put.member = not_put.member.saturating_add(1);
                 continue;
             }
@@ -844,8 +976,8 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
     /// lists them for `widen`; `over`: the crates `names` was opened over, in its order (their
     /// expansion directories place a written head); `failed`: the heads the Heads stage could
     /// not freeze.
-    pub(crate) fn new(table: &'t RequestTable, failed: &'t Failed, names: &'n Records<'n>, subjects: &'s Subjects, over: &'s [Crate<'s>], g: Alloc<'static>) -> StretchHeads<'t, 's, 'n> {
-        StretchHeads { table, failed, names, owners: RefCell::new(Owners::new(subjects, over, g)), g }
+    pub(crate) fn new(table: &'t RequestTable, failed: &'t Failed, names: &'n Records<'n>, subjects: &'s Subjects, over: &'s [Crate<'s>], listings: &'s crate::engine_heads::Listings, g: Alloc<'static>) -> StretchHeads<'t, 's, 'n> {
+        StretchHeads { table, failed, names, owners: RefCell::new(Owners::new(subjects, over, listings, g)), g }
     }
 
     /// Where this stretch's bodies make a need of an item declared in the body (the request's:

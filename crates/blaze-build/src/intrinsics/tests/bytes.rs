@@ -104,7 +104,7 @@ fn compare_bytes_orders_as_byte_order() {
 }
 
 /// `volatile_store::<[u32; 4]>` and `volatile_load::<[u32; 4]>`: four `i32` pieces each, every
-/// access `volatile`, and the value round-trips.
+/// access `volatile`, at each piece's offset.
 #[test]
 fn volatile_aggregates_move_by_volatile_pieces() {
     let mut env = Env::new();

@@ -88,7 +88,7 @@ pub struct AsyncInteriors<'a> {
     out: Option<tc::PortableTys<'a>>,
     /// Why the record's table could not be forked, when it could not.
     table: Option<tc::CheckError>,
-    /// Per async block lowered, its exact interior in `out`, in expression order.
+    /// Per async block lowered, its exact interior in `out`, in the order lowered.
     exact: AVec<'a, (tc::ExprId, tc::PTy)>,
 }
 
@@ -128,6 +128,25 @@ impl<'a> AsyncInteriors<'a> {
         }
         // An async block's flow has no type-parameter placeholders (borrows_nested.rs `flow_of`).
         Ok((lowered.flow, AVec::new_in(alloc)))
+    }
+
+    /// Keeps async block `block`'s exact interior from a lowering the caller made itself
+    /// (borrows.rs: the block's requirements need its externals), as `flow_of` does.
+    pub fn keep(&mut self, lowered: &blaze_flow_lower::LoweredAsync<Alloc<'a>>, done: &tc::Checked<'_>, block: tc::ExprId, alloc: Alloc<'a>) {
+        if !self.wanted {
+            return;
+        }
+        if self.out.is_none() && self.table.is_none() {
+            match done.types.fork_in(alloc) {
+                Ok(t) => self.out = Some(t),
+                Err(e) => self.table = Some(e),
+            }
+        }
+        if let Some(out) = self.out.as_mut()
+            && let Ok(t) = interior(lowered, done, block, out, alloc)
+        {
+            self.exact.push((block, t));
+        }
     }
 }
 

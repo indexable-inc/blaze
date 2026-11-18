@@ -40,8 +40,15 @@ const INVARIANT: &str = "a types-not-checked finding without its item and cause"
 const NOT_CHECKED: &str = "not checked because";
 /// The line's cause names what the lowering refused (rule 19; MX 2026-11-17: "lowering
 /// refused" alone named nothing on tempo's clap derives): the class, then the macro's call.
-const HELPER: &str = "not checked because lowering refused (Lowered: Macro ";
-const HELPER_CALL: &str = ", the call of `nowhere::missing!`): `helper` (";
+///
+/// Since `blaze check` is the engine (check_command.rs): the engine names a refused body in its
+/// own note, `` `<file>`: body `<item>`: <cause>: <words> `` (engine_bodies.rs
+/// `BodiesStage::note`), not under the old checker's grouped "not checked because <cause>:
+/// `<item>` (" line, so the cause is matched after the body's name. The old words were the old
+/// printer's layout (not_checked/items.rs), not what the test guards: one line naming the body,
+/// the lowering's class and the macro's call.
+const HELPER: &str = "body `helper`: lowering refused (Lowered: Macro ";
+const HELPER_CALL: &str = ", the call of `nowhere::missing!`): ";
 
 /// `blaze check` of a package whose `src/main.rs` is `main`: its status and everything it said.
 fn check(base: &Path, name: &str, main: &str) -> (Option<i32>, String) {

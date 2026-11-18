@@ -413,6 +413,17 @@ pub(crate) fn write_status(board: &Board<'_>, heading: Heading, now: u64, into: 
         Some((now_bytes, most)) => writeln!(into, " · footprint {now_bytes} (most {most})")?,
         None => writeln!(into, " · footprint unknown (the system did not answer)")?,
     }
+    // Each tag's share (blaze-mem tag.rs `Counters`), which the totals above do not name
+    // (tempo, 2026-11-18, tree 2c98ace5cf: the Bodies stage took 11 GB of regions in 21 s and
+    // the line said only "regions"; rule 16). Every tag holding 64 MiB or more, largest first.
+    let mut tags: [(blaze_mem::Tag, u64); blaze_mem::Tag::COUNT] = blaze_mem::Tag::ALL.map(|tag| (tag, s.get(tag).live));
+    tags.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    write!(into, "memory by tag (bytes):")?;
+    for (tag, live) in tags.iter().filter(|(_, live)| *live >= 64 << 20) {
+        let c = s.get(*tag);
+        write!(into, " · {tag:?} live {live} (most {}, reserved {}, regions {}, heap {})", c.high_water, c.reserved, c.regions, c.heap)?;
+    }
+    writeln!(into)?;
     let (longest, count) = board.longest();
     write!(into, "running: {count} task(s)")?;
     for one in longest.iter().flatten() {

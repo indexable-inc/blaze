@@ -53,7 +53,8 @@ fn engine_check_makes_a_bodys_own_items_in_its_own_store() {
             // The borrow check's own note is this fixture's (its core has no `Copy` lang item:
             // "borrows not checked: a trait fact of an ADT is not known"), not a body left
             // unchecked for a head: every OTHER note would be one.
-            let refused: std::vec::Vec<&std::string::String> = notes.iter().filter(|note| !note.contains(": borrows not checked: ")).collect();
+            // (Since lane SW1 the note reads "types checked; borrows not checked: ..".)
+            let refused: std::vec::Vec<&std::string::String> = notes.iter().filter(|note| !note.contains("borrows not checked: ")).collect();
             assert!(refused.is_empty(), "every body checked (wrong {wrong}, {workers} worker(s)): {refused:?}");
             // What is right, not what the old path printed (it answered status 4, incomplete, for
             // the wrong variant where the engine finds the one error: status 1): the old path is

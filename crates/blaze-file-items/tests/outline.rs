@@ -17,8 +17,18 @@ use blaze_surface::{
 use blaze_sim::{Broke, Config, Tape};
 
 fn parse(text: &str) -> Outline<'static> {
-    outline(text, Edition::E2024, blaze_own::testing::heap().alloc())
+    parse_as::<blaze_file_items::ByTokens>(text, Edition::E2024)
 }
+
+/// The outline of `text` in `edition`, each entry fed to its digests as `F` says
+/// (`outline_fed_by`; [`parse`] is `ByTokens` in 2024, what `outline` makes).
+fn parse_as<F: blaze_file_items::Feed>(text: &str, edition: Edition) -> Outline<'static> {
+    blaze_file_items::outline_fed_by::<F>(text, edition, blaze_own::testing::heap().alloc())
+}
+
+/// Keys from tokens: what moves an entry's digests and what does not.
+#[path = "outline/token_keys.rs"]
+mod token_keys;
 
 /// The first entry in source order whose name is `name`.
 fn named<'o>(outline: &'o Outline<'_>, text: &str, name: &str) -> (ItemIndex, &'o Item) {
@@ -330,15 +340,16 @@ fn each_item_form_has_its_kind_name_and_ranges() {
 }
 
 /// A second `impl S {}` after the first is told apart by its disambiguator, 1; the first keeps
-/// 0, and an impl with another header counts apart. A head is its bytes: `impl   S` is another
-/// head than `impl S` (crate docs, "Why bytes, not tokens").
+/// 0, and an impl with another header counts apart. A head is its TOKENS (lane K1; blaze-surface
+/// file_items.rs, "Its tokens'"): `impl   S` is the same head as `impl S`, so written a second
+/// time with other whitespace it is the second of its group, as a reformat must leave it.
 #[test]
 fn a_second_equal_impl_gets_disambiguator_one() {
     let one = "struct S;\nimpl S {}\nimpl Clone for S { fn clone(&self) -> S { S } }\n";
     let two = format!("{one}impl S {{}}\n");
     let spaced = parse(&format!("{one}impl   S {{}}\n"));
     let disambiguators = spaced.children(None).map(|(_, item)| item.disambiguator).collect::<Vec<_>>();
-    assert_eq!(disambiguators, [0, 0, 0, 0], "a head with other whitespace is another head");
+    assert_eq!(disambiguators, [0, 0, 0, 1], "a head with other whitespace is the same head: the second of its group");
     let (first, second) = (parse(one), parse(&two));
     let impls = |outline: &Outline<'_>| -> Vec<(u32, ContentId)> {
         outline
@@ -647,11 +658,22 @@ fn digests_are_the_definition(what: &str, text: &str) -> Result<(), String> {
     }
     let bytes = text.as_bytes();
     let wide = |offset: u32| usize::try_from(offset).expect("a small file");
+    // The text's tokens, lexed here.
+    let lexed = parser::LexedStr::new(parser::Edition::Edition2024, text);
     let items = side.items();
     let mut want = vec![(ContentId([0; 32]), ContentId([0; 32])); items.len()];
     for at in (0..items.len()).rev() {
         let item = &items[at];
         let (start, end) = (item.range.start, item.range.end);
+        // The crate docs' exception: an entry that calls a macro is fed by its bytes.
+        let by_bytes = item.flags.contains(blaze_surface::ItemFlags::MACRO_CALL);
+        let run = |digest: &mut blaze_ids::Hasher, from: u32, to: u32| {
+            if by_bytes {
+                digest.update(&[0]).part(&bytes[wide(from)..wide(to)]);
+            } else {
+                defined_tokens(digest, bytes, &lexed, wide(from), wide(to), wide(end));
+            }
+        };
         let signature_end = start + item.signature.end;
         let mut digest = blaze_ids::Hasher::new(blaze_file_items::SIGNATURE_DOMAIN);
         // Edition 2024's byte.
@@ -661,21 +683,21 @@ fn digests_are_the_definition(what: &str, text: &str) -> Result<(), String> {
         let index = ItemIndex(u32::try_from(at).expect("a small outline"));
         for (child, inner) in side.children(Some(index)) {
             if signature.is_none() && signature_end <= inner.range.start {
-                digest.update(&[0]).part(&bytes[wide(fed)..wide(signature_end)]);
+                run(&mut digest, fed, signature_end);
                 let cut = digest.finish();
                 signature = Some(cut);
                 digest = blaze_ids::Hasher::new(blaze_file_items::ITEM_DOMAIN);
                 digest.id(&cut);
                 fed = signature_end;
             }
-            digest.update(&[0]).part(&bytes[wide(fed)..wide(inner.range.start)]);
+            run(&mut digest, fed, inner.range.start);
             digest.update(&[1]).id(&want[child.at()].0);
             fed = inner.range.end;
         }
         let signature = match signature {
             Some(signature) => signature,
             None => {
-                digest.update(&[0]).part(&bytes[wide(fed)..wide(signature_end)]);
+                run(&mut digest, fed, signature_end);
                 fed = signature_end;
                 let cut = digest.finish();
                 digest = blaze_ids::Hasher::new(blaze_file_items::ITEM_DOMAIN);
@@ -683,7 +705,7 @@ fn digests_are_the_definition(what: &str, text: &str) -> Result<(), String> {
                 cut
             }
         };
-        digest.update(&[0]).part(&bytes[wide(fed)..wide(end)]);
+        run(&mut digest, fed, end);
         want[at] = (digest.finish(), signature);
     }
     for (at, (item, (hash, signature))) in items.iter().zip(&want).enumerate() {
@@ -698,6 +720,40 @@ fn digests_are_the_definition(what: &str, text: &str) -> Result<(), String> {
         return Err(format!("{what}: the parts' digests side by side are not each part's"));
     }
     Ok(())
+}
+
+/// The crate docs' token run of `from..to` in an entry ending at `limit`, written from the docs
+/// alone: the tag 2, the count (LEB128), per token the kind as a u16 with the top bit for joined,
+/// and a lexeme's length (LEB128) and bytes unless it is punctuation. Joined: punctuation but no
+/// delimiter, written right against punctuation or a lifetime that ends by `limit`. A token is
+/// any lexed one but whitespace and a plain comment.
+fn defined_tokens(digest: &mut blaze_ids::Hasher, bytes: &[u8], lexed: &parser::LexedStr<'_>, from: usize, to: usize, limit: usize) {
+    use parser::SyntaxKind::{L_BRACK, L_CURLY, L_PAREN, LIFETIME_IDENT, R_BRACK, R_CURLY, R_PAREN};
+    let token = |at: usize| (!lexed.kind(at).is_trivia()).then(|| (lexed.kind(at), lexed.text_range(at).start, lexed.text_range(at).end));
+    let inside = |at: usize| token(at).filter(|&(_, start, end)| from <= start && end <= to);
+    let leb = |digest: &mut blaze_ids::Hasher, mut value: usize| loop {
+        let low = u8::try_from(value & 0x7F).expect("seven bits");
+        value >>= 7;
+        if value == 0 {
+            digest.update(&[low]);
+            break;
+        }
+        digest.update(&[low | 0x80]);
+    };
+    let left = |kind: parser::SyntaxKind| kind.is_punct() && !matches!(kind, L_PAREN | R_PAREN | L_CURLY | R_CURLY | L_BRACK | R_BRACK);
+    digest.update(&[2]);
+    leb(digest, (0..lexed.len()).filter(|&at| inside(at).is_some()).count());
+    for (at, (kind, start, end)) in (0..lexed.len()).filter_map(|at| inside(at).map(|it| (at, it))) {
+        // The raw next token: a token right against this one, or trivia, which parts them.
+        let joined = (at + 1 < lexed.len()).then(|| token(at + 1)).flatten().is_some_and(|(next, next_start, next_end)| {
+            left(kind) && next_start == end && next_end <= limit && (left(next) || next == LIFETIME_IDENT)
+        });
+        digest.update(&((kind as u16) | (u16::from(joined) << 15)).to_le_bytes());
+        if !kind.is_punct() {
+            leb(digest, end - start);
+            digest.update(&bytes[start..end]);
+        }
+    }
 }
 
 /// Whether the outline made part by part (`outline`: `split_top_level`, each part walked into

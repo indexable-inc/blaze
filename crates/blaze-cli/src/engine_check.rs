@@ -119,7 +119,7 @@ impl fmt::Display for EngineCheckError {
             EngineCheckError::Grow { what, had } => write!(f, "{what}: the list could not grow past {had} entries: its allocator refused (engine_*.rs)"),
             EngineCheckError::CellTable { task, what } => write!(f, "{task:?}: its record's cell table {what} (engine_names.rs `cells_of`)"),
             EngineCheckError::OutlineBack(crate::engine_store::OutlineBack::Missing { name, key }) => {
-                write!(f, "{name:?}: its row stands, and the store holds no outline at {key:?}, the key the stored answer names (engine_check.rs `plan`; run `blaze engine-check` with the answer cleared)")
+                write!(f, "{name:?}: its row stands, and the store holds no outline at {key:?}, the key the stored answer names (engine_check.rs `plan`; run `blaze check` with the answer cleared)")
             }
             EngineCheckError::OutlineBack(crate::engine_store::OutlineBack::Unreadable { name, key, why }) => {
                 write!(f, "{name:?}: the outline at {key:?} is no whole drive record of it ({why:?}) (engine_store.rs `outline_from`)")
@@ -179,6 +179,10 @@ fn serve(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_
     // `why`'s first word is its target, never a checkout: it stands where blaze was started.
     let checkout = crate::checkout::checkout(if why.is_some() { None } else { flags.dir }, frame)?;
     let fs = io.need_fs()?;
+    // The named origin, opened as `check-old` opens it (main.rs): a miss is read from it.
+    // Declared before `shown`: the request's options and what it prints share one lifetime
+    // (`checking` takes `&mut Shown<'f>`), so the origin must outlive the printer's state.
+    let origin = crate::store::NamedOrigin::of(cx, &fs, io.net().as_ref(), flags.origin, flags.origin_key)?;
     let checkout_at: &str = match &checkout {
         Checkout::Under(dir) => work::held_str(dir.as_str(), frame),
         Checkout::Here => "",
@@ -245,7 +249,8 @@ fn serve(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_
         every: flags.status_every.map(|seconds| core::time::Duration::from_secs(u64::from(seconds.get()))),
         plant: crate::engine_status::Plant::None,
     };
-    let opts = Opts {
+    // One request's options; `--fix` asks two requests of the one edge.
+    let opts = || Opts {
         status,
         tools,
         workers,
@@ -255,21 +260,61 @@ fn serve(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_
         fresh: false,
         heads_from: crate::engine_seeds::HeadsFrom::Frozen,
         head_units: crate::engine_heads::HeadUnits::Each,
+        head_jobs: crate::engine_heads::HeadJobs::RULE,
         head_sources: crate::engine_heads_once::Sources::Job,
         frame,
         scope_reads: crate::engine_scope_reads::ScopeReadsAs::DEFAULT,
         unreadable: None,
         body_locals: blaze_ladder::front2::tables::seeds::BodyLocals::Lowered,
+        origin: origin.as_ref(),
     };
     let err = io.need_err()?;
-    match why {
-        None => Ok(check(cx, io, &root, opts, &mut shown, phases, out, &err)?.status),
-        Some(target) => crate::engine_why::explain(cx, io, &root, &opts, target, phases, out, &err),
-    }
+    let Some(target) = why else {
+        let checked = match flags.fix {
+            None => Some(check(cx, io, &root, opts(), &mut shown, phases, out, &err)?),
+            // `blaze check --fix <selector>..` (fix.rs): a quiet check, its findings' fixes
+            // written as one transaction, then a second check printing what is left; the
+            // listed findings are in the request's frame, which outlives both.
+            Some((start, end)) => {
+                let mut selectors: blaze_own::Vec<&str, &Frame> = blaze_own::Vec::with_capacity_in(end - start, frame);
+                selectors.extend((start..end).filter_map(|at| args.get(at)));
+                let mut ask = |mut shown| check(cx, io, &root, opts(), &mut shown, phases, out, &err).map(|checked| (checked, shown));
+                match crate::fix_then_check::<crate::fix::Atomic, Checked>(cx, &root, &selectors, (caps, view, shown_root.as_str()), frame, out, &mut ask)? {
+                    crate::Fixed::Refused => None,
+                    crate::Fixed::Checked(checked, _) => Some(checked),
+                }
+            }
+        };
+        let Some(checked) = checked else { return Ok(Status::FAILED) };
+        if flags.stats {
+            err.line(cx, format_args!("{}", stats_line(&checked, phases.in_main(), frame)))?;
+        }
+        return Ok(checked.status);
+    };
+    crate::engine_why::explain(cx, io, &root, &opts(), target, phases, out, &err)
+}
+
+/// `--stats`'s line on stderr, from what the check counted: "blaze: E of T task(s) entered, P
+/// record(s) put, G page(s) written, certificate stood|missed; M ms in main;
+/// .blaze/v2/profile.txt". The profile holds the rest.
+pub(crate) fn stats_line<'f>(checked: &Checked, in_main_ns: u64, frame: &'f Frame) -> bstd::mem::String<&'f Frame> {
+    let certificate = if checked.certified { "stood" } else { "missed" };
+    let ms = in_main_ns / 1_000_000;
+    let micros = (in_main_ns / 1_000) % 1_000;
+    bstd::mem::format_in!(
+        frame,
+        "blaze: {} of {} task(s) entered, {} record(s) put, {} page(s) written, certificate {certificate}; {ms}.{micros:03} ms in main; {}",
+        checked.entered,
+        checked.tasks,
+        checked.puts,
+        checked.pages_written,
+        print::PROFILE,
+    )
 }
 
 /// Where the command runs and what the fetches and scripts read, each given by the edge (rule
-/// 75; main.rs `request`'s first argument).
+/// 75; main.rs `request`'s first argument). Copied, never re-read: `--fix`'s two checks take one.
+#[derive(Clone, Copy)]
 pub(crate) struct Place<'f> {
     /// The checkout, relative to where blaze was started ("" for there).
     pub(crate) checkout: &'f str,
@@ -303,6 +348,9 @@ pub(crate) struct Opts<'f> {
     /// Under which units a head task freezes (engine_heads.rs `HeadUnits`): the command's is
     /// `Each`; a test plants one unit alone (rule 23).
     pub(crate) head_units: crate::engine_heads::HeadUnits,
+    /// How a crate's head tasks are split into pool jobs (engine_heads.rs `HeadJobs`, lane
+    /// OW1): the command's is the rule; a test sets a count (rule 78).
+    pub(crate) head_jobs: crate::engine_heads::HeadJobs,
     /// What a head task freezes its heads over (engine_heads_once.rs `Sources`): the command's
     /// is `Job`; a test sets `Head` for the measure before the table (rule 78).
     pub(crate) head_sources: crate::engine_heads_once::Sources,
@@ -324,6 +372,9 @@ pub(crate) struct Opts<'f> {
     /// What may ask the check for its status or stop it (engine_status.rs): the command's
     /// signals and `--status-every`; a test's plant; `Asking::NONE` in the other tests.
     pub(crate) status: crate::engine_status::Asking<'f>,
+    /// The named origin a miss is read from (`--origin <folder or http base> --origin-key
+    /// <hex>`, store.rs `NamedOrigin`), as `check-old` opens its store; `None`: the home alone.
+    pub(crate) origin: Option<&'f crate::store::NamedOrigin>,
 }
 
 /// The most one request's frame takes: its blocks are taken as it is used (blaze-mem
@@ -410,7 +461,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
 /// [`check`] under its board.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
 fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, shown: &mut print::Shown<'f>, phases: &mut Phases, out: &Out, err: &Out, board: &crate::engine_status::Board<'_>) -> Result<Checked, CliError> {
-    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _ } = opts;
+    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, origin } = opts;
     let began = phases.now();
     let erased = blaze_own::Erased::new(frame);
     // The request's arena (engine_phase_mem.rs): what this call keeps to its end and no record
@@ -429,7 +480,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     // `open_for_command`, `heap: &'static Heap`): its lease tables live to the command's end.
     let opened = crate::store::open_for_command(cx, io, place.home, root, place.checkout, phases.clock(), err, heap)?;
     crate::store::take::before_first_phase(cx, io, &opened, toolchain, phases, err)?;
-    let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
+    let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, origin, phases.clock().clone(), err, erased.handle())?;
     phases.mark_in("store open", frame);
     // 0. The stored answer (engine_answer.rs): its pointer, then the sweep of what it read.
     // Nothing moved, nothing owed and no findings kept: the certificate, from the pointer alone.
@@ -483,15 +534,14 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         phases.mark_in("sweep", frame);
         let facts = pointer.facts;
         if !moved && facts.printed.replayable && facts.owed == 0 {
-            // The whole answer's lines through the one printer, as the request that wrote them.
-            // PHASE-MEM-DEBT(Request): the printer's lists are on the process heap
-            // (engine_lines.rs `print_all`, `heap: &'static Heap`): the request's, not named so.
-            let tally = crate::engine_lines::print_all(cx, root, lines.blocks(), shown, heap, frame, out)?;
+            // The whole answer's lines through the one printer, as the request that wrote them;
+            // its lists in the request's arena.
+            let tally = crate::engine_lines::print_all(cx, root, lines.blocks(), shown, request, frame, out)?;
             crate::engine_head_notes::print_grouped(cx, lines.blocks(), shown, frame, out)?;
             let whole = facts.printed.bodies_whole;
-            let (ran_stages, not_stages) = crate::check_coverage(facts.printed.names, whole, whole, frame);
+            let (ran_stages, not_stages) = crate::check_coverage(facts.printed.names, whole, whole && tally.borrows == 0, frame);
             let coverage = (!not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
-            not_checked_notes(cx, &not_stages, shown, frame, out)?;
+            print::stage_notes(cx, &not_stages, shown, frame, out)?;
             print::closing(cx, shown, facts.files, phases.since(began), Some(0), None, coverage, frame, out)?;
             if let Some(words) = crate::not_checked::items::summary(tally.unchecked, shown.behind, frame) {
                 print::note(cx, words.as_str(), shown, frame, out)?;
@@ -505,7 +555,8 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
             drop(store);
             let cleanup = crate::store::after_answer_printed(cx, opened.lent, false, phases.clock(), err)?;
             phases.mark_in("store committed", frame);
-            let text = bstd::mem::format_in!(frame, "certificate stood: nothing the stored answer read moved; no task entered, no page read (the lines record alone), nothing written but the roots renewed\n{sweep_counts}\n{cleanup}\n{phases}");
+            let tail = tally.tail.line(tally.listed, frame);
+            let text = bstd::mem::format_in!(frame, "certificate stood: nothing the stored answer read moved; no task entered, no page read (the lines record alone), nothing written but the roots renewed\n{sweep_counts}\n{cleanup}\n{tail}\n{phases}");
             let file = root.create(cx, &Path::new(print::PROFILE)?)?;
             file.append(cx, text.as_bytes(), bstd::fs::Durable::No)?;
             file.close(cx, bstd::fs::Durable::No)?;
@@ -646,6 +697,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     let mut bodies = crate::engine_bodies::BodiesStage::new(scope_reads);
     let mut heads = crate::engine_heads::HeadsStage::new(scope_reads);
     heads.freeze = head_units;
+    heads.jobs = head_jobs;
     // PHASE-MEM-DEBT(Heads): the request's frozen heads on the process heap
     // (engine_heads_once.rs `HeadsOnce::new`, `heap: &'static Heap`): they cross from the Heads
     // phases to the Bodies phases, so the request's; to take `SharedAlloc<'r>` of the request.
@@ -815,11 +867,15 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
                 if let Some(table) = request_heads.as_mut() {
                     table.body_locals = body_locals;
                 }
+                // The dependency heads the Heads stage put by key are listed by the root too.
+                if let (Some(table), Some(once)) = (request_heads.as_mut(), heads.once.as_ref()) {
+                    table.list_too(once.put_keys());
+                }
                 // PHASE-MEM-DEBT(Bodies): the stage's packs, groups and notes on the process
                 // heap (`handles.env.heap`, engine_bodies.rs `run_phase`), and each run's frame
                 // shared by its bodies, not reset per body; its notes kept to the command's end
                 // for the print. To take `at_phase` for what lives to the phase's end.
-                bodies.run_phase(cx, &mut store, &mut read, &handles, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame, request_heads.as_ref())?;
+                bodies.run_phase(cx, &mut store, &mut read, &handles, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame, request_heads.as_ref(), heads.listings(heap))?;
                 // The dependency heads frozen now, put sorted by key and listed by the root.
                 if let Some(table) = &request_heads {
                     seed_counts = table.merge(cx, &mut store, &seed_root, &mut ledger, bodies.seeds)?;
@@ -840,6 +896,15 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
                 // kept to the command's end for the put and the notes, and the shelf's tables
                 // carried to the Bodies phases (`bodies.shelf`): to take `at_phase` for the
                 // first, and the store's records read in place for the second.
+                // A closed dependency's head is found by its key in the store's committed
+                // snapshot (lane H9; engine_heads_once.rs, "A CLOSED DEPENDENCY'S HEAD").
+                if let (Some(once), Some(stage), Some(graph)) = (heads.once.as_mut(), names.as_ref(), graph) {
+                    if let Some(list) = kept.list(cx, &mut store, &graph, frame)? {
+                        let records = store.snapshot_in(heap.shared())?;
+                        let crates = crate::engine_seeds::crates_in(&list, stage, heap.shared());
+                        once.find_dependencies(crate::engine_seeds::DependencyFinder::new(records, crates, crate::engine_seeds::tool_of(&tools)));
+                    }
+                }
                 heads.run_phase(cx, &mut store, &mut read, &handles, kept, shelf, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame)?;
             }
             // PHASE-MEM-DEBT(Lints): `LintsStage::made` on the process heap, kept to the
@@ -922,13 +987,24 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
             put.push(Put { key, name, source: task.planned.source, out, reads, payload, listing, extras });
         }
         // Each record's head, made in the phase's arena and written before it ends.
-        let put_now = crate::engine_store::put_all(cx, &mut store, &mut put, phase.stage, &mut ledger, mem.alloc())?;
-        puts += put_now;
+        let mut put_now = crate::engine_store::put_all(cx, &mut store, &mut put, phase.stage, &mut ledger, mem.alloc())?;
         drop(put);
+        // The closed dependency heads frozen this phase, put under their keys (lane H9).
+        if phase.stage == Stage::Heads
+            && let Some(once) = heads.once.as_mut()
+        {
+            put_now += once.put_dependencies(cx, &mut store, &mut ledger)?;
+        }
+        puts += put_now;
         // Written now, so the store's arena frees them: the next phase reads them in place from
         // the segment's mapping (rule 51; store.rs `commit_puts`).
         if put_now > 0 {
             store.commit_puts()?;
+            if phase.stage == Stage::Heads
+                && let Some(once) = heads.once.as_mut()
+            {
+                once.committed(store.snapshot_in(heap.shared())?);
+            }
         }
         // Each put record's handed payload freed now it is in the store (rule 51): a result
         // keeps its findings and lines, never its bytes; a later phase reads the store.
@@ -1002,6 +1078,9 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     }
     let heads_entered = u32::try_from(finished.answer.rows.iter().filter(|(_, row)| row.phase.stage == Stage::Heads).count()).unwrap_or(u32::MAX);
     phases.mark_in("engine", frame);
+    // The heap at each step of the tail (the profile's "tail heap" line): where it grows past
+    // the Bodies phase is named by the step, never guessed (rule 17).
+    let heap_engine = crate::engine_phase_mem::heap_now();
 
     // 3. Print: the whole answer's lines (engine_lines.rs), each entered task's block made from
     // its result now, each standing row's copied from the last request's record.
@@ -1076,14 +1155,24 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
                         lines.finding(*name, rule, start, end, None, &record.messages[from..to]);
                     }
                 }
-                Err(failed) if matches!(failed.failure.why, Why::Waited { .. }) => lines.note(*name, crate::engine_lines::Class::Waited, b""),
-                Err(failed) => {
-                    let words = match failed.words {
-                        Some(words) => bstd::mem::format_in!(frame, "{}: {words}", failed.failure),
-                        None => bstd::mem::format_in!(frame, "{}", failed.failure),
-                    };
-                    lines.note(*name, crate::engine_lines::Class::Failure, words.as_bytes());
-                }
+                Err(failed) => match failed.failure.why {
+                    // Its words its cause's name and its crate, as the old path files a wait
+                    // (work.rs `filed_answer`): the printer groups the waiters under the cause.
+                    Why::Waited { on } => {
+                        let label = match name.kind {
+                            Kind::CrateScope => names.as_ref().and_then(|stage| stage.names.as_ref()).and_then(|world| world.crate_at(name.subject).map(|at| world.crate_label(at))),
+                            _ => None,
+                        };
+                        lines.note(*name, crate::engine_lines::Class::Waited, crate::not_checked::waited::words(on, label, frame).as_bytes());
+                    }
+                    _ => {
+                        let words = match failed.words {
+                            Some(words) => bstd::mem::format_in!(frame, "{}: {words}", failed.failure),
+                            None => bstd::mem::format_in!(frame, "{}", failed.failure),
+                        };
+                        lines.note(*name, crate::engine_lines::Class::Failure, words.as_bytes());
+                    }
+                },
             }
             continue;
         };
@@ -1107,9 +1196,10 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     for (name, why) in scripts.unkept() {
         lines.note(name, crate::engine_lines::Class::Told, bstd::mem::format_in!(frame, "{}", crate::engine_scripts::UnkeptWords(name, why)).as_bytes());
     }
-    // PHASE-MEM-DEBT(Request): as the certificate's print, the printer's lists on the process
-    // heap (engine_lines.rs `print_all`): to take the request's `SharedAlloc<'_>`.
-    let tally = crate::engine_lines::print_all(cx, root, lines.blocks(), shown, heap, frame, out)?;
+    phases.mark_in("lines made", frame);
+    let heap_lines_made = crate::engine_phase_mem::heap_now();
+    // The printer's lists in the request's arena, as the certificate's print.
+    let tally = crate::engine_lines::print_all(cx, root, lines.blocks(), shown, alloc, frame, out)?;
     crate::engine_head_notes::print_grouped(cx, lines.blocks(), shown, frame, out)?;
     let unchecked = tally.unchecked;
     if bodies.ownerless > 0 {
@@ -1137,9 +1227,9 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     // Types and borrows are checked whole when every body of the answer was: those entered now
     // (engine_bodies.rs `whole`) and those that stand (`standing_bodies_whole`, above).
     let bodies_whole = names.is_some() && bodies.whole() && standing_bodies_whole;
-    let (ran_stages, not_stages) = crate::check_coverage(names.is_some(), bodies_whole, bodies_whole, frame);
+    let (ran_stages, not_stages) = crate::check_coverage(names.is_some(), bodies_whole, bodies_whole && tally.borrows == 0, frame);
     let coverage = (!not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
-    not_checked_notes(cx, &not_stages, shown, frame, out)?;
+    print::stage_notes(cx, &not_stages, shown, frame, out)?;
     let checked = u32::try_from(outlined.len()).unwrap_or(u32::MAX);
     print::closing(cx, shown, checked, phases.since(began), Some(finished.report.entered), None, coverage, frame, out)?;
     // The bodies not checked, under one line beside the closing line, as `check` prints it.
@@ -1147,6 +1237,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         print::note(cx, words.as_str(), shown, frame, out)?;
     }
     phases.mark_in("answer printed", frame);
+    let heap_printed = crate::engine_phase_mem::heap_now();
     let status = status_of(&tally, unprinted, shown, coverage.is_some());
     // The answer stored, its pointer written last, all in the store's one commit after it.
     let report = finished.report;
@@ -1160,6 +1251,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     let (lines_key, lines_bytes) = lines.record();
     let saved = crate::engine_answer::save(cx, &mut store, &answer_root, toolchain, &kept_answer, printed, (lines_key, &lines_bytes), last_root.as_ref(), &rows, &journal, alloc, frame)?;
     phases.mark_in("answer stored", frame);
+    let heap_stored = crate::engine_phase_mem::heap_now();
     // The store's one commit, after the answer, as `check`'s (main.rs).
     crate::store::Store::after_answer(&mut store, cx, &mut blaze_drive::profile::Profile::default())?;
     // Nothing read in place outlives the store's borrow of its `Lent` (engine_records.rs).
@@ -1175,7 +1267,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     scripts.profile(&mut text);
     crate::engine_memory::profile(&ledger, names.as_ref(), &mut text);
     // The head tasks' freezes by unit (engine_heads.rs `UnitCounts`), said beside the table's.
-    seed_counts.units = heads.units;
+    seed_counts.units = heads.unit_counts();
     seed_counts.once = crate::engine_heads_once::counts(&heads);
     crate::engine_seeds::profile(&seed_counts, &mut text);
     // A task by what it is about: a file's path, a crate's name, a script's crate, a body's item.
@@ -1205,6 +1297,8 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         let _ = writeln!(text, "{cleanup}");
         let made = phase_mem.counts;
         let _ = writeln!(text, "phase arenas: {} made, {} dropped, {} bytes given back at their drops (engine_phase_mem.rs)", made.made, made.dropped, made.returned);
+        let _ = writeln!(text, "{}", tally.tail.line(tally.listed, frame));
+        let _ = writeln!(text, "tail heap (bytes): engine finished {heap_engine}, lines made {heap_lines_made}, answer printed {heap_printed}, answer stored {heap_stored}");
     }
     // Written in place, never synced, as `check`'s profile (print.rs `profile`).
     let file = root.create(cx, &Path::new(print::PROFILE)?)?;
@@ -1390,22 +1484,6 @@ fn publish<'a>(discovered: &crate::engine_units::Discovered<'_>, task: &Task, al
     reads.sort_unstable_by_key(|(id, _)| *id);
     reads.dedup_by_key(|(id, _)| *id);
     Done { name: task.planned.name, key: task.key, out: record.out, defines, reads, findings: u32::try_from(record.findings.len()).unwrap_or(u32::MAX), failed: false }
-}
-
-/// A note for each stage of `not` (check_coverage's): a stage this build does not run says the
-/// build's reason, as `check` does (main.rs `close`); one it runs but did not run whole points at
-/// the notes. The certificate and a request that enters tasks print through this one.
-fn not_checked_notes(cx: &Cx, not: &[&'static str], shown: &print::Shown<'_>, frame: &Frame, out: &Out) -> Result<(), CliError> {
-    for (stage, built, why_not_built) in work::CHECK_STAGES {
-        if not.contains(&stage) {
-            let words = match built {
-                false => bstd::mem::format_in!(frame, "NOT checked: {stage}: {why_not_built}"),
-                true => bstd::mem::format_in!(frame, "NOT checked: {stage}: `engine-check` did not run it whole (the notes above say why)"),
-            };
-            print::note(cx, words.as_str(), shown, frame, out)?;
-        }
-    }
-    Ok(())
 }
 
 /// The command's status from what was printed, as main.rs `close`: an error or a failure is 1;

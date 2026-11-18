@@ -19,14 +19,14 @@ use super::engine_check_tests::{entries, said, why};
 use blaze_engine::Stage;
 
 /// What one request listed, printed (its closing line dropped) and counted.
-struct Answer {
+pub(super) struct Answer {
     ids: std::vec::Vec<(std::string::String, std::string::String)>,
-    lines: std::vec::Vec<std::string::String>,
-    checked: engine_check::Checked,
+    pub(super) lines: std::vec::Vec<std::string::String>,
+    pub(super) checked: engine_check::Checked,
 }
 
 /// One `engine-check` request on 2 workers, from the stored answer unless `fresh`.
-fn request(io: &Io, fresh: bool) -> Answer {
+pub(super) fn request(io: &Io, fresh: bool) -> Answer {
     let (ids, lines, checked) = said(io, fresh);
     Answer { ids, lines, checked }
 }
@@ -37,12 +37,12 @@ fn entered(checked: &engine_check::Checked, stage: Stage) -> u32 {
 }
 
 /// The tasks of `stage` one request entered for a cause other than "new" (a task that existed).
-fn entered_existing(checked: &engine_check::Checked, stage: Stage) -> u32 {
+pub(super) fn entered_existing(checked: &engine_check::Checked, stage: Stage) -> u32 {
     checked.because.iter().filter(|(group, _)| group.stage == stage && group.cause != "new").map(|(_, count)| *count).sum()
 }
 
 /// The printed finding lines (`error[..]`, `warning[..]`: each holds its file, line and column).
-fn findings(lines: &[std::string::String]) -> impl Iterator<Item = &str> {
+pub(super) fn findings(lines: &[std::string::String]) -> impl Iterator<Item = &str> {
     lines.iter().map(std::string::String::as_str).filter(|line| line.contains("error[") || line.contains("warning["))
 }
 
@@ -117,16 +117,16 @@ impl core::fmt::Display for Difference<'_> {
 
 /// One row's measured counts.
 #[derive(Clone, Copy, Debug)]
-struct Row {
-    outlines: u32,
-    names: u32,
-    heads: u32,
-    bodies: u32,
+pub(super) struct Row {
+    pub(super) outlines: u32,
+    pub(super) names: u32,
+    pub(super) heads: u32,
+    pub(super) bodies: u32,
 }
 
 /// What the oracle asserts of a row: the answer after the edit against a fresh request's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Oracle {
+pub(super) enum Oracle {
     /// Equal: the findings listed, every finding and note line (each as many times), the status.
     Equal,
     /// ENGINE GAP, asserted as today's truth: equal but for the fresh request's
@@ -157,7 +157,7 @@ fn missing_coverage_only(now: &Answer, fresh: &Answer) -> bool {
 
 /// The row after an edit: runs a FRESH request on the edited files (call it after every `why`
 /// probe: the fresh request writes a new stored answer), prints the row, and asserts `oracle`.
-fn settle(io: &Io, name: &str, now: &Answer, oracle: Oracle) -> Row {
+pub(super) fn settle(io: &Io, name: &str, now: &Answer, oracle: Oracle) -> Row {
     let fresh = request(io, true);
     let c = &now.checked;
     let row = Row { outlines: entered(c, Stage::Outlines), names: entered(c, Stage::Names), heads: entered(c, Stage::Heads), bodies: entered(c, Stage::Bodies) };
@@ -188,7 +188,7 @@ fn settle(io: &Io, name: &str, now: &Answer, oracle: Oracle) -> Row {
 
 /// Where a body stands in the stored answer, by `blaze why` (engine_why.rs `walk`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Seen {
+pub(super) enum Seen {
     /// Entered by the last request.
     Last,
     /// A task of the answer, entered by an earlier request only.
@@ -198,7 +198,7 @@ enum Seen {
 }
 
 /// [`Seen`] of the body `target` (`<file>::<item chain>`), printed with `why`'s first line.
-fn seen(io: &Io, row: &str, target: &str) -> Seen {
+pub(super) fn seen(io: &Io, row: &str, target: &str) -> Seen {
     let said = why(io, target);
     let first = said.lines().next().unwrap_or("");
     println!("row {row}: why {target}: {first}");
@@ -250,9 +250,16 @@ pub(super) const A_LIB: &str = a_lib!("", "    7\n", "u32", "    x\n", "", "    
 /// R2: a comment inside `base`'s body.
 const A_LIB_COMMENT: &str = a_lib!("", "    // the base is seven\n    7\n", "u32", "    x\n", "", "        let _x: u32 = super::base();\n", "");
 /// R3: [`A_LIB`] with one wrong body at its end (one type error, whose line R3 moves).
-const A_LIB_WRONG: &str = a_lib!("", "    7\n", "u32", "    x\n", "", "        let _x: u32 = super::base();\n", "\npub fn wrong() -> u32 {\n    true\n}\n");
+pub(super) const A_LIB_WRONG: &str = a_lib!("", "    7\n", "u32", "    x\n", "", "        let _x: u32 = super::base();\n", "\npub fn wrong() -> u32 {\n    true\n}\n");
 /// R3: [`A_LIB_WRONG`] with a blank line above `base`: every later item's line moves by one.
 const A_LIB_WRONG_BLANK: &str = a_lib!("\n", "    7\n", "u32", "    x\n", "", "        let _x: u32 = super::base();\n", "\npub fn wrong() -> u32 {\n    true\n}\n");
+/// Keys from tokens (engine_token_keys_tests.rs): [`A_LIB_WRONG`] with a comment line inside
+/// `wrong`, above its one error: the body's key stands and the error's line moves by one.
+pub(super) const A_LIB_WRONG_INSIDE: &str = a_lib!("", "    7\n", "u32", "    x\n", "", "        let _x: u32 = super::base();\n", "\npub fn wrong() -> u32 {\n    // the error is below\n    true\n}\n");
+/// Keys from tokens: `base`'s doc comment added (a doc is a token: `base` and its readers).
+pub(super) const A_LIB_DOC: &str = a_lib!("/// The base.\n", "    7\n", "u32", "    x\n", "", "        let _x: u32 = super::base();\n", "");
+/// Keys from tokens: a fn added above `base`: no existing key moves.
+pub(super) const A_LIB_ABOVE: &str = a_lib!("pub fn above() -> u32 {\n    3\n}\n\n", "    7\n", "u32", "    x\n", "", "        let _x: u32 = super::base();\n", "");
 /// R5, R12: a literal of `base`'s body changed.
 const A_LIB_LITERAL: &str = a_lib!("", "    8\n", "u32", "    x\n", "", "        let _x: u32 = super::base();\n", "");
 /// R6: a private fn added.
@@ -305,7 +312,7 @@ const C_LIB_MOVED: &str = c_lib!("counting");
 pub(super) const C_MODULE: &str ="pub struct Count {\n    pub n: u32,\n}\n\npub trait Bump {\n    fn bump(&self) -> u32;\n}\n\nimpl Bump for Count {\n    fn bump(&self) -> u32 {\n        self.n + 1\n    }\n}\n\npub fn start() -> u32 {\n    0\n}\n\npub fn measured() -> u32 {\n    b::wrap::Measure::measure(&b::wrap::Boxed { inner: 2 })\n}\n";
 
 /// The fixture's world, with `a/src/lib.rs` as `a_lib`.
-fn world(a_lib: &str) -> Io {
+pub(super) fn world(a_lib: &str) -> Io {
     let io = Io::simulated(SimWorld::new(17, Limits::USUAL));
     write(&io, "Cargo.toml", WORKSPACE);
     write(&io, "a/Cargo.toml", A_MANIFEST);
@@ -328,7 +335,7 @@ fn remove(io: &Io, path: &str) {
 
 /// The cold request: no stored answer, every task planned is entered. Printed, for the rows'
 /// context (which bodies the fixture checks clean, which carry a note).
-fn cold(io: &Io, name: &str) -> Answer {
+pub(super) fn cold(io: &Io, name: &str) -> Answer {
     let first = request(io, false);
     let c = &first.checked;
     println!(
@@ -376,10 +383,12 @@ fn r2_a_comment_in_a_body_enters_its_outline_alone() {
     write(&io, "a/src/lib.rs", A_LIB_COMMENT);
     let now = request(&io, false);
     let row = settle(&io, "R2 a comment inside a fn body", &now, Oracle::Equal);
-    // FLOOR (1, 0, 0, 0): a comment is not a token (X4, token-keys.md). Today the body's key is
-    // its bytes, and its head task's key holds the body text's digest (engine_heads.rs
-    // `plan_items`): 1 head and 1 body entered, both identical.
-    assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 1, 1), "R2: floor 1 outline, 0 names, 0 heads, 0 bodies: {PINNED}");
+    // FLOOR (1, 0, 0, 0): a comment is not a token (X4, token-keys.md). Since lane K1 the outline's
+    // digests are of tokens (blaze-file-items, "Identity"): `base`'s body key and its head task's
+    // key (which holds the body's source, engine_heads.rs `plan_items`) stand. It was (1, 0, 1, 1)
+    // when the keys were bytes: 1 head and 1 body entered, both identical. The control (bytes
+    // put back move `base`'s key) is blaze-file-items tests/outline/token_keys.rs.
+    assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 0, 0), "R2: 1 outline, 0 names, 0 heads, 0 bodies: {FLOOR}");
 }
 
 /// R3, A BLANK LINE ABOVE A FN (rule 71, item-relative positions): every later item's line
@@ -416,9 +425,14 @@ fn r4_a_reformatted_file_enters_no_head_or_body() {
     write(&io, "a/src/shapes.rs", A_SHAPES_REFORMATTED);
     let now = request(&io, false);
     let row = settle(&io, "R4 a whole file re-formatted", &now, Oracle::Equal);
-    // FLOOR (1, 0, 0, 0): X4, keys from tokens. Today 7 heads (5 by their keys, 2 by the file's
-    // `FileItems` cell) and 3 bodies (by their byte keys), all heads identical.
-    assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 7, 3), "R4: floor its outline alone, 0 names, 0 heads, 0 bodies (X4): {PINNED}");
+    // FLOOR (1, 0, 0, 0): X4, keys from tokens. Since lane K1 the keys are tokens: no head or
+    // body by its key. Left: 2 heads by the file's `FileItems` cell (`WHOLE`, the outline
+    // record's digest, which holds each part's file offset, work.rs `place: item.range.start`,
+    // so a reformat moves it), identical. It was (1, 0, 7, 3) with byte keys (5 heads and 3
+    // bodies by their keys). Lane K1 wrote (1, 0, 2, 0) without a run; the first run (2026-11-18,
+    // the cut of K1 + SW1 + BD1 + SW2 + H9 on c1ebcac4a3) gave (1, 0, 0, 0) with findings equal
+    // a fresh world's: the floor, so the assertion is the floor now.
+    assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 0, 0), "R4: floor its outline alone, 0 names, 0 heads, 0 bodies (X4)");
 }
 
 /// R5, ONE FN BODY EDITED, A LITERAL CHANGED (row "One statement edited, small project": 1

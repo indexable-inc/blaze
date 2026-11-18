@@ -4,7 +4,8 @@
 //! form's word is pinned by a test against the assembler's (src/tests.rs, `encodings`).
 //!
 //! All arithmetic forms here are the 64-bit (`x`) ones: the baseline tier computes every
-//! integer in a whole register and narrows after (lib.rs, "Values").
+//! integer in a whole register and narrows after (lib.rs, "Values"). An `asm!` template's
+//! 32-bit forms (asm/table.rs) are these words through [`sf`].
 
 /// A general register, 0..=31.
 pub(crate) type Reg = u32;
@@ -484,12 +485,18 @@ pub(crate) const fn umov_h0(rd: Reg, rn: Reg) -> u32 {
 
 /// `fcvt dd, hn` (`to_double`) or `fcvt sd, hn`: exact (C7.2 FCVT, ftype=11, opc 01 or 00).
 pub(crate) const fn fcvt_from_h(to_double: bool, rd: Reg, rn: Reg) -> u32 {
-    0x1ee2_4000 | ((to_double as u32) << 15) | (rn << 5) | rd
+    match to_double {
+        true => fcvt_between(Ftype::H, Ftype::D, rd, rn),
+        false => fcvt_between(Ftype::H, Ftype::S, rd, rn),
+    }
 }
 
 /// `fcvt hd, dn` (`from_double`) or `fcvt hd, sn`, rounding by FPCR (C7.2 FCVT, opc=11).
 pub(crate) const fn fcvt_to_h(from_double: bool, rd: Reg, rn: Reg) -> u32 {
-    0x1e23_c000 | ftype(from_double) | (rn << 5) | rd
+    match from_double {
+        true => fcvt_between(Ftype::D, Ftype::H, rd, rn),
+        false => fcvt_between(Ftype::S, Ftype::H, rd, rn),
+    }
 }
 
 /// `fadd`, `fsub`, `fmul`, `fdiv` (`opcode` 0010, 0011, 0000, 0001 at bits 12..16).
@@ -510,8 +517,8 @@ pub(crate) const fn fcmp(double: bool, rn: Reg, rm: Reg) -> u32 {
 /// `fcvt dd, sn` (`to_double`) or `fcvt sd, dn`.
 pub(crate) const fn fcvt(to_double: bool, rd: Reg, rn: Reg) -> u32 {
     match to_double {
-        true => 0x1e22_c000 | (rn << 5) | rd,
-        false => 0x1e62_4000 | (rn << 5) | rd,
+        true => fcvt_between(Ftype::S, Ftype::D, rd, rn),
+        false => fcvt_between(Ftype::D, Ftype::S, rd, rn),
     }
 }
 
@@ -632,7 +639,35 @@ pub(crate) enum Barrier {
 }
 
 pub(crate) const fn dmb(barrier: Barrier) -> u32 {
-    0xd503_30bf | ((barrier as u32) << 8)
+    dmb_crm(barrier as u32)
+}
+
+// Barriers and hints (C6.2.81 DMB, 83 DSB, 131 ISB, 238 NOP, 274 SB): `1101 0101 0000 0011
+// 0011 CRm op2 11111`, the option in CRm (`asm!`'s table, asm/table.rs).
+
+/// `nop` (the hint space, CRm 0000 op2 000).
+pub(crate) const fn nop() -> u32 {
+    0xd503_201f
+}
+
+/// `dmb <option>`: op2 101.
+pub(crate) const fn dmb_crm(crm: u32) -> u32 {
+    0xd503_30bf | (crm << 8)
+}
+
+/// `dsb <option>`: op2 100.
+pub(crate) const fn dsb(crm: u32) -> u32 {
+    0xd503_309f | (crm << 8)
+}
+
+/// `isb <option>`: op2 110 (`sy` is CRm 1111).
+pub(crate) const fn isb(crm: u32) -> u32 {
+    0xd503_30df | (crm << 8)
+}
+
+/// `sb` (FEAT_SB): CRm 0000 op2 111.
+pub(crate) const fn sb() -> u32 {
+    0xd503_30ff
 }
 
 // Large System Extensions (FEAT_LSE, Armv8.1): atomic memory operations and compare-and-swap.
@@ -676,7 +711,49 @@ pub(crate) const fn cas(size: Size, acq: bool, rel: bool, rs: Reg, rt: Reg, rn: 
 /// `mrs xt, tpidrro_el0` (op0 3, op1 3, CRn 13, CRm 0, op2 3): the read-only thread pointer,
 /// which macOS points at the thread's specific-data slots.
 pub(crate) const fn mrs_tpidrro_el0(rt: Reg) -> u32 {
-    0xd53b_d060 | rt
+    mrs(SysReg::TPIDRRO_EL0, rt)
+}
+
+/// A system register by its encoding (C5.3): `op0` 2 or 3, `op1` and `op2` 0..=7, `CRn` and
+/// `CRm` 0..=15.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SysReg {
+    pub(crate) op0: u32,
+    pub(crate) op1: u32,
+    pub(crate) crn: u32,
+    pub(crate) crm: u32,
+    pub(crate) op2: u32,
+}
+
+impl SysReg {
+    pub(crate) const TPIDRRO_EL0: SysReg = SysReg { op0: 3, op1: 3, crn: 13, crm: 0, op2: 3 };
+
+    const fn fields(self) -> u32 {
+        (self.op0 << 19) | (self.op1 << 16) | (self.crn << 12) | (self.crm << 8) | (self.op2 << 5)
+    }
+}
+
+/// `mrs xt, <sysreg>` (C6.2.229): `1101 0101 0011 o0 op1 CRn CRm op2 Rt`, op0 = `1:o0`.
+pub(crate) const fn mrs(reg: SysReg, rt: Reg) -> u32 {
+    0xd520_0000 | reg.fields() | rt
+}
+
+/// `msr <sysreg>, xt` (C6.2.231, register): as [`mrs`] with L (bit 21) clear.
+pub(crate) const fn msr(reg: SysReg, rt: Reg) -> u32 {
+    0xd500_0000 | reg.fields() | rt
+}
+
+/// A PSTATE field `msr` writes an immediate to (C6.2.230): its `op1` and `op2`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Pstate {
+    pub(crate) op1: u32,
+    pub(crate) op2: u32,
+}
+
+/// `msr <pstatefield>, #imm` (C6.2.230, immediate): `1101 0101 0000 0 op1 0100 CRm op2 11111`,
+/// the immediate in CRm.
+pub(crate) const fn msr_imm(field: Pstate, imm: u32) -> u32 {
+    0xd500_401f | (field.op1 << 16) | (imm << 8) | (field.op2 << 5)
 }
 
 /// The offset of a branch's or literal's field, for patching once its target is placed.
@@ -733,4 +810,145 @@ pub(crate) const fn far32_words(bytes: i64) -> Option<(u32, u32)> {
     }
     let off = bytes as u32;
     Some((movz(X10, off & 0xffff, 0), movk(X10, off >> 16, 1)))
+}
+
+// The forms `asm!` templates name (asm/table.rs), beside the tier's own: 32-bit forms by
+// [`sf`], the logical immediate, pointer authentication, CRC, floating point by its type, and
+// three NEON forms.
+
+/// The 32-bit (`w`) form of a data-processing word given in its 64-bit form: `sf` (bit 31)
+/// clear (C4.1: every data-processing form has `sf` there).
+pub(crate) const fn sf(wide: bool, word64: u32) -> u32 {
+    match wide {
+        true => word64,
+        false => word64 & !(1 << 31),
+    }
+}
+
+/// `ands xd, xn, xm` (C6.2.15, shifted register, no shift); `tst xn, xm` is `xd` = `xzr`.
+pub(crate) const fn ands(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0xea00_0000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `ands xd, xn, #imm` (C6.2.14) of [`logical_imm`]'s `N:immr:imms` (`nrs`); `tst xn, #imm`
+/// is `xd` = `xzr`. The 32-bit form by [`sf`] takes an `N` of 0 only.
+pub(crate) const fn ands_imm(rd: Reg, rn: Reg, nrs: u32) -> u32 {
+    0xf200_0000 | (nrs << 10) | (rn << 5) | rd
+}
+
+/// `pacib xd, xn` (C6.2.208, FEAT_PAuth): sign `xd` with key B and modifier `xn` (or `sp`).
+pub(crate) const fn pacib(rd: Reg, rn: Reg) -> u32 {
+    0xdac1_0400 | (rn << 5) | rd
+}
+
+/// `crc32{b,h,w,x}` (`c` clear) or `crc32c{..}` (C6.2.79, 80): `sf 0 0 11010110 Rm 010 C sz Rn
+/// Rd`, `sz` log2 of the bytes `rm` gives (`x` is `sf` 1 and `sz` 11).
+pub(crate) const fn crc32(c: bool, sz: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    let sf = (sz == 3) as u32;
+    0x1ac0_4000 | (sf << 31) | (rm << 16) | ((c as u32) << 12) | (sz << 10) | (rn << 5) | rd
+}
+
+/// A scalar floating-point type, its `ftype` field (C7.2, bits 22..24).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub(crate) enum Ftype {
+    S = 0b00,
+    D = 0b01,
+    H = 0b11,
+}
+
+/// `fmadd d, n, m, a` of `ft` (C7.2.105): `0001 1111 ftype 0 Rm 0 Ra Rn Rd`, `d = a + n * m`
+/// rounded once.
+pub(crate) const fn fmadd(ft: Ftype, rd: Reg, rn: Reg, rm: Reg, ra: Reg) -> u32 {
+    0x1f00_0000 | ((ft as u32) << 22) | (rm << 16) | (ra << 10) | (rn << 5) | rd
+}
+
+/// The opcode of a floating-point data-processing (1 source) form (C4.1.96): `fsqrt` 000011,
+/// `frintn` 001000.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub(crate) enum Fp1 {
+    Fsqrt = 0b00_0011,
+    Frintn = 0b00_1000,
+}
+
+/// A floating-point data-processing (1 source) word: `0001 1110 ftype 1 opcode 10000 Rn Rd`.
+pub(crate) const fn fp1(op: Fp1, ft: Ftype, rd: Reg, rn: Reg) -> u32 {
+    0x1e20_4000 | ((ft as u32) << 22) | ((op as u32) << 15) | (rn << 5) | rd
+}
+
+/// `fcvt <to>d, <from>n` (C7.2.69): the 1-source opcode `0001 opc`, `opc` the destination's
+/// type, `ftype` the source's. The three [`fcvt`] forms of the tier are its instances.
+pub(crate) const fn fcvt_between(from: Ftype, to: Ftype, rd: Reg, rn: Reg) -> u32 {
+    0x1e20_4000 | ((from as u32) << 22) | ((0b00_0100 | to as u32) << 15) | (rn << 5) | rd
+}
+
+/// `cmeq vd.T, vn.T, vm.T` (C7.2.27, register): `0 Q 1 01110 size 1 Rm 10001 1 Rn Rd`.
+pub(crate) const fn cmeq_v(q: bool, size: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x2e20_8c00 | ((q as u32) << 30) | (size << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `and vd.T, vn.T, vm.T` (C7.2.11, `T` 8b or 16b): `0 Q 0 01110 00 1 Rm 00011 1 Rn Rd`.
+pub(crate) const fn and_v(q: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x0e20_1c00 | ((q as u32) << 30) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `shrn vd.Tb, vn.Ta, #shift` (C7.2.283, Q 0): `0 0 0 011110 immh immb 1000 0 1 Rn Rd`, with
+/// `immh:immb` = 2 * `esize` - `shift` for a destination element of `esize` bits (8, 16, 32)
+/// and `shift` in 1..=`esize`.
+pub(crate) const fn shrn(esize: u32, shift: u32, rd: Reg, rn: Reg) -> u32 {
+    0x0f00_8400 | ((2 * esize - shift) << 16) | (rn << 5) | rd
+}
+
+/// The low `width` bits set.
+const fn low_ones(width: u32) -> u64 {
+    match width {
+        64.. => u64::MAX,
+        w => (1u64 << w) - 1,
+    }
+}
+
+/// `value` (the low `width` bits) as an arm64 logical immediate of a `size`-bit operation,
+/// encoded `N:immr:imms` (Arm ARM C6.2, `DecodeBitMasks`): an element of 2..=64 bits repeated,
+/// each a rotated run of ones. `None` for 0, all ones, or any other value.
+pub(crate) fn logical_imm(value: u64, size: u32) -> Option<u64> {
+    let value = match size {
+        32 => (value & 0xffff_ffff) | ((value & 0xffff_ffff) << 32),
+        _ => value,
+    };
+    if value == 0 || value == u64::MAX {
+        return None;
+    }
+    let mut esize: u32 = 64;
+    while esize > 2 {
+        let half = esize / 2;
+        let m = low_ones(half);
+        if value & m != (value >> half) & m {
+            break;
+        }
+        esize = half;
+    }
+    let emask = low_ones(esize);
+    let elem = value & emask;
+    let ones = elem.count_ones();
+    let run = low_ones(ones);
+    let mut rotation = None;
+    for r in 0..esize {
+        let rotated = match r {
+            0 => elem,
+            r => ((elem >> r) | (elem << (esize - r))) & emask,
+        };
+        if rotated == run {
+            rotation = Some(r);
+            break;
+        }
+    }
+    let r = rotation?;
+    let immr = u64::from((esize - r) % esize);
+    let imms = (u64::from(!(esize * 2 - 1)) & 0x3f) | u64::from(ones - 1);
+    let n = u64::from(esize == 64);
+    if size == 32 && n == 1 {
+        return None;
+    }
+    Some((n << 12) | (immr << 6) | imms)
 }

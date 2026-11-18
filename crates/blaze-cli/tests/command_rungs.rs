@@ -49,9 +49,14 @@
 //! `expected` (tests/run_not_run.rs proves the 125).
 //!
 //! Expected today: every rung REFUSED and `hello-blaze` not PASS until `blaze run` and
-//! `blaze check` use the new front end; the must-pass assertion names it.
+//! `blaze check` use the new front end; the must-pass assertion names it. `blaze check` is the
+//! engine (check_command.rs) since 2026-11-18; its line passes at status 0, and at status 3
+//! (the borrows stage, not built yet, the only one NOT checked) only once a root `main` cannot
+//! be silently unchecked (`judge_check`, `ROOT_MAIN_CHECKED`, false today).
 
 mod support;
+#[path = "support/switch.rs"]
+mod switch;
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -343,9 +348,27 @@ fn judge_run(ended: Ended, want: Expected) -> Verdict {
     Verdict::Wrong(Wrong::Answer { status, stdout, want })
 }
 
-/// `blaze check`'s verdict: status 0 without the old hollow note passes; the note is WRONG
-/// whatever the status; any other status is the command's refusal, named by its error line,
-/// else its "NOT checked" line, else its first line.
+/// The closing coverage line (agent view, blaze-report plain.rs `agent_closing`) of a check
+/// whose only stage not checked is the borrows stage this build does not build yet.
+const ONLY_BORROWS_NOT_BUILT: &str = "incomplete: NOT checked: borrows";
+
+/// Whether the engine checks a binary root's `main` whole, so that a status 3 whose only stage
+/// NOT checked is the unbuilt borrows stage cannot hide an unchecked `main`. FALSE today: a
+/// root `main` can be left unchecked with nothing said (lane SW2, Q1), so status 3 is NOT a
+/// pass. THE LINE TO FLIP, to `true`, is this one: once lane BD1's root-main check
+/// (engine_bodies.rs `groups` / `absent_entry`, written 2026-11-18, uncompiled when this was
+/// written) is compiled and a rung run shows a root `main` it cannot check as a note and status
+/// 4, never a quiet status 3.
+const ROOT_MAIN_CHECKED: bool = false;
+
+/// `blaze check`'s verdict: status 0 without the old hollow note passes; so does status 3 when
+/// the ONLY stage its closing line names NOT checked is the borrows stage and this build does not
+/// build it (`BORROWS_ARE_ERRORS` false), once a root `main` cannot be silently unchecked
+/// ([`ROOT_MAIN_CHECKED`]): every stage the build runs ran whole and found nothing, which is all
+/// `check` can do until the flow census is clean (rule 7: the expectation states what is right).
+/// Until then status 3 is the command's refusal, as any other. The note is WRONG whatever the
+/// status; any other status is the command's refusal, named by its error line, else its "NOT
+/// checked" line, else its first line.
 fn judge_check(ended: Ended) -> Verdict {
     let (status, stdout, stderr) = match ended {
         Ended::Hung { after } => return Verdict::Hung { after },
@@ -356,6 +379,11 @@ fn judge_check(ended: Ended) -> Verdict {
         return Verdict::Wrong(Wrong::HollowCheck { status });
     }
     if status == 0 {
+        return Verdict::Pass { status, stdout_compared: false };
+    }
+    let text = String::from_utf8_lossy(&stdout);
+    let only_borrows_unbuilt = ROOT_MAIN_CHECKED && status == 3 && !switch::borrows_are_errors() && text.lines().filter(|line| line.starts_with("incomplete: ")).all(|line| line == ONLY_BORROWS_NOT_BUILT) && holds(&stdout, ONLY_BORROWS_NOT_BUILT);
+    if only_borrows_unbuilt {
         return Verdict::Pass { status, stdout_compared: false };
     }
     let said = error_line(&stderr)

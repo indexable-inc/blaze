@@ -19,6 +19,8 @@ pub(crate) fn emit_class(error: &EmitError) -> Box<str> {
         EmitError::Record { why } => format!("emit: Record: {why}"),
         EmitError::TooLarge { what } => format!("emit: TooLarge: {what}"),
         EmitError::NoVia { place: _ } => "emit: NoVia".to_owned(),
+        // By the reason and the token (a mnemonic, a directive): never the instruction or line.
+        EmitError::Asm { inst: _, line: _, why, token } => format!("emit: Asm: {why}: {token}"),
         // By the op and the form legalize names, or the routine: never the instruction number.
         EmitError::Legalize(why) => match why {
             blaze_lir::legalize::LegalizeError::Refused { inst: _, op, what } => format!("emit: Legalize: `{}`: {what}", op.name()),

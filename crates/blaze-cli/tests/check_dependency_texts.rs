@@ -17,11 +17,18 @@
 //!    its `let n: u32 = ..` is a type error naming `main`; the edit undone, `check` passes again.
 //!    That `util`'s other bodies are not run again is the in-process tests' count, not seen here.
 //!
-//! Expected line: `DEPENDENCY TEXTS: cold 0, repeat 0, edited <not 0>, undone 0`.
+//! A clean check exits 3, never 0, while the borrows stage is NOT checked (`BORROWS_ARE_ERRORS`
+//! false, work.rs `CHECK_STAGES`): the old expectation of 0 was the old checker's too, and met
+//! by neither; with the switch on, 0. Since `blaze check` is the engine (check_command.rs).
+//!
+//! Expected line: `DEPENDENCY TEXTS: cold 3, repeat 3, edited <not 0>, undone 3` (0 for 3 once
+//! `BORROWS_ARE_ERRORS` is true).
 //!
 //! Needs the installed toolchain under `$HOME/.blaze/v2/toolchain` (linked into a fresh home).
 
 mod support;
+#[path = "support/switch.rs"]
+mod switch;
 
 use std::fs::File;
 use std::path::Path;
@@ -121,7 +128,16 @@ fn assert_clean(what: &str, (status, said): &(Option<i32>, String)) {
     assert!(!said.contains(GONE), "{what}: a file text was `Gone`:\n{said}");
     assert!(!said.contains(NOT_KEPT), "{what}: a file text was not kept:\n{said}");
     assert!(!said.contains(NOT_CHECKED), "{what}: a body was not checked:\n{said}");
-    assert_eq!(*status, Some(0), "{what}: status {status:?}:\n{said}");
+    // The engine's words for a body not checked (engine_bodies.rs `note`: "was not checked",
+    // "not checked whole") and for a stage (print.rs `stage_notes`): only the borrows stage,
+    // unbuilt while `BORROWS_ARE_ERRORS` is false, may be named.
+    let unchecked: Vec<&str> = said.lines().filter(|line| (line.contains("not checked") || line.contains("NOT checked")) && !line.contains("NOT checked: borrows")).collect();
+    assert!(unchecked.is_empty(), "{what}: a body or a stage was not checked: {unchecked:?}\n{said}");
+    assert!(said.lines().any(|line| line == "0 errors: blaze check"), "{what}: the closing line:\n{said}");
+    // A clean check exits 3, never 0, while the borrows stage is not built (work.rs
+    // `CHECK_STAGES`, `BORROWS_ARE_ERRORS`): the old expectation of 0 was met by no checker.
+    let clean = if switch::borrows_are_errors() { 0 } else { 3 };
+    assert_eq!(*status, Some(clean), "{what}: status {status:?}:\n{said}");
 }
 
 /// Should print `DEPENDENCY TEXTS: cold 0, repeat 0, edited <not 0>, undone 0`; on failure,

@@ -15,8 +15,10 @@
 //! The owner's flow is asked with [`NestedFacts`], which says each closure's and async block's
 //! body IS checked: true only because `borrows_of` lowers and checks every one of them, in
 //! expression order ([`next_nested`]); a refusal of any is the body's refusal. A nested body's
-//! outlives result is a relation its owner would have to prove (the closure requirements, not
-//! built): the caller files it as a refusal by name, never as a finding.
+//! outlives result is a relation its owner must prove: between two positions of the closure's
+//! or the future's VALUE (or `'static`) it is a requirement the owner's flow emits at the
+//! expression ([`Requirements`], closures and async blocks alike); any other is filed as a
+//! refusal by name, never as a finding.
 
 use blaze_flow::Flow;
 use blaze_flow_lower::{
@@ -74,8 +76,9 @@ impl<'f, 'a> NestedFacts<'f, 'a> {
 }
 
 /// The closure requirements of one body (the NLL RFC, "Closures": the closure's creator must
-/// prove the relations among the closure's external regions its body needs): each closure's
-/// flow is checked BEFORE the flow that makes it (innermost first: [`closures_inner_first`]),
+/// prove the relations among the closure's external regions its body needs; an async block's
+/// the same, keyed by the block's expression): each closure's and nested async block's flow is
+/// checked BEFORE the flow that makes it (innermost first: [`nested_inner_first`]),
 /// and each of its outlives results between two positions of the closure VALUE (or `'static`)
 /// is mapped through blaze-flow-lower `requirement` into this table, which the making flow's
 /// lowering emits at the closure expression (`Facts::closure_requirements`). A result that maps
@@ -113,25 +116,36 @@ fn run_of(closures: &[tc::ExprId], closure: tc::ExprId) -> (usize, usize) {
     (closures.partition_point(|&e| e < closure), closures.partition_point(|&e| e <= closure))
 }
 
-/// Every closure of the body (not `async`, whose flow is no closure's: `Form::AsyncClosure`),
-/// innermost first: by the length of its range, shorter first (a closure written inside
-/// another's body has a range strictly inside it), then by expression. What
-/// [`Requirements`] is filled in the order of.
-pub fn closures_inner_first<'a>(view: &tc::BodyView<'_>, alloc: Alloc<'a>) -> AVec<'a, tc::ExprId> {
+/// Every nested flow of the body whose outlives results are its maker's to prove: each closure
+/// (not `async`, whose flow is no closure's: `Form::AsyncClosure`) and each async block but an
+/// `async fn`'s root ([`FlowOf::is_nested`]), innermost first: by the length of its range,
+/// shorter first (one written inside another's body has a range strictly inside it), then by
+/// expression. What [`Requirements`] is filled in the order of, so every maker is lowered with
+/// the requirements of what it makes (lane B14: async blocks in the one mechanism of closures,
+/// rule 30; a closure inside an async block, or an async block inside a closure, either way).
+pub fn nested_inner_first<'a>(view: &tc::BodyView<'_>, alloc: Alloc<'a>) -> AVec<'a, FlowOf> {
     let mut out: AVec<'a, (u32, tc::ExprId)> = AVec::new_in(alloc);
     for (i, x) in view.exprs.iter().enumerate() {
-        if let tc::Expr::Closure { is_async: false, .. } = x {
-            let e = tc::ExprId(i as u32);
+        let e = tc::ExprId(i as u32);
+        let nested = match x {
+            tc::Expr::Closure { is_async: false, .. } => true,
+            tc::Expr::AsyncBlock { .. } => FlowOf::AsyncBlock(e).is_nested(view),
+            _ => false,
+        };
+        if nested {
             let len = view.expr_ranges.get(i).map_or(u32::MAX, |r| r.end - r.start);
             out.push((len, e));
         }
     }
     out.sort_unstable();
-    let mut ids: AVec<'a, tc::ExprId> = AVec::new_in(alloc);
+    let mut flows: AVec<'a, FlowOf> = AVec::new_in(alloc);
     for &(_, e) in out.iter() {
-        ids.push(e);
+        flows.push(match view.exprs.get(e.ix()) {
+            Some(tc::Expr::AsyncBlock { .. }) => FlowOf::AsyncBlock(e),
+            _ => FlowOf::Closure(e),
+        });
     }
-    ids
+    flows
 }
 
 /// A closure's flow with what each of its placeholders stands for in its owner

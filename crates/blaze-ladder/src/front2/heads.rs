@@ -759,8 +759,9 @@ pub enum NeedsMet {
     First,
 }
 
-/// A trait's clauses on `Self` and its associated types with their keys and defaults (in the
-/// store's table); made with its members ([`Want::Members`]).
+/// A trait's implied clauses (on `Self`, and its header's associated type bounds:
+/// `Preds::predicates_implying`) and its associated types with their keys and defaults (in
+/// the store's table); made with its members ([`Want::Members`]).
 pub struct TraitExtra {
     pub supertraits: Vec<PClause, Global>,
     pub assoc: Vec<tc::AssocTyDef, Global>,
@@ -1661,25 +1662,22 @@ impl<'n> Store<'n> {
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
         let me = intern(&mut self.tys, PNode::Param(0))?;
         let mut preds = Preds::new();
-        b.predicates(&mut self.tys, &env, v, 1, Some(me), self.sized, &mut preds)?;
+        // What elaborating `T: Trait` adds: its implied clauses (`Preds::predicates_implying`:
+        // the header's bounds with their associated item constraints, `where Self: ..`).
+        let mut supertraits = Vec::new_in(Global);
+        b.predicates_implying(&mut self.tys, &env, v, 1, Some(me), self.sized, &mut preds, &mut |c| supertraits.push(c))?;
         let mut inherited = Vec::with_capacity_in(preds.clauses.len() + 1, Global);
         inherited.push(PClause::Trait { trait_: ck, args: params(&mut self.tys, 0, own + 1, &cs)? });
         inherited.extend_from_slice(&preds.clauses);
-        // What elaborating `T: Trait` adds: the clauses on `Self` (supertraits, `where Self: ..`).
-        let mut supertraits = Vec::new_in(Global);
-        for c in preds.clauses.iter() {
-            let on_self = match *c {
-                PClause::Trait { args, .. } | PClause::Projection { args, .. } => self.tys.view().list(args).map_err(|_| Why::Unsupported("a clause list outside the store's table", whole))?.first() == Some(&me),
-                PClause::Const { .. } => false,
-            };
-            if on_self {
-                supertraits.push(*c);
-            }
-        }
-        // Before the members' signatures: `Self::Output` in `Fn::call` is a supertrait's.
+        // Before the members' signatures: `Self::Output` in `Fn::call` is a supertrait's. The
+        // supertraits proper: the implied trait clauses on `Self` (an associated type's bound,
+        // `<Self as Super>::A: B`, names no trait whose items `Self::` reaches).
         let mut supers = Vec::new_in(Global);
         for c in supertraits.iter() {
             if let PClause::Trait { trait_, args } = *c {
+                if self.tys.view().list(args).map_err(|_| Why::Unsupported("a clause list outside the store's table", whole))?.first() != Some(&me) {
+                    continue;
+                }
                 let lib = keys.library_in(names, trait_).ok_or(Why::Program(format!("the supertrait {trait_:?} has no library key").into_boxed_str(), whole))?;
                 supers.push((lib, args));
             }

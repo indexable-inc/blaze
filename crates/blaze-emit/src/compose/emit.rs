@@ -365,51 +365,6 @@ const fn mask(width: u32) -> u64 {
     }
 }
 
-/// `value` (the low `width` bits) as an arm64 logical immediate of a `size`-bit operation,
-/// encoded `N:immr:imms` (Arm ARM C6.2, `DecodeBitMasks`): an element of 2..=64 bits repeated,
-/// each a rotated run of ones. `None` for 0, all ones, or any other value.
-fn logical_imm(value: u64, size: u32) -> Option<u64> {
-    let value = match size {
-        32 => (value & 0xffff_ffff) | ((value & 0xffff_ffff) << 32),
-        _ => value,
-    };
-    if value == 0 || value == u64::MAX {
-        return None;
-    }
-    let mut esize: u32 = 64;
-    while esize > 2 {
-        let half = esize / 2;
-        let m = mask(half);
-        if value & m != (value >> half) & m {
-            break;
-        }
-        esize = half;
-    }
-    let emask = mask(esize);
-    let elem = value & emask;
-    let ones = elem.count_ones();
-    let run = mask(ones);
-    let mut rotation = None;
-    for r in 0..esize {
-        let rotated = match r {
-            0 => elem,
-            r => ((elem >> r) | (elem << (esize - r))) & emask,
-        };
-        if rotated == run {
-            rotation = Some(r);
-            break;
-        }
-    }
-    let r = rotation?;
-    let immr = u64::from((esize - r) % esize);
-    let imms = (u64::from(!(esize * 2 - 1)) & 0x3f) | u64::from(ones - 1);
-    let n = u64::from(esize == 64);
-    if size == 32 && n == 1 {
-        return None;
-    }
-    Some((n << 12) | (immr << 6) | imms)
-}
-
 /// The composer over one function. `'v` is the function's, `'r` the borrowed inputs', `'a` the
 /// record's allocator's.
 struct Composer<'v, 'r, 'a> {
@@ -1577,7 +1532,7 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
             // (no `shl` by an immediate: `lsl` is not linear in its amount). Every other
             // constant operand goes to a register.
             (Op::Add | Op::Sub | Op::PtrAdd, 1) if value < 4096 => Some((ImmClass::U12, value)),
-            (Op::And | Op::Or, 1) => logical_imm(value, 64).map(|it| (ImmClass::Logical64, it)),
+            (Op::And | Op::Or, 1) => crate::enc::logical_imm(value, 64).map(|it| (ImmClass::Logical64, it)),
             (Op::Lshr | Op::Ashr, 1) if value < u64::from(width) => match width {
                 32 => Some((ImmClass::Shift5, value)),
                 64 => Some((ImmClass::Shift6, value)),

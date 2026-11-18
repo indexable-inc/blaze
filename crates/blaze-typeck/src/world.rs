@@ -161,8 +161,13 @@ pub struct TraitDef<'w> {
     pub flags: TraitFlags,
     /// The lang item the trait is, if any (`#[lang = ".."]`).
     pub lang: Option<LangItem>,
-    /// The supertrait bounds and the trait's where-clauses on `Self`, `Self` as `Param(0)`:
-    /// what elaborating a `T: Trait` bound adds.
+    /// The trait's implied clauses, `Self` as `Param(0)`: what elaborating a `T: Trait` bound
+    /// adds (the reference's `explicit_implied_clauses_of`): the supertrait bounds, the
+    /// where-clauses on `Self`, and the associated item constraints' bounds written in them
+    /// (`trait Tr: Super<A: B>` gives `<Self as Super>::A: B`, whose self type is no
+    /// `Param(0)`). A walk of the supertraits proper keeps the clauses whose first argument is
+    /// `Param(0)` (`dyn_compat`, `lit_path::elaborate_bound_traits`). A where-clause on another
+    /// type is not here (the Reference, "Traits", "Supertraits").
     pub supertraits: &'w [PClause],
     pub assoc_types: &'w [AssocTyDef],
     pub types: PTys<'w>,

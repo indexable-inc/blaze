@@ -761,7 +761,7 @@ fn cost_of_one_body() {
     let start = Instant::now();
     let freezing: &'static Freezing<'static, 'static, &'static Records<'static>> = Box::leak(Box::new(Freezing::new(
         freeze_records,
-        SeededHeads::new(SeededHeadsOpts { names: freeze_records, sized, frame: frame(), scratch: g, alloc: g, consts: Some(evaluator), known: None, owners: None }),
+        SeededHeads::new(SeededHeadsOpts { names: freeze_records, sized, pointers: blaze_ladder::front2::receiver::Pointers::NOT_LOOKED_UP, frame: frame(), scratch: g, alloc: g, consts: Some(evaluator), known: None, owners: None }),
     )));
     // A body whose heads the record form cannot carry yet (FJ's known limits) is REFUSED by
     // type: counted with its reason, and left out of the seeded run.

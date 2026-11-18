@@ -97,6 +97,19 @@ const OWNERLESS_DOMAIN: &str = "blaze-cli engine bodies ownerless 1";
 /// The domain of the verdict of an entry whose expansion wrote several bodies (or none).
 const ENTRY_DOMAIN: &str = "blaze-cli engine bodies expansion entry 1";
 
+/// The most bodies a macro wrote that no entry covers named by label in the request's note
+/// (the rest counted in it): a cap on the note, never on what is counted (rule 18).
+const MOST_UNCOVERED_NAMED: usize = 16;
+
+/// The lines block of the note of bodies a macro wrote that no entry covers: no task's (its
+/// domain is no task name's), stable across requests.
+const UNCOVERED_NOTE: &[u8] = b"{bodies a macro wrote that no entry covers}";
+
+/// The label of the root's `fn main` that D104's launcher replaced (body_types/covered.rs
+/// `Root::label`): its findings are at the entry's start, said so (`WRITTEN_UNPLACED`).
+const REPLACED_MAIN: &str = "{the expansion that took `main`}";
+
+
 /// One `BodyCheck` task a body part of each outlined file, sorted by name (one per name).
 pub(crate) fn plan<'h>(outlined: &[Outlined<'_>], alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
     let mut planned: SVec<'h, Planned> = SVec::new_in(alloc);
@@ -131,6 +144,9 @@ pub(crate) enum Said {
     /// `BodyOut::said`'s `NotChecked` and `BorrowsNotChecked` lines, said.rs's words), each
     /// line "<cause>: <words>", joined by "; " ("" when the verdict said none).
     Unchecked(&'static str),
+    /// Types checked whole; the move and borrow check refused: its verdict's words why, as
+    /// [`Said::Unchecked`]'s (a [`crate::engine_lines::Class::Borrows`] note, never a failure).
+    BorrowsUnchecked(&'static str),
 }
 
 /// One body as the phase took it: what the printer and the profile read.
@@ -158,9 +174,10 @@ pub(crate) struct Ran<'f> {
     pub(crate) head_failed: Option<crate::engine_seeds::FirstFailure>,
     /// Its entry's chain (work.rs `item_chain`; 0 when it was not found).
     chain: u64,
-    /// Its verdict's findings, sorted by (start, end, rule, message): printed as `check` prints
-    /// them ([`BodiesStage::lines`]).
-    found: Vec<BodyFinding, Global>,
+    /// Its verdict's findings, sorted by (place, rule, message): printed as `check` prints them
+    /// ([`BodiesStage::lines`]). Made in the body's scratch, copied once as the task ends into
+    /// its run's output and at the merge into the request's frame: no list a body on the heap.
+    found: &'f [BodyFinding<'f>],
     /// How many item bodies its check took (its own, those an expansion at its entry wrote and
     /// those of its blocks' modules; 0 when it was not checked): what the profile's "item
     /// bodies" count sums, each body once (rule 77).
@@ -186,6 +203,11 @@ struct Took<'f> {
 #[derive(Clone, Copy)]
 struct Place<'f> {
     chain: u64,
+    /// The entry's file, as its crate's records number it (front2 `Records::file_now`), and the
+    /// entry's range in that text: where a stretch reads the item's text to say its findings'
+    /// ranges as token places ([`found_of`]).
+    file: u32,
+    item: blaze_surface::Range,
     /// One a body the task checks, in the order of its keys: `None` for the entry's own body
     /// (its findings' ranges are from the item's start); else a body whose text's place in the
     /// file is not known, by its label, so each finding is at the item's start, said so: a body
@@ -222,12 +244,98 @@ impl core::fmt::Display for BlockLabel<'_, '_> {
 }
 
 /// One finding of a body task, as `check` files it (body_types.rs, where a body's findings are
-/// filed): its rule, its range from its item's start, and its message's pieces joined.
-struct BodyFinding {
+/// filed): its rule, where it is in its item ([`FoundAt`]), and its message's pieces joined.
+#[derive(Clone, Copy)]
+struct BodyFinding<'f> {
     rule: u16,
-    start: u32,
-    end: u32,
-    message: Vec<u8, Global>,
+    at: FoundAt,
+    message: &'f [u8],
+}
+
+/// What a run hands on beside its `Done`s, filled as each body's task ends: each finding as
+/// (the body's index in the run's `Ran`s, rule, place, its message's range in `messages`), in
+/// the body's sorted order. The phase's arena, never the process heap; copied once into the
+/// request's frame at the merge ([`BodiesStage::run_phase`]).
+struct RunOut<'a> {
+    found: SVec<'a, (u32, u16, FoundAt, u32, u32)>,
+    messages: SVec<'a, u8>,
+    /// The most a body's scratch frame held when its body ended ([`BODY_SCRATCH`]): one body's
+    /// alone when the scratch is reset per body, all the run's when it is not (the plant).
+    scratch_most: u64,
+}
+
+impl<'a> RunOut<'a> {
+    fn new(alloc: SharedAlloc<'a>) -> RunOut<'a> {
+        RunOut { found: SVec::new_in(alloc), messages: SVec::new_in(alloc), scratch_most: 0 }
+    }
+}
+
+/// A body's scratch frame (its findings and their messages while the body is checked), reset
+/// when the body ends (rule 11): reserved once a run, nothing committed until used.
+const BODY_SCRATCH: usize = 1 << 26;
+
+/// The floor of what the stage holds a body after its task ends (rule 67): its task's name (the
+/// key it is found by), its record's key (the verdict's digest) and a status byte.
+pub(crate) const HELD_FLOOR: usize = core::mem::size_of::<Name>() + core::mem::size_of::<ContentId>() + 1;
+
+/// What the stage holds past the bodies' tasks ([`BodiesStage::held`]): every body's row, its
+/// label, findings and note words, summed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Held {
+    pub(crate) bodies: u64,
+    pub(crate) bytes: u64,
+}
+
+impl Held {
+    /// Bytes held a body, rounded down (0 with no body).
+    pub(crate) fn per_body(self) -> u64 {
+        self.bytes.checked_div(self.bodies).unwrap_or(0)
+    }
+}
+
+/// PLANTED BUG, tests only (rule 23): a body's scratch is never reset between bodies, so a run's
+/// scratch holds every body's findings at once; the answers must not change. Read on the
+/// coordinator's thread when a phase begins ([`BodiesStage::run_phase`]).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PLANT_KEEP_SCRATCH: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// PLANTED BUG, tests only (rule 23): the old arm of `groups`, every body entry the records
+    /// list no body at taken as no unit's (`ENTRY_ABSENT`), silent: the control of the coverage
+    /// tests. Read on the coordinator's thread ([`absent_entry`]).
+    pub(crate) static PLANT_SILENT_ABSENT: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn planted_keep_scratch() -> bool {
+    PLANT_KEEP_SCRATCH.with(core::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn planted_keep_scratch() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn planted_silent_absent() -> bool {
+    PLANT_SILENT_ABSENT.with(core::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn planted_silent_absent() -> bool {
+    false
+}
+
+/// Where a body's finding is in its item. By tokens, never bytes (rule 71): the task's key is
+/// its item's tokens (blaze-file-items, "Identity"), so it stands across a comment or a reformat
+/// and its stored lines are printed again unentered; a byte range would then point into the old
+/// layout, a token place points at the same tokens in the new (`blaze_file_items::place_bytes`,
+/// at print time).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FoundAt {
+    /// At the item's start: a body whose text's place in its file is not known ([`Unplaced`]).
+    Start,
+    /// These tokens of the item's text, counted from its first token.
+    Tokens(parser::token_key::TokenPlace),
 }
 
 /// One member crate's check scope as a run reads it: all read-only, shared by its runs. Its
@@ -533,6 +641,15 @@ pub(crate) struct BodiesStage<'f> {
     pub(crate) runs: u32,
     /// Bodies a macro wrote that no entry covers (`Found::uncovered`), said in the profile.
     uncovered: u32,
+    /// Their note's words, the first named by label ([`MOST_UNCOVERED_NAMED`], [`Uncovered`]):
+    /// the request's lines say them ([`BodiesStage::plan_lines`]), so none is left out in
+    /// silence (rule 3). `None`: every body a macro wrote is covered.
+    uncovered_note: Option<&'static str>,
+    /// Whether this request's phase found the members' records (`groups` ran whole): else the
+    /// uncovered note stands from the last request's lines.
+    groups_found: bool,
+    /// The most a body's scratch frame held when its body ended, over every run ([`RunOut`]).
+    scratch_most: u64,
     /// The bodies checked from the request's frozen heads, refused at a seed, and their rounds
     /// (engine_seeds.rs `SeedTally`), summed over every run.
     pub(crate) seeds: crate::engine_seeds::SeedTally,
@@ -556,6 +673,9 @@ impl<'f> BodiesStage<'f> {
             wall_ns: 0,
             runs: 0,
             uncovered: 0,
+            uncovered_note: None,
+            groups_found: false,
+            scratch_most: 0,
             seeds: crate::engine_seeds::SeedTally::default(),
             heads_failed: crate::engine_head_notes::Failed::new(),
             outside: crate::engine_body_plan::Outside::new(),
@@ -577,11 +697,24 @@ impl<'f> BodiesStage<'f> {
     /// was entered.
     pub(crate) fn plan_lines(&self, outlined: &[Outlined<'_>], last: Option<&crate::engine_lines::Last<'_, '_>>, lines: &mut crate::engine_lines::Lines<'_>) {
         self.outside.lines(self.ran.iter().map(|one| one.file), outlined, last, lines);
+        // The bodies a macro wrote that no task checks: named once a request, never silent.
+        // Decided by this request's phase when it read the members' records; else the last
+        // request's note stands (nothing it is a function of was read again).
+        let name = crate::engine_body_plan::note_name(UNCOVERED_NOTE);
+        match (self.groups_found, self.uncovered_note) {
+            (true, Some(words)) => lines.note(name, crate::engine_lines::Class::Unchecked, words.as_bytes()),
+            (true, None) => {}
+            (false, _) => {
+                if let Some(block) = last.and_then(|last| last.block(name)) {
+                    lines.keep(name, block);
+                }
+            }
+        }
     }
 
     /// Whether every body entered was checked: none refused, none in a file no crate holds.
     pub(crate) fn whole(&self) -> bool {
-        self.ownerless == 0 && self.ran.iter().all(|one| one.said.is_none())
+        self.ownerless == 0 && self.ran.iter().all(|one| matches!(one.said, None | Some(Said::BorrowsUnchecked(_))))
     }
 
     /// One Bodies phase: every task entered once, its result in `buffer`.
@@ -599,6 +732,7 @@ impl<'f> BodiesStage<'f> {
         alloc: SharedAlloc<'a>,
         frame: &'f Frame,
         request_heads: Option<&crate::engine_seeds::RequestTable>,
+        listings: &crate::engine_heads::Listings,
     ) -> Result<(), CliError> {
         let cx = cx.span("engine: one bodies phase");
         let began = handles.clock.now();
@@ -671,7 +805,7 @@ impl<'f> BodiesStage<'f> {
                             // (engine_body_plan.rs `Outside::lines`), so the row keeps the certificate.
                             buffer.done.push(Done { name, key: task.key, out: crate::engine_body_plan::outside_out(name), defines: SVec::new_in(alloc), reads, findings: 0, failed: false });
                             self.outside.push(name, file, is);
-                            self.ran.push(Ran { name, label, file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 0, said: None, head_failed: None, chain: 0, found: Vec::new_in(Global), items: 0 });
+                            self.ran.push(Ran { name, label, file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 0, said: None, head_failed: None, chain: 0, found: &[], items: 0 });
                             continue;
                         }
                         // No member crate's records hold the body's file: checked by no crate. It
@@ -689,7 +823,7 @@ impl<'f> BodiesStage<'f> {
                             }
                             let out = ContentId::of(OWNERLESS_DOMAIN, &name.subject.0);
                             buffer.done.push(Done { name, key: task.key, out, defines: SVec::new_in(alloc), reads, findings: 0, failed: false });
-                            self.ran.push(Ran { name, label: "", file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 0, said: None, head_failed: None, chain: 0, found: Vec::new_in(Global), items: 0 });
+                            self.ran.push(Ran { name, label: "", file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 0, said: None, head_failed: None, chain: 0, found: &[], items: 0 });
                             continue;
                         }
                     }
@@ -706,7 +840,7 @@ impl<'f> BodiesStage<'f> {
                 true => planned_label(&mut labels, &cx, handles.root, handles.outlined, file, name, frame),
                 false => label,
             };
-            self.ran.push(Ran { name, label, file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 1, said: Some(Said::Refused(refused)), head_failed: None, chain: 0, found: Vec::new_in(Global), items: 0 });
+            self.ran.push(Ran { name, label, file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 1, said: Some(Said::Refused(refused)), head_failed: None, chain: 0, found: &[], items: 0 });
         }
         self.outside.finish();
         // 3. Your code first is the next piece (engine.md 4); today: by member, file, name.
@@ -723,9 +857,11 @@ impl<'f> BodiesStage<'f> {
             from = to;
         }
         self.runs = u32::try_from(runs.len()).unwrap_or(u32::MAX);
-        let mut buffers: Vec<(Buffer<'a>, Vec<Ran<'f>, Global>), Global> = Vec::new_in(Global);
+        // Each run's results in the phase's arena: its `Done`s, its bodies' rows and their
+        // findings ([`RunOut`]); merged below, never kept on the process heap.
+        let mut buffers: SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)> = SVec::with_capacity_in(runs.len(), alloc);
         for _ in 0..runs.len() {
-            buffers.push((Buffer::new_in(alloc), Vec::new_in(Global)));
+            buffers.push((Buffer::new_in(alloc), SVec::new_in(alloc), RunOut::new(alloc)));
         }
         let Some(found) = found.as_ref() else {
             // Nothing to run: every task's result is in `buffer` above.
@@ -736,7 +872,8 @@ impl<'f> BodiesStage<'f> {
         self.uncovered = found.uncovered;
         let (packs, corrected) = found.trees;
         let procs = handles.names.and_then(|stage| stage.names.as_ref()).and_then(|names| names.procs());
-        let shared = Shared { root: handles.root, packs, corrected, procs, groups: &found.groups, heads: &found.heads, view, heap, shelf: &self.shelf, seeds: request_heads, heads_failed: &self.heads_failed, scope_reads: self.scope_reads, board: handles.board };
+        let keep_scratch = planted_keep_scratch();
+        let shared = Shared { listings, root: handles.root, packs, corrected, procs, groups: &found.groups, heads: &found.heads, view, heap, shelf: &self.shelf, seeds: request_heads, heads_failed: &self.heads_failed, scope_reads: self.scope_reads, board: handles.board, keep_scratch };
         // Each run's counts of its seeded bodies, summed after the join.
         let mut tallies: Vec<crate::engine_seeds::SeedTally, Global> = Vec::new_in(Global);
         tallies.resize(runs.len(), crate::engine_seeds::SeedTally::default());
@@ -745,11 +882,11 @@ impl<'f> BodiesStage<'f> {
             scope.narrow_workers(handles.workers, Class::Foreground);
             // One handle a run: as many as the project's bodies over `RUN`, so in the heap.
             let mut running = Vec::new_in(heap.alloc());
-            for ((run, (out, ran)), tally) in runs.iter().zip(buffers.iter_mut()).zip(tallies.iter_mut()) {
+            for ((run, (out, ran, run_out)), tally) in runs.iter().zip(buffers.iter_mut()).zip(tallies.iter_mut()) {
                 let shared = &shared;
                 let clock = handles.clock.clone();
                 running.push(scope.may_overlap("engine bodies run", BODIES_FRAME, move |cx: &Cx| {
-                    run_bodies(cx, shared, run, &clock, out, ran, tally, alloc);
+                    run_bodies(cx, shared, run, &clock, out, ran, run_out, tally, alloc);
                     Ok::<(), Infallible>(())
                 }));
             }
@@ -767,13 +904,38 @@ impl<'f> BodiesStage<'f> {
         for tally in tallies.iter() {
             self.seeds.add(tally);
         }
-        for (mut out, ran) in buffers.into_iter() {
+        for (mut out, mut ran, run_out) in buffers.into_iter() {
             buffer.done.append(&mut out.done);
             buffer.made.append(&mut out.made);
             for one in ran.iter() {
                 times.push(one.name, one.ns);
             }
-            self.ran.extend(ran);
+            // The run's findings into the request's frame, once: one copy of its messages, and
+            // each body's findings as one slice beside its row (rule 51: written once, read in
+            // place by the print).
+            self.scratch_most = self.scratch_most.max(run_out.scratch_most);
+            let messages: &'f [u8] = {
+                let mut copy: Vec<u8, &'f Frame> = Vec::with_capacity_in(run_out.messages.len(), frame);
+                copy.extend_from_slice(&run_out.messages);
+                &*copy.leak()
+            };
+            let mut at = 0usize;
+            while at < run_out.found.len() {
+                let body = run_out.found[at].0;
+                let mut to = at;
+                while to < run_out.found.len() && run_out.found[to].0 == body {
+                    to += 1;
+                }
+                let mut one_found: Vec<BodyFinding<'f>, &'f Frame> = Vec::with_capacity_in(to - at, frame);
+                for &(_, rule, place, from, end) in run_out.found[at..to].iter() {
+                    // In range by construction: `run_stretch` pushed both together.
+                    one_found.push(BodyFinding { rule, at: place, message: &messages[from as usize..end as usize] });
+                }
+                // The run's own index of the body whose task pushed them.
+                ran[body as usize].found = &*one_found.leak();
+                at = to;
+            }
+            self.ran.extend(ran.drain(..));
         }
         self.ran.sort_unstable_by_key(|one| one.name);
         self.wall_ns = self.wall_ns.saturating_add(handles.clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)));
@@ -786,6 +948,9 @@ impl<'f> BodiesStage<'f> {
     fn groups<'r>(&mut self, cx: &Cx, store: &mut dyn crate::store::Store<'r>, read: &mut EngineRecords<'r>, handles: &Handles<'_, '_, '_, '_>, frame: &'f Frame) -> Result<Result<Found<'f, 'r>, Stop<'f>>, CliError> {
         let heap = handles.env.heap;
         let g = heap.alloc();
+        // Set again when this phase finds the members' records whole (the end of this fn).
+        self.groups_found = false;
+        self.uncovered_note = None;
         // No `UnitGraph` task was planned (no lock file to match) and no `Names` stage ran: no
         // cell of this command says so, so these two stops read nothing and are owed, entered
         // again each request, until the plan's own inputs (the manifests and the lock, plan row
@@ -830,6 +995,8 @@ impl<'f> BodiesStage<'f> {
         // records could be read" reads.
         let mut member_cells: Vec<CellId, Global> = Vec::new_in(Global);
         let mut uncovered = 0u32;
+        // The first of them by label (at most [`MOST_UNCOVERED_NAMED`]), in the request's heap.
+        let mut uncovered_named: Vec<&'static str, blaze_own::Alloc<'static>> = Vec::new_in(g);
         let mut heads: Vec<([u8; 8], u32, Name), Global> = Vec::new_in(Global);
         let procs = names.names.as_ref().and_then(|names| names.procs());
         let input_at = |at: usize| names.input_of(blaze_drive::key::crate_scope_name(&list.key(at)));
@@ -967,21 +1134,33 @@ impl<'f> BodiesStage<'f> {
                     Some(texts) => (crate::body_types::covered::written_by(records, texts, &listed, g), crate::body_types::covered::in_blocks(records, texts, &listed, g)),
                     None => (blaze_own::AVec::new_in(g), Ok(blaze_own::AVec::new_in(g))),
                 };
-                (records, index_by_chain(records, &mine, &blaze_file_items::item_chain, g), written, blocks)
+                // The unit's cfg, as the names library lowered the crate (body_types.rs
+                // `Checker::holds`): what tells an entry a `cfg` left out from one the records
+                // lost ([`absent_entry`]).
+                let cfg = NamesSource::cfg_atoms(records, 0).map(|atoms| blaze_scope::task::Cfg::from_atoms(atoms, g));
+                (records, index_by_chain(records, &mine, &blaze_file_items::item_chain, g), written, blocks, cfg)
             });
             // The bodies a macro wrote that no entry covers: neither at a file entry nor in a
-            // block's module (counted and named in the profile, never dropped in silence).
-            if let Some((records, _, written, Ok(blocks))) = index.as_ref() {
+            // block's module: each NAMED in the request's lines (`plan_lines`), never dropped in
+            // silence (rule 3), and counted in the profile.
+            if let Some((records, _, written, Ok(blocks), _)) = index.as_ref() {
                 for w in written.iter().filter(|w| w.top.is_err()) {
                     let key = crate::body_types::covered::body_key(records, w.listed.body);
                     if !key.is_some_and(|key| blocks.iter().any(|one| one.key == key)) {
                         uncovered = uncovered.saturating_add(1);
+                        if uncovered_named.len() < MOST_UNCOVERED_NAMED {
+                            uncovered_named.push(crate::engine_head_notes::leak(g, format_args!("{}", crate::body_types::covered::written_label(records, w))));
+                        }
                     }
                 }
             }
+            // The member's crate root, by its path: its top-level `fn main` is D104's
+            // (body_types/covered.rs `root_of`, `Root::Replaced`).
+            let root_path = list.root(member).strip_prefix("/0/").unwrap_or(list.root(member));
             for &(file, outline_at) in files.iter() {
                 let file_name = handles.outlined[outline_at as usize].name;
-                let Some((records, chains, written, blocks)) = index.as_ref() else {
+                let root_file = handles.outlined[outline_at as usize].path.as_slice() == root_path.as_bytes();
+                let Some((records, chains, written, blocks, cfg)) = index.as_ref() else {
                     // Its file is the member's; its scope could not be read: every body says why.
                     let (why, reads) = refused.unwrap_or((RULE, empty));
                     member_files.push(FileClaim { at: outline_at, unit, is: FileIs::Refused(why), reads });
@@ -1021,10 +1200,26 @@ impl<'f> BodiesStage<'f> {
                         // walk that ends in a file is no block's): so checked once (rule 77).
                         let mut keys: Vec<ItemKey, _> = Vec::new_in(g);
                         let mut labels: Vec<Option<Unplaced<'f>>, _> = Vec::new_in(g);
+                        // COVERAGE (body_types/covered.rs, the reference): every body of the entry
+                        // is in its task's list, or the entry is refused by name; an entry is left
+                        // to no unit (`ENTRY_ABSENT`) only when its `cfg` is false for this unit.
                         let own = match chains {
                             Err(_) => Err("its file's bodies could not be indexed by their outline entries (front2 project_records.rs `index_by_chain`)"),
-                            Ok(_) if !body => {
-                                let mut missing = Ok(());
+                            Ok(chains) => 'own: {
+                                // 1. The entry's own body, listed at its chain.
+                                let listed = if body { chains.get(file, blaze_file_items::item_chain(outline, item, text)) } else { None };
+                                if let Some(listed) = listed {
+                                    match crate::body_types::covered::body_key(records, listed) {
+                                        Some(key) => {
+                                            keys.push(key);
+                                            labels.push(None);
+                                        }
+                                        None => break 'own Err("a member the records list has no key of its own"),
+                                    }
+                                }
+                                // 2. Each body an expansion at the entry wrote: an expansion
+                                // entry's, and an attribute's at a body entry (its output kept or
+                                // replaced the item: D122, the entry's task checks them).
                                 for w in written.iter().filter(|w| w.top == top) {
                                     match crate::body_types::covered::body_key(records, w.listed.body) {
                                         Some(key) => {
@@ -1033,23 +1228,23 @@ impl<'f> BodiesStage<'f> {
                                             let shown: &'f str = core::str::from_utf8(shown.into_bytes().leak()).unwrap_or("");
                                             labels.push(Some(Unplaced { label: shown, words: crate::body_types::covered::WRITTEN_UNPLACED }));
                                         }
-                                        None => missing = Err("a member a macro wrote has no key of its own in its crate's records"),
+                                        None => break 'own Err("a member a macro wrote has no key of its own in its crate's records"),
                                     }
                                 }
-                                missing
-                            }
-                            Ok(chains) => match chains.get(file, blaze_file_items::item_chain(outline, item, text)) {
-                                Some(body) => match crate::body_types::covered::body_key(records, body) {
-                                    Some(key) => {
-                                        keys.push(key);
-                                        labels.push(None);
-                                        Ok(())
+                                // 3. A body entry the records list no body at, and no macro wrote
+                                // one at: the root's replaced `fn main`, a `cfg` that is false
+                                // (not this unit's), or a refusal naming why (never silent).
+                                if body && keys.is_empty() {
+                                    match absent_entry(records, outline, item, text, root_file, cfg.as_ref(), g) {
+                                        Ok(key) => {
+                                            keys.push(key);
+                                            labels.push(Some(Unplaced { label: REPLACED_MAIN, words: crate::body_types::covered::WRITTEN_UNPLACED }));
+                                        }
+                                        Err(why) => break 'own Err(why),
                                     }
-                                    None => Err("a member the records list has no key of its own"),
-                                },
-                                // Not this unit's body (engine_body_plan.rs `BodyIs::Absent`).
-                                None => Err(crate::engine_body_plan::ENTRY_ABSENT),
-                            },
+                                }
+                                Ok(())
+                            }
                         };
                         let found = match (own, blocks) {
                             (Err(why), _) => Err(why),
@@ -1073,7 +1268,7 @@ impl<'f> BodiesStage<'f> {
                                 Ok((at, &*keys.leak()))
                             }
                         };
-                        let place = Place { chain: work::item_chain(outline, item, text), written: &*labels.leak() };
+                        let place = Place { chain: work::item_chain(outline, item, text), file, item: item.range, written: &*labels.leak() };
                         if grown.is_ok() {
                             grown = EngineCheckError::push(&mut took, Took { name, label, item: found, place, unit }, "the bodies found in their crates' records (engine_bodies.rs `groups`)");
                         }
@@ -1109,6 +1304,8 @@ impl<'f> BodiesStage<'f> {
         heads.dedup();
         member_cells.sort_unstable();
         member_cells.dedup();
+        self.uncovered_note = (uncovered > 0).then(|| crate::engine_head_notes::leak(g, format_args!("{}", Uncovered { count: uncovered, named: &uncovered_named })));
+        self.groups_found = true;
         Ok(Ok(Found { groups, took, holders, members, member_cells, heads, uncovered, trees: (packs, corrected) }))
     }
 
@@ -1124,11 +1321,19 @@ impl<'f> BodiesStage<'f> {
             let file = outlined.get(one.file as usize).ok_or(EngineCheckError::Unplaced { body: name, what: "its file is none of the planner's outlines" })?;
             let edition = blaze_surface::Edition::from_byte(file.edition).ok_or(EngineCheckError::Unplaced { body: name, what: "its file's edition byte is no edition" })?;
             for found in one.found.iter() {
-                lines.placed(name, found.rule, found.start, found.end, &file.path, one.chain, edition, &found.message);
+                match found.at {
+                    FoundAt::Start => lines.placed(name, found.rule, 0, 0, &file.path, one.chain, edition, &found.message),
+                    // Printed at the tokens' bytes in the item as it is when printed (print.rs).
+                    FoundAt::Tokens(at) => lines.placed_tokens(name, found.rule, at, &file.path, one.chain, edition, &found.message),
+                }
             }
         }
         if let Some(words) = self.note(name, outlined, frame) {
-            let class = if self.not_checked(name) { crate::engine_lines::Class::Unchecked } else { crate::engine_lines::Class::Failure };
+            let class = match &one.said {
+                Some(Said::BorrowsUnchecked(_)) => crate::engine_lines::Class::Borrows,
+                _ if self.not_checked(name) => crate::engine_lines::Class::Unchecked,
+                _ => crate::engine_lines::Class::Failure,
+            };
             lines.note(name, class, words.as_bytes());
         }
         if let Some(first) = one.head_failed {
@@ -1155,6 +1360,7 @@ impl<'f> BodiesStage<'f> {
             Some(Said::Refused(why)) => Some(bstd::mem::format_in!(frame, "`{path}`: the body of `{item}` was not checked: {why} ({RULE})")),
             Some(Said::Unchecked("")) => Some(bstd::mem::format_in!(frame, "`{path}`: body `{item}`: not checked whole: its verdict failed and said no cause (front2 tables/task.rs `said_of`; {RULE})")),
             Some(Said::Unchecked(why)) => Some(bstd::mem::format_in!(frame, "`{path}`: body `{item}`: {why}")),
+            Some(Said::BorrowsUnchecked(why)) => Some(bstd::mem::format_in!(frame, "`{path}`: body `{item}`: types checked; {why}")),
             None => None,
         }
     }
@@ -1194,6 +1400,23 @@ impl<'f> BodiesStage<'f> {
         (notes, clean.saturating_sub(self.ownerless).saturating_sub(self.outside.len()))
     }
 
+    /// What the stage holds past its bodies' tasks, an upper bound: each body's row, its label's
+    /// bytes, its findings (rows and messages) and its note's words, summed over the bodies
+    /// entered (a label or words shared by many bodies is counted at each). Its floor is
+    /// [`HELD_FLOOR`] a body (rule 67); the profile's `bodies:` line says both.
+    pub(crate) fn held(&self) -> Held {
+        let mut bytes = 0u64;
+        for one in self.ran.iter() {
+            let words = match one.said {
+                Some(Said::Refused(words) | Said::Unchecked(words) | Said::BorrowsUnchecked(words)) => words.len(),
+                Some(Said::Task(_) | Said::Panicked | Said::FrameUsedUp { .. }) | None => 0,
+            };
+            let found: usize = one.found.iter().map(|f| core::mem::size_of::<BodyFinding<'_>>() + f.message.len()).sum();
+            bytes = bytes.saturating_add((core::mem::size_of::<Ran<'_>>() + one.label.len() + found + words) as u64);
+        }
+        Held { bodies: self.ran.len() as u64, bytes }
+    }
+
     /// The profile's lines: per body microseconds (sum, median, the 10 slowest with their
     /// paths), bodies per second of CPU, and the phase's wall against its CPU.
     pub(crate) fn profile(&self, outlined: &[Outlined<'_>], workers: NonZeroU32, into: &mut blaze_own::String<&Frame>) {
@@ -1209,6 +1432,17 @@ impl<'f> BodiesStage<'f> {
         for path in self.ownerless_paths(outlined).iter() {
             let _ = writeln!(into, "bodies: in no member's module tree: {path}");
         }
+        // What outlives the bodies' tasks (rule 67: the floor and the ratio), and the most one
+        // body's scratch held (reset as each body ends).
+        let held = self.held();
+        let _ = writeln!(
+            into,
+            "bodies: held per body {} bytes (floor {HELD_FLOOR}, {:.1}x) over {} bodies; a body's scratch at most {} bytes",
+            held.per_body(),
+            held.per_body() as f64 / HELD_FLOOR as f64,
+            held.bodies,
+            self.scratch_most
+        );
         // What the plan left to no unit (engine_body_plan.rs): entries, and files, counted.
         self.outside.profile(self.ran.len(), outlined, into);
         // Each item body is in one task's list alone (engine_bodies.rs `groups`), so this sum
@@ -1240,6 +1474,9 @@ impl<'f> BodiesStage<'f> {
 
 /// What every run reads: all read-only and shared.
 struct Shared<'s, 'a, 'f, 'r> {
+    /// The request's listings of each crate's heads, made once a crate (engine_heads.rs
+    /// `Listings`, lane OW1): every stretch's `Owners` places its reads in them.
+    listings: &'s crate::engine_heads::Listings,
     root: &'s Dir<ReadWrite>,
     packs: &'s [blaze_fetch::PackView<'static>],
     corrected: &'s [(u32, &'static str, &'static str)],
@@ -1258,6 +1495,9 @@ struct Shared<'s, 'a, 'f, 'r> {
     /// How a body's names reads are kept (engine_scope_reads.rs).
     scope_reads: crate::engine_scope_reads::ScopeReadsAs,
     board: &'s crate::engine_status::Board<'s>,
+    /// PLANTED BUG when true, tests only ([`PLANT_KEEP_SCRATCH`]): a body's scratch is not
+    /// reset when it ends.
+    keep_scratch: bool,
 }
 
 /// A gauge that reads nothing: a body's [`Cost`] counts its rounds alone here (the profile's
@@ -1333,7 +1573,12 @@ const STRETCH_FULL: usize = BODIES_FRAME / 2;
 /// One run: its bodies checked in stretches, each over a frame of its own that ends with it
 /// ([`STRETCH_FULL`]), so no run uses up a frame however many bodies it holds.
 #[expect(clippy::too_many_arguments, reason = "a run's edge: each argument one handle of it")]
-fn run_bodies<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>], clock: &Clock, out: &mut Buffer<'a>, ran: &mut Vec<Ran<'f>, Global>, tally: &mut crate::engine_seeds::SeedTally, alloc: SharedAlloc<'a>) {
+fn run_bodies<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>], clock: &Clock, out: &mut Buffer<'a>, ran: &mut SVec<'a, Ran<'f>>, run_out: &mut RunOut<'a>, tally: &mut crate::engine_seeds::SeedTally, alloc: SharedAlloc<'a>) {
+    // The bodies' scratch: one reservation a run, reset as each body ends (rule 11).
+    let Ok(mut scratch) = Frame::with_reserve(BODY_SCRATCH, bstd::mem::Tag::Other) else {
+        refuse(run, "the scratch frame of its run's bodies could not be reserved (engine_bodies.rs `BODY_SCRATCH`)", out, ran, alloc);
+        return;
+    };
     let mut at = 0;
     while at < run.len() {
         let rest = &run[at..];
@@ -1345,7 +1590,7 @@ fn run_bodies<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>],
             return;
         }
         let took = match Frame::with_reserve(BODIES_FRAME, bstd::mem::Tag::Other) {
-            Ok(stretch) => run_stretch(cx, shared, rest, &stretch, clock, out, ran, tally, alloc),
+            Ok(stretch) => run_stretch(cx, shared, rest, &stretch, &mut scratch, clock, out, ran, run_out, tally, alloc),
             Err(_) => refuse(rest, "the frame of its run's stretch could not be reserved (engine_bodies.rs `BODIES_FRAME`)", out, ran, alloc),
         };
         at += took.max(1);
@@ -1353,12 +1598,12 @@ fn run_bodies<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>],
 }
 
 /// Every body of `rest` refused for one reason, each named (rule 3): how many it took (all).
-fn refuse<'a, 'f>(rest: &[One<'f>], why: &'static str, out: &mut Buffer<'a>, ran: &mut Vec<Ran<'f>, Global>, alloc: SharedAlloc<'a>) -> usize {
+fn refuse<'a, 'f>(rest: &[One<'f>], why: &'static str, out: &mut Buffer<'a>, ran: &mut SVec<'a, Ran<'f>>, alloc: SharedAlloc<'a>) -> usize {
     for one in rest {
         // A machine's refusal (a frame not reserved, records not opened in the run): a function
         // of no cell, so no read; owed (empty reads), entered again by the next request.
         out.done.push(crate::engine_tasks::failed(&one.task, alloc));
-        ran.push(Ran { name: one.task.planned.name, label: one.label, file: one.file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 1, said: Some(Said::Refused(why)), head_failed: None, chain: one.place.chain, found: Vec::new_in(Global), items: 0 });
+        ran.push(Ran { name: one.task.planned.name, label: one.label, file: one.file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 1, said: Some(Said::Refused(why)), head_failed: None, chain: one.place.chain, found: &[], items: 0 });
     }
     rest.len()
 }
@@ -1366,17 +1611,35 @@ fn refuse<'a, 'f>(rest: &[One<'f>], why: &'static str, out: &mut Buffer<'a>, ran
 /// One stretch of a run: its member's records opened once into `frame`, each body checked over
 /// one view until the frame is past [`STRETCH_FULL`]. How many bodies it took (at least one).
 #[expect(clippy::too_many_arguments, reason = "a stretch's edge: each argument one handle of it")]
-fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>], frame: &Frame, clock: &Clock, out: &mut Buffer<'a>, ran: &mut Vec<Ran<'f>, Global>, tally: &mut crate::engine_seeds::SeedTally, alloc: SharedAlloc<'a>) -> usize {
+fn run_stretch<'a, 'f>(
+    cx: &Cx,
+    shared: &Shared<'_, 'a, '_, '_>,
+    run: &[One<'f>],
+    frame: &Frame,
+    scratch: &mut Frame,
+    clock: &Clock,
+    out: &mut Buffer<'a>,
+    ran: &mut SVec<'a, Ran<'f>>,
+    run_out: &mut RunOut<'a>,
+    tally: &mut crate::engine_seeds::SeedTally,
+    alloc: SharedAlloc<'a>,
+) -> usize {
     let Some(first) = run.first() else { return 0 };
     let Some(group) = shared.groups.get(first.group as usize) else {
         return refuse(run, "a body's member group is gone", out, ran, alloc);
     };
     let g = shared.heap.alloc();
+    // The stretch's frame as an allocator: what is placed in the frame (which runs no drop)
+    // allocates its lists in the frame too, so they end with the stretch's reset. Before, the
+    // impl table's notes, the evaluator's sink and the constants' lists were placed in the frame
+    // but grew on the process heap (`g`), never freed until the request ended: the Bodies
+    // stage's growth on a 700-crate workspace (engine_bodies.rs memory table, lane BD1).
+    let fa = frame.alloc(blaze_own::Erased::new(frame)).handle();
     // The impls from the request's shelf: each impl question reads its crate's bucket cell
     // (front2 tables/task.rs `cell_id`), which the Heads stage defined. Held in the stretch's
     // frame, so it lives as long as the records it is read beside (`Tables` takes both for one
-    // lifetime); the frame runs no drop, so its notes stay in the request's heap until it ends.
-    let impls: &TableSet<'_> = frame.alloc(TableSet::lent(shared.shelf, g));
+    // lifetime); its notes in the frame too (`fa`).
+    let impls: &TableSet<'_> = frame.alloc(TableSet::lent(shared.shelf, fa));
     let Ok(env) = env_in(group.env, frame) else {
         return refuse(run, "its member's environment did not copy into the run (blaze-scope crate_env.rs `EnvLent::copy_in`)", out, ran, alloc);
     };
@@ -1394,12 +1657,12 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
     // frame runs no drop: the freezer's lists are in the frame too, through `fa`). A want is
     // placed by this stretch's names the one way `widen` places a read (engine_seeds.rs
     // `StretchHeads`), on the stack so its `Owners` is dropped with the stretch.
-    let stretch_heads = shared.seeds.map(|table| crate::engine_seeds::StretchHeads::new(table, shared.heads_failed, opened.records, shared.heads, &group.crates[..], g));
+    let stretch_heads = shared.seeds.map(|table| crate::engine_seeds::StretchHeads::new(table, shared.heads_failed, opened.records, shared.heads, &group.crates[..], shared.listings, g));
     // The seed freezer's constant evaluator: the head tasks' own (engine_head_consts.rs), its
     // lang index built by the one function a head task builds it by, once a stretch, and what
     // it reads kept as it grows (`EvalSink`), so each body's read list takes it ([`add_eval_reads`]).
     // Two crates declaring one lang item refuse the stretch by name, as they fail a head task.
-    let evaluated: &crate::engine_head_consts::EvalSink<'_> = frame.alloc(crate::engine_head_consts::EvalSink::new(g));
+    let evaluated: &crate::engine_head_consts::EvalSink<'_> = frame.alloc(crate::engine_head_consts::EvalSink::new(fa));
     let index: Option<&blaze_ladder::front2::index::Index<'_>> = match shared.seeds {
         Some(_) => match crate::engine_head_consts::lang_index(tables, evaluated, &group.lang) {
             Ok(index) => Some(&*frame.alloc(index)),
@@ -1420,9 +1683,13 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
                     }
                 });
             }
-            let fa = frame.alloc(blaze_own::Erased::new(frame)).handle();
-            let consts = index.map(|index| frame.alloc(crate::engine_head_consts::HeadConsts::new(tables.reading_into(evaluated), index, g)) as &mut (dyn ConstValues<'_> + '_));
-            let freezer = SeededHeads::new(SeededHeadsOpts { names: opened.records, sized, frame, scratch: g, alloc: fa, consts, known: Some(table), owners: None });
+            let consts = index.map(|index| frame.alloc(crate::engine_head_consts::HeadConsts::new(tables.reading_into(evaluated), index, fa)) as &mut (dyn ConstValues<'_> + '_));
+            // The program's receiver pointer types, as the Heads stage's freezes are made with
+            // (engine_heads.rs `heads_of`): without them this freezer would write other bytes
+            // under a dependency head's key (rule 21; lane H9).
+            let Some(index) = index else { return refuse(run, "its scope has no lang index for its receiver pointer types (engine_bodies.rs `run_stretch`)", out, ran, alloc) };
+            let pointers = blaze_ladder::front2::receiver::Pointers::find(index, blaze_ladder::resolve::Paths { names: tables });
+            let freezer = SeededHeads::new(SeededHeadsOpts { names: opened.records, sized, pointers, frame, scratch: g, alloc: fa, consts, known: Some(table), owners: None });
             Some(frame.alloc(RequestSeed::new(RequestSeedOpts { names: opened.records, heads: table, freezer, body_locals: table.body_locals() })))
         }
         None => None,
@@ -1431,7 +1698,9 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
     // seeded (runtime.md point 3).
     let cost: &Cost<'_> = frame.alloc(Cost::new(&NO_GAUGE));
     let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed, sources: Some(opened.sources), goals: None };
-    let mut owners = crate::engine_heads::Owners::new(shared.heads, &group.crates[..], g);
+    // Each crate's listing from the request's table (engine_heads.rs `Listings`): made once a
+    // request, not once a stretch that places a read in it.
+    let mut owners = crate::engine_heads::Owners::new(shared.heads, &group.crates[..], shared.listings, g);
     let mut taken = 0usize;
     for one in run {
         if taken > 0 && frame.used() > STRETCH_FULL {
@@ -1443,6 +1712,12 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
             break;
         }
         taken += 1;
+        // The body's scratch starts empty (rule 11): the last body's findings and words were
+        // copied out as it ended. Kept only under the plant (the answers must not change).
+        if !shared.keep_scratch {
+            scratch.reset();
+        }
+        let sc: &Frame = &*scratch;
         // The guard (rule 54): the frame's use before and after each body, one load each; a
         // later body's growth is what a question kept past its body (engine_memory.rs
         // `BodyFrames`).
@@ -1458,11 +1733,18 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
         let mut reads: SVec<'a, (CellId, ContentId)> = SVec::new_in(alloc);
         let mut single = None;
         let (mut findings, mut failed, mut said) = (0u32, false, None);
-        let mut why = std::string::String::new();
-        let mut found: Vec<BodyFinding, Global> = Vec::new_in(Global);
+        // The body's words why and its findings, in its scratch until the body ends.
+        let mut why = blaze_own::String::new_in(sc);
+        // Whether a cause of `why` is not about borrows alone: the body's types were then not
+        // checked whole ([`Said::Unchecked`]); else only its borrows were ([`Said::BorrowsUnchecked`]).
+        let mut types_short = false;
+        let mut found: Vec<BodyFinding<'_>, &Frame> = Vec::new_in(sc);
         let before = cost.spent();
         // A head the frozen form could not give it (rule 3: never lowered instead).
         let mut seed_refused = false;
+        // The entry's text as its bodies were checked from (its crate's records, the member at
+        // 0), and its crate's edition: what its findings' ranges are said as tokens of.
+        let item_text = opened.records.file_now(0, one.place.file).and_then(|text| text.get(one.place.item.to_usize())).zip(NamesSource::edition_of(opened.records, 0));
         for (at, item) in one.items.iter().enumerate() {
             let mut asked = one.task;
             asked.planned.name = Name::new(Kind::BodyCheck, item.0);
@@ -1480,6 +1762,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
                             && let Some(cut) = line.words.as_str().find(blaze_ladder::front2::MACRO_REFUSED)
                         {
                             let cause = &line.words.as_str()[cut + blaze_ladder::front2::MACRO_REFUSED.len()..];
+                            types_short = true;
                             if !why.contains(cause) {
                                 if !why.is_empty() {
                                     why.push_str("; ");
@@ -1490,11 +1773,12 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
                             }
                             continue;
                         }
-                        match found_of(line, written) {
+                        match found_of(line, written, item_text, sc) {
                             Ok(Some(one_found)) => found.push(one_found),
                             Ok(None) => {}
                             // Never quietly dropped (rule 3): the body is then not checked whole.
                             Err(cause) => {
+                                types_short = true;
                                 if !why.is_empty() {
                                     why.push_str("; ");
                                 }
@@ -1518,6 +1802,9 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
                             why.push_str(line.words.as_str());
                         }
                     }
+                    // A failed verdict whose only gap is the borrow check: types checked whole.
+                    let borrows_only = body.said.iter().any(|l| matches!(l.what, SaidWhat::BorrowsNotChecked)) && !body.said.iter().any(|l| matches!(l.what, SaidWhat::NotChecked { .. }));
+                    types_short |= body.done.failed && !borrows_only;
                     failed |= body.done.failed;
                     out.made.extend(body.made);
                     if one.items.len() == 1 {
@@ -1639,7 +1926,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
                 false => crate::engine_tasks::failed_with(&one.task, reads, alloc),
                 true => crate::engine_tasks::failed(&one.task, alloc),
             });
-            ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: 1, said, head_failed, chain: one.place.chain, found: Vec::new_in(Global), items: 0 });
+            ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: 1, said, head_failed, chain: one.place.chain, found: &[], items: 0 });
             continue;
         }
         // What the seed's constant evaluator read until now (module docs of
@@ -1660,11 +1947,11 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
             // A panic or a `TaskError` (check_body returns no reads with it): owed, never filed
             // on a partial read list (work.rs: panics and machine faults stay holes).
             out.done.push(crate::engine_tasks::failed(&one.task, alloc));
-            ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: 1, said: Some(said), head_failed: None, chain: one.place.chain, found: Vec::new_in(Global), items: 0 });
+            ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: 1, said: Some(said), head_failed: None, chain: one.place.chain, found: &[], items: 0 });
             continue;
         }
         // Rule 25: the lines record's bytes a function of the findings alone.
-        found.sort_unstable_by(|a, b| (a.start, a.end, a.rule, &a.message[..]).cmp(&(b.start, b.end, b.rule, &b.message[..])));
+        found.sort_unstable_by(|a, b| (a.at, a.rule, a.message).cmp(&(b.at, b.rule, b.message)));
         let mut done = match single {
             Some(done) => done,
             None => {
@@ -1694,6 +1981,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
                 done.defines.clear();
                 done.findings = done.findings.max(1);
             }
+            types_short = true;
             // After the body's own reason when it has one: both are said.
             if !why.is_empty() {
                 why.push_str("; ");
@@ -1702,9 +1990,22 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
         }
         // One a body not checked whole (its verdict failed, or a line of it could not be said
         // as a finding): in the request's heap, as the labels are.
-        let said = (done.failed || !why.is_empty()).then(|| Said::Unchecked(core::str::from_utf8(bstd::mem::format_in!(g, "{why}").into_bytes().leak()).unwrap_or("")));
+        let said = (done.failed || !why.is_empty()).then(|| {
+            let words = core::str::from_utf8(bstd::mem::format_in!(g, "{why}").into_bytes().leak()).unwrap_or("");
+            if types_short { Said::Unchecked(words) } else { Said::BorrowsUnchecked(words) }
+        });
         let items = u32::try_from(one.items.len()).unwrap_or(u32::MAX);
-        ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: done.findings, said, head_failed: None, chain: one.place.chain, found, items });
+        // Its findings out of its scratch into the run's output, keyed by its row's index there
+        // (the merge makes them the row's slice in the request's frame: [`RunOut`]).
+        let row = u32::try_from(ran.len()).unwrap_or(u32::MAX);
+        for one_found in found.iter() {
+            let from = u32::try_from(run_out.messages.len()).unwrap_or(u32::MAX);
+            run_out.messages.extend_from_slice(one_found.message);
+            let end = u32::try_from(run_out.messages.len()).unwrap_or(u32::MAX);
+            run_out.found.push((row, one_found.rule, one_found.at, from, end));
+        }
+        run_out.scratch_most = run_out.scratch_most.max(sc.used() as u64);
+        ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: done.findings, said, head_failed: None, chain: one.place.chain, found: &[], items });
         out.done.push(done);
     }
     // The stretch's records opened each expansion's origin column once (front2 source.rs
@@ -1719,9 +2020,10 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
 /// move or borrow finding as `BORROWS` (a note while `BORROWS_ARE_ERRORS` is false: print.rs);
 /// `None` for a not-checked line, which the body's note says. `written`: the label of a body a
 /// macro wrote, or of a block's module, whose findings are at its entry's start, and the words
-/// that say why. `Err`: the line cannot be said as a finding, and why (the body is then not
-/// checked whole: rule 3).
-fn found_of(line: &Line<'_>, written: Option<Unplaced<'_>>) -> Result<Option<BodyFinding>, &'static str> {
+/// that say why. `item`: the entry's text its bodies were checked from and its edition, which
+/// the entry's own findings' ranges are said as tokens of ([`FoundAt`]). `Err`: the line cannot
+/// be said as a finding, and why (the body is then not checked whole: rule 3).
+fn found_of<'s>(line: &Line<'_>, written: Option<Unplaced<'_>>, item: Option<(&str, blaze_surface::Edition)>, scratch: &'s Frame) -> Result<Option<BodyFinding<'s>>, &'static str> {
     let (rule, code) = match &line.what {
         SaidWhat::Type { code } => (crate::body_types::TYPES, Some(*code)),
         SaidWhat::Borrow { code } => (crate::body_types::BORROWS, Some(*code)),
@@ -1731,23 +2033,117 @@ fn found_of(line: &Line<'_>, written: Option<Unplaced<'_>>) -> Result<Option<Bod
         },
         SaidWhat::NotChecked { .. } | SaidWhat::BorrowsNotChecked => return Ok(None),
     };
-    let mut message = Vec::new_in(Global);
+    let mut message: Vec<u8, &'s Frame> = Vec::new_in(scratch);
     if let Some(code) = code {
         message.extend_from_slice(code.as_bytes());
         message.push(0x1F);
     }
-    let (start, end) = match written {
-        None => (line.start, line.end),
+    let at = match written {
+        None => {
+            let (text, edition) = item.ok_or(ITEM_TEXT_UNREAD)?;
+            let range = line.start as usize..line.end as usize;
+            FoundAt::Tokens(blaze_file_items::token_place(text, edition, range).map_err(|_| NOT_TOKENS)?)
+        }
         Some(unplaced) => {
             message.extend_from_slice(b"in `");
             message.extend_from_slice(unplaced.label.as_bytes());
             message.extend_from_slice(b"`, ");
             message.extend_from_slice(unplaced.words.as_bytes());
-            (0, 0)
+            FoundAt::Start
         }
     };
     message.extend_from_slice(line.words.as_str().as_bytes());
-    Ok(Some(BodyFinding { rule, start, end, message }))
+    Ok(Some(BodyFinding { rule, at, message: &*message.leak() }))
+}
+
+/// Why a body's finding has no place: its entry's text was not in its crate's records.
+const ITEM_TEXT_UNREAD: &str = "its entry's text is not in its crate's records (front2 `Records::file_now`), so its findings cannot be placed by tokens";
+/// Why a body's finding has no place: its range is no range of its item's tokens.
+const NOT_TOKENS: &str = "a finding's range starts or ends in trivia or cuts a token of its item (blaze_file_items::token_place, rule 71)";
+
+/// The note of the bodies a macro wrote that no entry covers: how many, the first by label.
+struct Uncovered<'l> {
+    count: u32,
+    named: &'l [&'static str],
+}
+
+impl core::fmt::Display for Uncovered<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} body(ies) a macro wrote are checked by no task: the walk up from their call ends at no file entry and in no block's module (body_types/covered.rs `written_by`, `in_blocks`)", self.count)?;
+        for (at, label) in self.named.iter().enumerate() {
+            f.write_str(if at == 0 { ": " } else { ", " })?;
+            write!(f, "`{label}`")?;
+        }
+        let rest = (self.count as usize).saturating_sub(self.named.len());
+        if rest > 0 {
+            write!(f, ", and {rest} more")?;
+        }
+        write!(f, "; not checked ({RULE})")
+    }
+}
+
+/// Why an entry has no body: its unit's cfg is not in its crate's records.
+const CFG_ATOMS_UNREAD: &str = "its crate's cfg atoms are not in its records (front2 source.rs `cfg_atoms`), so whether a `cfg` left this entry out cannot be told; not checked";
+/// Why an entry has no body: a `cfg` predicate on it does not read (body_types.rs `CFG_UNREAD`).
+const CFG_UNREAD: &str = "a `cfg` predicate on it or on an item it is written in does not read (blaze-scope `Cfg::eval`), so whether its crate holds it cannot be told; not checked";
+/// Why an entry has no body: its crate holds it under its cfg, yet its records list no body there.
+const ENTRY_UNLISTED: &str = "its crate holds it under its cfg, yet its crate's records list no body at this entry and no macro wrote one at it (front2 project_records.rs `index_by_chain`); not checked";
+/// Why the root's replaced `fn main` has no body to check: front2's root `main` has no place.
+const ROOT_MAIN_UNPLACED: &str = "this is the root's `fn main`, which D104's launcher replaced; the root `main` has no place in the records (body_types/covered.rs `root_of`); not checked";
+
+/// A body entry of a held file at which its unit's records list no body and no macro wrote one
+/// ([`BodiesStage::groups`], step 3), as body_types/covered.rs `root_of` and body_types.rs
+/// `Checker::holds` decide it (the reference for coverage): `Err(ENTRY_ABSENT)` when a `cfg` on
+/// it or on an item it is written in is false under the unit's cfg (not this unit's body: the
+/// Reference, "Conditional compilation"); the key of the launcher's `main` when it is the root
+/// file's top-level `fn main` (D104: the launcher `fn main() -> Exit { fn main(..) <the written
+/// body> .. }`; its local `main`, the body the user wrote, is checked by the task's work list,
+/// front2 tables/task.rs); else a refusal naming why. Never a silent absence (rule 3).
+fn absent_entry<'n>(
+    records: &'n blaze_ladder::front2::source::Records<'n>,
+    outline: &blaze_file_items::Outline<'_>,
+    item: &blaze_surface::Item,
+    text: &str,
+    root_file: bool,
+    cfg: Option<&blaze_scope::task::Cfg<'_, '_>>,
+    g: blaze_own::Alloc<'static>,
+) -> Result<ItemKey, &'static str> {
+    if planted_silent_absent() {
+        return Err(crate::engine_body_plan::ENTRY_ABSENT);
+    }
+    let Some(cfg) = cfg else { return Err(CFG_ATOMS_UNREAD) };
+    // Up the parents, bounded by the outline's length (rule 18).
+    let all = outline.items();
+    let mut at = Some(item);
+    let mut steps = 0usize;
+    while let Some(entry) = at {
+        let attrs = blaze_scope::task::item_attrs(cfg, outline, entry, text, g);
+        if attrs.cfg_unread > 0 {
+            return Err(CFG_UNREAD);
+        }
+        if !attrs.cfg_ok {
+            return Err(crate::engine_body_plan::ENTRY_ABSENT);
+        }
+        steps += 1;
+        if steps > all.len() {
+            return Err(CFG_UNREAD);
+        }
+        at = entry.parent.and_then(|p| all.get(p.0 as usize));
+    }
+    let root_main_entry = root_file && item.parent.is_none() && matches!(item.kind(), blaze_surface::ItemKind::Function) && crate::item_name::shown_name(item, text) == "main";
+    if !root_main_entry {
+        return Err(ENTRY_UNLISTED);
+    }
+    let key = blaze_ladder::front2::program::run_entry::root_main(records)
+        .map_err(|why| crate::engine_head_notes::leak(g, format_args!("this is the root's `fn main`, which D104's launcher replaced, and the launcher's `main` is not found: {why} (body_types/covered.rs `root_of`); not checked")))?;
+    match NamesSource::place_of(records, key).map(|p| p.at) {
+        Some(blaze_scope::resolve::At::Expansion(_)) => Ok(key),
+        Some(blaze_scope::resolve::At::File(file)) => Err(crate::engine_head_notes::leak(
+            g,
+            format_args!("this is the root's `fn main`, but the root `main` the records list is written in file {file} and not at this item (body_types/covered.rs `root_of`); not checked"),
+        )),
+        None => Err(ROOT_MAIN_UNPLACED),
+    }
 }
 
 /// A member's lent environment copied into `frame` (no allocator of the lending thread is

@@ -93,6 +93,7 @@ mod test_run;
 mod toolchain;
 mod units;
 mod work;
+mod check_command;
 mod engine_answer;
 mod engine_answer_rows;
 mod engine_check;
@@ -154,6 +155,9 @@ pub enum CliError {
     NotBuilt { command: &'static str },
     /// A word that is no command of blaze and never will be: the commands that do its work.
     NoSuchCommand { command: &'static str, instead: &'static str },
+    /// A flag of `check` that the engine's check (check_command.rs) does not honour yet: refused
+    /// by name, never quietly ignored and never run on the old checker instead (rule 3).
+    NotOnEngine { flag: &'static str, why: &'static str },
     Missing(Missing),
     Path(PathError),
     Fs(FsError),
@@ -246,7 +250,13 @@ pub enum CliError {
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CliError::Usage(what) => write!(f, "usage: blaze <check|run|test> [dir] [--color=auto|always|never] [--stats] [--workers N], blaze clean [dir] [--store], blaze explain [status]: {what}"),
+            CliError::Usage(what) => write!(
+                f,
+                "usage: blaze check [dir] [--color=auto|always|never] [--view person|agent|json] [--each] [--workers N] [--status-every S], blaze <run|test> [dir] [--stats] [--workers N], blaze clean [dir] [--store], blaze explain [status], blaze check-old [dir] (the old checker, kept for comparison until the switch is done, then deleted): {what}"
+            ),
+            CliError::NotOnEngine { flag, why } => {
+                write!(f, "`blaze check {flag}`: the engine's check does not take {flag} yet ({why}; check_command.rs); `blaze check-old {flag}` is the old checker's, which goes away")
+            }
             CliError::NotBuilt { command } => write!(f, "`blaze {command}` is not built on the new item layer yet (drive.md)"),
             CliError::NoSuchCommand { command, instead } => write!(f, "blaze has no `{command}` command: {instead}"),
             CliError::Missing(missing) => write!(f, "{missing}"),
@@ -269,7 +279,7 @@ impl fmt::Display for CliError {
             CliError::Store(failure) => write!(f, "{failure}"),
             CliError::BuildId(error) => write!(f, "{error}: blaze keys every record by its own code and will not run without that id"),
             CliError::Pool(error) => write!(f, "{error}"),
-            CliError::EngineCheck(error) => write!(f, "engine-check: {error}"),
+            CliError::EngineCheck(error) => write!(f, "check: {error}"),
             CliError::ProcAnswers(error) => write!(f, "{error}"),
             CliError::Clean(error) => write!(f, "{error}"),
             CliError::Input { name, why } => write!(f, "the input {name} a task needed could not be read: {why}"),
@@ -510,13 +520,24 @@ fn words<'o>(command: Command, out: &'o Out, err: &'o Out) -> &'o Out {
 /// What `blaze build` is told: the two commands that do what it would.
 const NO_BUILD: &str = "`blaze run` compiles what the program reaches and runs it; `blaze export` (not built yet) writes the program as a file";
 
+/// The old checker's word, and the first line it prints: what it is, that `check` is not it,
+/// and that it goes away (tests/check_command.rs reads the line's start).
+pub(crate) const CHECK_OLD: (&str, &str) = (
+    "check-old",
+    "check-old: the OLD checker (main.rs `request`, body_types.rs), kept only to compare with `blaze check`, which is the engine; it goes away when `run` and `test` leave it",
+);
+
 fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'static blaze_own::Heap) -> Result<Status, CliError> {
     let args = io.need_args()?;
     let (command, word) = match args.get(1) {
-        Some("check") => (Command::Check, "check"),
-        // `check` through the execution engine (engine_check.rs), `check`'s arguments; deleted
-        // at the switch, when `check` itself is this path.
-        Some("engine-check") => return engine_check::run(cx, io, out, phases, heap),
+        // `check` IS the execution engine (check_command.rs over engine_check.rs): one checker
+        // (rule 30). `engine-check` is its old name, an alias until the scripts that type it
+        // are moved.
+        Some("check" | "engine-check") => return check_command::run(cx, io, out, phases, heap),
+        // The old checker (`request`, body_types.rs), by its own word only, for comparison
+        // while the engine becomes the only checker: `check` never runs it (rule 3: no
+        // fallback). It goes away with `request` once `run` and `test` leave it too.
+        Some("check-old") => (Command::Check, "check-old"),
         Some("why") => return engine_check::why(cx, io, out, phases, heap),
         Some("run") => (Command::Run, "run"),
         Some("test") => (Command::Test, "test"),
@@ -527,7 +548,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
         // The checkout's state, and with `--store` the home's store, removed (clean.rs).
         Some("clean") => return clean::run(cx, io, &args, out),
         Some("store") => return store::publish_command::run(cx, io, out, err, heap),
-        Some(_) | None => return Err(CliError::Usage("the command is check, run, test, clean or explain")),
+        Some(_) | None => return Err(CliError::Usage("the command is check, run, test, clean or explain (or check-old, the old checker, going away)")),
     };
     let flags = flags(&args)?;
     if command != Command::Run && flags.select != run_package::Select::NONE {
@@ -576,6 +597,10 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
     };
     let mut shown = print::Shown::new(caps, view, shown_root.as_str(), frame);
     shown.each = flags.each;
+    // `check-old` says first what it is: its answer is the old checker's, never `check`'s.
+    if word == CHECK_OLD.0 {
+        print::note(cx, CHECK_OLD.1, &shown, frame, out)?;
+    }
     phases.mark_in("open checkout", frame);
     let mut ran = None;
     let workers = flags.workers.map_or(u32::try_from(workers).unwrap_or(u32::MAX), |n| n.get());
@@ -636,7 +661,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
                 }
                 let mut selectors: Vec<&str, &Frame> = Vec::with_capacity_in(end - start, frame);
                 selectors.extend((start..end).filter_map(|at| args.get(at)));
-                match fix_then_check::<fix::Atomic>(cx, &root, &selectors, (caps, view, shown_root.as_str()), frame, out, &mut |shown| ask(shown, &mut ran, phases, watch))? {
+                match fix_then_check::<fix::Atomic, _>(cx, &root, &selectors, (caps, view, shown_root.as_str()), frame, out, &mut |shown| ask(shown, &mut ran, phases, watch))? {
                     Fixed::Refused => Ok(None),
                     Fixed::Checked(finished, again) => Ok(Some((finished, again))),
                 }
@@ -753,27 +778,29 @@ fn close(cx: &Cx, command: Command, finished: &Finished<'_>, shown: &print::Show
     }
 }
 
-/// What `blaze check --fix` ended with.
-enum Fixed<'f> {
+/// What `blaze check --fix` ended with: `R` is the check's answer (main.rs `Finished` for
+/// `check-old`, engine_check.rs `Checked` for `check`).
+enum Fixed<'f, R> {
     /// A refusal was printed; nothing was written.
     Refused,
     /// The fixes were written and the check ran again: its answer, and what it printed.
-    Checked(Finished<'f>, print::Shown<'f>),
+    Checked(R, print::Shown<'f>),
 }
 
 /// `blaze check --fix <selector>...` (D70; fix.rs): the check run once with nothing printed, its
 /// findings chosen by `selectors` and their fixes written through `W` as one transaction (every
 /// refusal decided before a byte is written), then the check run again in the same command,
-/// printing what is left in the command's view. `run` is the request as `command` makes it.
-fn fix_then_check<'f, W: fix::Writer + Default>(
+/// printing what is left in the command's view. `run` is the request as the command makes it:
+/// the old checker's (`command`) or the engine's (engine_check.rs `serve`), one home for both.
+fn fix_then_check<'f, W: fix::Writer + Default, R>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     selectors: &[&str],
     (caps, view, shown_root): (blaze_report::frame::Caps, View, &'f str),
     frame: &'f Frame,
     out: &Out,
-    run: &mut dyn FnMut(print::Shown<'f>) -> Result<(Finished<'f>, print::Shown<'f>), CliError>,
-) -> Result<Fixed<'f>, CliError> {
+    run: &mut dyn FnMut(print::Shown<'f>) -> Result<(R, print::Shown<'f>), CliError>,
+) -> Result<Fixed<'f, R>, CliError> {
     let mut first = print::Shown::new(caps, view, shown_root, frame);
     first.quiet = true;
     let (_, first) = run(first)?;
@@ -812,7 +839,7 @@ pub(crate) const UNCHECKED_ITEMS: Status = Status(4);
 const STATUSES: [(u8, &str); 5] = [
     (0, "check: every stage `check` is defined to run ran and found nothing (run: the program's own status); clean: each folder it printed was removed, or it printed \"nothing to remove\""),
     (1, "check: an error was found, a task failed, or blaze itself failed (its message says which); run: the program's own status; clean: a folder was not blaze's, or the disk refused (named), and nothing after it was removed"),
-    (3, "check: incomplete: the stages this build runs found nothing, but a stage `check` is defined to run is not built yet (the closing line's \"NOT checked\" names which); not a pass"),
+    (3, "check: incomplete: the stages that ran found nothing, but a stage `check` is defined to run is not built yet or did not run whole (a body's borrow check refused, say); the closing line's \"NOT checked\" names which, and a note before it why; not a pass"),
     (4, "check: blaze could not check some items (each named by its cause in the \"not checked because ..\" lines, counted in \"the check is incomplete: blaze could not check N items\"); the code it did check had no error; not a pass"),
     (125, "run and test: blaze did not start the program (the manifest, a finding, a build or the start failed; its message says which); no program returned it"),
 ];
@@ -1930,6 +1957,7 @@ mod tests {
         }
     }
 
+    // The test modules, one a file under src/tests/ (a new test is a new file, its line here).
     mod check_whole_tests;
     mod draw_tests;
     mod extra_roots_tests;
@@ -1939,12 +1967,15 @@ mod tests {
     mod members_tests;
     mod names_records_tests;
     mod engine_check_tests;
+    mod engine_body_memory_tests;
+    mod engine_body_coverage_tests;
     mod engine_script_reads_tests;
     mod engine_script_reads_e2e_tests;
     mod engine_script_hole_tests;
     mod engine_memory_tests;
     mod engine_status_tests;
     mod engine_phase_mem_tests;
+    mod engine_tail_mem_tests;
     mod engine_body_frames_tests;
     mod engine_seeds_tests;
     mod engine_answer_rows_tests;
@@ -1966,9 +1997,14 @@ mod tests {
     mod engine_scope_reads_tests;
     mod engine_scope_reads_tables_tests;
     mod engine_edit_rows_tests;
-    mod engine_heads_cover_tests;
+    mod engine_token_keys_tests;
     mod engine_heads_once_tests;
+    mod engine_heads_cover_tests;
+    mod engine_heads_failed_once_tests;
+    mod engine_heads_found_tests;
+    mod engine_heads_split_tests;
     mod engine_heads_stop_tests;
+    mod engine_owners_once_tests;
     mod native_image_tests;
     mod include_data_tests;
     mod include_outside_tests;
@@ -2092,7 +2128,7 @@ mod tests {
         };
         let (finished, shown) = match fix {
             None => run(shown, &mut ran, &mut phases)?,
-            Some(selectors) => match fix_then_check::<W>(&cx, &root, selectors, (blaze_report::frame::Caps::LINES, view, "/ws"), frame, said, &mut |shown| run(shown, &mut ran, &mut phases))? {
+            Some(selectors) => match fix_then_check::<W, _>(&cx, &root, selectors, (blaze_report::frame::Caps::LINES, view, "/ws"), frame, said, &mut |shown| run(shown, &mut ran, &mut phases))? {
                 Fixed::Refused => return Ok(Checked::refused()),
                 Fixed::Checked(finished, shown) => (finished, shown),
             },

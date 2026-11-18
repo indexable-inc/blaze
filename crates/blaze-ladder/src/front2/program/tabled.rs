@@ -90,33 +90,19 @@ fn row<'n>(
     // store's (front2/panic_entry.rs `local_abi`, `local_name`).
     let local = |why: crate::front2::panic_entry::Refused| Front2Refusal::Attrs { function: function(), why: why.form().into() };
     let foreign = foreign.or_else(|| crate::front2::panic_entry::local_abi(store, key));
-    // A declaration of an `extern "llvm-intrinsic"` block has no calling convention and is no
-    // symbol to link: it IS the LLVM intrinsic its `link_name` names (front2/llvm_intrinsic.rs).
-    // So it is routed here, one call before the ABI's one rule (head_abi.rs, where such a block
-    // has no builder ABI). One in blaze-build's set (intrinsics/target.rs `named`, the one home
-    // of what the builder builds) is tabled for the walk to build in place; any other name is
-    // refused by name.
-    if foreign == Some(crate::front2::llvm_intrinsic::ABI) {
-        let symbol = crate::front2::llvm_intrinsic::symbol(symbols.link_name.as_deref())
-            .map_err(|why| Front2Refusal::Attrs { function: function(), why: why.form().into() })?;
-        let Ok(target) = blaze_build::intrinsics::target::named(symbol) else {
-            return Err(Front2Refusal::TargetIntrinsic { function: function(), symbol: symbol.into() });
-        };
-        // `Abi::C`: the convention blaze-build declares a barrier in (intrinsics/target.rs
-        // `build`); a call of an intrinsic row reads no ABI (the walk builds it in place).
-        // `nounwind`: an intrinsic is an instruction, never a callee that unwinds.
+    if let Some(llvm) = lazy::seam_rules::llvm_row(foreign, symbols.link_name.as_deref(), path)? {
         return Ok(Row {
             body: None,
             checked: None,
-            kind: FnKind::Free,
+            kind: llvm.kind,
             at,
-            abi: Abi::C,
-            nounwind: true,
-            track_caller: false,
-            symbol: Box::<str>::from(""),
+            abi: llvm.build.abi,
+            nounwind: llvm.build.nounwind,
+            track_caller: llvm.track_caller,
+            symbol: llvm.symbol.into(),
             export: symbols.export,
             lits: Literals::default(),
-            intrinsic: Some(Intrinsic::Target(target)),
+            intrinsic: Some(llvm.intrinsic),
         });
     }
     // The head's ABI, a foreign block's overriding it (head_abi.rs: one rule for the table's
@@ -134,28 +120,22 @@ fn row<'n>(
     // `__rust_no_alloc_shim_is_unstable_v2` is built in place as nothing (front2/alloc_shim.rs).
     let alloc_shim = crate::front2::alloc_shim::declares(names, store, key, alloc)
         .map_err(|why| Front2Refusal::Attrs { function: function(), why: why.detail() })?;
-    // Every other `extern "Rust"` `#[rustc_std_internal_symbol]` declaration is no symbol
-    // either: a call of one is a call of its definition (the walk queued it; `resolve` answers
-    // it) (front2/internal_symbol.rs).
-    let internal_symbol = crate::front2::internal_symbol::declares(names, store, key, alloc)
-        .map_err(|why| Front2Refusal::Attrs { function: function(), why: why.detail() })?;
-    let (body, checked, kind, symbol, lits) = match body {
-        Some((body, checked)) => {
+    let bound = lazy::seam_rules::bound_decl_row(names, store, key, panic_entry, alloc_shim, path)?;
+    let (body, checked, kind, symbol, lits) = match (body, bound) {
+        (Some((body, checked)), _) => {
             let lits = literals(&body, path)?;
             (Some(body), Some(checked), FnKind::Free, Box::<str>::from(""), lits)
         }
         // Tabled for its ABI alone (the builder reads a call's ABI from the item the call
         // names): no body, no symbol, never `Foreign`.
-        None if panic_entry => (None, None, FnKind::Free, Box::<str>::from(""), Literals::default()),
-        None if alloc_shim.is_some() => (None, None, FnKind::Free, Box::<str>::from(""), Literals::default()),
-        None if internal_symbol.is_some() => (None, None, FnKind::Free, Box::<str>::from(""), Literals::default()),
+        (None, Some((kind, symbol))) => (None, None, kind, symbol.into(), Literals::default()),
         // A declaration in an `extern` block is called by its symbol: its `#[link_name]`,
         // else its name.
-        None if foreign.is_some() && head.container.is_none() => {
+        (None, None) if foreign.is_some() && head.container.is_none() => {
             let symbol = symbols.link_name.unwrap_or_else(|| declared_name.unwrap_or(row_path.ident()).into());
             (None, None, FnKind::Foreign, symbol, Literals::default())
         }
-        None => {
+        (None, None) => {
             let kind = lazy::seam_rules::rust_row_kind(of_trait, symbols.intrinsic, path)?;
             (None, None, kind, Box::<str>::from(""), Literals::default())
         }

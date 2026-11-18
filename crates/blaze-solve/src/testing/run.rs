@@ -24,7 +24,7 @@ use crate::tys::Tys;
 pub const PRELUDE: &str = include_str!("../tests/cases/prelude.solve");
 
 /// The case files, by name.
-pub const FILES: [(&str, &str); 7] = [
+pub const FILES: [(&str, &str); 8] = [
     ("core.solve", include_str!("../tests/cases/core.solve")),
     ("builtin.solve", include_str!("../tests/cases/builtin.solve")),
     ("auto.solve", include_str!("../tests/cases/auto.solve")),
@@ -32,6 +32,7 @@ pub const FILES: [(&str, &str); 7] = [
     ("coherence.solve", include_str!("../tests/cases/coherence.solve")),
     ("dyn_auto.solve", include_str!("../tests/cases/dyn_auto.solve")),
     ("shadow.solve", include_str!("../tests/cases/shadow.solve")),
+    ("env_bounds.solve", include_str!("../tests/cases/env_bounds.solve")),
 ];
 
 /// What a run found.

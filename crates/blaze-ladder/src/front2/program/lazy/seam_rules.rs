@@ -22,8 +22,47 @@
 use super::*;
 
 use crate::front2::keys::Keys;
+use crate::front2::program::head_abi::BuildAbi;
 use crate::front2::source::NamesSource;
 use crate::seam::PositionGap;
+
+pub(in crate::front2::program) struct LlvmRow {
+    pub(in crate::front2::program) kind: FnKind,
+    pub(in crate::front2::program) build: BuildAbi,
+    pub(in crate::front2::program) track_caller: bool,
+    pub(in crate::front2::program) symbol: &'static str,
+    pub(in crate::front2::program) intrinsic: Intrinsic,
+}
+
+/// The block ABI selects an LLVM declaration. Its link name selects the instruction.
+/// The builder declares the instruction with the C convention and emits it in place.
+pub(in crate::front2::program) fn llvm_row(foreign: Option<&str>, link_name: Option<&str>, path: &str) -> Result<Option<LlvmRow>, Front2Refusal> {
+    use crate::front2::llvm_intrinsic;
+
+    if foreign != Some(llvm_intrinsic::ABI) {
+        return Ok(None);
+    }
+    let symbol = llvm_intrinsic::symbol(link_name).map_err(|why| Front2Refusal::Attrs { function: path.into(), why: why.form().into() })?;
+    let target = blaze_build::intrinsics::target::named(symbol)
+        .map_err(|_| Front2Refusal::TargetIntrinsic { function: path.into(), symbol: symbol.into() })?;
+    Ok(Some(LlvmRow {
+        kind: FnKind::Free,
+        build: BuildAbi { abi: Abi::C, nounwind: true },
+        track_caller: false,
+        symbol: "",
+        intrinsic: Intrinsic::Target(target),
+    }))
+}
+
+/// A panic entry, allocator shim or std-internal declaration supplies the call's ABI.
+/// Its row has no outside symbol to link.
+pub(in crate::front2::program) fn bound_decl_row<'n, S: NamesSource<'n>>(
+    names: S, store: &Store<'_>, key: ItemKey, panic_entry: bool, alloc_shim: Option<crate::front2::alloc_shim::Shim>, path: &str,
+) -> Result<Option<(FnKind, &'static str)>, Front2Refusal> {
+    let internal = crate::front2::internal_symbol::declares(names, store, key, store.tys.alloc())
+        .map_err(|why| Front2Refusal::Attrs { function: path.into(), why: why.detail() })?;
+    Ok((panic_entry || alloc_shim.is_some() || internal.is_some()).then_some((FnKind::Free, "")))
+}
 
 /// A trait declaration supplies the call signature until dispatch selects an implementation.
 /// For other Rust rows the builder needs a body or an intrinsic. The lazy row can count a

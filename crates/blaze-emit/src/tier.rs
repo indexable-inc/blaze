@@ -51,6 +51,11 @@ fn refused(error: RecordEmitError) -> TierError {
         RecordEmitError::Emit(EmitError::Data { row: _, why }) => TierError::Refused { tier: TIER, inst: None, what: why },
         RecordEmitError::Emit(EmitError::Record { why }) => TierError::Refused { tier: TIER, inst: None, what: why },
         RecordEmitError::Emit(EmitError::Legalize(why)) | RecordEmitError::Legalize(why) => legalize_refused(why),
+        // The seam's refusal holds a static reason only: the line and token stay in the
+        // emitter's own error (`EmitError::Asm`'s `Display`).
+        RecordEmitError::Emit(EmitError::Asm { inst, line: _, why, token: _ }) => {
+            TierError::Refused { tier: TIER, inst: Some(inst), what: why }
+        }
         RecordEmitError::NoSymbol { of } => TierError::NoName { tier: TIER, of },
         RecordEmitError::CName { of: _ } => {
             TierError::Refused { tier: TIER, inst: None, what: "a C name given for a reference other than a function or a static" }

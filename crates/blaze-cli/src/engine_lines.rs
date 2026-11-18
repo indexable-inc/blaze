@@ -9,11 +9,18 @@
 //! (engine_answer.rs), its bytes pinned with the answer's pages.
 //!
 //! ```text
-//! record  "BEF2" | blocks u32 | per block, by name: kind u8 | subject [32] | bytes u32 | entries
+//! record  "BEF3" | blocks u32 | per block, by name: kind u8 | subject [32] | bytes u32 | entries
 //! entry   0 | rule u16 | start u32 | end u32 | path bytes u32 (NO_PATH: none) | path | words u32 | words
 //!         1 | class u8 | words u32 | words
 //!         2 | rule u16 | start u32 | end u32 | path u32 | path | chain u64 | edition u8 | words u32 | words
+//!         3 | rule u16 | first u32 | last u32 | inside u8 | inside.0 u32 | inside.1 u32 | path u32 | path | chain u64 | edition u8 | words u32 | words
 //! ```
+//!
+//! A TOKEN-PLACED finding (3, lane K1) is a body's whose place is its tokens `first..=last` in
+//! its item (and with `inside` 1, the bytes `inside.0..inside.1` of the one token's lexeme;
+//! both 0 when `inside` is 0): a comment or a re-format inside the body moves no token, so the
+//! body's key stands and its stored finding prints where its tokens are today (print.rs
+//! `Place::Tokens`).
 //!
 //! A finding's words are its record's message as stored (a names record's place pieces in
 //! them); a finding with a path is an outline's, placed at its file's start. A PLACED finding
@@ -22,7 +29,12 @@
 //! so a finding that stands while lines above its item moved is drawn where the item is now.
 //! A block's entries are in the order its maker sorted them (a body's by start, end, rule and
 //! words: rule 25). (2: the placed finding; a "BEF1" record is refused as another form, and the
-//! request is answered in full.)
+//! request is answered in full.) (3: the token-placed finding, and a WAITED note's words are its
+//! cause's name and its crate, not_checked/waited.rs `words`; a "BEF2" record is refused so.)
+//!
+//! A waited note ([`Class::Waited`]) is never printed alone: [`print_all`] groups the waiters by
+//! the task their chain of waits ends at and prints, a cause, one line naming it and its reason
+//! (its own failure note's words) with what hangs from it.
 
 use core::fmt;
 
@@ -38,13 +50,14 @@ use bstd::out::Out;
 use crate::{CliError, print, work};
 
 /// The record's form.
-pub(crate) const LINES_MAGIC: &[u8; 4] = b"BEF2";
+pub(crate) const LINES_MAGIC: &[u8; 4] = b"BEF3";
 const LINES_DOMAIN: &str = "blaze-cli engine-check lines";
 /// A finding with no path of its own.
 const NO_PATH: u32 = u32::MAX;
 const FINDING: u8 = 0;
 const NOTE: u8 = 1;
 const PLACED: u8 = 2;
+const PLACED_TOKENS: u8 = 3;
 
 /// What a note counts as in the command's status (main.rs `close`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -62,6 +75,13 @@ pub(crate) enum Class {
     /// Said, counted as nothing: a fact of the plan, not of a check (engine_body_plan.rs: a file
     /// no unit of its crate holds under its cfg). Printed; fails nothing, leaves nothing unchecked.
     Told = 4,
+    /// A body whose TYPES were checked whole and whose move and borrow check was refused
+    /// (engine_bodies.rs `Said::BorrowsUnchecked`): it leaves the borrows stage not whole
+    /// ([`Tally::borrows`]) and never the types stage ([`not_checked_whole`]); it fails nothing and is no item left unchecked
+    /// (the closing line's "NOT checked: borrows" says it, status 3). Printed as the old path
+    /// prints a `BORROWS_NOT_CHECKED` note (print.rs `finding`): one by one under `--each`, or
+    /// always once the borrow check is trusted (`BORROWS_ARE_ERRORS`); counted always.
+    Borrows = 5,
 }
 
 impl Class {
@@ -72,6 +92,7 @@ impl Class {
             2 => Some(Class::Waited),
             3 => Some(Class::Head),
             4 => Some(Class::Told),
+            5 => Some(Class::Borrows),
             _ => None,
         }
     }
@@ -142,6 +163,30 @@ impl<'a> Lines<'a> {
         block.extend_from_slice(&rule.to_le_bytes());
         word(block, start);
         word(block, end);
+        word(block, len_of(path));
+        block.extend_from_slice(path);
+        block.extend_from_slice(&chain.to_le_bytes());
+        block.push(edition.byte());
+        word(block, len_of(words));
+        block.extend_from_slice(words);
+    }
+
+    /// A finding of `name` (a body's) placed by its tokens `at` in an item of the file at `path`
+    /// (lane K1): the item the one whose chain is `chain` in the file's outline of `edition`.
+    #[expect(clippy::too_many_arguments, reason = "one entry's fields, each written as it is stored")]
+    pub(crate) fn placed_tokens(&mut self, name: Name, rule: u16, at: parser::token_key::TokenPlace, path: &[u8], chain: u64, edition: blaze_surface::Edition, words: &[u8]) {
+        let block = self.block(name);
+        block.push(PLACED_TOKENS);
+        block.extend_from_slice(&rule.to_le_bytes());
+        word(block, at.first);
+        word(block, at.last);
+        let (inside, (from, to)) = match at.inside {
+            Some(inside) => (1u8, inside),
+            None => (0u8, (0, 0)),
+        };
+        block.push(inside);
+        word(block, from);
+        word(block, to);
         word(block, len_of(path));
         block.extend_from_slice(path);
         block.extend_from_slice(&chain.to_le_bytes());
@@ -248,6 +293,8 @@ enum Entry<'m> {
     Note { class: Class, words: &'m [u8] },
     /// A body's finding, placed by its item's chain (module docs).
     Placed { rule: u16, start: u32, end: u32, path: &'m str, chain: u64, edition: blaze_surface::Edition, words: &'m [u8] },
+    /// A body's finding placed by its tokens in its item (module docs, lane K1).
+    PlacedTokens { rule: u16, at: parser::token_key::TokenPlace, path: &'m str, chain: u64, edition: blaze_surface::Edition, words: &'m [u8] },
 }
 
 fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
@@ -268,7 +315,7 @@ fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
         }
         NOTE => {
             let at = reader.at;
-            let class = Class::of_byte(reader.byte("a note's class")?).ok_or(LinesError { at, what: "a note's class is none of the four" })?;
+            let class = Class::of_byte(reader.byte("a note's class")?).ok_or(LinesError { at, what: "a note's class is none of the six" })?;
             let words = reader.sized("a note's words")?;
             if core::str::from_utf8(words).is_err() {
                 return Err(LinesError { at: reader.at, what: "a note's words are not UTF-8" });
@@ -287,7 +334,28 @@ fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
             let words = reader.sized("a placed finding's words")?;
             Ok(Entry::Placed { rule, start, end, path, chain, edition, words })
         }
-        _ => Err(LinesError { at: reader.at - 1, what: "an entry's tag is none of finding, note and placed finding" }),
+        PLACED_TOKENS => {
+            let rule = reader.u16("a token-placed finding's rule")?;
+            let first = reader.u32("a token-placed finding's first token")?;
+            let last = reader.u32("a token-placed finding's last token")?;
+            let at = reader.at;
+            let inside = reader.byte("a token-placed finding's inside flag")?;
+            let from = reader.u32("a token-placed finding's inside start")?;
+            let to = reader.u32("a token-placed finding's inside end")?;
+            let inside = match inside {
+                0 if (from, to) == (0, 0) => None,
+                1 => Some((from, to)),
+                _ => return Err(LinesError { at, what: "a token-placed finding's inside flag is neither 0 (with no range) nor 1" }),
+            };
+            let at_path = reader.at;
+            let path = core::str::from_utf8(reader.sized("a token-placed finding's path")?).map_err(|_| LinesError { at: at_path, what: "a token-placed finding's path is not UTF-8" })?;
+            let chain = reader.u64("a token-placed finding's item chain")?;
+            let at_edition = reader.at;
+            let edition = blaze_surface::Edition::from_byte(reader.byte("a token-placed finding's edition")?).ok_or(LinesError { at: at_edition, what: "a token-placed finding's edition byte is no edition" })?;
+            let words = reader.sized("a token-placed finding's words")?;
+            Ok(Entry::PlacedTokens { rule, at: parser::token_key::TokenPlace { first, last, inside }, path, chain, edition, words })
+        }
+        _ => Err(LinesError { at: reader.at - 1, what: "an entry's tag is none of finding, note, placed finding and token-placed finding" }),
     }
 }
 
@@ -295,7 +363,7 @@ fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
 pub(crate) fn decode<'m, 'a>(bytes: &'m [u8], alloc: SharedAlloc<'a>) -> Result<Last<'m, 'a>, LinesError> {
     let mut reader = Reader { bytes, at: 0 };
     if reader.take(4, "the form")? != LINES_MAGIC {
-        return Err(LinesError { at: 0, what: "the form is not BEF2" });
+        return Err(LinesError { at: 0, what: "the form is not BEF3" });
     }
     let count = reader.u32("the block count")?;
     let mut blocks: SVec<'a, (Name, &'m [u8])> = SVec::new_in(alloc);
@@ -332,9 +400,13 @@ pub(crate) fn head_notes<'m>(block: &'m [u8], each: &mut dyn FnMut(&'m str)) -> 
     Ok(())
 }
 
-/// Whether `block` holds a note that says its task's item was not checked whole: a
+/// Whether `block` holds a note that says its task's item was not TYPE-checked whole: a
 /// [`Class::Failure`], [`Class::Unchecked`] or [`Class::Waited`] note (a body refused, failed,
-/// panicked or not checked whole, engine_bodies.rs `note`). A finding of a checked body is not.
+/// panicked or not checked whole, engine_bodies.rs `note`). A finding of a checked body is not,
+/// and neither is a [`Class::Borrows`] note: its types were checked, and its borrows not being
+/// whole is counted by [`print_all`] (`Tally::borrows`) over every block, standing or entered,
+/// so the borrows stage is told apart from the types stage (main.rs `check_coverage`; the
+/// owner's rule: never a pass for a stage that did not run, and never a fail for one that did).
 /// What a standing body row says of the answer's coverage (engine_check.rs `check`).
 pub(crate) fn not_checked_whole(block: &[u8]) -> Result<bool, LinesError> {
     let mut reader = Reader { bytes: block, at: 0 };
@@ -352,10 +424,53 @@ pub(crate) struct Tally {
     pub(crate) failures: u32,
     pub(crate) unchecked: u32,
     pub(crate) waited: u32,
+    /// Bodies whose types were checked and whose borrows were not ([`Class::Borrows`]): no
+    /// failure and no item unchecked; the borrows stage's coverage says them.
+    pub(crate) borrows: u32,
     /// Heads that could not be frozen ([`Class::Head`]).
     pub(crate) heads: u32,
     /// Findings listed (after one finding of two tasks is folded into one).
     pub(crate) listed: u32,
+    /// What printing held ([`Tail`]).
+    pub(crate) tail: Tail,
+}
+
+/// The tail's memory: what [`print_all`] held at its most. The lines are STREAMED (print.rs
+/// [`print::Held`]): a file's text is read into a frame emptied per file and held only while
+/// its findings are placed or drawn, a line is drawn in a frame emptied per line, and nothing
+/// drawn is kept. So its bound is the floor: one file's work (its text, and its outline while
+/// placing) and one line, at their largest: `peak <= floor`. The lists
+/// a finding needs before any is drawn (its listing, for the ids' shown lengths) are the
+/// findings' own size, said apart in `listing`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Tail {
+    /// The scratch frames at their most, the largest text and the largest line.
+    pub(crate) held: print::Held,
+    /// The bytes the findings' lists reserved (prints, places, runs, the one-of-two set, the
+    /// listing and the words kept): a finding's worth each, never a text's.
+    pub(crate) listing: usize,
+}
+
+impl Tail {
+    /// The profile's line: "tail: peak B bytes (floor F; ratio R): one file's work W (its text
+    /// T), one line L; listing B bytes for N finding(s)". Streamed, the ratio is at most 1.
+    pub(crate) fn line<'f>(&self, findings: u32, frame: &'f Frame) -> bstd::mem::String<&'f Frame> {
+        let held = self.held;
+        let floor = held.floor();
+        // The ratio in hundredths: no float in a record's words.
+        let ratio = (held.peak as u128).saturating_mul(100).checked_div(floor as u128).unwrap_or(0);
+        bstd::mem::format_in!(
+            frame,
+            "tail: peak {} bytes (floor {floor}; ratio {}.{:02}): one file's work {} (its text {}), one line {}; listing {} bytes for {findings} finding(s) (engine_lines.rs `Tail`)",
+            held.peak,
+            ratio / 100,
+            ratio % 100,
+            held.file,
+            held.text,
+            held.line,
+            self.listing,
+        )
+    }
 }
 
 /// What makes two findings one when printed: their file, their item (its chain, or its start),
@@ -367,31 +482,39 @@ struct Seen<'p> {
     rule: u16,
     start: u32,
     end: u32,
+    /// A token-placed finding's range inside its tokens: two that differ only there are two.
+    inside: Option<(u32, u32)>,
     words: &'p [u8],
 }
 
 /// Every block printed as `check` prints (main.rs `draw`): each note as it comes, then the
 /// findings listed and drawn a file at a time; a names record's unresolved path, include outside
 /// its package and failed call placed by their message's pieces; one finding two tasks hold
-/// printed once, the second task named with it.
+/// printed once, the second task named with it. The waited notes are grouped under the task
+/// their chain of waits ends at, a line a cause, after the findings ([`waited_lines`]). The
+/// lists are in `alloc`, the request's arena: given back with it.
 pub(crate) fn print_all<'f, 'b>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     blocks: impl Iterator<Item = (Name, &'b [u8])>,
     shown: &mut print::Shown<'f>,
-    heap: &'static blaze_own::Heap,
+    alloc: SharedAlloc<'_>,
     frame: &'f Frame,
     out: &Out,
 ) -> Result<Tally, CliError> {
     let erased = blaze_own::Erased::new(frame);
     let listed = erased.handle();
-    let alloc = heap.shared();
-    // One a finding or a file: the project's size, so in the request's heap, never the frame.
-    let mut prints: Vec<Print<'_>, blaze_own::Alloc<'static>> = Vec::new_in(heap.alloc());
-    let mut wanted: Vec<print::Wanted<'f>, blaze_own::Alloc<'static>> = Vec::new_in(heap.alloc());
+    let frame_at = frame.used();
+    let listed_at = shown.listed.len();
+    // One a finding or a file: the project's size, so in the request's arena, never the frame.
+    let mut prints: SVec<'_, Print<'_>> = SVec::new_in(alloc);
+    let mut wanted: SVec<'_, print::Wanted<'f>> = SVec::new_in(alloc);
     // (path, first print, past the last): each file's findings are neighbours.
-    let mut runs: Vec<(Option<&'f str>, usize, usize), blaze_own::Alloc<'static>> = Vec::new_in(heap.alloc());
+    let mut runs: SVec<'_, (Option<&'f str>, usize, usize)> = SVec::new_in(alloc);
     let mut seen: SMap<'_, Seen<'f>, usize> = SMap::new_in(alloc);
+    // The waiters, and the failures' own words by task: what a waiter's cause line names.
+    let mut waits: Vec<crate::not_checked::waited::Wait<'f>, &'f Frame> = Vec::new_in(frame);
+    let mut failed: SMap<'_, Name, &'f str> = SMap::new_in(alloc);
     let mut tally = Tally::default();
     let refused = |why: LinesError| CliError::Text { what: why.what };
     for (name, block) in blocks {
@@ -399,7 +522,9 @@ pub(crate) fn print_all<'f, 'b>(
         while reader.at < block.len() {
             // A finding's rule, range and message, and where it is drawn: its file, its place and
             // the words drawn (the message but for its place pieces).
-            let (rule, start, end, message, path, place, words): (u16, u32, u32, &[u8], Option<&'f str>, print::Place, &[u8]) = match entry(&mut reader).map_err(refused)? {
+            // The printer reads a finding's words from its `Wanted` (print.rs `list`), never its
+            // whole message: no second copy is made of it (the tail's memory).
+            let (rule, start, end, _message, path, place, words): (u16, u32, u32, &[u8], Option<&'f str>, print::Place, &[u8]) = match entry(&mut reader).map_err(refused)? {
                 Entry::Note { class, words } => {
                     // Checked UTF-8 at the decode, and made from a `str` at the write.
                     let words = core::str::from_utf8(words).map_err(|_| CliError::Text { what: "a note's words are not UTF-8" })?;
@@ -407,18 +532,34 @@ pub(crate) fn print_all<'f, 'b>(
                         Class::Failure => {
                             tally.failures += 1;
                             print::note(cx, words, shown, frame, out)?;
+                            // A task's first failure is what its waiters' line names.
+                            if !failed.contains_key(&name) {
+                                failed.insert(name, work::held_str(words, frame));
+                            }
                         }
                         Class::Unchecked => {
                             tally.unchecked += 1;
                             print::note(cx, words, shown, frame, out)?;
                         }
+                        // Grouped under its cause, printed after the findings.
                         Class::Waited => {
                             tally.failures += 1;
                             tally.waited += 1;
+                            let (on, label) = crate::not_checked::waited::read(words.as_bytes())?;
+                            waits.push(crate::not_checked::waited::Wait { name, on, label: work::held_str(label, frame), file: None });
                         }
                         // Printed grouped by reason (engine_head_notes.rs `print_grouped`).
                         Class::Head => tally.heads += 1,
                         Class::Told => print::note(cx, words, shown, frame, out)?,
+                        // As the old path's `BORROWS_NOT_CHECKED` (print.rs `finding`): counted;
+                        // drawn under `--each`, or always once borrows are errors.
+                        Class::Borrows => {
+                            tally.borrows += 1;
+                            shown.borrows_unchecked += 1;
+                            if shown.each || crate::body_types::BORROWS_ARE_ERRORS {
+                                print::note(cx, words, shown, frame, out)?;
+                            }
+                        }
                     }
                     continue;
                 }
@@ -440,6 +581,10 @@ pub(crate) fn print_all<'f, 'b>(
                 }
                 // A body's finding: in its item, found by its chain in the file as it is now.
                 Entry::Placed { rule, start, end, path, chain, edition, words } => (rule, start, end, words, Some(work::held_str(path, frame)), print::Place::Chain(chain, edition), words),
+                // A body's finding at token places (lane K1, rule 71): its bytes are found in its
+                // item's text today (print.rs `list`), so a comment above it moves no key. Its
+                // first and last tokens stand as its range in what makes two findings one.
+                Entry::PlacedTokens { rule, at, path, chain, edition, words } => (rule, at.first, at.last, words, Some(work::held_str(path, frame)), print::Place::Tokens(chain, edition, at), words),
             };
             let kept: &'f [u8] = Vec::from_slice_in(words, frame).leak();
             let at = prints.len();
@@ -447,8 +592,13 @@ pub(crate) fn print_all<'f, 'b>(
                 print::Place::Chain(chain, _) => (1, chain),
                 print::Place::At(start) => (0, u64::from(start)),
                 print::Place::Counted => (2, 0),
+                print::Place::Tokens(chain, ..) => (3, chain),
             };
-            let what = Seen { path, at_item, rule, start, end, words: kept };
+            let inside = match place {
+                print::Place::Tokens(_, _, at) => at.inside,
+                _ => None,
+            };
+            let what = Seen { path, at_item, rule, start, end, inside, words: kept };
             if let Some(&first) = seen.get(&what) {
                 if prints[first].name != name && !prints[first].also.contains(&name) {
                     prints[first].also.push(name);
@@ -456,9 +606,7 @@ pub(crate) fn print_all<'f, 'b>(
                 continue;
             }
             seen.insert(what, at);
-            let mut whole = Vec::new_in(listed);
-            whole.extend_from_slice(message);
-            prints.push(Print { name, also: Vec::new_in(listed), condition: Condition::ANY, file: None, place: 0, rule, start, end, message: whole });
+            prints.push(Print { name, also: Vec::new_in(listed), condition: Condition::ANY, file: None, place: 0, rule, start, end, message: Vec::new_in(listed) });
             wanted.push(print::Wanted { path, place, words: kept });
             match runs.last_mut() {
                 Some(run) if run.0 == path && run.2 == at => run.2 = at + 1,
@@ -473,9 +621,51 @@ pub(crate) fn print_all<'f, 'b>(
     for &(path, from, past) in runs.iter() {
         print::file_findings(cx, root, path, first + from..first + past, shown, &mut scratch, out)?;
     }
-    if tally.waited > 0 {
-        print::note(cx, bstd::mem::format_in!(frame, "{} task(s) not run: each waits on a task that failed", tally.waited).as_str(), shown, frame, out)?;
-    }
+    waited_lines(cx, &mut waits, &failed, shown, &mut scratch, frame, out)?;
     tally.listed = u32::try_from(prints.len()).unwrap_or(u32::MAX);
+    // What the lists reserved: their capacities, the set's entries, the listing's rows, and
+    // the frame's bytes past where this call began (the words kept, the listing's growth).
+    let size = core::mem::size_of::<usize>();
+    let set = seen.len().saturating_mul(core::mem::size_of::<Seen<'_>>().saturating_add(size));
+    let lists = prints.capacity().saturating_mul(core::mem::size_of::<Print<'_>>())
+        .saturating_add(wanted.capacity().saturating_mul(core::mem::size_of::<print::Wanted<'_>>()))
+        .saturating_add(runs.capacity().saturating_mul(core::mem::size_of::<(Option<&str>, usize, usize)>()))
+        .saturating_add(set)
+        .saturating_add(failed.len().saturating_mul(core::mem::size_of::<(Name, &str)>()));
+    let in_frame = frame.used().saturating_sub(frame_at).max(shown.listed.len().saturating_sub(listed_at).saturating_mul(core::mem::size_of::<crate::fix::Listed<'_>>()));
+    tally.tail = Tail { held: scratch.held(), listing: lists.saturating_add(in_frame) };
     Ok(tally)
+}
+
+/// The waiters, a line a cause (not_checked/waited.rs `groups`): "N task(s) not run: each waits
+/// on a task that failed: <the cause's own failure>", once a cause, and when crates hang from
+/// it, what (`waited::line`). A cause whose failure is not among these lines (its row stands
+/// with no block, or the machine's own) is named by its task. Causes in name order (rule 25).
+fn waited_lines<'f>(
+    cx: &Cx,
+    waits: &mut Vec<crate::not_checked::waited::Wait<'f>, &'f Frame>,
+    failed: &SMap<'_, Name, &'f str>,
+    shown: &mut print::Shown<'f>,
+    scratch: &mut print::Scratch,
+    frame: &'f Frame,
+    out: &Out,
+) -> Result<(), CliError> {
+    if waits.is_empty() {
+        return Ok(());
+    }
+    let groups = crate::not_checked::waited::groups(waits, frame)?;
+    for group in groups.iter() {
+        let one = scratch.one();
+        let mut words = match failed.get(&group.cause) {
+            Some(reason) => bstd::mem::format_in!(one, "{} task(s) not run: each waits on a task that failed: {reason}", group.tasks),
+            None => bstd::mem::format_in!(one, "{} task(s) not run: each waits on `{}`, which failed (its failure is not among these lines)", group.tasks, group.cause),
+        };
+        if !group.crates.is_empty() {
+            words.push_str("; ");
+            words.push_str(crate::not_checked::waited::line(group, one)?.as_str());
+        }
+        shown.behind.add(group.items);
+        print::note(cx, words.as_str(), shown, frame, out)?;
+    }
+    Ok(())
 }

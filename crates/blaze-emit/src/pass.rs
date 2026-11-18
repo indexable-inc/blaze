@@ -15,6 +15,8 @@ use crate::{
     enc::{self, Cond, FP, Field, LR, Reg, SP, Size, X0, X1, X8, X9, X10, X11, X12, X16, ZR},
 };
 
+/// `asm!` blocks: operands placed in registers around the template's words (asm.rs).
+mod asm;
 mod atomic;
 mod bulk;
 mod float;
@@ -1357,7 +1359,8 @@ impl<A: Allocator> Pass<'_, '_, A> {
             Op::Invoke | Op::InvokeIndirect => self.call(inst, op).map(|()| self.invoke_normal(inst, op, next))?,
             Op::Resume => self.resume(inst),
             Op::TailCall | Op::TailCallIndirect => return Err(unsupported(inst, op, "a tail call")),
-            Op::Asm | Op::AsmBr => return Err(unsupported(inst, op, "inline assembly")),
+            Op::Asm => self.asm(inst, op)?,
+            Op::AsmBr => return Err(unsupported(inst, op, "an `asm!` block with `label` operands (`asm_br`)")),
             // A coroutine body is split by `blaze_lir::coroutine::split` before any backend
             // (decision D73); its two outputs hold neither operation.
             Op::Suspend | Op::Cancelled => {

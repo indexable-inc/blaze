@@ -116,6 +116,7 @@ use super::heads::{CrateCfg, Store};
 use super::index::Index;
 use super::keys::checker_of;
 use super::reach::Reached;
+use super::source::NamesSource;
 use blaze_id::ItemKey as LibKey;
 
 /// The attribute this file binds by.
@@ -215,14 +216,14 @@ impl core::fmt::Display for InternalRefused {
 /// Whether the item whose text (from its first attribute) is `text`, of crate `krate`, carries
 /// [`ATTR`]: its lowered signature's attributes, `cfg_attr` evaluated under the crate's cfg.
 /// `Err(())` when the text does not lower. `alloc` holds the lowering, dropped on return.
-fn carries(names: &Names<'_>, krate: usize, text: &str, alloc: Alloc<'_>) -> Result<bool, ()> {
+fn carries<'n, S: NamesSource<'n>>(names: S, krate: usize, text: &str, alloc: Alloc<'_>) -> Result<bool, ()> {
     // The attribute is a word of the item's own text wherever it is written (an expansion's
     // text included): a text without it carries none, and nothing is lowered for it.
     if !text.contains(ATTR) {
         return Ok(false);
     }
-    let atoms = names.krate(krate).cfg.atoms();
-    let sig = blaze_lower::lower_signature(text, names.edition(krate), &mut CrateCfg(atoms), alloc).map_err(|_| ())?;
+    let atoms = names.cfg_atoms(krate).ok_or(())?;
+    let sig = blaze_lower::lower_signature(text, names.edition_of(krate).ok_or(())?, &mut CrateCfg(atoms), alloc).map_err(|_| ())?;
     let v = sig.view();
     for &n in v.rows(v.list(head::ATTRS)).map_err(|_| ())? {
         let a = v.attr(n).map_err(|_| ())?;
@@ -235,12 +236,12 @@ fn carries(names: &Names<'_>, krate: usize, text: &str, alloc: Alloc<'_>) -> Res
 
 /// The `#[link_name]` written on the lowered item `text`, when it names a symbol other than
 /// `name`: such a declaration is not bound by name here.
-fn renamed(names: &Names<'_>, krate: usize, text: &str, name: &str, alloc: Alloc<'_>) -> Result<bool, ()> {
+fn renamed<'n, S: NamesSource<'n>>(names: S, krate: usize, text: &str, name: &str, alloc: Alloc<'_>) -> Result<bool, ()> {
     if !text.contains("link_name") {
         return Ok(false);
     }
-    let atoms = names.krate(krate).cfg.atoms();
-    let sig = blaze_lower::lower_signature(text, names.edition(krate), &mut CrateCfg(atoms), alloc).map_err(|_| ())?;
+    let atoms = names.cfg_atoms(krate).ok_or(())?;
+    let sig = blaze_lower::lower_signature(text, names.edition_of(krate).ok_or(())?, &mut CrateCfg(atoms), alloc).map_err(|_| ())?;
     let v = sig.view();
     for &n in v.rows(v.list(head::ATTRS)).map_err(|_| ())? {
         let a = v.attr(n).map_err(|_| ())?;
@@ -345,20 +346,28 @@ pub fn definition(names: &Names<'_>, name: &str, panic: Panic, alloc: Alloc<'_>)
 /// `#[link_name]` naming another symbol. `Ok(None)` for every other item;
 /// [`InternalRefused::NotInRustBlock`] when the block's ABI is not `"Rust"`. `alloc` holds the
 /// signature's lowering, dropped on return.
-pub fn declares(names: &Names<'_>, store: &Store<'_>, key: ItemKey, alloc: Alloc<'_>) -> Result<Option<Declared>, InternalRefused> {
+pub fn declares<'n, S: NamesSource<'n>>(names: S, store: &Store<'_>, key: ItemKey, alloc: Alloc<'_>) -> Result<Option<Declared>, InternalRefused> {
     let Some(h) = store.fns.get(&key) else { return Ok(None) };
     if h.has_body || h.container.is_some() || !h.text.contains(ATTR) {
         return Ok(None);
     }
     // A module-level declaration is named and placed by the names library; one an `extern`
     // block in a body declares, by the store (panic_entry's `local_name`, `local_abi`).
-    let local_name = super::panic_entry::local_name(store, key).ok().flatten();
-    let Some(name) = names.item_text(h.lib).and_then(|t| t.name).or(local_name) else { return Ok(None) };
+    let local_abi = super::panic_entry::local_abi(store, key);
+    let name = if local_abi.is_some() {
+        super::panic_entry::local_name(store, key).map_err(|_| InternalRefused::Attrs { name: super::item_shown::ItemShown::of_lib(names, h.lib).boxed() })?
+    } else {
+        names.name_of(h.lib)
+    };
+    let Some(name) = name else { return Ok(None) };
     if Shim::ALL.iter().any(|s| s.declared() == name) {
         return Ok(None);
     }
-    let (_, placed_abi) = super::program::placed(names, h.lib).map_err(|_| InternalRefused::Unplaced { name: Box::from(name) })?;
-    let Some(abi) = placed_abi.or_else(|| super::panic_entry::local_abi(store, key)) else { return Ok(None) };
+    let abi = match local_abi {
+        Some(local) => Some(local),
+        None => names.extern_abi(h.lib).ok_or_else(|| InternalRefused::Unplaced { name: name.into() })?,
+    };
+    let Some(abi) = abi else { return Ok(None) };
     let attrs = || InternalRefused::Attrs { name: Box::from(name) };
     let krate = names.crate_of(h.lib).ok_or_else(attrs)?;
     if !carries(names, krate, h.text, alloc).map_err(|()| attrs())? {

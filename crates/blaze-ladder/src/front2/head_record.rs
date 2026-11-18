@@ -87,7 +87,10 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// its other members, and a body that calls that one is refused for its reason.
 /// 14: an ADT's record holds its valid range's two optional bounds where the narrowed-range
 /// flag was (`AdtRow::valid`: layout takes its niches outside them, as rustc does).
-pub const VERSION: u32 = 14;
+/// 15: a trait's `supertraits` holds every clause its header implies (heads.rs `trait_members`,
+/// preds.rs `predicates_implying`): the bounds on its associated types too (`Curve<A: B>`),
+/// where before only clauses on `Self` were kept.
+pub const VERSION: u32 = 15;
 /// The digest domains: the record's out digest and a fn text's check.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";

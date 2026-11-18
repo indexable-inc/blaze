@@ -47,6 +47,16 @@
 //! `Store::make_lives`): the borrow check's `BorrowHead`/`BorrowAdt` facts read the head cell
 //! (tables/task.rs `fact_read`), so an edit of a lifetime bound alone moves that cell's meaning
 //! and the `Signature` out with it (head_tests.rs `a_lifetime_bound_alone_moves_the_head`).
+//!
+//! ## A cell that does not freeze (lane HF1)
+//!
+//! A [`SeededHeads`] keeps each failed cell's OWN failure ([`SeededHeads::failure`]): a cell that
+//! failed by itself keeps its typed reason; a cell that needed one that did not freeze keeps that
+//! DIRECT need, the first of its own demand order not frozen; each keeps the heads its last
+//! attempt read, and its names reads are its own (its owner entered for every attempt). Every ask
+//! of a failed cell, the first too, is answered [`FreezeError::Again`] naming that cell or its
+//! need. So a failure's answer, reason and reads are a function of the cell, whatever order a job
+//! or two workers ask in (rule 25; failed_once_tests.rs, with the old rule as its control).
 
 use blaze_drive::cells::Cell;
 use blaze_drive::key::{self, ABSENT, Key, Kind, Name, Tool};
@@ -65,6 +75,7 @@ use crate::front2::check::{BuildOrder, Records, eval_len};
 use crate::front2::consts::{ConstFail, Consts};
 use crate::front2::fill::FillError;
 use crate::front2::index::Index;
+use crate::front2::receiver::Pointers;
 use crate::front2::types::Why;
 use crate::front2::head_record::{self, Head, HeadAt, HeadRecordError, HeadRef};
 use crate::front2::heads::{HeadError, SeedFailed, Seeded, Store, Want};
@@ -124,8 +135,11 @@ pub enum FreezeError {
     TooDeep { depth: usize, outermost: Want, innermost: [Want; 4] },
     /// One ask took more than `most` freeze attempts ([`SeededHeads`]'s driver).
     Steps { want: Want, most: usize },
-    /// Cell `want` is not frozen again: it failed before, as cell `failed`'s freeze did (the
-    /// first asker was handed that failure).
+    /// Cell `want` did not freeze, and every ask of it, the first too, is answered this (lane HF1:
+    /// the answer is a function of the cell, never of who asked first). `failed == want`: its own
+    /// freeze failed, its typed reason kept by its source ([`SeededHeads::failure`],
+    /// [`CellFailure::Own`]). Else it needed cell `failed`, its DIRECT need (the first that did not
+    /// freeze in its own demand order), which did not freeze ([`CellFailure::Needs`]).
     Again { want: Want, failed: Want },
     /// Cell `want` is not the asker's to freeze, and its knower holds no bytes of it
     /// ([`Known::Refused`]): a member crate's head a body asked that its head task did not
@@ -150,7 +164,8 @@ impl core::fmt::Display for FreezeError {
                 write!(f, "frozen head: a chain of {depth} cells, each needing the next, is deeper than {MOST_MAKING}: from {outermost:?} to {innermost:?}")
             }
             FreezeError::Steps { want, most } => write!(f, "frozen head of {want:?}: more than {most} freeze attempts"),
-            FreezeError::Again { want, failed } => write!(f, "frozen head of {want:?}: not made again, as cell {failed:?} failed when first frozen"),
+            FreezeError::Again { want, failed } if want == failed => write!(f, "frozen head of {want:?}: its freeze failed (its own reason is kept by its source: front2 tables/head.rs `SeededHeads::failure`)"),
+            FreezeError::Again { want, failed } => write!(f, "frozen head of {want:?}: not made, as cell {failed:?} it needs did not freeze"),
             FreezeError::NotTheirs { why, .. } => write!(f, "{}", why.said()),
         }
     }
@@ -466,10 +481,15 @@ pub struct Frozen<'a> {
 /// The item whose whole want is `want`, frozen: a pure function of the item and the names. It
 /// is lowered in a scratch store of its own (`frame` and `scratch` hold that store's lowering
 /// and table, dropped here), so nothing another item made is in it; `sized` is the program's
-/// `Sized` (front2 index.rs `lang("sized")`), as every store is made with.
+/// `Sized` (front2 index.rs `lang("sized")`), as every store is made with; `pointers` the
+/// program's receiver pointer types (front2 receiver.rs `Pointers::find`), so a receiver such as
+/// `self: Pin<&mut Self>` is decided, never a gap (lane H9, after FL2's finding: with
+/// `Pointers::NOT_LOOKED_UP` every struct receiver was a gap and `Future`'s and `Stream`'s
+/// dyn-compatibility verdicts were `Gap`).
 pub fn freeze<'n, 'a, N: NamesSource<'n>>(
     names: N,
     sized: Option<LibKey>,
+    pointers: Pointers,
     want: Want,
     frame: &'n blaze_mem::Frame,
     scratch: Alloc<'static>,
@@ -480,6 +500,7 @@ pub fn freeze<'n, 'a, N: NamesSource<'n>>(
         return Err(FreezeError::NotACell { want, cell });
     }
     let mut store = Store::new(sized, frame, scratch);
+    store.pointers = pointers;
     let mut keys = Keys::new();
     let mut needed: AVec<'a, Want> = AVec::new_in(alloc);
     store.ensure_noting(names, &mut keys, want, &mut |w| needed.push(w)).map_err(|error| FreezeError::Head { want, error })?;
@@ -499,26 +520,46 @@ pub fn freeze<'n, 'a, N: NamesSource<'n>>(
 pub fn freeze_seeded<'n, 'a, N: NamesSource<'n>, H: ConstSource<'n>>(
     names: N,
     sized: Option<LibKey>,
+    pointers: Pointers,
     want: Want,
     source: &mut H,
     frame: &'n blaze_mem::Frame,
     scratch: Alloc<'static>,
     alloc: Alloc<'a>,
 ) -> Result<Frozen<'a>, FreezeError> {
+    let mut needed: AVec<'a, Want> = AVec::new_in(alloc);
+    freeze_noting(names, sized, pointers, want, source, frame, scratch, alloc, &mut needed)
+}
+
+/// [`freeze_seeded`], each need its making met noted in `needed` as it is met (before its seed),
+/// whether the freeze ends made or failed: what a FAILED cell read of other heads, up to and
+/// with the need whose seed failed ([`SeededHeads::failure`]).
+#[allow(clippy::too_many_arguments)]
+fn freeze_noting<'n, 'a, N: NamesSource<'n>, H: ConstSource<'n>>(
+    names: N,
+    sized: Option<LibKey>,
+    pointers: Pointers,
+    want: Want,
+    source: &mut H,
+    frame: &'n blaze_mem::Frame,
+    scratch: Alloc<'static>,
+    alloc: Alloc<'a>,
+    needed: &mut AVec<'a, Want>,
+) -> Result<Frozen<'a>, FreezeError> {
     let cell = cell_of(names, want)?;
     if cell != want {
         return Err(FreezeError::NotACell { want, cell });
     }
     let mut store = Store::new(sized, frame, scratch);
+    store.pointers = pointers;
     let mut keys = Keys::new();
-    let mut needed: AVec<'a, Want> = AVec::new_in(alloc);
     let mut asked: AVec<'a, LibKey> = AVec::new_in(alloc);
     // What the constant evaluator lowered in this store ([`Frozen::eval_lowered`]).
     let mut by_eval = 0u32;
     for _ in 0..=MOST_FREEZE_CONSTS {
-        let c = match ensure_in(names, want, want, source, &mut store, &mut keys, &mut needed, scratch) {
+        let c = match ensure_in(names, want, want, source, &mut store, &mut keys, needed, scratch) {
             Ok(()) => {
-                let mut frozen = finish(names, &keys, &mut store, want, &needed, alloc)?;
+                let mut frozen = finish(names, &keys, &mut store, want, &needed[..], alloc)?;
                 frozen.lowered = frozen.lowered.saturating_sub(by_eval);
                 frozen.eval_lowered = by_eval;
                 return Ok(frozen);
@@ -541,7 +582,7 @@ pub fn freeze_seeded<'n, 'a, N: NamesSource<'n>, H: ConstSource<'n>>(
             // Its key's origin, which the evaluator lowers its body by (keys.rs `library_in`;
             // `Front2::new` files every item's in a body's keys, a freeze's start empty).
             keys.item(c).map_err(|clash| FreezeError::Head { want, error: HeadError::Key(clash) })?;
-            match ensure_in(names, want, Want::Fn(c), source, &mut store, &mut keys, &mut needed, scratch) {
+            match ensure_in(names, want, Want::Fn(c), source, &mut store, &mut keys, needed, scratch) {
                 Ok(()) => {}
                 Err(Need::Fail(e)) => return Err(e),
                 Err(Need::Const(of)) => return Err(FreezeError::Const { want, c, error: ConstRefused::TypeNeedsConst { of } }),
@@ -1018,6 +1059,7 @@ impl<'n, N: NamesSource<'n>> HeadSource for StoreHeads<'_, 'n, '_, N> {
 pub struct FrozenHeads<'n, 'a, N> {
     names: N,
     sized: Option<LibKey>,
+    pointers: Pointers,
     frame: &'n blaze_mem::Frame,
     scratch: Alloc<'static>,
     kept: Kept<'a>,
@@ -1028,6 +1070,8 @@ pub struct FrozenHeads<'n, 'a, N> {
 pub struct FrozenHeadsOpts<'n, 'a, N> {
     pub names: N,
     pub sized: Option<LibKey>,
+    /// The program's receiver pointer types ([`freeze`]).
+    pub pointers: Pointers,
     pub frame: &'n blaze_mem::Frame,
     pub scratch: Alloc<'static>,
     pub alloc: Alloc<'a>,
@@ -1035,14 +1079,14 @@ pub struct FrozenHeadsOpts<'n, 'a, N> {
 
 impl<'n, 'a, N: NamesSource<'n>> FrozenHeads<'n, 'a, N> {
     pub fn new(o: FrozenHeadsOpts<'n, 'a, N>) -> FrozenHeads<'n, 'a, N> {
-        FrozenHeads { names: o.names, sized: o.sized, frame: o.frame, scratch: o.scratch, kept: Kept { cells: AVec::new_in(o.alloc) }, alloc: o.alloc }
+        FrozenHeads { names: o.names, sized: o.sized, pointers: o.pointers, frame: o.frame, scratch: o.scratch, kept: Kept { cells: AVec::new_in(o.alloc) }, alloc: o.alloc }
     }
 }
 
 impl<'n, N: NamesSource<'n>> HeadSource for FrozenHeads<'n, '_, N> {
     fn frozen(&mut self, want: Want) -> Result<FrozenHead<'_>, FreezeError> {
-        let (names, sized, frame, scratch, alloc) = (self.names, self.sized, self.frame, self.scratch, self.alloc);
-        self.kept.get_or_make(want, || Ok(freeze(names, sized, want, frame, scratch, alloc)?.bytes))
+        let (names, sized, pointers, frame, scratch, alloc) = (self.names, self.sized, self.pointers, self.frame, self.scratch, self.alloc);
+        self.kept.get_or_make(want, || Ok(freeze(names, sized, pointers, want, frame, scratch, alloc)?.bytes))
     }
 
     fn open(&mut self, _want: Want) -> bool {
@@ -1055,6 +1099,7 @@ impl<'n, N: NamesSource<'n>> HeadSource for FrozenHeads<'n, '_, N> {
 pub struct SeededHeads<'n, 'a, N> {
     names: N,
     sized: Option<LibKey>,
+    pointers: Pointers,
     frame: &'n blaze_mem::Frame,
     scratch: Alloc<'static>,
     kept: Kept<'a>,
@@ -1065,9 +1110,17 @@ pub struct SeededHeads<'n, 'a, N> {
     /// The cells being frozen now, innermost last: the driver's explicit stack ([`MOST_MAKING`]
     /// deep at most), each cell frozen after the needs it met unfrozen.
     making: AVec<'a, Want>,
-    /// Each cell whose freeze failed, with why: asked again, it is refused by that, never
-    /// frozen twice.
-    failed: AVec<'a, (Want, Unmade)>,
+    /// The needs each cell on `making` noted in its last attempt (at its index there): what it
+    /// read of other heads when it is given up for a need that fails.
+    making_noted: AVec<'a, AVec<'a, Want>>,
+    /// Each cell whose freeze failed, in the order they failed: why (its own reason, its direct
+    /// need, a refusal), and the cells of the heads its last attempt read (sorted by their bytes,
+    /// each once, its own left out). Asked again it is refused by that, never frozen twice.
+    failed: AVec<'a, (Want, Unmade, AVec<'a, Want>)>,
+    /// The own reason of each cell that failed by itself ([`Unmade::Own`] indexes it).
+    own: AVec<'a, FreezeError>,
+    /// The failure rule, or a test's planted bug ([`FailPlant`]).
+    plant: FailPlant,
     /// Every freeze begun, made or given up for a need frozen first (`attempts - cells` were
     /// begun again).
     pub attempts: u32,
@@ -1096,31 +1149,64 @@ pub struct SeededHeads<'n, 'a, N> {
     /// a walk of every cell kept so far (a job of a large member keeps tens of thousands, and
     /// each ask walked them: quadratic in the job, lane H8).
     at: Map<[u8; WANT_BYTES], usize, FixedState, Alloc<'a>>,
-    /// Each failed cell's [`Unmade`], by its bytes: the lookup of `failed`, which keeps the order.
-    failed_at: Map<[u8; WANT_BYTES], Unmade, FixedState, Alloc<'a>>,
+    /// Each failed cell's index in `failed`, by its bytes: the lookup of `failed`, which keeps
+    /// the order.
+    failed_at: Map<[u8; WANT_BYTES], usize, FixedState, Alloc<'a>>,
     alloc: Alloc<'a>,
 }
 
-/// Why a [`SeededHeads`] cell was not made, kept for every later ask of it.
+/// Why a [`SeededHeads`] cell was not made, kept for every ask of it (lane HF1: a function of
+/// the cell alone, whatever order its source was asked in).
 #[derive(Clone, Copy, Debug)]
 enum Unmade {
-    /// The freeze of this cell (itself, or a need of it on its stack) failed: asked again it
-    /// is [`FreezeError::Again`], naming that cell.
-    Failed(Want),
-    /// A need of it was not the asker's to freeze ([`Known::Refused`]): asked again it is
-    /// that same typed refusal ([`FreezeError::NotTheirs`]), never `Again`, so every body that
-    /// meets it is told the refusal's own words and class (blaze-cli engine_seeds.rs).
+    /// Its OWN freeze failed: the reason at this index of `own`. Asked, it is
+    /// [`FreezeError::Again`] naming itself.
+    Own(usize),
+    /// It needed this cell, its DIRECT need (the need its last attempt met first that did not
+    /// freeze), which did not freeze. Asked, it is [`FreezeError::Again`] naming that need.
+    Needs(Want),
+    /// A need of it was not the asker's to freeze for an engine's lack ([`NotTheirs::OtherUnits`],
+    /// [`NotTheirs::NoCell`]): asked, it is that same typed refusal ([`FreezeError::NotTheirs`]),
+    /// never `Again`, so every body that meets it is told the refusal's own words and class
+    /// (blaze-cli engine_seeds.rs). A need its knower holds as FAILED ([`NotTheirs::Failed`]) is
+    /// [`Unmade::Needs`], as one failed here is.
     Refused { want: Want, why: NotTheirs },
 }
 
 impl Unmade {
-    /// The error a later ask of cell `want` is handed.
+    /// The error an ask of cell `want` is handed: the first ask's and every later one's.
     fn again(self, want: Want) -> FreezeError {
         match self {
-            Unmade::Failed(failed) => FreezeError::Again { want, failed },
+            Unmade::Own(_) => FreezeError::Again { want, failed: want },
+            Unmade::Needs(failed) => FreezeError::Again { want, failed },
             Unmade::Refused { want, why } => FreezeError::NotTheirs { want, why },
         }
     }
+}
+
+/// Why a cell of a [`SeededHeads`] did not freeze, as its source keeps it ([`SeededHeads::failure`]):
+/// a function of the cell, its names and the heads it read, never of the order its source was
+/// asked in (lane HF1; blaze-cli engine_heads_once.rs publishes it in the request's table).
+#[derive(Clone, Copy, Debug)]
+pub enum CellFailure<'s> {
+    /// Its own freeze failed, for this typed reason.
+    Own(&'s FreezeError),
+    /// It needed this cell, its direct need, which did not freeze.
+    Needs(Want),
+    /// A need of it, `want`, was refused as not its source's to freeze ([`Known::Refused`]).
+    Refused { want: Want, why: NotTheirs },
+}
+
+/// The failure rule of a [`SeededHeads`], or a test's planted bug (failed_once_tests.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailPlant {
+    /// Each cell keeps its own failure, every ask answered by it ([`Unmade`]).
+    Rule,
+    /// PLANTED BUG, for tests only: the rule before lane HF1. The ask on which a freeze fails is
+    /// handed the error of the cell that failed first (the top of the stack), and every cell on
+    /// the stack keeps that first failed cell as its need, none its own reason: so a cell's
+    /// answer and its failure depend on whether it, or a cell needing it, was asked first.
+    FirstFailedNamed,
 }
 
 /// Frozen heads a [`SeededHeads`] takes before it freezes a cell itself: the request's table
@@ -1157,7 +1243,10 @@ pub enum NotTheirs {
     /// Its head task ran for the asker's unit and could not freeze it: `said` quotes that
     /// task's own reason (blaze-cli engine_head_notes.rs `Failed`). The project's head, not
     /// the engine: the asker is not checked, as a head it froze itself and could not make
-    /// (blaze-cli engine_bodies.rs `unmade_head`), the head reported once, at its task.
+    /// (blaze-cli engine_bodies.rs `unmade_head`), the head reported once, at its task. Also a
+    /// cell the Heads stage's table holds as FAILED (blaze-cli engine_heads_once.rs `HeadsOnce`,
+    /// lane HF1): some freeze of it this request failed, `said` its own reason's words, so no
+    /// worker freezes it again; a cell that needs it fails naming it ([`CellFailure::Needs`]).
     Failed { said: &'static str },
 }
 
@@ -1173,6 +1262,9 @@ impl NotTheirs {
 pub struct SeededHeadsOpts<'n, 'a, N> {
     pub names: N,
     pub sized: Option<LibKey>,
+    /// The program's receiver pointer types ([`freeze`]; front2 receiver.rs `Pointers::find`,
+    /// found once a job by the caller, as project.rs `ProjectWorld::new` finds them once).
+    pub pointers: Pointers,
     pub frame: &'n blaze_mem::Frame,
     pub scratch: Alloc<'static>,
     pub alloc: Alloc<'a>,
@@ -1195,13 +1287,17 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
         SeededHeads {
             names: o.names,
             sized: o.sized,
+            pointers: o.pointers,
             frame: o.frame,
             scratch: o.scratch,
             kept,
             reads: AVec::new_in(o.alloc),
             values: AVec::new_in(o.alloc),
             making: AVec::new_in(o.alloc),
+            making_noted: AVec::new_in(o.alloc),
             failed: AVec::new_in(o.alloc),
+            own: AVec::new_in(o.alloc),
+            plant: FailPlant::Rule,
             attempts: 0,
             consts: o.consts,
             lowered: 0,
@@ -1244,17 +1340,51 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
         self.failed.len()
     }
 
-    /// The cell whose freeze failed last among the failures recorded from mark `from` on: the
-    /// cell the failure handed to that ask is about (the top of its stack, `drive`), which a
-    /// later ask of it, or of any cell that needed it, is refused for as [`FreezeError::Again`]
-    /// (`failed`). `None`: no freeze failed since `from`.
+    /// The cell the last failure recorded from mark `from` on is about: one that failed by
+    /// itself (the top of its stack, `drive`, recorded last of its ask), else the need it names.
+    /// `None`: no freeze failed since `from`. Every failure since a mark, each with its own
+    /// reason, is [`SeededHeads::failures_from`].
     pub fn failed_since(&self, from: usize) -> Option<Want> {
-        // A cell whose need was refused as not the asker's (`Unmade::Refused`) is told its own
-        // typed refusal when asked again, never `Again`; the cell named here is the need.
-        self.failed.get(from..)?.last().map(|(_, unmade)| match unmade {
-            Unmade::Failed(failed) => *failed,
+        self.failed.get(from..)?.last().map(|(w, unmade, _)| match unmade {
+            Unmade::Own(_) => *w,
+            Unmade::Needs(need) => *need,
             Unmade::Refused { want, .. } => *want,
         })
+    }
+
+    /// Cell `failed`'s kept failure as the source answers it.
+    fn failure_at(&self, at: usize) -> Option<(Want, CellFailure<'_>, &[Want])> {
+        let (w, unmade, heads) = self.failed.get(at)?;
+        let failure = match unmade {
+            Unmade::Own(i) => CellFailure::Own(self.own.get(*i)?),
+            Unmade::Needs(need) => CellFailure::Needs(*need),
+            Unmade::Refused { want, why } => CellFailure::Refused { want: *want, why: *why },
+        };
+        Some((*w, failure, &heads[..]))
+    }
+
+    /// Why cell `want` did not freeze, and the cells of the heads its last attempt read (sorted
+    /// by their bytes, each once, its own left out; with its direct need for a
+    /// [`CellFailure::Needs`]); `None` when it froze or was never asked. A function of the cell
+    /// alone (module docs of blaze-cli engine_heads_once.rs; failed_once_tests.rs): its own
+    /// reads are its source's owners' (front2 tables/owned_reads.rs), entered as it.
+    pub fn failure(&self, want: Want) -> Option<(CellFailure<'_>, &[Want])> {
+        let at = *self.failed_at.get(&want_bytes(want))?;
+        self.failure_at(at).map(|(_, failure, heads)| (failure, heads))
+    }
+
+    /// Each cell that failed from mark `from` on ([`SeededHeads::failed_len`]), in the order
+    /// recorded, with its failure and the heads it read ([`SeededHeads::failure`]): what a caller
+    /// publishes after an ask (blaze-cli engine_heads_once.rs `publish_since`; seeds.rs
+    /// `RequestSeed::seed` hands each own reason to the request).
+    pub fn failures_from(&self, from: usize) -> impl Iterator<Item = (Want, CellFailure<'_>, &[Want])> + '_ {
+        (from..self.failed.len()).filter_map(move |at| self.failure_at(at))
+    }
+
+    /// From now on, failures follow `plant` (the failure test's planted bug, failed_once_tests.rs).
+    #[cfg(test)]
+    pub(crate) fn plant_failures(&mut self, plant: FailPlant) {
+        self.plant = plant;
     }
 
     /// Each cell kept from index `from` on that this source froze itself (not one taken from
@@ -1274,7 +1404,8 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
         if let Some(&at) = self.at.get(&key) {
             return Ok(at);
         }
-        if let Some(&unmade) = self.failed_at.get(&key) {
+        if let Some(&at) = self.failed_at.get(&key) {
+            let unmade = self.failed[at].1;
             return Err(unmade.again(want));
         }
         // Known already (the request's table, another worker's freeze): copied in, so its
@@ -1301,8 +1432,10 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
             return Err(FreezeError::Unfrozen { need: want });
         }
         self.making.push(want);
+        self.making_noted.push(AVec::new_in(self.alloc));
         let driven = self.drive(want);
         self.making.clear();
+        self.making_noted.clear();
         driven?;
         // The driver returns once `want`, the stack's bottom, is kept.
         self.at.get(&key).copied().ok_or(FreezeError::Unfrozen { need: want })
@@ -1312,9 +1445,11 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
     /// need not yet frozen pushes it and is begun again once it is kept. Rule 18: each attempt
     /// keeps a cell or pushes one, the stack at most [`MOST_MAKING`] deep, the attempts at most
     /// [`MOST_ATTEMPTS`]. A failure fails every cell on the stack (each needs the one above it),
-    /// kept so none is frozen again, and is handed to the asker as it was.
+    /// each kept with ITS OWN failure ([`Unmade`]): the top its own reason, each below it the
+    /// cell above it, its direct need. The asker is answered its own cell's kept failure, as every
+    /// later ask is (lane HF1).
     fn drive(&mut self, want: Want) -> Result<(), FreezeError> {
-        let (names, sized, frame, scratch, alloc, owners) = (self.names, self.sized, self.frame, self.scratch, self.alloc, self.owners);
+        let (names, sized, pointers, frame, scratch, alloc, owners) = (self.names, self.sized, self.pointers, self.frame, self.scratch, self.alloc, self.owners);
         for _ in 0..MOST_ATTEMPTS {
             let Some(&top) = self.making.last() else { return Ok(()) };
             self.attempts += 1;
@@ -1324,13 +1459,19 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
             if let Some(owners) = owners {
                 owners.enter(top);
             }
-            let attempt = freeze_seeded(names, sized, top, self, frame, scratch, alloc);
+            let mut noted: AVec<'a, Want> = AVec::new_in(alloc);
+            let attempt = freeze_noting(names, sized, pointers, top, self, frame, scratch, alloc, &mut noted);
             if let Some(owners) = owners {
                 owners.leave();
+            }
+            // What this attempt met of other heads: `top`'s, should it be given up for good.
+            if let Some(last) = self.making_noted.last_mut() {
+                *last = noted;
             }
             match attempt {
                 Ok(f) => {
                     self.making.pop();
+                    self.making_noted.pop();
                     self.lowered += f.lowered;
                     self.eval_lowered += f.eval_lowered;
                     self.lowered_each.push(f.lowered);
@@ -1349,31 +1490,102 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
                         return Err(FreezeError::TooDeep { depth: m.len(), outermost: m[0], innermost });
                     }
                     self.making.push(need);
+                    self.making_noted.push(AVec::new_in(alloc));
                 }
                 Err(e) => {
                     let making = core::mem::replace(&mut self.making, AVec::new_in(alloc));
-                    // A need refused as not the asker's: each cell on the stack keeps that
-                    // refusal itself, so a later ask meets its words and class, not `Again`.
-                    // A need that failed BEFORE (`Again`, from a seed of it inside this freeze):
-                    // the cells on the stack failed because THAT cell did, so a later ask names
-                    // it, the cell whose reason the request was told when it first failed
-                    // (front2 tables/seeds.rs `RequestSeed::seed`). Named `top` instead, a later
-                    // ask's `Again` pointed at a cell no failure was ever handed for (lane H8:
-                    // tempo printed "the request was never told why" 718 times).
-                    let unmade = match &e {
-                        FreezeError::NotTheirs { want, why } => Unmade::Refused { want: *want, why: *why },
-                        FreezeError::Again { failed, .. } => Unmade::Failed(*failed),
-                        _ => Unmade::Failed(top),
-                    };
-                    self.failed.extend(making.iter().map(|w| (*w, unmade)));
-                    for w in making.iter() {
-                        self.failed_at.insert(want_bytes(*w), unmade);
-                    }
-                    return Err(e);
+                    let noted = core::mem::replace(&mut self.making_noted, AVec::new_in(alloc));
+                    return Err(self.fail(top, e, &making, &noted));
                 }
             }
         }
         Err(FreezeError::Steps { want, most: MOST_ATTEMPTS })
+    }
+
+    /// The freeze of `top`, the innermost cell of `making` (the stack, its bottom the ask's
+    /// cell; `noted` each one's last attempt's needs), failed with `e`: every cell on the stack
+    /// kept failed, and the error the ask is answered.
+    ///
+    /// Each keeps ITS OWN failure (lane HF1), so its answer, its failure and its reads are a
+    /// function of the cell, never of the order its source was asked in:
+    /// - `top` failed by itself (its reason kept, [`CellFailure::Own`]), or because the need its
+    ///   attempt met had not frozen: a need failed BEFORE (its seed answered `Again`) or one its
+    ///   knower holds as failed ([`NotTheirs::Failed`]): [`CellFailure::Needs`] that need. Either
+    ///   way it is the first need of its own demand order that did not freeze: the needs before it
+    ///   froze, which is a fact of their cells, not of who asked first.
+    /// - each cell below it needs the cell above it, the need its last attempt was given up for:
+    ///   its first need not frozen in its own demand order, which then failed.
+    /// - a need refused for an engine's lack ([`NotTheirs::OtherUnits`], [`NotTheirs::NoCell`]):
+    ///   every cell on the stack keeps that refusal, as before (blaze-cli engine_seeds.rs).
+    ///
+    /// The heads each cell read are its last attempt's noted needs, as cells, under its own owner
+    /// ([`SeededHeadsOpts::owners`]): the lookups that find a need's cell are the cell's reads, as
+    /// they are in the attempt itself (`seed`), so no read is offered with no owner. A need whose
+    /// cell cannot be told is no head read: the failure that met it is that `cell_of`'s, and its
+    /// names reads are the cell's own.
+    fn fail(&mut self, top: Want, e: FreezeError, making: &[Want], noted: &[AVec<'a, Want>]) -> FreezeError {
+        let (names, alloc, owners) = (self.names, self.alloc, self.owners);
+        let heads_of = |cell: Want, at: usize| -> AVec<'a, Want> {
+            let mut out: AVec<'a, Want> = AVec::new_in(alloc);
+            let Some(needs) = noted.get(at) else { return out };
+            if let Some(owners) = owners {
+                owners.enter(cell);
+            }
+            for w in needs.iter().copied() {
+                if let Ok(c) = cell_of(names, w)
+                    && c != cell
+                {
+                    out.push(c);
+                }
+            }
+            if let Some(owners) = owners {
+                owners.leave();
+            }
+            out.sort_unstable_by_key(|w| want_bytes(*w));
+            out.dedup();
+            out
+        };
+        // PLANTED BUG (tests only): the rule before lane HF1, every cell naming the first failed.
+        if self.plant == FailPlant::FirstFailedNamed {
+            let first = match &e {
+                FreezeError::Again { failed, .. } => *failed,
+                FreezeError::NotTheirs { want, .. } => *want,
+                _ => top,
+            };
+            for (at, w) in making.iter().copied().enumerate() {
+                let heads = heads_of(w, at);
+                self.failed_at.insert(want_bytes(w), self.failed.len());
+                self.failed.push((w, Unmade::Needs(first), heads));
+            }
+            return e;
+        }
+        let top_unmade = match &e {
+            FreezeError::NotTheirs { want: need, why: NotTheirs::Failed { .. } } => Unmade::Needs(*need),
+            FreezeError::NotTheirs { want, why } => Unmade::Refused { want: *want, why: *why },
+            FreezeError::Again { want: need, .. } => Unmade::Needs(*need),
+            _ => Unmade::Own(self.own.len()),
+        };
+        let mut asked: Option<Unmade> = None;
+        for (at, w) in making.iter().copied().enumerate() {
+            let unmade = match (making.get(at + 1), top_unmade) {
+                (None, _) => top_unmade,
+                (Some(_), Unmade::Refused { .. }) => top_unmade,
+                (Some(above), Unmade::Own(_) | Unmade::Needs(_)) => Unmade::Needs(*above),
+            };
+            asked.get_or_insert(unmade);
+            let heads = heads_of(w, at);
+            self.failed_at.insert(want_bytes(w), self.failed.len());
+            self.failed.push((w, unmade, heads));
+        }
+        let answer = match asked {
+            Some(unmade) => unmade.again(making[0]),
+            // No cell on the stack (the driver always has one): `top` alone.
+            None => top_unmade.again(top),
+        };
+        if matches!(top_unmade, Unmade::Own(_)) {
+            self.own.push(e);
+        }
+        answer
     }
 }
 

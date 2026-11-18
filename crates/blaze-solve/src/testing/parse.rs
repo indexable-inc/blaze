@@ -142,7 +142,14 @@ pub struct BoundA {
     pub trait_: String,
     pub args: Vec<TyA>,
     pub assoc: Vec<(String, TyA)>,
+    /// `Name: B + ..` (an associated item constraint with bounds, RFC 2289): each bound on
+    /// `<self as Trait<args>>::Name`, nested as written.
+    pub assoc_bounds: Vec<(String, Vec<BoundA>)>,
 }
+
+/// A bound's arguments: the written ones, the `Name = T` bindings and the `Name: Bounds`
+/// constraints, each list in writing order.
+type BoundArgs = (Vec<TyA>, Vec<(String, TyA)>, Vec<(String, Vec<BoundA>)>);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PredA {
@@ -205,7 +212,9 @@ pub struct ImplItemA {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeclA {
-    Trait { attrs: Attrs, name: String, params: Vec<ParamA>, supers: Vec<BoundA>, items: Vec<TraitItemA> },
+    /// `wheres`: the trait's `where` list (`trait T: S where P; P`), which is not elaborated
+    /// (only `supers` and their associated item constraints are implied by `X: T`).
+    Trait { attrs: Attrs, name: String, params: Vec<ParamA>, supers: Vec<BoundA>, wheres: Vec<PredA>, items: Vec<TraitItemA> },
     Adt { attrs: Attrs, name: String, params: Vec<ParamA>, is_enum: bool, variants: Vec<Vec<TyA>> },
     Impl { attrs: Attrs, label: Option<String>, params: Vec<ParamA>, negative: bool, trait_: String, args: Vec<TyA>, self_ty: TyA, wheres: Vec<PredA>, items: Vec<ImplItemA> },
     Fn { attrs: Attrs, name: String, params: Vec<ParamA>, inputs: Vec<TyA>, output: TyA },
@@ -541,6 +550,15 @@ impl P<'_> {
                 let name = self.ident()?;
                 let params = self.generics()?;
                 let supers = if self.eat(":") { self.bounds()? } else { Vec::new() };
+                let mut wheres = Vec::new();
+                if self.eat_word("where") {
+                    loop {
+                        wheres.push(self.pred()?);
+                        if !self.eat(";") || self.done() || self.is("{") {
+                            break;
+                        }
+                    }
+                }
                 let mut items = Vec::new();
                 if self.eat("{") {
                     while !self.eat("}") {
@@ -575,7 +593,7 @@ impl P<'_> {
                         items.push(TraitItemA { lang, is_const, name, params, bounds, ty, default });
                     }
                 }
-                Ok(DeclA::Trait { attrs, name, params, supers, items })
+                Ok(DeclA::Trait { attrs, name, params, supers, wheres, items })
             }
             "struct" | "enum" => {
                 let is_enum = kw == "enum";
@@ -704,27 +722,43 @@ impl P<'_> {
             if t != "Sized" {
                 return Err(self.err("only `?Sized`"));
             }
-            return Ok(BoundA { negative: false, maybe: true, trait_: t, args: Vec::new(), assoc: Vec::new() });
+            return Ok(BoundA { negative: false, maybe: true, trait_: t, args: Vec::new(), assoc: Vec::new(), assoc_bounds: Vec::new() });
         }
         let negative = self.eat("!");
         let trait_ = self.ident()?;
-        let (args, assoc) = self.args()?;
-        Ok(BoundA { negative, maybe: false, trait_, args, assoc })
+        let (args, assoc, assoc_bounds) = self.bound_args()?;
+        Ok(BoundA { negative, maybe: false, trait_, args, assoc, assoc_bounds })
     }
 
-    /// `<A, B, Name = T>` or nothing.
+    /// `<A, B, Name = T>` or nothing (no `Name: Bounds`: that is a bound's only).
     fn args(&mut self) -> Parsed<(Vec<TyA>, Vec<(String, TyA)>)> {
+        let (args, assoc, bounds) = self.bound_args()?;
+        if !bounds.is_empty() {
+            return Err(self.err("an associated item constraint with bounds (`Name: B`) outside a bound"));
+        }
+        Ok((args, assoc))
+    }
+
+    /// `<A, B, Name = T, Name: B + B>` or nothing: a bound's arguments.
+    fn bound_args(&mut self) -> Parsed<BoundArgs> {
         let mut args = Vec::new();
         let mut assoc = Vec::new();
+        let mut assoc_bounds = Vec::new();
         if !self.eat("<") {
-            return Ok((args, assoc));
+            return Ok((args, assoc, assoc_bounds));
         }
         while !self.eat(">") {
-            let binding = matches!(self.peek(), Some(Tok::Ident(_))) && matches!(self.peek_at(1), Some(Tok::P("=")));
+            let named = matches!(self.peek(), Some(Tok::Ident(_)));
+            let binding = named && matches!(self.peek_at(1), Some(Tok::P("=")));
+            let constraint = named && matches!(self.peek_at(1), Some(Tok::P(":")));
             if binding {
                 let n = self.ident()?;
                 self.expect("=")?;
                 assoc.push((n, self.ty()?));
+            } else if constraint {
+                let n = self.ident()?;
+                self.expect(":")?;
+                assoc_bounds.push((n, self.bounds()?));
             } else {
                 args.push(self.ty()?);
             }
@@ -733,7 +767,7 @@ impl P<'_> {
                 break;
             }
         }
-        Ok((args, assoc))
+        Ok((args, assoc, assoc_bounds))
     }
 
     fn ty_args(&mut self) -> Parsed<Vec<TyA>> {

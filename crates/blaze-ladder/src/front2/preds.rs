@@ -504,6 +504,32 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
 
     #[expect(clippy::too_many_arguments, reason = "the item's text, where it is written, and the out lists")]
     pub fn predicates(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, base: u32, self_bounds: Option<PTy>, sized: Option<LibKey>, out: &mut Preds) -> Result<(), Why> {
+        self.predicates_implying(tys, env, v, base, self_bounds, sized, out, &mut |_| {})
+    }
+
+    /// [`Self::predicates`], and each clause that `X: Trait` implies handed to `implied` as it
+    /// is made (a trait's head: `self_bounds` is `Some(Self)`). The reference's
+    /// `explicit_implied_clauses_of` (`PredicateFilter::SelfAndAssociatedTypeBounds`,
+    /// rustc_hir_analysis collect/predicates_of.rs): every clause of the header's bounds list
+    /// (`trait Tr: Super<A: B>` gives `Self: Super` AND `<Self as Super>::A: B`), and of a
+    /// `where` predicate whose bounded type is `Self` (with its associated item constraints
+    /// too). A `where` predicate on another type, `<Self as Super>::A: B` written in the
+    /// `where` list included, is a clause of the trait's own items but not implied (the
+    /// Reference, "Traits", "Supertraits"; rust-lang/rust#20671). No implied clause is an own
+    /// parameter's implied `Sized` (a trait's `Self` has none here, and those are the only ones
+    /// the end of this function changes or drops), so each is handed over final.
+    #[expect(clippy::too_many_arguments, reason = "the item's text, where it is written, and the out lists")]
+    pub fn predicates_implying(
+        &self,
+        tys: &mut PortableTys<'_>,
+        env: &Env<'_>,
+        v: &View<'n>,
+        base: u32,
+        self_bounds: Option<PTy>,
+        sized: Option<LibKey>,
+        out: &mut Preds,
+        implied: &mut dyn FnMut(PClause),
+    ) -> Result<(), Why> {
         // The Reference, "Trait and lifetime bounds": every type parameter is `Sized` unless its
         // bounds say otherwise (`?Sized`, or a sizedness trait: [`Self::states_size`]), on the
         // parameter or in a `where` clause of the same item. Each own parameter, and the index
@@ -545,10 +571,14 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
             for &b in v.rows(v.list(head::BOUNDS))? {
                 let b = lf::Bound::decode(b)?;
                 if let lf::Bound::Trait { ty, .. } = b {
+                    let from = out.clauses.len();
                     if self.bound(tys, env, v, b, me, sized, &mut out.clauses)? == Sizing::Relaxed {
                         // The Reference, "Trait and lifetime bounds": `?` relaxes the implied
                         // bound of a type parameter or associated type only; `Self` has none.
                         return Err(Why::Unsupported("`?Sized` on a trait's `Self`", place(v, v.type_range(ty))?));
+                    }
+                    for &c in &out.clauses[from..] {
+                        implied(c);
                     }
                 }
             }
@@ -563,8 +593,15 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                     lifetimes_only(v, binder, r)?;
                     let me = self.ty(tys, env, v, ty)?;
                     let mine = own.iter().find(|(t, _)| *t == me).copied();
+                    let on_self = self_bounds == Some(me);
                     for &b in v.rows(bounds)? {
+                        let from = out.clauses.len();
                         let s = self.bound(tys, env, v, lf::Bound::decode(b)?, me, sized, &mut out.clauses)?;
+                        if on_self {
+                            for &c in &out.clauses[from..] {
+                                implied(c);
+                            }
+                        }
                         match mine {
                             // `where T: ?Sized` on the item's own parameter relaxes its default
                             // to `MetaSized`; a sizedness trait there takes it away.

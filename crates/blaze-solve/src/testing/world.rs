@@ -301,6 +301,9 @@ impl Names {
                 let mut autos = Vec::new();
                 // `Self` of the existential: an erased self, never read.
                 for b in bounds {
+                    if !b.assoc_bounds.is_empty() {
+                        return Err(err(line, "an associated item constraint with bounds in a `dyn` type".to_string()));
+                    }
                     let tn = self.trait_(line, &b.trait_)?.clone();
                     if tn.auto {
                         autos.push(s.node(TyKind::ExAuto(tn.def)).map_err(e)?);
@@ -404,6 +407,19 @@ impl Names {
             let alias = s.node(TyKind::Alias(Rigid::No, ak, item, l)).map_err(e)?;
             let term = self.ty(s, sc, line, val)?;
             out.push(Pred::Projection { alias, term });
+        }
+        // `Name: Bounds` (RFC 2289): `self_ty: Tr<Name: B>` is `self_ty: Tr` and
+        // `<self_ty as Tr>::Name: B`, nested as written (`Tr<A: U<B: V>>`).
+        for (name, list) in &b.assoc_bounds {
+            let (item, kind, generics) = self.item(line, &b.trait_, name)?;
+            if kind == AssocKind::Const {
+                return Err(err(line, format!("`{name}: ..` bounds an associated const")));
+            }
+            let l = s.list(&v[..generics as usize]).map_err(e)?;
+            let alias = s.node(TyKind::Alias(Rigid::No, AliasKind::Projection, item, l)).map_err(e)?;
+            for nb in list {
+                self.bound(s, sc, line, alias, nb, out)?;
+            }
         }
         Ok(())
     }
@@ -577,7 +593,7 @@ impl World {
         // Pass 1: names.
         for &(line, d) in decls {
             match d {
-                DeclA::Trait { attrs, name, params, supers, items } => {
+                DeclA::Trait { attrs, name, params, supers, items, .. } => {
                     let def = def_of("trait", name);
                     let tn = TraitName {
                         def,
@@ -646,7 +662,7 @@ impl World {
         let t = &mut self.table;
         let e = |x: SolveError| solve_err(line, x);
         match d {
-            DeclA::Trait { attrs, name, params, supers, items } => {
+            DeclA::Trait { attrs, name, params, supers, wheres: written_wheres, items } => {
                 let def = names.trait_(line, name)?.def;
                 let mut pn: Vec<String> = std::vec!["Self".to_string()];
                 pn.extend(params.iter().map(|p| p.name.clone()));
@@ -658,6 +674,21 @@ impl World {
                 }
                 let mut wheres = Vec::new();
                 names.param_clauses(t, sc, line, 1, params, &mut wheres)?;
+                // The `where` list: the trait's where-clauses, not elaborated by `X: Trait` (the
+                // Reference, "Traits", "Supertraits": only bounds on `Self` are supertraits;
+                // rustc's `explicit_implied_clauses_of` keeps a where-clause only when its
+                // bounded type is `Self`). A `where Self: ..` is not written in a case: it would
+                // be a supertrait, written `trait T: ..`.
+                for p in written_wheres {
+                    let mut cl = Vec::new();
+                    names.pred(t, sc, line, p, &mut cl)?;
+                    for c in cl {
+                        if c.bound != 0 {
+                            return Err(err(line, "a trait where-clause under `for<..>`".to_string()));
+                        }
+                        wheres.push(c.pred);
+                    }
+                }
                 let generics = pn.len() as u32;
                 let mut assoc = Vec::new();
                 let mut item_bounds = Vec::new();

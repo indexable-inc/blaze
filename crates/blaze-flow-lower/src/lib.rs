@@ -243,7 +243,9 @@ pub trait Facts {
     /// owner cannot prove is the owner's finding at the closure's range. The caller checks a
     /// closure's flow BEFORE the flow that holds its expression and answers with what it found;
     /// empty: nothing required (or the closure not checked yet: then its outlives results must
-    /// still be refused, never dropped).
+    /// still be refused, never dropped). An async block's requirements are asked the same way,
+    /// by the block's expression (coroutine.rs `LoweredAsync::externals`; `closure_value` makes
+    /// both values and emits both).
     fn closure_requirements(&self, _closure: ExprId) -> &[Requirement] {
         &[]
     }

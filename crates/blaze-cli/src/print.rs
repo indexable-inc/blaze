@@ -130,13 +130,15 @@ pub fn area_of(finding: &Print<'_>) -> Area {
     }
 }
 
-/// One finding placed in its file's `text` ([`list`]): `place` its item's start there,
-/// `grammar` the file's outline when it is Rust, `read` the text's digest.
-fn placed_in<'f>(path: &'f str, text: &str, read: blaze_ids::ContentId, grammar: Option<&blaze_file_items::Outline<'_>>, place: u32, message: &'f [u8], finding: &Print<'_>) -> Result<Listed<'f>, CliError> {
+/// One finding placed in its file's `text` ([`list`]): `place` its item's start there, `range`
+/// its bytes from that start (the finding's own `start..end`, or its token place's bytes today:
+/// [`Place::Tokens`]), `grammar` the file's outline when it is Rust, `read` the text's digest.
+#[expect(clippy::too_many_arguments, reason = "one finding's facts, each a different one")]
+fn placed_in<'f>(path: &'f str, text: &str, read: blaze_ids::ContentId, grammar: Option<&blaze_file_items::Outline<'_>>, place: u32, range: (u32, u32), message: &'f [u8], finding: &Print<'_>) -> Result<Listed<'f>, CliError> {
     let area = area_of(finding);
     let code = code_of(area, finding.rule);
-    let start = place.saturating_add(finding.start).min(text.len() as u32);
-    let end = place.saturating_add(finding.end).clamp(start, text.len() as u32);
+    let start = place.saturating_add(range.0).min(text.len() as u32);
+    let end = place.saturating_add(range.1).clamp(start, text.len() as u32);
     let (item, item_end, chain) = crate::fix::item_in(grammar, text, start);
     let id = Id::of(path.as_bytes(), chain, &text.as_bytes()[item as usize..item_end as usize], code, (start - item, end - item));
     let fix = match (area, finding.rule) {
@@ -178,6 +180,77 @@ pub struct Scratch {
     file: Frame,
     one: Frame,
     limit: usize,
+    /// What the two frames held at their most, and the floor under it ([`Held`]).
+    held: Held,
+    /// The frames' `used` where the current file's work and the current line began: what is
+    /// past them is that file's and that line's alone.
+    from: (usize, usize),
+}
+
+/// The print path's memory (the tail's bound): it is STREAMED, so what it holds at once is one
+/// file's work (its text, and its outline while placing) in the file frame, emptied per file,
+/// and one line's drawing in the one frame, emptied per line. The floor any printer of these
+/// lines holds is one file's work and one line, at their largest ([`Held::floor`]): each is
+/// measured from where it began, so it is that file's or that line's alone, whatever the frames
+/// held before. `peak` is what both frames held together at their most (their whole `used`).
+/// Streamed, `peak <= floor`; a printer that kept the texts or the lines holds their sum. The
+/// per-finding lists (`Listed`, `Wanted`, the one-of-two set) are not here: they are the
+/// findings' own size, counted apart (engine_lines.rs `Tail`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    /// Both frames' bytes together at their most.
+    pub peak: usize,
+    /// The most one file's work took (its text and outlines).
+    pub file: usize,
+    /// The largest file text read (a part of `file`).
+    pub text: usize,
+    /// The most one finding's drawing (or placing) took.
+    pub line: usize,
+}
+
+impl Held {
+    /// The least any printer of these lines holds at once: one file's work and one line.
+    pub fn floor(&self) -> usize {
+        self.file.saturating_add(self.line)
+    }
+
+    /// After one finding: the frames as they stand, the file's work and the line from `from`.
+    fn saw(&mut self, file: &Frame, one: &Frame, from: (usize, usize), text: usize) {
+        self.peak = self.peak.max(file.used().saturating_add(one.used()));
+        self.file = self.file.max(file.used().saturating_sub(from.0));
+        self.line = self.line.max(one.used().saturating_sub(from.1));
+        self.text = self.text.max(text);
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// The planted control of the tail's bound ([`with_frames_kept`]): the frames never emptied.
+    static KEPT: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// `run` with the print path's frames never emptied (rule 23's control for the tail's bound):
+/// every text and every line stays held to the end, the same bytes printed.
+#[cfg(test)]
+pub(crate) fn with_frames_kept<R>(run: impl FnOnce() -> R) -> R {
+    struct Back;
+    impl Drop for Back {
+        fn drop(&mut self) {
+            KEPT.with(|kept| kept.set(false));
+        }
+    }
+    KEPT.with(|kept| kept.set(true));
+    let _back = Back;
+    run()
+}
+
+/// A scratch frame emptied for the next file or finding: the one place the print path lets go.
+fn emptied(frame: &mut Frame) {
+    #[cfg(test)]
+    if KEPT.with(core::cell::Cell::get) {
+        return;
+    }
+    frame.reset();
 }
 
 /// What a [`Scratch`] frame says it is when a file does not fit it.
@@ -187,13 +260,30 @@ impl Scratch {
     /// Two frames of `limit` bytes each, reserved: no memory is taken until used.
     pub fn new(limit: usize) -> Result<Scratch, CliError> {
         let frame = |what| Frame::with_reserve(limit, bstd::mem::Tag::Other).map_err(|_| CliError::Text { what });
-        Ok(Scratch { file: frame("the frame for one file's findings could not be reserved")?, one: frame("the frame for one finding's drawing could not be reserved")?, limit })
+        Ok(Scratch { file: frame("the frame for one file's findings could not be reserved")?, one: frame("the frame for one finding's drawing could not be reserved")?, limit, held: Held::default(), from: (0, 0) })
     }
 
-    /// The frame of one drawing, emptied: for a drawing that reads no file of its own.
+    /// The frame of one drawing, emptied: for a drawing that reads no file of its own. The
+    /// drawing before it is measured first.
     pub fn one(&mut self) -> &Frame {
-        self.one.reset();
+        self.held.saw(&self.file, &self.one, self.from, 0);
+        emptied(&mut self.one);
+        self.from.1 = self.one.used();
         &self.one
+    }
+
+    /// What the frames held at their most so far, and the floor under it.
+    pub fn held(&self) -> Held {
+        let mut held = self.held;
+        held.saw(&self.file, &self.one, self.from, 0);
+        held
+    }
+
+    /// The file frame emptied for the next file's work, and where that work begins.
+    fn next_file(&mut self) -> usize {
+        emptied(&mut self.file);
+        self.from.0 = self.file.used();
+        self.from.0
     }
 
     /// Why the work on `path`'s findings stopped, from the frames as the stop left them.
@@ -264,6 +354,11 @@ pub enum Place {
     At(u32),
     /// The item's chain, in the outline of this edition (a crate's unresolved path).
     Chain(u64, blaze_surface::Edition),
+    /// A body's finding by its tokens (lane K1, rule 71): the item found by its chain in the
+    /// outline of this edition, then the place's tokens made bytes of the item's text as it is
+    /// now (blaze-file-items `place_bytes`), so a comment edit above the finding inside its
+    /// body moves the printed line with no body entered.
+    Tokens(u64, blaze_surface::Edition, parser::token_key::TokenPlace),
     /// Not placed: a finding only counted under its cause (not drawn without `--each`), listed
     /// with its file's path and its task's name, its file never read for it.
     Counted,
@@ -306,8 +401,8 @@ pub fn list<'f>(cx: &Cx, root: &Dir<ReadWrite>, prints: &[Print<'_>], wanted: &[
             }
             continue;
         };
-        scratch.file.reset();
-        let (file, one) = (&scratch.file, &mut scratch.one);
+        let file_at = scratch.next_file();
+        let (file, one, held) = (&scratch.file, &mut scratch.one, &mut scratch.held);
         let placed = crate::work::unwinding(|| -> Result<(), CliError> {
             let mut bytes = Bytes::new_in(file, FILE_ARENA);
             root.read_all(cx, &Path::new(path)?, &mut bytes)?;
@@ -315,8 +410,10 @@ pub fn list<'f>(cx: &Cx, root: &Dir<ReadWrite>, prints: &[Print<'_>], wanted: &[
             // filed `FileItems` failure, says so): each is listed by its task's name alone.
             let Ok(text) = core::str::from_utf8(bytes.as_slice()) else {
                 for &i in run {
-                    one.reset();
+                    emptied(one);
+                    let line_at = one.used();
                     into[first + i] = unplaced(wanted[i].words, &prints[i], no_text, one);
+                    held.saw(file, one, (file_at, line_at), bytes.len());
                 }
                 return Ok(());
             };
@@ -328,29 +425,47 @@ pub fn list<'f>(cx: &Cx, root: &Dir<ReadWrite>, prints: &[Print<'_>], wanted: &[
             // The outline a chain is looked up in is its crate's edition's: made once for each
             // edition the file's findings name (one, but for a file two crates share).
             let mut of_edition: Option<(blaze_surface::Edition, blaze_file_items::Outline<'_>)> = None;
+            // The item whose chain is `chain` in the outline of `edition`: its start today.
+            let mut by_chain = |chain: u64, edition: blaze_surface::Edition| match &grammar {
+                Some(outline) if edition == crate::fix::ITEM_GRAMMAR => crate::work::item_by_chain(outline, text, chain),
+                _ => {
+                    if of_edition.as_ref().is_none_or(|(made, _)| *made != edition) {
+                        of_edition = Some((edition, blaze_file_items::outline(text, edition, erased.handle())));
+                    }
+                    of_edition.as_ref().and_then(|(_, outline)| crate::work::item_by_chain(outline, text, chain))
+                }
+            };
             for &i in run {
-                one.reset();
+                emptied(one);
+                let line_at = one.used();
+                let own = (prints[i].start, prints[i].end);
+                // The item's start and the finding's bytes from it.
                 let place = match wanted[i].place {
-                    Place::At(place) => Some(place),
+                    Place::At(place) => Some((place, own)),
                     // Listed above, with no file read.
                     Place::Counted => None,
-                    Place::Chain(chain, edition) => match &grammar {
-                        Some(outline) if edition == crate::fix::ITEM_GRAMMAR => crate::work::item_by_chain(outline, text, chain),
-                        _ => {
-                            if of_edition.as_ref().is_none_or(|(made, _)| *made != edition) {
-                                of_edition = Some((edition, blaze_file_items::outline(text, edition, erased.handle())));
-                            }
-                            of_edition.as_ref().and_then(|(_, outline)| crate::work::item_by_chain(outline, text, chain))
+                    Place::Chain(chain, edition) => by_chain(chain, edition).map(|place| (place, own)),
+                    Place::Tokens(chain, edition, at) => match by_chain(chain, edition) {
+                        None => None,
+                        Some(place) => {
+                            const NOT_IN_ITEM: CliError = CliError::Text { what: "a body finding's token place is not in its item's text today (rule 71)" };
+                            let item = text.get(place as usize..).ok_or(NOT_IN_ITEM)?;
+                            let bytes = blaze_file_items::place_bytes(at, item, edition).map_err(|_| NOT_IN_ITEM)?;
+                            let start = u32::try_from(bytes.start).map_err(|_| NOT_IN_ITEM)?;
+                            let end = u32::try_from(bytes.end).map_err(|_| NOT_IN_ITEM)?;
+                            Some((place, (start, end)))
                         }
                     },
                 };
                 into[first + i] = match place {
-                    Some(place) => placed_in(path, text, read, grammar.as_ref(), place, wanted[i].words, &prints[i])?,
+                    Some((place, range)) => placed_in(path, text, read, grammar.as_ref(), place, range, wanted[i].words, &prints[i])?,
                     None => unplaced(wanted[i].words, &prints[i], no_text, one),
                 };
+                held.saw(file, one, (file_at, line_at), text.len());
             }
             Ok(())
         });
+        scratch.from.1 = scratch.one.used();
         match placed {
             Ok(done) => done?,
             Err(crate::work::Panicked) => return Err(scratch.stopped("placing", path)),
@@ -371,8 +486,8 @@ pub fn file_findings<'f>(cx: &Cx, root: &Dir<ReadWrite>, path: Option<&str>, whi
         }
         return Ok(());
     };
-    scratch.file.reset();
-    let (file, one) = (&scratch.file, &mut scratch.one);
+    let file_at = scratch.next_file();
+    let (file, one, held) = (&scratch.file, &mut scratch.one, &mut scratch.held);
     let drawn = crate::work::unwinding(|| -> Result<bool, CliError> {
         let mut bytes = Bytes::new_in(file, FILE_ARENA);
         root.read_all(cx, &Path::new(path)?, &mut bytes)?;
@@ -382,11 +497,14 @@ pub fn file_findings<'f>(cx: &Cx, root: &Dir<ReadWrite>, path: Option<&str>, whi
             if listed.read != read {
                 return Ok(false);
             }
-            one.reset();
+            emptied(one);
+            let line_at = one.used();
             finding(cx, &listed, bytes.as_slice(), shown, one, out)?;
+            held.saw(file, one, (file_at, line_at), bytes.len());
         }
         Ok(true)
     });
+    scratch.from.1 = scratch.one.used();
     match drawn {
         Ok(Ok(true)) => Ok(()),
         Ok(Ok(false)) => {
@@ -643,6 +761,38 @@ pub fn note(cx: &Cx, words: &str, shown: &Shown<'_>, frame: &Frame, out: &Out) -
         View::Person | View::Agent => blaze_report::frame::note(&mut line, words, shown.caps),
     }
     out.write_all(cx, line.as_bytes())?;
+    Ok(())
+}
+
+/// One note for each stage of `not` (main.rs `check_coverage`'s second list), in the order of
+/// `work::CHECK_STAGES`, before the closing line: a "NOT checked" never stands without its
+/// reason (rule 19), and names exactly the stage that did not run (the owner's rule: never a
+/// pass printed for a stage that did not run, and never a fail for one that did). A stage this
+/// build does not build says the build's reason; one it builds and did not run whole says what
+/// left it so. Then, when bodies' borrow checks were refused and their notes were not drawn one
+/// by one (engine_lines.rs `Class::Borrows`), one line counting them. `blaze check`'s.
+pub(crate) fn stage_notes(cx: &Cx, not: &[&'static str], shown: &Shown<'_>, frame: &Frame, out: &Out) -> Result<(), CliError> {
+    for (stage, built, why_not_built) in crate::work::CHECK_STAGES {
+        if !not.contains(&stage) {
+            continue;
+        }
+        let why = match (built, stage) {
+            (false, _) => why_not_built,
+            (true, crate::work::NAMES_STAGE) => "the answer holds no crate's names (the notes above say why)",
+            (true, crate::work::TYPES_STAGE) => "a body's types were not checked to the end (each such body is named in a note above)",
+            // Also when a body's types stopped short: it is then not borrow checked, and the
+            // types stage's own note above says so.
+            (true, crate::work::BORROWS_STAGE) => "a body's move and borrow check did not run to the end (each such body is named in a note above)",
+            (true, _) => "it did not run whole (the notes above say why)",
+        };
+        note(cx, format_in!(frame, "NOT checked: {stage}: {why}").as_str(), shown, frame, out)?;
+    }
+    let drawn = shown.each || crate::body_types::BORROWS_ARE_ERRORS;
+    if shown.borrows_unchecked > 0 && !drawn {
+        let n = shown.borrows_unchecked;
+        let bodies = if n == 1 { "body" } else { "bodies" };
+        note(cx, format_in!(frame, "{n} {bodies} type-checked whole had the move and borrow check refused (`--each` names each)").as_str(), shown, frame, out)?;
+    }
     Ok(())
 }
 

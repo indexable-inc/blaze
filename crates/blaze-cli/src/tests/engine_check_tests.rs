@@ -46,12 +46,14 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
         fresh,
         heads_from: crate::engine_seeds::HeadsFrom::Frozen,
         head_units: crate::engine_heads::HeadUnits::Each,
+        head_jobs: crate::engine_heads::HeadJobs::RULE,
         head_sources: crate::engine_heads_once::Sources::Job,
         frame,
         scope_reads: crate::engine_scope_reads::ScopeReadsAs::DEFAULT,
         unreadable: None,
         body_locals: blaze_ladder::front2::tables::seeds::BodyLocals::Lowered,
         status: crate::engine_status::Asking::NONE,
+        origin: None,
     }
 }
 
@@ -358,9 +360,11 @@ fn every_head_read_of_a_body_is_a_head_task_cell() {
 ///   read of its head moved); one head task: `area`'s, whose heads moved (see the edits below);
 /// - a struct gains a field: the two bodies that read its head (and three more by a names cell,
 ///   OPEN, below); `P`'s head task, moving, and its readers', identical;
-/// - a body edit, and a comment inside a body: that body by its key, and the floor of the head
-///   tasks: one, its item's (keyed by the item's whole text, engine_heads.rs `plan_items`),
-///   which makes the heads it made (identical), so nothing reads a moved head.
+/// - a body edit: that body by its key, and the floor of the head tasks: one, its item's (keyed
+///   by the item's tokens, engine_heads.rs `plan_items`), which makes the heads it made
+///   (identical), so nothing reads a moved head;
+/// - a comment inside a body: nothing (lane K1: a comment is no token, so neither the body's key
+///   nor its item's head task's moves; its findings are token places, printed where they are now).
 /// (A comment between items enters no head task: engine_check_starts_from_its_stored_answer.)
 #[test]
 fn a_moved_head_enters_exactly_its_readers() {
@@ -418,7 +422,7 @@ fn a_moved_head_enters_exactly_its_readers() {
     let (entered, identical) = heads(&field);
     assert!((3..=7).contains(&entered) && identical + 1 == entered, "a struct gains a field: the head tasks (entered, identical) are `P`'s, moved, and readers that come out identical: {}", entries(&field));
     edit("a body edit", lib(p2, area_u64, "    4\n"), &[("key moved", None, 1)], Some((1, 1)));
-    edit("a comment inside a body", lib(p2, area_u64, "    // four\n    4\n"), &[("key moved", None, 1)], Some((1, 1)));
+    edit("a comment inside a body", lib(p2, area_u64, "    // four\n    4\n"), &[], Some((0, 0)));
 }
 
 /// AN EDITION EDIT IS IN THE KEYS (rule 21): `a`'s body names a local `gen`, a name in 2021 and

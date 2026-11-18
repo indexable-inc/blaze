@@ -591,6 +591,8 @@ impl<'v, 'r, 'a> Out<'v, 'r, 'a> {
             | Op::ReduceFmin
             | Op::ReduceFmax => first(0),
             Op::ReduceFadd | Op::ReduceFmul => first(1),
+            // An `asm!` block with a vector operand (lane T13: vector.rs `Out::asm` packs it).
+            Op::Asm => self.asm_reads_vector(inst),
             _ => false,
         }
     }

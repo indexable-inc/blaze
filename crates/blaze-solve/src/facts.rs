@@ -155,8 +155,13 @@ pub struct TraitDef<'w> {
     /// Generic parameters, `Self` included as 0.
     pub generics: u32,
     pub lang: Option<Lang>,
-    /// The supertrait clauses (`Self: Super<..>`, and projection bounds on `Self`), elaborated
-    /// one level: what `elaborate.rs` walks.
+    /// The trait's implied clauses, one level: what `elaborate.rs` walks (the reference's
+    /// `explicit_implied_clauses_of`, `PredicateFilter::SelfAndAssociatedTypeBounds`): the
+    /// supertrait clauses (`Self: Super<..>`, projection bounds on `Self`) and the bounds of
+    /// the associated item constraints written with them (`Tr: Super<A: B>` gives
+    /// `<Self as Super>::A: B`). A walk of the supertraits proper (dyn upcasting, object
+    /// candidates) keeps the clauses whose self type is `Self` (builtin.rs `on_self`). The
+    /// trait's other where-clauses are not implied (the Reference, "Traits", "Supertraits").
     pub supertraits: &'w [Pred],
     /// The trait's other where-clauses.
     pub where_clauses: &'w [Pred],

@@ -124,7 +124,7 @@ impl Failed {
 
     /// The words of a body refused because it reads head `cell` of task `task`, which was not
     /// frozen: the head named, its reason quoted.
-    pub(crate) fn body_words(&self, task: Name, cell: Cell, into: &mut std::string::String) {
+    pub(crate) fn body_words<A: core::alloc::Allocator>(&self, task: Name, cell: Cell, into: &mut blaze_own::String<A>) {
         match self.find(task, cell) {
             Some(one) => {
                 into.push_str("the head of `");

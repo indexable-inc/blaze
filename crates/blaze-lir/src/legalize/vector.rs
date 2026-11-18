@@ -9,7 +9,8 @@
 //! pass makes no blocks), volatile vector accesses (one access may not become several),
 //! vectors of `i1` in memory, a lane index past the end, pointer vectors' arithmetic, and a
 //! vector crossing an ABI (a call's argument or result, a `return`, the function's own
-//! parameter).
+//! parameter). An `asm!` operand is the one ABI rewritten: a vector of 64 or 128 bits passes
+//! as the integer of its width (`Out::asm`).
 
 use super::{LegalizeError, Out};
 use crate::{
@@ -168,6 +169,7 @@ impl Out<'_, '_, '_> {
             Op::MaskedLoad | Op::MaskedStore | Op::Gather | Op::Scatter => {
                 return Err(self.refuse(inst, "a masked or gathered vector access (its lanes are conditional; legalize makes no blocks)"));
             }
+            Op::Asm => self.asm(inst, ty)?,
             _ if lane_by_lane(op) => self.lane_by_lane(inst, op, flags, ty)?,
             _ => return Err(self.refuse(inst, "a vector operation legalize does not scalarize")),
         }
@@ -371,34 +373,7 @@ impl Out<'_, '_, '_> {
             return Err(self.refuse(inst, "a `bitcast` between vector shapes of more than 128 bits"));
         };
         let whole = match src.is_vector() {
-            true => {
-                let width = src.lane().bits(ptr_bits);
-                let Some(lane_int) = Ty::int(width) else {
-                    return Err(self.refuse(inst, "a `bitcast` of a vector whose lanes are no integer width"));
-                };
-                let mut acc = None;
-                for k in 0..src.lanes() {
-                    let mut it = self.get(from, k);
-                    if src.lane().is_float() {
-                        it = self.emit(Op::Bitcast, 0, lane_int, 0, &[it]);
-                    }
-                    if width < total {
-                        it = self.emit(Op::Zext, 0, int, 0, &[it]);
-                    }
-                    if k > 0 {
-                        let shift = self.iconst(int, u128::from(k * width));
-                        it = self.emit(Op::Shl, 0, int, 0, &[it, shift]);
-                    }
-                    acc = Some(match acc {
-                        None => it,
-                        Some(acc) => self.emit(Op::Or, 0, int, 0, &[acc, it]),
-                    });
-                }
-                match acc {
-                    Some(acc) => acc,
-                    None => return Err(self.refuse(inst, "a `bitcast` of a vector of no lanes")),
-                }
-            }
+            true => self.pack(inst, from, src, int)?,
             false => {
                 let it = self.get(from, 0);
                 match src.is_float() {
@@ -416,9 +391,47 @@ impl Out<'_, '_, '_> {
             self.stats.scalarized += 1;
             return Ok(());
         }
+        self.unpack(inst, whole, ty, int)
+    }
+
+    /// The lanes of input vector `from` (of type `src`) as one output integer of type `int`,
+    /// its whole width: lane 0 lowest, each float lane by its bits.
+    fn pack(&mut self, inst: usize, from: u32, src: Ty, int: Ty) -> Result<u32, LegalizeError> {
+        let ptr_bits = self.ptr_bits();
+        let total = int.bits(ptr_bits);
+        let width = src.lane().bits(ptr_bits);
+        let Some(lane_int) = Ty::int(width) else {
+            return Err(self.refuse(inst, "a vector whose lanes are no integer width, as one integer (a `bitcast`, an `asm!` operand)"));
+        };
+        let mut acc = None;
+        for k in 0..src.lanes() {
+            let mut it = self.get(from, k);
+            if src.lane().is_float() {
+                it = self.emit(Op::Bitcast, 0, lane_int, 0, &[it]);
+            }
+            if width < total {
+                it = self.emit(Op::Zext, 0, int, 0, &[it]);
+            }
+            if k > 0 {
+                let shift = self.iconst(int, u128::from(k * width));
+                it = self.emit(Op::Shl, 0, int, 0, &[it, shift]);
+            }
+            acc = Some(match acc {
+                None => it,
+                Some(acc) => self.emit(Op::Or, 0, int, 0, &[acc, it]),
+            });
+        }
+        acc.ok_or(self.refuse(inst, "a vector of no lanes as one integer (a `bitcast`, an `asm!` operand)"))
+    }
+
+    /// Input `inst`'s result, a vector of type `ty`, as the lanes of output integer `whole` (of
+    /// type `int`, the vector's whole width): [`Out::pack`] undone.
+    fn unpack(&mut self, inst: usize, whole: u32, ty: Ty, int: Ty) -> Result<(), LegalizeError> {
+        let ptr_bits = self.ptr_bits();
+        let total = int.bits(ptr_bits);
         let width = ty.lane().bits(ptr_bits);
         let Some(lane_int) = Ty::int(width) else {
-            return Err(self.refuse(inst, "a `bitcast` to a vector whose lanes are no integer width"));
+            return Err(self.refuse(inst, "a vector whose lanes are no integer width, from one integer (a `bitcast`, an `asm!` output)"));
         };
         self.begin_lanes(inst);
         for k in 0..ty.lanes() {
@@ -435,6 +448,69 @@ impl Out<'_, '_, '_> {
             }
             self.push_lane(it);
         }
+        Ok(())
+    }
+
+    /// Whether `asm` instruction `inst` takes a vector operand (mod.rs `reads_vector`).
+    pub(super) fn asm_reads_vector(&self, inst: usize) -> bool {
+        let view = self.view;
+        let at = view.data[inst] as usize + 1;
+        let n = view.extra[at] as usize;
+        view.extra[at + 1..at + 1 + n].iter().any(|&value| self.ty_of(value).is_vector())
+    }
+
+    /// An `asm` instruction with vector operands or a vector result (AArch64's `vreg` takes
+    /// `i8x8`..`f64x2`, constant_time_eq's `uint8x16_t`): the block is the same with each
+    /// vector as the integer of its whole width, 64 or 128 bits ([`Out::pack`] before it, lane 0
+    /// lowest, as a vector register holds it, and [`Out::unpack`] after). The emitter places
+    /// that integer in the vector register (blaze-emit pass/asm.rs: `ldr q` of the cell), so
+    /// the block sees the vector's bytes in the register's low bits, as the Reference has it.
+    /// A vector of another width, and a result holding a vector among several (mod.rs refuses
+    /// it before this), are refused by name.
+    fn asm(&mut self, inst: usize, ty: Ty) -> Result<(), LegalizeError> {
+        let view = self.view;
+        let flags = view.flags[inst];
+        let attrs = view.attrs[inst];
+        let at = view.data[inst] as usize;
+        let id = view.extra[at];
+        let n = view.extra[at + 1] as usize;
+        let whole = |out: &Self, vector: Ty| match vector.bits(out.ptr_bits()) {
+            64 => Ok(Ty::I64),
+            128 => Ok(Ty::I128),
+            _ => Err(out.refuse(inst, "a vector `asm!` operand of other than 64 or 128 bits (a `vreg` holds a `d` or a `q`)")),
+        };
+        // The operands first (each pack is instructions of its own), then the block's words.
+        let mut renamed = [0u32; 32];
+        if n > renamed.len() {
+            return Err(self.refuse(inst, "an `asm!` block of more than 32 inputs"));
+        }
+        for k in 0..n {
+            let value = view.extra[at + 2 + k];
+            let vector = self.ty_of(value);
+            renamed[k] = match vector.is_vector() {
+                true => {
+                    let int = whole(self, vector)?;
+                    self.pack(inst, value, vector, int)?
+                }
+                false => self.get(value, 0),
+            };
+        }
+        let result = match ty.is_vector() {
+            true => whole(self, ty)?,
+            false => ty,
+        };
+        let start = self.extra_at();
+        self.push_word(id);
+        self.push_word(n as u32);
+        for &value in &renamed[..n] {
+            self.push_value(value);
+        }
+        let made = self.raw(Op::Asm, flags, result, start, attrs);
+        match ty.is_vector() {
+            true => self.unpack(inst, made, ty, result)?,
+            false => self.set(inst, made),
+        }
+        self.stats.scalarized += 1;
         Ok(())
     }
 }

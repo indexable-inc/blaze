@@ -54,7 +54,7 @@ fn members_of(text: &str) -> Members {
     let prepared = Prepares::new_in(alloc);
     let mut evaluator = StoreConsts { names: &names, index: &front.index, prepared };
     let sized = front.index.lang("sized");
-    let mut source = SeededHeads::new(SeededHeadsOpts { names: &names, sized, frame: &frame, scratch: alloc, alloc, consts: Some(&mut evaluator), known: None, owners: None });
+    let mut source = SeededHeads::new(SeededHeadsOpts { names: &names, sized, pointers: blaze_ladder::front2::receiver::Pointers::NOT_LOOKED_UP, frame: &frame, scratch: alloc, alloc, consts: Some(&mut evaluator), known: None, owners: None });
     let cell = cell_of(&names, Want::Members(tr)).unwrap_or_else(|e| panic!("the cell of `Tr`'s members: {e}"));
     assert_eq!(cell, Want::Members(tr), "`Tr`'s members are a cell of their own");
     // The trait's members frozen: never refused whole for one member's constant.

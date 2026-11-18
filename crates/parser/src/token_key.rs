@@ -346,7 +346,7 @@ fn key_tokens<'t>(text: &'t str, edition: Edition, mut each: impl FnMut(KeyToken
             continue;
         }
         let next = raw.peek().copied();
-        let joined = joins_left(kind) && next.is_some_and(|(next, _)| joins_right(next));
+        let joined = next.is_some_and(|(next, _)| joined(kind, next));
         let separated = next.is_some_and(|(next, len)| !counts(next, &text[at..at + len]));
         each(KeyToken { index, start, lexeme, kind, joined, separated });
         index += 1;
@@ -396,6 +396,13 @@ fn joins_left(kind: SyntaxKind) -> bool {
 /// punctuation that is not a delimiter, or a lifetime, whose `'` is punctuation to a macro.
 fn joins_right(kind: SyntaxKind) -> bool {
     joins_left(kind) || kind == SyntaxKind::LIFETIME_IDENT
+}
+
+/// Whether a token of `kind` written right against a token of `next` is joined to it: the one
+/// rule a token key's joined bit follows, for [`key_tokens`] and for a digest made from kinds
+/// (blaze-file-items digest.rs).
+pub fn joined(kind: SyntaxKind, next: SyntaxKind) -> bool {
+    joins_left(kind) && joins_right(next)
 }
 
 /// `text` fits the u32 offsets and counts of a token place.

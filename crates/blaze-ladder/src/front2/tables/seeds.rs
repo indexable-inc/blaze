@@ -37,7 +37,7 @@ use blaze_own::{AVec, Alloc};
 use super::super::heads::{Seeded, Store, Want};
 use super::super::keys::Keys;
 use super::super::source::NamesSource;
-use super::head::{FreezeError, FrozenHead, HeadSource, Known, KnownHeads, NotTheirs, SeededHeads, cell_of, seed, want_bytes};
+use super::head::{CellFailure, FreezeError, FrozenHead, HeadSource, Known, KnownHeads, NotTheirs, SeededHeads, cell_of, seed, want_bytes};
 
 /// What a body's store asks for each head it needs (heads.rs `Store::seeds`).
 pub trait HeadSeed<'n> {
@@ -377,11 +377,16 @@ impl<'n, N: NamesSource<'n>, H: RequestHeads> HeadSeed<'n> for RequestSeed<'_, '
         }
         // A freeze that failed on this ask: its reason handed to the request with the cell it
         // is about, before any caller can drop it (`RequestHeads::refused`).
-        if let Err(error) = &seeded
-            && !matches!(error, FreezeError::Again { .. })
-            && let Some(failed) = freezer.failed_since(failed_from)
-        {
-            self.heads.refused(failed, error);
+        // (Lane HF1: every ask of a failed cell is `Again`, so the reasons are read from the
+        // cells the source kept as failed on this ask, each its own.)
+        if seeded.is_err() {
+            for (failed, failure, _) in freezer.failures_from(failed_from) {
+                match failure {
+                    CellFailure::Own(error) => self.heads.refused(failed, error),
+                    CellFailure::Needs(needed) => self.heads.refused(failed, &FreezeError::Again { want: failed, failed: needed }),
+                    CellFailure::Refused { .. } => {}
+                }
+            }
         }
         self.froze.set(self.froze.get().saturating_add(1));
         seeded.map_err(SeedError::of_freeze)

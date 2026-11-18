@@ -168,8 +168,9 @@
 //! (arguments past `x7`/`v7` go on the stack, both ways: pass/stack.rs), a C-variadic definition, a
 //! variable argument narrower than 32 bits, an `f32`, an `i128` or a compound, more than 510
 //! stacked or stacked under an `invoke`, more than two returns, a `volatile` bulk
-//! operation, `uninit`, `invoke` and unwinding, tail calls, `asm!`, target
-//! intrinsics, and `frame_address`, `return_address`, `stack_pointer`. The provenance
+//! operation, `uninit`, `invoke` and unwinding, tail calls, `asm!` with `label` operands
+//! (`asm_br`) or a template statement outside the assembler's table (pass/asm.rs, asm.rs),
+//! target intrinsics outside pass/target.rs's four, and `frame_address`, `return_address`, `stack_pointer`. The provenance
 //! operations are their bits: `expose` is `ptr_addr`, `from_exposed` the address itself,
 //! `ptr_with_addr` the new address.
 //!
@@ -185,6 +186,8 @@ use core::fmt;
 
 use blaze_lir::{Op, View};
 
+/// The `asm!` template reader and its mnemonic table (pass/asm.rs lowers the block).
+mod asm;
 mod compose;
 mod enc;
 mod enc_probe;
@@ -198,6 +201,7 @@ mod routines;
 pub mod table_gen;
 mod tier;
 pub use tier::Reference;
+pub use asm::AsmToken;
 
 pub use record::{Named, Names, Outside, RecordEmitError, emit_record};
 pub use routines::{Called, RoutinePlaces};
@@ -289,6 +293,18 @@ mod atomic_wide_tests;
 /// (blaze-lir legalize/quad.rs, routines.rs).
 #[cfg(all(test, target_arch = "aarch64"))]
 mod quad_run_tests;
+
+/// `asm!` blocks: the template reader and the operands' registers (asm.rs, pass/asm.rs).
+#[cfg(test)]
+mod asm_tests;
+
+/// The `asm!` mnemonic table against the A64 layouts (asm/table.rs).
+#[cfg(test)]
+mod asm_table_tests;
+
+/// `asm!` rows run: CRC32, `fsqrt`, `tst`+`csel`, explicit registers, `cntvct_el0`.
+#[cfg(all(test, target_arch = "aarch64"))]
+mod asm_run_tests;
 
 
 /// The most bytes a `memcpy` or `memset` of a constant length is emitted inline; past it, the
@@ -527,6 +543,9 @@ pub enum EmitError {
     /// widened), and binds no soft-float routine, so an `f128` operation is refused here naming
     /// its routine ([`blaze_lir::legalize::LegalizeError::NoRoutine`]).
     Legalize(blaze_lir::legalize::LegalizeError),
+    /// The template of the `asm` at instruction `inst` (asm.rs): line `line` of it (from 1) is
+    /// not assembled, for `why`, at `token` (a mnemonic, a directive, a label or an operand).
+    Asm { inst: u32, line: u32, why: &'static str, token: AsmToken },
 }
 
 impl fmt::Display for EmitError {
@@ -541,6 +560,9 @@ impl fmt::Display for EmitError {
             EmitError::Data { row, why } => write!(f, "data row {row}: the baseline tier does not place {why}"),
             EmitError::Record { why } => write!(f, "the code record form (run.md, \"The code record\") does not emit {why}"),
             EmitError::Legalize(why) => why.fmt(f),
+            EmitError::Asm { inst, line, why, token } => {
+                write!(f, "instruction {inst} (`asm`): line {line} of its template is not assembled: {why}: {token}")
+            }
         }
     }
 }

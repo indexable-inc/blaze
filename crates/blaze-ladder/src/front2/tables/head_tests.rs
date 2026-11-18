@@ -316,7 +316,7 @@ fn alone(names: Src, sized: Option<LibKey>, frame: &'static blaze_mem::Frame, or
     for w in order.iter().copied() {
         let mut kept = AVec::new_in(a());
         if plant == Plant::None {
-            let f = freeze(names, sized, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze {w:?}: {e}"));
+            let f = freeze(names, sized, crate::front2::receiver::Pointers::NOT_LOOKED_UP, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze {w:?}: {e}"));
             kept.extend_from_slice(&f.bytes);
         } else {
             let one = in_one_store(names, sized, frame, &[w], true, plant);
@@ -405,7 +405,7 @@ fn a_frozen_head_imports_as_today_s_head() {
     }
     let mut compared = 0;
     for w in cells.iter().copied() {
-        let f = freeze(names, sized, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze {w:?}: {e}"));
+        let f = freeze(names, sized, crate::front2::receiver::Pointers::NOT_LOOKED_UP, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze {w:?}: {e}"));
         let frozen = FrozenHead::read(&f.bytes).unwrap_or_else(|e| panic!("read {w:?}: {e}"));
         // Its meaning is the `Signature` out's digest of the same want in today's store.
         let today = want_digest_in(names, &keys, &mut store, w, a()).unwrap_or_else(|e| panic!("digest {w:?}: {e:?}"));
@@ -457,7 +457,7 @@ fn a_frozen_head_carries_the_store_s_side_tables() {
     }
     let (mut rows, mut wheres, mut consts, mut fieldless, mut frames) = (0, 0, 0, 0, 0);
     for w in cells.iter().copied() {
-        let f = freeze(names, sized, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze {w:?}: {e}"));
+        let f = freeze(names, sized, crate::front2::receiver::Pointers::NOT_LOOKED_UP, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze {w:?}: {e}"));
         let frozen = FrozenHead::read(&f.bytes).unwrap_or_else(|e| panic!("read {w:?}: {e}"));
         let mut texts: AVec<'static, (HeadAt, &'static str)> = AVec::new_in(a());
         for e in frozen.heads() {
@@ -578,7 +578,7 @@ fn the_two_sources_answer_alike() {
     let mut store = Store::new(sized, frame, a());
     let mut keys = Keys::new();
     let mut by_store = StoreHeads::new(StoreHeadsOpts { names, keys: &mut keys, store: &mut store, alloc: a() });
-    let mut by_freeze = FrozenHeads::new(FrozenHeadsOpts { names, sized, frame, scratch: a(), alloc: a() });
+    let mut by_freeze = FrozenHeads::new(FrozenHeadsOpts { names, sized, pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP, frame, scratch: a(), alloc: a() });
     let mut reads = 0;
     for w in cells.iter().copied() {
         let x: AVec<'static, u8> = {
@@ -589,7 +589,7 @@ fn the_two_sources_answer_alike() {
         };
         let y = by_freeze.frozen(w).unwrap_or_else(|e| panic!("freeze {w:?}: {e}"));
         assert!(x[..] == y.bytes()[..], "ORACLE: {w:?} froze otherwise from the store than alone");
-        let f = freeze(names, sized, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze {w:?}: {e}"));
+        let f = freeze(names, sized, crate::front2::receiver::Pointers::NOT_LOOKED_UP, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze {w:?}: {e}"));
         let seen = reads_seen(&f.reads, &mut by_freeze, a()).unwrap_or_else(|e: FreezeError| panic!("reads of {w:?}: {e}"));
         reads += seen.len();
     }
@@ -602,7 +602,7 @@ fn the_two_sources_answer_alike() {
         _ => {}
     });
     let (total, area) = (total.expect("`total`"), area.expect("`Area`"));
-    let f = freeze(names, sized, Want::Fn(total), frame, a(), a()).unwrap_or_else(|e| panic!("freeze total: {e}"));
+    let f = freeze(names, sized, crate::front2::receiver::Pointers::NOT_LOOKED_UP, Want::Fn(total), frame, a(), a()).unwrap_or_else(|e| panic!("freeze total: {e}"));
     assert!(f.reads.iter().any(|w| *w == Want::Members(area)), "`total`'s reads miss `Area`: {:?}", &f.reads[..]);
     std::println!("sources: {} cells alike; {reads} reads, `total` reads `Area`", cells.len());
 }
@@ -615,7 +615,7 @@ fn a_store_filed_from_frozen_heads_alone_lowers_nothing() {
     let (names, sized, frame) = world();
     let cells = cells(names);
     let alone = alone(names, sized, frame, &cells, Plant::None);
-    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None, known: None, owners: None });
+    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP, frame, scratch: a(), alloc: a(), consts: None, known: None, owners: None });
     let mut store = Store::new(sized, frame, a());
     let keys = Keys::new();
     for w in cells.iter().copied() {
@@ -755,7 +755,7 @@ fn a_seeded_store_answers_every_ctor_lookup_as_lowering() {
     for w in cells.iter().copied() {
         lowered.ensure(names, &mut lkeys, w).unwrap_or_else(|e| panic!("ensure {w:?}: {e}"));
     }
-    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None, known: None, owners: None });
+    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP, frame, scratch: a(), alloc: a(), consts: None, known: None, owners: None });
     let seeded = Store::new(sized, frame, a());
     let skeys = Keys::new();
     for w in cells.iter().copied() {
@@ -811,9 +811,9 @@ fn a_seeded_freeze_lowers_each_item_once() {
     // Today's: each cell frozen alone lowers every head it needs again.
     let mut unseeded = 0u32;
     for w in cells.iter().copied() {
-        unseeded += freeze(names, sized, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze {w:?}: {e}")).lowered;
+        unseeded += freeze(names, sized, crate::front2::receiver::Pointers::NOT_LOOKED_UP, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze {w:?}: {e}")).lowered;
     }
-    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None, known: None, owners: None });
+    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP, frame, scratch: a(), alloc: a(), consts: None, known: None, owners: None });
     let mut seeded: AVec<'static, (Want, AVec<'static, u8>)> = AVec::new_in(a());
     for w in cells.iter().copied() {
         let f = source.frozen(w).unwrap_or_else(|e| panic!("seeded {w:?}: {e}"));
@@ -859,7 +859,7 @@ fn head_tasks_are_equal_in_any_order() {
     let cells = cells(names);
     let tool = blaze_drive::key::Tool(ContentId::of("blaze-ladder head task test", b"head"));
     let run = |order: &[Want]| {
-        let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None, known: None, owners: None });
+        let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP, frame, scratch: a(), alloc: a(), consts: None, known: None, owners: None });
         let mut done: AVec<'static, (Want, super::head::HeadDone<'static>)> = AVec::new_in(a());
         for w in order.iter().copied() {
             let d = head_task(names, &mut source, w, tool, a());
@@ -892,7 +892,7 @@ fn head_tasks_are_equal_in_any_order() {
     }
     // Control: the key is the tool's too; the out is not.
     let other = blaze_drive::key::Tool(ContentId::of("blaze-ladder head task test", b"another"));
-    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None, known: None, owners: None });
+    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP, frame, scratch: a(), alloc: a(), consts: None, known: None, owners: None });
     let (w, f) = &fwd[0];
     let d = head_task(names, &mut source, *w, other, a());
     assert!(d.key != f.key && d.out == f.out, "another tool: another key, the same out");
@@ -941,7 +941,7 @@ fn longer_of(app: &'static str) -> Longer {
     });
     let lib = found.expect("`longer`");
     let w = Want::Fn(lib);
-    let f = freeze(names, sized, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze `longer`: {e}"));
+    let f = freeze(names, sized, crate::front2::receiver::Pointers::NOT_LOOKED_UP, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze `longer`: {e}"));
     let frozen = FrozenHead::read(&f.bytes).unwrap_or_else(|e| panic!("read `longer`: {e}")).meaning();
     let mut store = Store::new(sized, frame, a());
     let mut keys = Keys::new();

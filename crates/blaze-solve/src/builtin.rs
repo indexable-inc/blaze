@@ -264,6 +264,13 @@ fn elaborate_supertraits<T: Tys, F: Facts>(
             let Pred::Trait { trait_, args: sa, .. } = cx.import_pred(td.portable, p, a)? else {
                 return Err(malformed());
             };
+            // The supertraits proper (`explicit_super_clauses_of`, `Self` the self type): an
+            // associated type's bound from the header (`Tr: Super<A: B>`) is implied by the
+            // trait but names no supertrait.
+            let self_ty = cx.arg(a, 0);
+            if !on_self(cx, Pred::Trait { trait_, args: sa, polarity: Polarity::Positive }, self_ty) {
+                continue;
+            }
             let mut seen = false;
             for &(od, oa) in &out[base..] {
                 if od == trait_ && same_list(cx, oa, sa) {
@@ -280,6 +287,25 @@ fn elaborate_supertraits<T: Tys, F: Facts>(
         }
     }
     Ok(())
+}
+
+/// Whether the imported supertrait clause `p` is on `self_ty` (a trait, projection or
+/// outlives clause whose self type is that term; a clause of another kind has no self type
+/// and is kept): a supertrait proper, as the reference's `explicit_super_clauses_of`
+/// (`PredicateFilter::SelfOnly`) gives it. A trait's `supertraits` are its implied clauses
+/// (`explicit_implied_clauses_of`, `SelfAndAssociatedTypeBounds`: also `<Self as Super>::A: B`
+/// from `Tr: Super<A: B>`), which the param env elaborates whole (eval.rs `env_once`).
+fn on_self<T: Tys, F: Facts>(cx: &Cx<'_, '_, T, F>, p: Pred, self_ty: Ty) -> bool {
+    let args = match p {
+        Pred::Trait { args, .. } | Pred::HostEffect { args, .. } => args,
+        Pred::Projection { alias, .. } => match cx.kind(alias) {
+            TyKind::Alias(_, _, _, al) => al,
+            _ => return false,
+        },
+        Pred::TypeOutlives { ty, .. } => return ty == self_ty,
+        _ => return true,
+    };
+    args.len != 0 && cx.arg(args, 0) == self_ty
 }
 
 /// Two lists of equal handles (interned terms: equal terms).
@@ -1027,6 +1053,11 @@ fn step_object<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Resu
     }
     let td = cx.trait_def(cand.d)?;
     let mut reqs: Vec<Pred, Alloc<'_>> = Vec::new_in(cx.alloc);
+    // Deviation: the reference takes `explicit_super_clauses_of` (the clauses on `Self`) and
+    // elaborates them; `supertraits` here are the implied clauses, so a header's associated
+    // type bound (`Tr: Super<A: B>`) is a requirement too. Over an object it is
+    // `<projection's term>: B`, which the object type's well-formedness needs anyway; blaze-cert
+    // check.rs replays this list as it is.
     for &p in td.supertraits {
         reqs.push(cx.import_pred(td.portable, p, assumption)?);
     }

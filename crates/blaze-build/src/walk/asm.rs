@@ -12,9 +12,13 @@
 //! - `out(<reg>) _`: "the contents of the register are discarded at the end of the asm code":
 //!   the operand stays an output (the register is still written), its member never stored.
 //! - `const <expr>`: "the value of the expression is formatted as a string and substituted
-//!   directly into the asm template string". Refused by name for now: blaze-lower keeps the
-//!   plain expression and no evaluated value of it is recorded (P9b's ruling). Once one is,
-//!   it is formatted into a text piece and the operand is no LIR operand.
+//!   directly into the asm template string": the integer in decimal, a `-` before a negative
+//!   one of a signed type, merged into the text around it; the operand is no LIR operand. Its
+//!   value comes from where the walk already reads constants: an integer literal (negated or
+//!   not), a `const` item's record, a `const { .. }` block's record, or a const generic
+//!   parameter's argument ([`ConstText`]). Any other expression, a type other than an
+//!   integer, a value holding an address and a template modifier on its placeholder are
+//!   refused by name.
 //! - `sym <path>`: "<path> must refer to a fn or static": a `Func` or `Static` reference of
 //!   the function, the operand's `aux` its row of `refs`.
 //! - `label <block>`: "If the assembly code jumps to the label, the block is executed": the
@@ -38,11 +42,71 @@ use blaze_code::record::TrapKind;
 use blaze_lir::builder::{AsmOperand, AsmPiece, MemAttrs, RegKind};
 use blaze_lir::func::{AsmOperandKind, AsmRec, RefKind};
 use blaze_lir::{Block, Flags, Scalar, Ty, Value};
-use blaze_typeck::{AsmArch, AsmKind, AsmPiece as TcPiece, AsmReg, BodyView, Def, Expr, ExprId, List, PNode};
+use blaze_typeck::{AsmArch, AsmKind, AsmPiece as TcPiece, AsmReg, BodyView, Def, Expr, ExprId, List, PNode, UnOp};
 
-use super::{Repr, Task, V, Walk, layout_err, malformed, prim_ty, unsupported};
+use super::{PTR_BITS, Repr, Task, V, Walk, layout_err, malformed, prim_ty, unsupported};
+use crate::data::DataRecord;
 use crate::layout::LayoutCx;
 use crate::{BuildError, Instance};
+
+/// `const` operands' text ([`ConstText::write`]).
+#[cfg(test)]
+mod const_tests;
+
+/// A `const` operand's value as the template's text takes it: its bits at its type's width
+/// and whether the type is signed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ConstText {
+    bits: u128,
+    width: u32,
+    signed: bool,
+}
+
+impl ConstText {
+    /// Appends the value in decimal (the Reference's "formatted as a string": `Display`):
+    /// a signed type's value with its sign, at most 40 bytes.
+    fn write<A: Allocator>(self, out: &mut Vec<u8, A>) {
+        let mask = match self.width {
+            128.. => u128::MAX,
+            w => (1u128 << w) - 1,
+        };
+        let bits = self.bits & mask;
+        let negative = self.signed && self.width > 0 && (bits >> (self.width - 1)) & 1 == 1;
+        let mut magnitude = match negative {
+            true => (!bits).wrapping_add(1) & mask,
+            false => bits,
+        };
+        if negative {
+            out.push(b'-');
+        }
+        // u128::MAX has 39 digits.
+        let mut digits = [0u8; 39];
+        let mut n = 0;
+        loop {
+            digits[n] = b'0' + (magnitude % 10) as u8;
+            n += 1;
+            magnitude /= 10;
+            if magnitude == 0 {
+                break;
+            }
+        }
+        out.extend(digits[..n].iter().rev());
+    }
+}
+
+/// The bits of a scalar constant's record at `width` bits: its root's bytes, little-endian
+/// (as walk.rs `const_record_value_as` reads a scalar record); a record whose root holds an
+/// address is refused, as no address is known when the template is written.
+fn record_bits<B: Allocator>(e: ExprId, record: &DataRecord<B>, width: u32) -> Result<u128, BuildError> {
+    let bad = |why| BuildError::Malformed { what: why };
+    record.check().map_err(|_| bad("a const's record that breaks the data form"))?;
+    let root = record.allocs.first().ok_or(bad("a const's record with no allocation"))?;
+    if !root.relocs.is_empty() {
+        return Err(unsupported(e, "a `const` operand of `asm!` whose value holds an address"));
+    }
+    let bytes = root.bytes.get(..(width / 8) as usize).ok_or(bad("a const's bytes shorter than its type"))?;
+    Ok(bytes.iter().enumerate().fold(0u128, |value, (i, &byte)| value | (u128::from(byte) << (8 * i))))
+}
 
 /// How an operand's value is held around the block.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -174,6 +238,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let mut members: Vec<Ty, A> = Vec::new_in(self.alloc.clone());
         let mut stores: Vec<Store, A> = Vec::new_in(self.alloc.clone());
         let mut labels: Vec<(Block, ExprId), A> = Vec::new_in(self.alloc.clone());
+        // Per operand of the source, its value when it is a `const`.
+        let mut consts: Vec<Option<ConstText>, A> = Vec::with_capacity_in(ops.len(), self.alloc.clone());
         let mut next = base;
         for op in ops {
             lir_index.push(lir_ops.len() as u32);
@@ -258,11 +324,14 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     labels.push((block, op.expr));
                     (AsmOperandKind::Label, (labels.len() - 1) as u32)
                 }
-                // Its value is to be formatted into the text, with no LIR operand; nothing
-                // records it yet (blaze-lower keeps the plain expression, with no inline-const
-                // record for the constant evaluator to fill).
-                AsmKind::Const => return Err(unsupported(e, "a `const` operand of `asm!` (no evaluated value of it is recorded yet)")),
+                // Its value is formatted into the text below, with no LIR operand.
+                AsmKind::Const => {
+                    let value = self.asm_const(e, op.expr)?;
+                    consts.push(Some(value));
+                    continue;
+                }
             };
+            consts.push(None);
             lir_ops.push(AsmOperand { kind, reg, reg_kind, aux });
         }
         if next != self.vals.len() {
@@ -284,11 +353,19 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 // The Reference, "Template string arguments": the strings "concatenated with a
                 // \n between them".
                 TcPiece::Line => text.push(b'\n'),
-                TcPiece::Operand { index, modifier } => {
-                    let at = *lir_index.get(index as usize).ok_or(malformed("an `asm!` placeholder past its operands"))?;
-                    raws.push(Raw::Operand { index: at, modifier });
-                    continue;
-                }
+                TcPiece::Operand { index, modifier } => match consts.get(index as usize).copied().flatten() {
+                    // The Reference, "Template modifiers": a modifier applies to a register
+                    // operand; rustc refuses one on a `const`.
+                    Some(_) if modifier.is_some() => {
+                        return Err(unsupported(e, "a template modifier on a `const` operand of `asm!`"));
+                    }
+                    Some(value) => value.write(&mut text),
+                    None => {
+                        let at = *lir_index.get(index as usize).ok_or(malformed("an `asm!` placeholder past its operands"))?;
+                        raws.push(Raw::Operand { index: at, modifier });
+                        continue;
+                    }
+                },
             }
             match raws.last_mut() {
                 Some(Raw::Text(_, end)) if *end == start => *end = text.len(),
@@ -428,6 +505,56 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let count = u32::try_from(lanes.count).map_err(|_| unsupported(x, "an `asm!` vector operand of more than 2^32 lanes"))?;
         let ty = Ty::vector(elem, count).ok_or(unsupported(x, "an `asm!` vector operand LIR has no vector type for"))?;
         Ok(Held::Vector(ty, lanes.align))
+    }
+
+    /// The value of `const` operand `expr` of `asm!` `e` (parentheses peeled), from the four
+    /// places the walk reads constants: an integer literal (`lit`'s `int_lit`), `-` of one,
+    /// a `const` item's record ([`Self::const_value`]'s), a `const { .. }` block's record, and
+    /// a const generic parameter's argument ([`Self::const_param_value`]'s). The Reference:
+    /// "must be an integer constant expression".
+    fn asm_const(&mut self, e: ExprId, expr: ExprId) -> Result<ConstText, BuildError> {
+        let mut x = expr;
+        while let Expr::Paren(inner) = self.expr(x)? {
+            x = inner;
+        }
+        let Repr::Int { ty, signed } = self.expr_repr(x)? else {
+            return Err(unsupported(e, "a `const` operand of `asm!` of a type other than an integer"));
+        };
+        let width = ty.bits(PTR_BITS);
+        let adts = self.adts;
+        let owner = self.body.owner;
+        let bits = match self.expr(x)? {
+            Expr::Lit(_) => adts.int_lit(owner, x).ok_or(BuildError::NoLiteralValue { expr: x })?,
+            Expr::Unary { op: UnOp::Neg, operand } if matches!(self.expr(operand)?, Expr::Lit(_)) => {
+                adts.int_lit(owner, operand).ok_or(BuildError::NoLiteralValue { expr: operand })?.wrapping_neg()
+            }
+            Expr::ConstBlock { .. } => {
+                let record = adts.const_block_value(owner, x, self.args).ok_or(BuildError::NoConstBlockValue { expr: x, owner })?;
+                record_bits(e, record, width)?
+            }
+            Expr::Path(_) => match self.expr_def(x) {
+                Some(Def::Const(item)) => {
+                    let args = self.const_path_args(x)?;
+                    let record = adts.const_value(item, &args[..]).ok_or(BuildError::NoConstValue { expr: x, item })?;
+                    record_bits(e, record, width)?
+                }
+                Some(Def::TyParam(index)) => {
+                    let g = *self.args.get(index as usize).ok_or(malformed("a const parameter past the instance's arguments"))?;
+                    let PNode::ConstValue { bits, .. } = self.ground_node(g).map_err(|error| Self::ty_err(x, error))? else {
+                        return Err(malformed("a const parameter's argument that is not a value in the ground table"));
+                    };
+                    bits
+                }
+                _ => return Err(unsupported(e, "a `const` operand of `asm!` naming a path that is no constant or const parameter")),
+            },
+            _ => {
+                return Err(unsupported(
+                    e,
+                    "a `const` operand of `asm!` other than an integer literal, a constant, a `const { .. }` block or a const parameter (an arithmetic expression is not evaluated here)",
+                ));
+            }
+        };
+        Ok(ConstText { bits, width, signed })
     }
 
     /// `sym` operand path `x`: the row of `refs` of the fn instance or static it names.

@@ -74,6 +74,8 @@
 //! refused by name, never left to freeze it (rule 3).
 
 use core::convert::Infallible;
+use core::num::NonZeroU32;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use blaze_drive::cells::Cell;
 use blaze_drive::{Input, Key, Kind, Locate, Name};
@@ -203,11 +205,37 @@ pub(crate) struct HeadsStage {
     /// The request's frozen heads, each cell once (engine_heads_once.rs), made at the first
     /// phase that runs head tasks and kept across its waves.
     pub(crate) once: Option<crate::engine_heads_once::HeadsOnce>,
+    /// How a crate's head tasks are cut into pool jobs and its listing shared (the command's:
+    /// [`HeadJobs::RULE`]; a test's plant otherwise).
+    pub(crate) jobs: HeadJobs,
+    /// The request's crate listings ([`Listings`]), each crate's once: made at the first phase
+    /// that asks (a Heads phase, or a Bodies phase through [`HeadsStage::listings`]) and kept to
+    /// the request's end, for every Heads job and every Bodies stretch.
+    listings: Option<Listings>,
 }
 
 impl HeadsStage {
     pub(crate) fn new(scope_reads: crate::engine_scope_reads::ScopeReadsAs) -> HeadsStage {
-        HeadsStage { made: std::vec::Vec::new_in(Global), refused: std::vec::Vec::new_in(Global), read_back: 0, freeze: HeadUnits::Each, units: UnitCounts::default(), scope_reads, once: None }
+        HeadsStage { made: std::vec::Vec::new_in(Global), refused: std::vec::Vec::new_in(Global), read_back: 0, freeze: HeadUnits::Each, units: UnitCounts::default(), scope_reads, once: None, jobs: HeadJobs::RULE, listings: None }
+    }
+
+    /// The request's crate listings over its heap (`heap`: the request's, the one the Heads
+    /// phases are handed, `Handles::env.heap`), made on first ask: what the Bodies stage's
+    /// stretches place their head reads by (engine_bodies.rs `run_stretch`, engine_seeds.rs
+    /// `StretchHeads`), the same table the head tasks listed their crates into.
+    pub(crate) fn listings(&mut self, heap: &'static blaze_own::Heap) -> &Listings {
+        let plant = self.jobs.listings;
+        self.listings.get_or_insert_with(|| Listings::new(heap, plant))
+    }
+
+    /// The head tasks' counts with the listings' as they stand now (the Bodies stretches ask the
+    /// table after the Heads phases ran, so read at the profile, not at a phase's end).
+    pub(crate) fn unit_counts(&self) -> UnitCounts {
+        let mut counts = self.units;
+        if let Some(listings) = &self.listings {
+            counts.listings = listings.counts();
+        }
+        counts
     }
 
     /// Task `name`'s record, when it was entered and made this request.
@@ -246,6 +274,9 @@ impl HeadsStage {
         }
         let heap = handles.env.heap;
         let at_cells = self.scope_reads.tables_at_cells();
+        // The request's crate listings: a header's head read is placed by them (`Owners`).
+        let listings_plant = self.jobs.listings;
+        let listings: &Listings = self.listings.get_or_insert_with(|| Listings::new(heap, listings_plant));
         let refused = &mut self.refused;
         // A refusal with the cells it is a function of, each read as the view holds it today
         // (ABSENT where no task defines it: a crate whose names task failed or did not run), so
@@ -343,7 +374,7 @@ impl HeadsStage {
                 let clock = clock.clone();
                 running.push(scope.may_overlap("engine impl tables", HEADS_FRAME, move |cx: &Cx| {
                     let began = clock.now();
-                    let made = work::unwinding(|| tables_of(cx, root, packs, corrected, procs, job, subjects, heap));
+                    let made = work::unwinding(|| tables_of(cx, root, packs, corrected, procs, job, subjects, heap, listings));
                     Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns)))
                 }));
             }
@@ -468,6 +499,7 @@ fn tables_of(
     job: &Job<'_>,
     subjects: Option<&Subjects>,
     heap: &'static blaze_own::Heap,
+    listings: &Listings,
 ) -> Result<Worked, &'static str> {
     let frame = cx.frame();
     let g = heap.alloc();
@@ -489,7 +521,7 @@ fn tables_of(
     let view = Tables::new(TablesOpts { records, impls: None, lang_crates: &[], reads: &unused });
     let mut reads: std::vec::Vec<CellId, Global> = std::vec::Vec::with_capacity_in(done.reads.len(), Global);
     let mut heads: std::vec::Vec<CellId, Global> = std::vec::Vec::new_in(Global);
-    let mut owners = subjects.map(|subjects| Owners::new(subjects, &job.crates[..], g));
+    let mut owners = subjects.map(|subjects| Owners::new(subjects, &job.crates[..], listings, g));
     for read in done.reads.iter() {
         match cell_id(view, *read) {
             // A names read: at cell grain its cell (the coordinator keeps it where its crate
@@ -648,12 +680,180 @@ pub(crate) struct UnitCounts {
     /// Items frozen under two units or more (each a freeze a head form relative to "this crate"
     /// would share).
     pub(crate) shared: u32,
+    /// Head tasks given to split jobs (one a (task, unit): a task two units hold, twice),
+    /// summed over the phases.
+    pub(crate) tasks: u32,
+    /// Crate jobs (one a unit with head tasks: its setup), summed over the phases.
+    pub(crate) crate_jobs: u32,
+    /// Split jobs (each a run of one crate's tasks, [`split_count`]), summed over the phases.
+    pub(crate) split_jobs: u32,
+    /// Split jobs that ran a task, summed over the phases.
+    pub(crate) busy: u32,
+    /// The floor of `busy`: min(workers, head tasks to run), summed over the phases.
+    pub(crate) busy_floor: u32,
+    /// The most split jobs one crate's tasks were cut into, in any phase.
+    pub(crate) most_splits: u32,
+    /// The request's crate listings ([`Listings`]).
+    pub(crate) listings: ListingCounts,
 }
 
-/// The profile's line of the head tasks' freezes by unit.
+/// The profile's lines of the head tasks' freezes by unit, their jobs and their listings.
 pub(crate) fn unit_profile(counts: &UnitCounts, into: &mut blaze_own::String<&Frame>) {
     use core::fmt::Write as _;
     let _ = writeln!(into, "heads frozen: {} for {} items in {} units ({} items held by 2+ units)", counts.frozen, counts.items, counts.units, counts.shared);
+    let _ = writeln!(
+        into,
+        "head jobs: {} tasks in {} split jobs over {} crate jobs, {} busy (floor min(workers, tasks) = {}: {}), at most {} splits in one crate",
+        counts.tasks,
+        counts.split_jobs,
+        counts.crate_jobs,
+        counts.busy,
+        counts.busy_floor,
+        Hundredths::of(counts.busy, counts.busy_floor),
+        counts.most_splits
+    );
+    let l = &counts.listings;
+    let _ = writeln!(
+        into,
+        "head listings: {} made for {} crates (floor 1 a crate: {}), {} twice by a race, {} unequal, {} refused full, {} asks",
+        l.made,
+        l.crates,
+        Hundredths::of(l.made, l.crates),
+        l.twice,
+        l.unequal,
+        l.full,
+        l.asks
+    );
+}
+
+/// A ratio printed to two places, `n/a` over nothing (rule 67: the ratio to the floor).
+struct Hundredths(Option<u64>);
+
+impl Hundredths {
+    fn of(top: u32, floor: u32) -> Hundredths {
+        Hundredths((floor > 0).then(|| u64::from(top) * 100 / u64::from(floor)))
+    }
+}
+
+impl core::fmt::Display for Hundredths {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(at) => write!(f, "ratio {}.{:02}", at / 100, at % 100),
+            None => write!(f, "ratio n/a"),
+        }
+    }
+}
+
+/// How a crate's head tasks are cut into pool jobs ([`split_count`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeadSplit {
+    /// The rule: a crate's share of the phase's jobs by its share of the tasks.
+    Rule,
+    /// Each crate's tasks in this many jobs (at most one a task): a test's knob.
+    #[cfg_attr(not(test), expect(dead_code, reason = "a test's knob"))]
+    Jobs(NonZeroU32),
+}
+
+/// How the split jobs' results are merged ([`in_split_order`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MergePlant {
+    /// The rule: each in its split's place, whatever finished first.
+    Rule,
+    /// As they arrived: the control of the merge's test (rule 23).
+    #[cfg_attr(not(test), expect(dead_code, reason = "a test's plant (rule 23)"))]
+    Arrival,
+}
+
+/// The Heads stage's jobs: how a crate's tasks are split, and the listings' and the merge's
+/// plants (the command's: [`HeadJobs::RULE`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeadJobs {
+    pub(crate) split: HeadSplit,
+    pub(crate) listings: ListingsPlant,
+    pub(crate) merge: MergePlant,
+}
+
+impl HeadJobs {
+    pub(crate) const RULE: HeadJobs = HeadJobs { split: HeadSplit::Rule, listings: ListingsPlant::Rule, merge: MergePlant::Rule };
+}
+
+/// The phase's jobs a worker under the rule ([`split_count`]): enough that a crate whose tasks
+/// are slow does not hold the phase's end, few enough that each job's own source (its records
+/// reopened, its tables and lang index, its recorders) is small beside its tasks.
+const JOBS_A_WORKER: usize = 2;
+
+/// Into how many jobs a crate's `tasks` head tasks are cut, of the phase's `total` over
+/// `workers` workers. THE GRAIN: under the rule each crate takes its share of
+/// `workers * JOBS_A_WORKER` jobs by its share of the phase's tasks, at least one and at most one
+/// a task; each job a contiguous run of the crate's tasks in file order (`run_items` sorts them
+/// by (file, name)), cut evenly, so a file's tasks are cut only where it holds more than a run.
+/// FLOOR: busy jobs = min(workers, tasks with work): one crate of T tasks is cut into
+/// min(T, 2 * workers) jobs, and many crates fill the workers by themselves.
+pub(crate) fn split_count(split: HeadSplit, tasks: usize, total: usize, workers: usize) -> usize {
+    if tasks == 0 {
+        return 0;
+    }
+    match split {
+        HeadSplit::Jobs(n) => usize::try_from(n.get()).unwrap_or(usize::MAX).min(tasks),
+        HeadSplit::Rule => workers.saturating_mul(JOBS_A_WORKER).saturating_mul(tasks).div_ceil(total.max(tasks)).clamp(1, tasks),
+    }
+}
+
+/// Why the split jobs' results could not be put in split order ([`in_split_order`]): the
+/// merge's own inconsistency, named (rule 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MergeError {
+    /// A split's result came twice.
+    Twice { split: u32 },
+    /// A split's result is past the splits made.
+    Past { split: u32, splits: u32 },
+    /// A split's result never came.
+    Missing { split: u32 },
+}
+
+impl core::fmt::Display for MergeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            MergeError::Twice { split } => write!(f, "head split job {split}'s result came twice (engine_heads.rs `in_split_order`)"),
+            MergeError::Past { split, splits } => write!(f, "head split job {split}'s result is past the {splits} split jobs made (engine_heads.rs `in_split_order`)"),
+            MergeError::Missing { split } => write!(f, "head split job {split}'s result never came (engine_heads.rs `in_split_order`)"),
+        }
+    }
+}
+
+/// The split jobs' results (`arrived`: (split, result) as each finished) in split order, which
+/// is task order: what the merge reads, so no order of completion shows in a row (rule 25).
+/// Each split exactly once, or a typed refusal. Under [`MergePlant::Arrival`], as they arrived.
+pub(crate) fn in_split_order<'a, T>(arrived: SVec<'a, (u32, T)>, splits: usize, plant: MergePlant, alloc: SharedAlloc<'a>) -> Result<SVec<'a, T>, MergeError> {
+    let count = u32::try_from(splits).unwrap_or(u32::MAX);
+    let mut slots: SVec<'a, Option<T>> = SVec::with_capacity_in(splits, alloc);
+    slots.extend((0..splits).map(|_| None));
+    let mut order: SVec<'a, u32> = SVec::with_capacity_in(arrived.len(), alloc);
+    for (split, one) in arrived.into_iter() {
+        let Some(slot) = slots.get_mut(split as usize) else {
+            return Err(MergeError::Past { split, splits: count });
+        };
+        if slot.is_some() {
+            return Err(MergeError::Twice { split });
+        }
+        *slot = Some(one);
+        order.push(split);
+    }
+    if let Some(split) = slots.iter().position(Option::is_none) {
+        return Err(MergeError::Missing { split: u32::try_from(split).unwrap_or(u32::MAX) });
+    }
+    if plant == MergePlant::Arrival {
+        let mut out: SVec<'a, T> = SVec::with_capacity_in(splits, alloc);
+        for split in order.iter() {
+            if let Some(one) = slots.get_mut(*split as usize).and_then(Option::take) {
+                out.push(one);
+            }
+        }
+        return Ok(out);
+    }
+    let mut out: SVec<'a, T> = SVec::with_capacity_in(splits, alloc);
+    out.extend(slots.into_iter().flatten());
+    Ok(out)
 }
 
 /// One `Signature` task an outline entry that has a head (signature.rs `is_signature_entry`), in
@@ -707,26 +907,28 @@ pub(crate) enum HeadAt {
     Unlisted { scope: Name, why: &'static str },
 }
 
-/// Each head of the member crates a task reads, by its item's head name, filled one crate at a
-/// time on first ask, over a task's own records and its crates' expansion directories.
+/// Each head of the member crates a task reads, by its item's head name: each crate's listing
+/// taken from the request's table ([`Listings`]) on its first ask here, and every place after a
+/// binary search in it. A reader's own table of the crates it asked of, so a place takes no
+/// shared lookup; the listing itself is made once a request (the table's floor).
 pub(crate) struct Owners<'s> {
     subjects: &'s Subjects,
     /// The crates the records were opened over, in the records' order (run_names.rs
     /// `names_records`: crate `k` of the records is `crates[k]`): their expansion directories,
     /// which the walk of a written head reads.
     over: &'s [Crate<'s>],
-    /// The crates (by key prefix) filled so far.
-    filled: Vec<[u8; 8], Alloc<'static>>,
-    /// (head name, its entry's task, its file, its cell in that task), sorted by head name.
-    rows: Vec<(Name, Name, Name, Cell), Alloc<'static>>,
-    /// (head name, why no head task holds it), sorted by head name ([`HeadAt::Unlisted`]).
-    unlisted: Vec<(Name, &'static str), Alloc<'static>>,
+    /// The request's listings, every crate's once.
+    listings: &'s Listings,
+    /// The crates (by key prefix) asked of so far, sorted by prefix: each one's listing, or the
+    /// words its listing was refused with ([`HeadAt::Unlisted`]).
+    filled: Vec<([u8; 8], Result<&'static Listing, &'static str>), Alloc<'static>>,
 }
 
 impl<'s> Owners<'s> {
-    /// `over`: the crates the readers' records are opened over, in their order.
-    pub(crate) fn new(subjects: &'s Subjects, over: &'s [Crate<'s>], g: Alloc<'static>) -> Owners<'s> {
-        Owners { subjects, over, filled: Vec::new_in(g), rows: Vec::new_in(g), unlisted: Vec::new_in(g) }
+    /// `over`: the crates the readers' records are opened over, in their order; `listings`: the
+    /// request's table ([`HeadsStage::listings`]).
+    pub(crate) fn new(subjects: &'s Subjects, over: &'s [Crate<'s>], listings: &'s Listings, g: Alloc<'static>) -> Owners<'s> {
+        Owners { subjects, over, listings, filled: Vec::new_in(g) }
     }
 
     /// Where the head read `id` is read from; `None`: its crate is none of `records`'. By the
@@ -748,25 +950,90 @@ impl<'s> Owners<'s> {
         if self.subjects.get(from).is_none_or(|(p, _, _)| *p != prefix) {
             return Some(HeadAt::Dependency(scope));
         }
-        if !self.filled.contains(&prefix) {
-            let Some(texts) = self.over.get(k).filter(|one| one.records.key == key).map(|one| one.records.expansions) else {
-                return Some(HeadAt::Unlisted { scope, why: OVER_NOT_RECORDS });
-            };
-            self.filled.push(prefix);
-            let (rows, unlisted) = (&mut self.rows, &mut self.unlisted);
-            heads_of_crate(records, &texts, k, prefix, self.subjects, g, &mut |one| match one {
-                CrateRow::Head(one) => rows.push((one.sig, one.entry, one.file, one.cell)),
-                CrateRow::Unlisted { sig, why } => unlisted.push((sig, why)),
-                CrateRow::Call { .. } => {}
-            });
-            rows.sort_unstable();
-            rows.dedup_by_key(|(sig, _, _, _)| *sig);
-            unlisted.sort_unstable_by_key(|(sig, _)| *sig);
-            unlisted.dedup_by_key(|(sig, _)| *sig);
-        }
-        Some(match self.rows.binary_search_by_key(&id.of, |(sig, _, _, _)| *sig) {
+        // `g`: the listing's lists are the request heap's, `Listings`' own (kept for the call's
+        // shape, which the head tasks and the stretches share: engine_heads_once.rs `one_head`).
+        let _ = g;
+        let listing = match self.filled.binary_search_by_key(&prefix, |(p, _)| *p) {
+            Ok(at) => self.filled[at].1,
+            Err(at) => {
+                let listing = match self.over.get(k).filter(|one| one.records.key == key) {
+                    Some(one) => self.listings.listing(records, &one.records.expansions, k, key, self.subjects),
+                    None => Err(OVER_NOT_RECORDS),
+                };
+                // Linear in the crates this reader asked of (a scope's crates, once each).
+                self.filled.insert_shift(at, (prefix, listing));
+                listing
+            }
+        };
+        Some(match listing {
+            Ok(listing) => listing.place(id, scope),
+            Err(why) => HeadAt::Unlisted { scope, why },
+        })
+    }
+}
+
+/// How many crate listings one request's table holds (rule 18): one a (crate, unit view) the
+/// request reads heads of. Tempo's workspace has about 700 crates, a few views each; past this
+/// a reader's head is refused by [`LISTINGS_FULL`], never listed outside the table (rule 3).
+pub(crate) const MOST_LISTINGS: usize = 1 << 16;
+
+/// [`HeadAt::Unlisted`]'s words for a crate whose listing the full table could not take.
+const LISTINGS_FULL: &str = "the request's table of crate listings is full, so this crate's heads were not listed (engine_heads.rs `MOST_LISTINGS`)";
+
+/// [`HeadAt::Unlisted`]'s words for a crate whose two listings, made at once by two jobs under
+/// one key, were not equal: two values under one key (rule 21), the key short of an input.
+const LISTINGS_UNEQUAL: &str = "two listings of this crate's heads made under one key (its crate key and its member files) were not equal, so its key misses an input (engine_heads.rs `Listings::listing`)";
+
+/// [`HeadAt::Unlisted`]'s words for a reader whose records name a crate first that is not its
+/// own unit's (run_names.rs `names_records` opens a job's own crate at 0).
+const NOT_OWN_FIRST: &str = "its records' first crate is not the unit its head tasks freeze under (engine_heads.rs `crate_setup`)";
+
+/// The domain of a listing's digest ([`Listing::digest`]): what two makes are compared by.
+const LISTING_DOMAIN: &str = "blaze-cli engine heads: a crate's listing 1";
+
+/// The domain of the digest of a crate's member files ([`ListingKey::subjects`]).
+const LISTING_SUBJECTS_DOMAIN: &str = "blaze-cli engine heads: a listing's member files 1";
+
+/// One head of a crate's listing ([`Listing::heads`]): a [`HeadRow`] whose words are the
+/// request heap's, so it outlives the records it was read from.
+#[derive(Clone, Copy)]
+pub(crate) struct ListedHead {
+    entry: Name,
+    cell: Cell,
+    sig: Name,
+    file: Name,
+    want: Want,
+    item: Cell,
+    label: HeadLabel<'static>,
+}
+
+/// A crate's heads, listed once a request ([`heads_of_crate`], through [`Listings::listing`]):
+/// what its head tasks freeze, by entry, and where every reader places a read of one, by head
+/// name. Every list is the request heap's and sorted, so it is read in place by any worker.
+pub(crate) struct Listing {
+    /// Each head by (entry, cell, head name), once each; equal keys keep the least by every
+    /// field (rule 25: no order of the walk shows).
+    heads: &'static [ListedHead],
+    /// Indexes into `heads` sorted by (head name, entry, file, cell), one a head name: the
+    /// least row of each, as `Owners` placed before.
+    by_sig: &'static [u32],
+    /// (head name, why no head task holds it), sorted, one a head name.
+    unlisted: &'static [(Name, &'static str)],
+    /// (entry, a call whose walk ends under it), sorted: the expansion records its task reads.
+    calls: &'static [(Name, blaze_id::ItemKey)],
+    /// Of every row, in order: two makes under one key are compared by it.
+    digest: ContentId,
+}
+
+impl Listing {
+    /// Where the head read `id` of this crate is read from (`scope`: the crate's names record).
+    fn place(&self, id: &CellId, scope: Name) -> HeadAt {
+        match self.by_sig.binary_search_by(|at| self.heads[*at as usize].sig.cmp(&id.of)) {
             // The only part is the whole head (`WHOLE`, front2 head.rs `cell_id`).
-            Ok(at) => HeadAt::Cell { cell: CellId { of: self.rows[at].1, cell: self.rows[at].3 }, file: self.rows[at].2 },
+            Ok(at) => {
+                let head = &self.heads[self.by_sig[at] as usize];
+                HeadAt::Cell { cell: CellId { of: head.entry, cell: head.cell }, file: head.file }
+            }
             // A body's own item: its subject is the checker key's bytes (front2 head.rs
             // `signature_name`), byte 8 its `INNER` mark.
             Err(_) if id.of.subject.0[8] & blaze_id::ItemKey::INNER != 0 => HeadAt::OfTheBody(scope),
@@ -774,7 +1041,234 @@ impl<'s> Owners<'s> {
                 Ok(at) => HeadAt::Unlisted { scope, why: self.unlisted[at].1 },
                 Err(_) => HeadAt::Unlisted { scope, why: NO_HEAD_ROW },
             },
-        })
+        }
+    }
+
+    /// The heads entry `entry`'s task freezes, by cell.
+    fn of_entry(&self, entry: Name) -> &'static [ListedHead] {
+        let heads = self.heads;
+        let from = heads.partition_point(|one| one.entry < entry);
+        let len = heads[from..].iter().take_while(|one| one.entry == entry).count();
+        &heads[from..from + len]
+    }
+
+    /// The calls whose walk ends under entry `entry` (`CrateRow::Call`).
+    fn calls_of(&self, entry: Name) -> &'static [(Name, blaze_id::ItemKey)] {
+        let calls = self.calls;
+        let from = calls.partition_point(|(one, _)| *one < entry);
+        let len = calls[from..].iter().take_while(|(one, _)| *one == entry).count();
+        &calls[from..from + len]
+    }
+
+    /// Whether `entry` is an entry of this crate that freezes a head.
+    fn holds_entry(&self, entry: Name) -> bool {
+        !self.of_entry(entry).is_empty()
+    }
+}
+
+/// A name's bytes into a digest (its kind's wire byte, its subject).
+fn name_part(h: &mut blaze_ids::Hasher, name: Name) {
+    h.part(&[name.kind as u8]).part(&name.subject.0);
+}
+
+/// Crate `k`'s listing, made from `records` by [`heads_of_crate`] (the one walk), sorted, its
+/// words copied to the request heap (`g`), its digest taken.
+fn list_crate<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>, k: usize, prefix: [u8; 8], subjects: &Subjects, g: Alloc<'static>) -> &'static Listing {
+    let text = |words: &str| -> &'static str {
+        match words.is_empty() {
+            true => "",
+            false => crate::engine_head_notes::leak(g, format_args!("{words}")),
+        }
+    };
+    let mut heads: Vec<ListedHead, Alloc<'static>> = Vec::new_in(g);
+    let mut unlisted: Vec<(Name, &'static str), Alloc<'static>> = Vec::new_in(g);
+    let mut calls: Vec<(Name, blaze_id::ItemKey), Alloc<'static>> = Vec::new_in(g);
+    heads_of_crate(records, texts, k, prefix, subjects, g, &mut |one| match one {
+        CrateRow::Head(one) => heads.push(ListedHead {
+            entry: one.entry,
+            cell: one.cell,
+            sig: one.sig,
+            file: one.file,
+            want: one.want,
+            item: one.item,
+            label: HeadLabel { want: Some(one.want), name: text(one.name), member: one.member.map(text), entry_name: text(one.entry_name), by: one.by.map(|by| by.map(text)) },
+        }),
+        CrateRow::Unlisted { sig, why } => unlisted.push((sig, why)),
+        CrateRow::Call { entry, call } => calls.push((entry, call)),
+    });
+    heads.sort_unstable_by(|a, b| (a.entry, a.cell, a.sig, want_bytes(a.want), a.item, a.file).cmp(&(b.entry, b.cell, b.sig, want_bytes(b.want), b.item, b.file)));
+    heads.dedup_by_key(|one| (one.entry, one.cell, one.sig));
+    let mut by_sig: Vec<u32, Alloc<'static>> = Vec::with_capacity_in(heads.len(), g);
+    by_sig.extend((0..heads.len()).map(|at| u32::try_from(at).unwrap_or(u32::MAX)));
+    by_sig.sort_unstable_by_key(|at| {
+        let one = &heads[*at as usize];
+        (one.sig, one.entry, one.file, one.cell)
+    });
+    by_sig.dedup_by_key(|at| heads[*at as usize].sig);
+    unlisted.sort_unstable();
+    unlisted.dedup_by_key(|(sig, _)| *sig);
+    calls.sort_unstable();
+    calls.dedup();
+    let mut h = blaze_ids::Hasher::new(LISTING_DOMAIN);
+    h.part(&u64::try_from(heads.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for one in heads.iter() {
+        name_part(&mut h, one.entry);
+        h.part(&one.cell.0);
+        name_part(&mut h, one.sig);
+        name_part(&mut h, one.file);
+        h.part(&want_bytes(one.want)).part(&one.item.0);
+        h.part(one.label.name.as_bytes()).part(one.label.member.unwrap_or("").as_bytes()).part(one.label.entry_name.as_bytes());
+    }
+    h.part(&u64::try_from(unlisted.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for (sig, why) in unlisted.iter() {
+        name_part(&mut h, *sig);
+        h.part(why.as_bytes());
+    }
+    h.part(&u64::try_from(calls.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for (entry, call) in calls.iter() {
+        name_part(&mut h, *entry);
+        h.part(&call.0.0);
+    }
+    let digest = h.finish();
+    let mut one: Vec<Listing, Alloc<'static>> = Vec::with_capacity_in(1, g);
+    one.push(Listing { heads: heads.leak(), by_sig: by_sig.leak(), unlisted: unlisted.leak(), calls: calls.leak(), digest });
+    let one: &'static [Listing] = one.leak();
+    &one[0]
+}
+
+/// What a listing is kept under: the crate's key as the reader's unit views it (its prefix is
+/// what every head name of it begins with) and the digest of the crate's member files the walk
+/// was given (`Subjects`' rows of that prefix: the Heads stage and the impl tables make theirs
+/// apart, so the files are part of the key, never assumed one list; rule 21).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ListingKey {
+    krate: [u8; 32],
+    subjects: [u8; 32],
+}
+
+/// The digest of `subjects`' rows of crate `prefix` (each file's index and outline name).
+fn subjects_digest(subjects: &Subjects, prefix: [u8; 8]) -> ContentId {
+    let from = subjects.partition_point(|(p, _, _)| *p < prefix);
+    let mut h = blaze_ids::Hasher::new(LISTING_SUBJECTS_DOMAIN);
+    for (_, file, name) in subjects[from..].iter().take_while(|(p, _, _)| *p == prefix) {
+        h.part(&file.to_le_bytes());
+        name_part(&mut h, *name);
+    }
+    h.finish()
+}
+
+/// Whether a listing is the table's (the rule) or made at each ask (the control of the test
+/// that a crate is listed once a request: engine_owners_once_tests.rs, rule 23).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListingsPlant {
+    Rule,
+    /// Every ask makes its own listing and the table is never asked; a head task asks for its
+    /// crate's listing at each of its tasks.
+    #[cfg_attr(not(test), expect(dead_code, reason = "a test's plant (rule 23)"))]
+    PerAsk,
+}
+
+/// The listings' counts (the profile's "head listings" line; floor: `made == crates`).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct ListingCounts {
+    /// Listings the table holds: one a (crate, unit view, member files).
+    pub(crate) crates: u32,
+    /// Walks made ([`heads_of_crate`] through the table).
+    pub(crate) made: u32,
+    /// Seconds of a race: two jobs made one key at once, the two equal, the first kept.
+    pub(crate) twice: u32,
+    /// Seconds of a race whose listing was not equal (refused: [`LISTINGS_UNEQUAL`]).
+    pub(crate) unequal: u32,
+    /// Asks: one a reader's first place in a crate, one a crate's head setup.
+    pub(crate) asks: u32,
+    /// Asks refused because the table was full ([`MOST_LISTINGS`]).
+    pub(crate) full: u32,
+}
+
+/// THE LISTINGS: each crate's listing of heads ([`Listing`]), request-wide and insert-only, in
+/// the tree's concurrent map, its lists lent from the request heap (as [`HeadsOnce`]'s cells).
+/// Every Heads job (a crate's setup, each split's `Owners`) and every Bodies stretch
+/// (`Owners` in engine_bodies.rs and engine_seeds.rs) asks it, so the walk is made once a crate a
+/// request (the floor) where before it was made by every job and every stretch that placed a
+/// read in the crate. Two jobs that make one key at once: the first is kept, the second, equal,
+/// is counted; unequal is refused by name (rule 21). No lock is held: the map's own pins.
+///
+/// [`HeadsOnce`]: crate::engine_heads_once::HeadsOnce
+pub(crate) struct Listings {
+    heap: &'static blaze_own::Heap,
+    plant: ListingsPlant,
+    lists: blaze_core::SharedMap<ListingKey, &'static Listing, SharedAlloc<'static>>,
+    made: AtomicU32,
+    twice: AtomicU32,
+    unequal: AtomicU32,
+    asks: AtomicU32,
+    full: AtomicU32,
+}
+
+impl Listings {
+    /// An empty table over the request's heap.
+    pub(crate) fn new(heap: &'static blaze_own::Heap, plant: ListingsPlant) -> Listings {
+        Listings {
+            heap,
+            plant,
+            lists: blaze_core::SharedMap::new_in("engine.heads: each crate's listing once a request", heap.shared()),
+            made: AtomicU32::new(0),
+            twice: AtomicU32::new(0),
+            unequal: AtomicU32::new(0),
+            asks: AtomicU32::new(0),
+            full: AtomicU32::new(0),
+        }
+    }
+
+    /// Crate `k` of `records`' listing (`key`: its key there; `texts`: its expansion
+    /// directory), from the table or made now and put; `Err`: why none (rule 3).
+    fn listing<'n>(&self, records: &'n Records<'n>, texts: &ExpansionTexts<'n>, k: usize, key: blaze_id::CrateItemKey, subjects: &Subjects) -> Result<&'static Listing, &'static str> {
+        self.asks.fetch_add(1, Ordering::Relaxed);
+        let prefix = key.prefix();
+        let at = ListingKey { krate: key.0.0, subjects: subjects_digest(subjects, prefix).0 };
+        if self.plant == ListingsPlant::Rule
+            && let Some(found) = self.lists.pin().get(&at).copied()
+        {
+            return Ok(found);
+        }
+        let made = list_crate(records, texts, k, prefix, subjects, self.heap.alloc());
+        self.made.fetch_add(1, Ordering::Relaxed);
+        if self.plant == ListingsPlant::PerAsk {
+            return Ok(made);
+        }
+        let lists = self.lists.pin();
+        if lists.len() >= MOST_LISTINGS {
+            self.full.fetch_add(1, Ordering::Relaxed);
+            return Err(LISTINGS_FULL);
+        }
+        match lists.try_insert(at, made) {
+            Ok(_) => Ok(made),
+            Err(occupied) => {
+                let held: &'static Listing = *occupied.current;
+                match held.digest == made.digest {
+                    true => {
+                        self.twice.fetch_add(1, Ordering::Relaxed);
+                        Ok(held)
+                    }
+                    false => {
+                        self.unequal.fetch_add(1, Ordering::Relaxed);
+                        Err(LISTINGS_UNEQUAL)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The counts as they stand.
+    pub(crate) fn counts(&self) -> ListingCounts {
+        ListingCounts {
+            crates: u32::try_from(self.lists.len()).unwrap_or(u32::MAX),
+            made: self.made.load(Ordering::Relaxed),
+            twice: self.twice.load(Ordering::Relaxed),
+            unequal: self.unequal.load(Ordering::Relaxed),
+            asks: self.asks.load(Ordering::Relaxed),
+            full: self.full.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -1059,8 +1553,8 @@ fn member_subjects<'r>(
     subjects
 }
 
-/// One member crate's head tasks, made on one worker over its check scope's records (in place
-/// in the store's mapping, engine_records.rs).
+/// One member crate's head tasks, made over its check scope's records (in place in the store's
+/// mapping, engine_records.rs): its setup on one worker, its tasks in split jobs on any.
 struct ItemJob<'r> {
     prefix: [u8; 8],
     crates: Vec<Crate<'r>, Global>,
@@ -1165,7 +1659,9 @@ impl<'a> UnitsMade<'a> {
 
 impl HeadsStage {
     /// The head tasks of one Heads phase (module docs, "THE HEAD TASKS"): each member crate's
-    /// tasks on one worker, each result its row in `buffer`.
+    /// setup once ([`crate_setup`]), its tasks cut into split jobs over every worker
+    /// ([`split_count`]), merged in task order ([`in_split_order`]), each result its row in
+    /// `buffer`.
     #[expect(clippy::too_many_arguments, reason = "a phase's edge: each argument one handle of it")]
     fn run_items<'a, 'r>(
         &mut self,
@@ -1379,35 +1875,101 @@ impl HeadsStage {
         shows.dedup_by_key(|(name, _)| *name);
         let shows = &shows[..];
         jobs.retain(|job| !job.tasks.is_empty());
-        // 2. Each member's heads, at once, on the workers.
+        // Each crate's tasks in file order, then by name: a split job is a contiguous run of
+        // them ([`split_count`]), so a file's tasks stay together.
+        for job in jobs.iter_mut() {
+            job.tasks.sort_unstable_by_key(|task| (task.planned.file, task.planned.name));
+        }
+        // 2. Each member's heads, at once, on the workers: first each crate's setup, once a crate
+        // (`crate_setup`: its listing from the request's table, its lang index's reads, its
+        // receiver pointers and theirs), then its tasks cut into split jobs (`split_count`),
+        // each over a source and recorders of its own (`heads_of`), all crates' splits at once.
         let procs = names.names.as_ref().and_then(|names| names.procs());
         let root = handles.root;
         let clock = handles.clock;
         let subjects = &subjects[..];
         let expansion_reads = self.freeze != HeadUnits::NoExpansionReads;
         type Ran = Result<Result<std::vec::Vec<Result<WorkedHead, HeadFailed>, Global>, &'static str>, work::Panicked>;
-        let mut worked: std::vec::Vec<(Ran, u64), Global> = std::vec::Vec::with_capacity_in(jobs.len(), Global);
+        type Setup = Result<Result<CrateSetup, &'static str>, work::Panicked>;
         // The request's table of frozen heads, lent to every worker (engine_heads_once.rs).
         let once_table = self.once.take().unwrap_or_else(|| crate::engine_heads_once::HeadsOnce::new(heap, crate::engine_heads_once::OncePlant::Rule, crate::engine_heads_once::Sources::Job));
         let once = &once_table;
+        // The request's crate listings, lent to every worker as the frozen heads are.
+        let head_jobs = self.jobs;
+        let listings: &Listings = self.listings.get_or_insert_with(|| Listings::new(heap, head_jobs.listings));
+        let workers = usize::try_from(handles.workers.get()).unwrap_or(usize::MAX);
+        let board = handles.board;
+        // Each crate's setup and its time, in job order.
+        let mut setups: SVec<'static, (Setup, u64)> = SVec::with_capacity_in(jobs.len(), heap.shared());
         {
             let scope = cx.scope();
             scope.narrow_workers(handles.workers, Class::Foreground);
-            let mut running = std::vec::Vec::with_capacity_in(jobs.len(), Global);
-            let board = handles.board;
+            let mut running = Vec::with_capacity_in(jobs.len(), g);
             for job in jobs.iter() {
                 let clock = clock.clone();
-                running.push(scope.may_overlap("engine heads", HEADS_FRAME, move |cx: &Cx| {
+                running.push(scope.may_overlap("engine heads: a crate's setup", HEADS_FRAME, move |cx: &Cx| {
                     let began = clock.now();
-                    let on_board = OnBoard { board, clock: &clock, shows };
-                    let made = work::unwinding(|| heads_of(cx, root, packs, corrected, procs, job, subjects, view, expansion_reads, heap, once, on_board));
+                    let made = work::unwinding(|| crate_setup(cx, root, packs, corrected, procs, job, subjects, view, heap, listings));
                     Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns)))
                 }));
             }
             let mut stopped = None;
             for handle in running.into_iter() {
                 match handle.join(cx) {
-                    Ok(one) => worked.push(one),
+                    Ok(one) => setups.push(one),
+                    Err(error) => {
+                        stopped.get_or_insert(error);
+                    }
+                }
+            }
+            scope.join(cx).map_err(CliError::Pool)?;
+            if let Some(error) = stopped {
+                return Err(CliError::Pool(error));
+            }
+        }
+        // Each crate whose setup was made, cut into split jobs, in job order and task order.
+        let total: usize = jobs.iter().zip(setups.iter()).filter(|(_, (setup, _))| matches!(setup, Ok(Ok(_)))).map(|(job, _)| job.tasks.len()).sum();
+        let mut splits: SVec<'static, SplitAt> = SVec::new_in(heap.shared());
+        let mut most_splits = 0usize;
+        for (at, (job, (setup, _))) in jobs.iter().zip(setups.iter()).enumerate() {
+            if !matches!(setup, Ok(Ok(_))) {
+                continue;
+            }
+            let len = job.tasks.len();
+            let n = split_count(head_jobs.split, len, total, workers);
+            most_splits = most_splits.max(n);
+            for cut in 0..n {
+                let (from, to) = (cut * len / n, (cut + 1) * len / n);
+                splits.push(SplitAt { job: u32::try_from(at).unwrap_or(u32::MAX), from: u32::try_from(from).unwrap_or(u32::MAX), to: u32::try_from(to).unwrap_or(u32::MAX) });
+            }
+        }
+        // Each split's result as it was joined, then in split order ([`in_split_order`]).
+        let mut arrived: SVec<'static, (u32, (Ran, u64))> = SVec::with_capacity_in(splits.len(), heap.shared());
+        {
+            let scope = cx.scope();
+            scope.narrow_workers(handles.workers, Class::Foreground);
+            let mut running = Vec::with_capacity_in(splits.len(), g);
+            for (at, split) in splits.iter().enumerate() {
+                let job = &jobs[split.job as usize];
+                // Only a crate whose setup was made has splits (above).
+                let Ok(Ok(setup)) = &setups[split.job as usize].0 else { continue };
+                let tasks = &job.tasks[split.from as usize..split.to as usize];
+                let clock = clock.clone();
+                let at = u32::try_from(at).unwrap_or(u32::MAX);
+                running.push((
+                    at,
+                    scope.may_overlap("engine heads", HEADS_FRAME, move |cx: &Cx| {
+                        let began = clock.now();
+                        let on_board = OnBoard { board, clock: &clock, shows };
+                        let made = work::unwinding(|| heads_of(cx, root, packs, corrected, procs, job, setup, tasks, subjects, view, expansion_reads, heap, once, listings, head_jobs.listings, on_board));
+                        Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns)))
+                    }),
+                ));
+            }
+            let mut stopped = None;
+            for (at, handle) in running.into_iter() {
+                match handle.join(cx) {
+                    Ok(one) => arrived.push((at, one)),
                     Err(error) => {
                         stopped.get_or_insert(error);
                     }
@@ -1419,24 +1981,31 @@ impl HeadsStage {
             }
         }
         self.once = Some(once_table);
-        // 3. Each unit's results gathered by task (units in prefix order), then each task as the
-        // engine's row, in task order.
+        let worked = in_split_order(arrived, splits.len(), head_jobs.merge, heap.shared()).map_err(|error| CliError::Text { what: crate::engine_head_notes::leak(g, format_args!("{error}")) })?;
+        // 3. Each unit's results gathered by task (units in prefix order, a unit's splits in task
+        // order), then each task as the engine's row, in task order.
         let acc = |accs: &[(Task, UnitsMade<'a>)], task: &Task| -> Option<usize> { accs.binary_search_by_key(&task.planned.name, |(one, _)| one.planned.name).ok() };
-        for (job, (ran, ns)) in jobs.iter().zip(worked) {
+        let mut worked = worked.into_iter();
+        let mut cursor = 0usize;
+        let mut busy = 0usize;
+        for (at, (job, (setup, setup_ns))) in jobs.iter().zip(setups.iter()).enumerate() {
+            // The setup's time shared by the crate's tasks, as a job's was.
             let each = u64::try_from(job.tasks.len()).unwrap_or(1).max(1);
             for task in job.tasks.iter() {
-                if let Some(at) = acc(&accs, task) {
-                    accs[at].1.ns = accs[at].1.ns.saturating_add(ns / each);
+                if let Some(i) = acc(&accs, task) {
+                    accs[i].1.ns = accs[i].1.ns.saturating_add(*setup_ns / each);
                 }
             }
-            let made = match ran {
-                Ok(Ok(made)) => made,
-                // The scope's records not opened (`heads_of`): a function of the graph's cell
-                // (the packs) and each scope crate's names cell.
+            match setup {
+                Ok(Ok(_)) => {}
+                // The scope's records not opened, or its lang index or listing refused
+                // (`crate_setup`): a function of the graph's cell (the packs) and each scope
+                // crate's names cell.
                 Ok(Err(why)) => {
+                    let why = *why;
                     for task in job.tasks.iter() {
-                        if let Some(at) = acc(&accs, task) {
-                            accs[at].1.fail(why, &job.cells, false);
+                        if let Some(i) = acc(&accs, task) {
+                            accs[i].1.fail(why, &job.cells, false);
                         }
                     }
                     continue;
@@ -1444,34 +2013,75 @@ impl HeadsStage {
                 // A panic is not a function of reads: owed, entered again each request (rule 20).
                 Err(work::Panicked) => {
                     for task in job.tasks.iter() {
-                        if let Some(at) = acc(&accs, task) {
-                            accs[at].1.fail("its crate's head tasks panicked; that crate's heads alone failed", &[], true);
+                        if let Some(i) = acc(&accs, task) {
+                            accs[i].1.fail("its crate's head setup panicked; that crate's heads alone failed", &[], true);
                         }
                     }
                     continue;
                 }
-            };
-            // A stop refused the tasks from `ran` on before they began (`heads_of`): each owed (no
-            // read), and the driver stops before the merge (engine_status.rs).
-            let ran = made.len();
-            for task in job.tasks.iter().skip(ran) {
-                if let Some(at) = acc(&accs, task) {
-                    accs[at].1.fail(NOT_BEGUN, &[], true);
-                }
             }
-            for (task, one) in job.tasks.iter().zip(made) {
-                let Some(at) = acc(&accs, task) else { continue };
-                match one {
-                    Ok(one) => accs[at].1.take(job.prefix, one),
-                    // What its freeze read until it failed, and its member's names cell: its
-                    // heads' rows are that crate's records' (`heads_of_crate`), so a refusal
-                    // that read nothing else (two heads under one cell) stands on it too.
-                    Err(mut failed) => {
-                        failed.reads.push(job.cells[1]);
-                        accs[at].1.fail(failed.why, &failed.reads, false);
+            while let Some(split) = splits.get(cursor).filter(|split| split.job as usize == at) {
+                cursor += 1;
+                let Some((ran, ns)) = worked.next() else { break };
+                let tasks = &job.tasks[split.from as usize..split.to as usize];
+                let each = u64::try_from(tasks.len()).unwrap_or(1).max(1);
+                for task in tasks.iter() {
+                    if let Some(i) = acc(&accs, task) {
+                        accs[i].1.ns = accs[i].1.ns.saturating_add(ns / each);
+                    }
+                }
+                let made = match ran {
+                    Ok(Ok(made)) => made,
+                    // The split's records not opened again (`heads_of`): as the setup's.
+                    Ok(Err(why)) => {
+                        for task in tasks.iter() {
+                            if let Some(i) = acc(&accs, task) {
+                                accs[i].1.fail(why, &job.cells, false);
+                            }
+                        }
+                        continue;
+                    }
+                    // A panic fails its split's tasks alone, owed (rule 20): the crate's other
+                    // splits, and every other crate's, stand.
+                    Err(work::Panicked) => {
+                        for task in tasks.iter() {
+                            if let Some(i) = acc(&accs, task) {
+                                accs[i].1.fail("a run of its crate's head tasks panicked; those tasks alone failed", &[], true);
+                            }
+                        }
+                        continue;
+                    }
+                };
+                if !made.is_empty() {
+                    busy += 1;
+                }
+                // A stop refused the tasks from `ran` on before they began (`heads_of`): each owed
+                // (no read), and the driver stops before the merge (engine_status.rs).
+                let ran = made.len();
+                for task in tasks.iter().skip(ran) {
+                    if let Some(i) = acc(&accs, task) {
+                        accs[i].1.fail(NOT_BEGUN, &[], true);
+                    }
+                }
+                for (task, one) in tasks.iter().zip(made) {
+                    let Some(i) = acc(&accs, task) else { continue };
+                    match one {
+                        Ok(one) => accs[i].1.take(job.prefix, one),
+                        // What its freeze read until it failed, and its member's names cell: its
+                        // heads' rows are that crate's records' (`heads_of_crate`), so a refusal
+                        // that read nothing else (two heads under one cell) stands on it too.
+                        Err(mut failed) => {
+                            failed.reads.push(job.cells[1]);
+                            accs[i].1.fail(failed.why, &failed.reads, false);
+                        }
                     }
                 }
             }
+        }
+        // Every split was merged (`in_split_order` answered each): one left is this function's
+        // bug, named (rule 3).
+        if cursor != splits.len() || worked.next().is_some() {
+            return Err(CliError::Text { what: "the head split jobs' results were not each merged into their crate's tasks (engine_heads.rs `run_items`)" });
         }
         let mut heads_failed: std::vec::Vec<crate::engine_head_notes::Refused, Global> = std::vec::Vec::new_in(Global);
         let mut counts = UnitCounts::default();
@@ -1538,11 +2148,20 @@ impl HeadsStage {
         units.dedup();
         counts.units = u32::try_from(units.len()).unwrap_or(u32::MAX);
         // Summed over the request's Heads phases (the units: the most one phase froze under).
+        // The jobs: summed over the phases, as the freezes (the most splits: the most of any).
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
         self.units = UnitCounts {
             frozen: self.units.frozen.saturating_add(counts.frozen),
             items: self.units.items.saturating_add(counts.items),
             units: self.units.units.max(counts.units),
             shared: self.units.shared.saturating_add(counts.shared),
+            tasks: self.units.tasks.saturating_add(count(total)),
+            crate_jobs: self.units.crate_jobs.saturating_add(count(jobs.len())),
+            split_jobs: self.units.split_jobs.saturating_add(count(splits.len())),
+            busy: self.units.busy.saturating_add(count(busy)),
+            busy_floor: self.units.busy_floor.saturating_add(count(workers.min(total))),
+            most_splits: self.units.most_splits.max(count(most_splits)),
+            listings: listings.counts(),
         };
         self.refused.extend(heads_failed);
         self.made.sort_unstable_by_key(|one| one.name);
@@ -1550,12 +2169,6 @@ impl HeadsStage {
     }
 }
 
-/// One member crate's head tasks on a worker: its scope's records opened in the task's frame,
-/// each task's heads frozen (front2 tables/head.rs `head_task`), each over a source of its own
-/// so its read list is its own: every names cell its freeze consulted (the recorder), and for
-/// each head its freeze read, the cell of the head task that covers it (a same-stage read: the
-/// engine enters the reader at the wave after its definer, engine.rs), or its crate's names
-/// record.
 /// What a head task not begun because of a stop is refused for (engine_status.rs; as
 /// engine_bodies.rs `run_bodies` refuses a body).
 pub(crate) const NOT_BEGUN: &str = "not checked: the command was stopped by a signal before this head task began (engine_status.rs)";
@@ -1585,8 +2198,59 @@ fn board_label(entry_name: Option<&str>, name: Name) -> crate::engine_status::La
     }
 }
 
+/// One split job's place: tasks `from..to` of crate job `job`'s (sorted by file, then name).
+#[derive(Clone, Copy, Debug)]
+struct SplitAt {
+    job: u32,
+    from: u32,
+    to: u32,
+}
+
+/// What a crate's split jobs share, made once a crate a phase by [`crate_setup`], each list
+/// the request heap's so every split reads it in place on any worker. What cannot be shared:
+/// the records themselves (a reader is one thread's, front2 source.rs `Records`), so a split
+/// opens them again over the same bytes and builds its own tables and lang index from them (the
+/// index holds only the lang rows; what building it reads is `lang_reads`, read here once).
+#[derive(Clone, Copy)]
+struct CrateSetup {
+    /// The crates whose lang rows name the lang items.
+    lang: &'static [usize],
+    sized: Option<blaze_id::ItemKey>,
+    /// The program's receiver pointer types (`Pointers::find`, once a crate).
+    pointers: blaze_ladder::front2::receiver::Pointers,
+    /// What the lang index read, each coarse (engine_heads_once.rs `JobCx::lang_reads`).
+    lang_reads: &'static [CellId],
+    /// What finding the pointers read, with `lang_reads` (engine_heads_once.rs `JobCx::pointer_reads`).
+    pointer_reads: &'static [CellId],
+    /// The scope names of the job's crates that are members, sorted.
+    members: &'static [Name],
+    /// The crate's listing, from the request's table.
+    listing: &'static Listing,
+}
+
+/// A job's scope's records opened in `frame` (run_names.rs `names_records`): what the setup and
+/// each split open, the one place a head job opens them.
+#[expect(clippy::too_many_arguments, reason = "the names records' edge: each argument one input of them")]
+fn open_scope<'n>(
+    cx: &'n Cx,
+    root: &'n bstd::fs::Dir<bstd::fs::ReadWrite>,
+    crates: &[Crate<'n>],
+    packs: &'static [blaze_fetch::PackView<'static>],
+    corrected: &'static [(u32, &'static str, &'static str)],
+    procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
+    frame: &'n Frame,
+    g: Alloc<'static>,
+) -> Result<&'n Records<'n>, &'static str> {
+    let opened = crate::run_names::names_records(cx, root, crates, packs, corrected, procs, std::vec::Vec::new_in(Global), None, frame, g).map_err(|_| "its crate's records could not be opened (run_names.rs `names_records`)")?;
+    Ok(opened.records)
+}
+
+/// One member crate's setup for its head tasks, on a worker, once a crate a phase: its records
+/// opened in the job's frame, its lang rows, the `Sized` item, its lang index's reads, its
+/// receiver pointers and their reads, its member crates, and its listing from the request's
+/// table (made here when no job made it yet: [`Listings::listing`]).
 #[expect(clippy::too_many_arguments, reason = "a worker's edge: each argument one handle of it")]
-fn heads_of(
+fn crate_setup(
     cx: &Cx,
     root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
     packs: &'static [blaze_fetch::PackView<'static>],
@@ -1595,15 +2259,12 @@ fn heads_of(
     job: &ItemJob<'_>,
     subjects: &Subjects,
     view: View<'_, '_>,
-    expansion_reads: bool,
     heap: &'static blaze_own::Heap,
-    once: &crate::engine_heads_once::HeadsOnce,
-    on_board: OnBoard<'_>,
-) -> Result<std::vec::Vec<Result<WorkedHead, HeadFailed>, Global>, &'static str> {
+    listings: &Listings,
+) -> Result<CrateSetup, &'static str> {
     let frame = cx.frame();
     let g = heap.alloc();
-    let opened = crate::run_names::names_records(cx, root, &job.crates, packs, corrected, procs, std::vec::Vec::new_in(Global), None, frame, g).map_err(|_| "its crate's records could not be opened (run_names.rs `names_records`)")?;
-    let records = opened.records;
+    let records = open_scope(cx, root, &job.crates, packs, corrected, procs, frame, g)?;
     let mut lang: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(job.lang.len(), g);
     lang.extend_from_slice(&job.lang);
     let lang: &'static [usize] = lang.leak();
@@ -1617,8 +2278,8 @@ fn heads_of(
     }
     let unused = Recorder::new(RecorderOpts { alloc: g });
     let base = Tables::new(TablesOpts { records, impls: None, lang_crates: lang, reads: &unused });
-    // The constant evaluator's lang index, once a job; what it read is read by every head that
-    // evaluates (engine_head_consts.rs).
+    // The constant evaluator's lang index; what it read is read by every head that evaluates
+    // (engine_head_consts.rs).
     let lang_recorder = Recorder::new(RecorderOpts { alloc: g });
     let index = crate::engine_head_consts::lang_index(base, &lang_recorder, lang).map_err(|_| "two crates of its scope declare one lang item, so its constants have no index (front2 index.rs `LangTwice`)")?;
     // The scope names of the job's crates that are members, sorted: every other crate's names
@@ -1627,69 +2288,135 @@ fn heads_of(
     members.extend(job.crates.iter().filter(|one| subjects.binary_search_by(|(p, _, _)| p.cmp(&one.records.key.prefix())).is_ok()).map(|one| blaze_drive::key::crate_scope_name(&one.records.key)));
     members.sort_unstable();
     members.dedup();
+    let members: &'static [Name] = members.leak();
     let mut lang_reads: Vec<CellId, Alloc<'static>> = Vec::new_in(g);
     for one in lang_recorder.finish().map_err(|_| "its lang index read more names cells than the recorder holds (front2 tables/recorder.rs)")?.iter() {
         if let Some(id) = cell_id(base, *one).map_err(|_| "a names read of its lang index names a crate its scope does not hold (front2 tables/task.rs `cell_id`)")? {
-            lang_reads.push(crate::engine_heads_once::coarse(&members, names_read(view, id)));
+            lang_reads.push(crate::engine_heads_once::coarse(members, names_read(view, id)));
         }
     }
     lang_reads.sort_unstable();
     lang_reads.dedup();
-    // (entry, its cell, head name, want, its item) of the crate at 0 (this job's unit), sorted.
-    let mut rows: std::vec::Vec<(Name, Cell, Name, Want, Cell), Global> = std::vec::Vec::new_in(Global);
-    // Each row's words (want, item name, impl fn name) by the same (entry, cell, head name):
-    // what a refusal of two heads under one cell names them by.
-    let mut labels: Vec<(Name, Cell, Name, HeadLabel<'_>), Alloc<'static>> = Vec::new_in(g);
-    // (entry, a call whose walk ends under it), sorted: the expansion records its task reads.
-    let mut calls: Vec<(Name, blaze_id::ItemKey), Alloc<'static>> = Vec::new_in(g);
+    // The program's receiver pointer types (`Box`, `Rc`, `Arc`, `Pin`), once a crate as front2
+    // project.rs `ProjectWorld::new` finds them: without them every struct receiver
+    // (`self: Pin<&mut Self>`) is a gap and `Future`'s and `Stream`'s dyn-compatibility verdicts
+    // are `Gap` (lane FL2's finding, fixed by lane H9). What finding them read beyond the lang
+    // index (alloc's `crate::rc::Rc` and `crate::sync::Arc` resolved from `Box`'s module) is
+    // every cell's read (engine_heads_once.rs `JobCx::pointer_reads`); the lang rows they take are
+    // `lang_reads`', which every cell then reads too.
+    let pointer_recorder = Recorder::new(RecorderOpts { alloc: g });
+    let pointers = blaze_ladder::front2::receiver::Pointers::find(&index, blaze_ladder::resolve::Paths { names: base.reading_into(&pointer_recorder) });
+    let mut pointer_reads: Vec<CellId, Alloc<'static>> = Vec::new_in(g);
+    pointer_reads.extend_from_slice(&lang_reads);
+    for one in pointer_recorder.finish().map_err(|_| "finding its receiver pointer types read more names cells than the recorder holds (front2 tables/recorder.rs)")?.iter() {
+        if let Some(id) = cell_id(base, *one).map_err(|_| "a names read of finding its receiver pointer types names a crate its scope does not hold (front2 tables/task.rs `cell_id`)")? {
+            pointer_reads.push(crate::engine_heads_once::coarse(members, names_read(view, id)));
+        }
+    }
+    pointer_reads.sort_unstable();
+    pointer_reads.dedup();
+    // The crate at 0 is this job's unit (run_names.rs `names_records` opens the job's own first).
+    let crate_key = NamesSource::crate_key(records, 0).ok_or("its crate has no key in its own records (front2 source.rs `crate_key`)")?;
+    if crate_key.prefix() != job.prefix {
+        return Err(NOT_OWN_FIRST);
+    }
+    let texts = job.crates.first().filter(|one| one.records.key == crate_key).map(|one| one.records.expansions).ok_or("its crate is not the first of the crates its records were opened over (run_names.rs `names_records`)")?;
+    let listing = listings.listing(records, &texts, 0, crate_key, subjects)?;
+    Ok(CrateSetup { lang, sized, pointers, lang_reads: lang_reads.leak(), pointer_reads: pointer_reads.leak(), members, listing })
+}
+
+/// One run of a member crate's head tasks (`tasks`, a split of `job`'s: [`split_count`]) on a
+/// worker: its scope's records opened again in the job's frame over the crate's `setup`, each
+/// task's heads frozen (front2 tables/head.rs `head_task`) through the split's one source, so
+/// each cell's read list is its own: every names cell its freeze consulted (the recorder), and
+/// for each head its freeze read, the cell of the head task that covers it (a same-stage read:
+/// the engine enters the reader at the wave after its definer, engine.rs), or its crate's names
+/// record. A panic here fails this split's tasks alone (`run_items`).
+#[expect(clippy::too_many_arguments, reason = "a worker's edge: each argument one handle of it")]
+fn heads_of(
+    cx: &Cx,
+    root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
+    packs: &'static [blaze_fetch::PackView<'static>],
+    corrected: &'static [(u32, &'static str, &'static str)],
+    procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
+    job: &ItemJob<'_>,
+    setup: &CrateSetup,
+    tasks: &[Task],
+    subjects: &Subjects,
+    view: View<'_, '_>,
+    expansion_reads: bool,
+    heap: &'static blaze_own::Heap,
+    once: &crate::engine_heads_once::HeadsOnce,
+    listings: &Listings,
+    plant: ListingsPlant,
+    on_board: OnBoard<'_>,
+) -> Result<std::vec::Vec<Result<WorkedHead, HeadFailed>, Global>, &'static str> {
+    let frame = cx.frame();
+    let g = heap.alloc();
+    let records = open_scope(cx, root, &job.crates, packs, corrected, procs, frame, g)?;
+    let CrateSetup { lang, sized, pointers, lang_reads, pointer_reads, members, listing } = *setup;
+    let unused = Recorder::new(RecorderOpts { alloc: g });
+    let base = Tables::new(TablesOpts { records, impls: None, lang_crates: lang, reads: &unused });
+    // The split's own lang index over its own records (the index borrows them); what building
+    // it reads is the setup's `lang_reads`, so this recorder's are dropped.
+    let index_recorder = Recorder::new(RecorderOpts { alloc: g });
+    let index = crate::engine_head_consts::lang_index(base, &index_recorder, lang).map_err(|_| "two crates of its scope declare one lang item, so its constants have no index (front2 index.rs `LangTwice`)")?;
     let crate_key = NamesSource::crate_key(records, 0).ok_or("its crate has no key in its own records (front2 source.rs `crate_key`)")?;
     let texts = job.crates.first().filter(|one| one.records.key == crate_key).map(|one| one.records.expansions).ok_or("its crate is not the first of the crates its records were opened over (run_names.rs `names_records`)")?;
-    heads_of_crate(records, &texts, 0, job.prefix, subjects, g, &mut |one| match one {
-        CrateRow::Head(one) => {
-            rows.push((one.entry, one.cell, one.sig, one.want, one.item));
-            labels.push((one.entry, one.cell, one.sig, HeadLabel { want: Some(one.want), name: one.name, member: one.member, entry_name: one.entry_name, by: one.by }));
-        }
-        CrateRow::Call { entry, call } => calls.push((entry, call)),
-        // A head no task holds is the reader's refusal (`Owners::place`), not this task's.
-        CrateRow::Unlisted { .. } => {}
-    });
-    rows.sort_unstable_by_key(|(entry, cell, sig, _, _)| (*entry, *cell, *sig));
-    rows.dedup_by_key(|(entry, cell, sig, _, _)| (*entry, *cell, *sig));
-    labels.sort_unstable_by_key(|(entry, cell, sig, _)| (*entry, *cell, *sig));
-    labels.dedup_by_key(|(entry, cell, sig, _)| (*entry, *cell, *sig));
-    calls.sort_unstable();
-    calls.dedup();
-    let label = |entry: Name, cell: Cell, sig: Name| match labels.binary_search_by_key(&(entry, cell, sig), |(e, c, s, _)| (*e, *c, *s)) {
-        Ok(at) => labels[at].3,
-        Err(_) => HeadLabel { want: None, name: "", member: None, entry_name: "", by: None },
-    };
     let scope_name = blaze_drive::key::crate_scope_name(&crate_key);
-    let mut owners = Owners::new(subjects, &job.crates[..], g);
+    let mut owners = Owners::new(subjects, &job.crates[..], listings, g);
     let tool = blaze_drive::key::Tool(ContentId::of(HEAD_TOOL_DOMAIN, b""));
-    // ONE SOURCE A JOB over the request's table (engine_heads_once.rs): every names read by the
-    // cell it is made for, so each cell's reads are its own.
+    // ONE SOURCE A SPLIT over the request's table (engine_heads_once.rs): every names read by
+    // the cell it is made for, so each cell's reads are its own.
     let owned = || blaze_ladder::front2::tables::owned_reads::OwnedRecorder::new(blaze_ladder::front2::tables::owned_reads::OwnedRecorderOpts { alloc: g, owning: blaze_ladder::front2::tables::owned_reads::Owning::Each });
     let (freeze_names, eval_names) = (owned(), owned());
     let both = blaze_ladder::front2::tables::owned_reads::BothOwners { names: &freeze_names, evals: &eval_names };
     let shared = base.reading_into(&freeze_names);
     let mut once_consts = crate::engine_heads_once::OnceConsts::new(base.reading_into(&eval_names), &index, g, once, job.prefix);
-    let mut source = SeededHeads::new(SeededHeadsOpts { names: shared, sized, frame, scratch: g, alloc: g, consts: Some(&mut once_consts as &mut dyn ConstValues<'_>), known: Some(once), owners: Some(&both) });
-    let same_crate = |of: Name| rows.binary_search_by(|(entry, _, _, _, _)| entry.cmp(&of)).is_ok();
-    let job_cx = crate::engine_heads_once::JobCx { base, shared, view, records, subjects, crates: &job.crates[..], index: &index, lang_reads: &lang_reads, sized, frame, g, tool, once, names: &freeze_names, evals: &eval_names, same_crate: &same_crate, members: &members };
-    let mut done = std::vec::Vec::with_capacity_in(job.tasks.len(), Global);
-    for (at_task, task) in job.tasks.iter().enumerate() {
+    let mut source = SeededHeads::new(SeededHeadsOpts { names: shared, sized, pointers, frame, scratch: g, alloc: g, consts: Some(&mut once_consts as &mut dyn ConstValues<'_>), known: Some(once), owners: Some(&both) });
+    // An entry of the crate (any split's): the whole crate's listing, not this split's tasks.
+    let same_crate = |of: Name| listing.holds_entry(of);
+    let job_cx = crate::engine_heads_once::JobCx {
+        base,
+        shared,
+        view,
+        records,
+        subjects,
+        crates: &job.crates[..],
+        index: &index,
+        lang_reads,
+        sized,
+        pointers,
+        pointer_reads,
+        frame,
+        g,
+        tool,
+        once,
+        names: &freeze_names,
+        evals: &eval_names,
+        same_crate: &same_crate,
+        members,
+    };
+    let mut done = std::vec::Vec::with_capacity_in(tasks.len(), Global);
+    for (at_task, task) in tasks.iter().enumerate() {
         let name = task.planned.name;
         // The workers' scheduling point (engine_status.rs): stopped, this task and the rest are
         // not begun; `run_items` refuses them (owed) and the driver stops before the merge.
         if on_board.board.stopping().is_some() {
-            let rest = job.tasks[at_task..].iter().filter(|one| on_board.shows(one.planned.name, job.prefix)).count();
+            let rest = tasks[at_task..].iter().filter(|one| on_board.shows(one.planned.name, job.prefix)).count();
             on_board.board.refused(Stage::Heads, rest as u64);
             break;
         }
-        let from = rows.partition_point(|(entry, _, _, _, _)| *entry < name);
+        // The crate's listing: the setup's, or under the plant one made for this task alone
+        // (the control of engine_owners_once_tests.rs).
+        let listing = match plant {
+            ListingsPlant::Rule => listing,
+            ListingsPlant::PerAsk => listings.listing(records, &texts, 0, crate_key, subjects)?,
+        };
+        let mine = listing.of_entry(name);
         // Shown on the board by the one unit that shows it, labelled by its entry's name.
         let running = on_board.shows(name, job.prefix).then(|| {
-            let entry_name = rows.get(from).filter(|(entry, _, _, _, _)| *entry == name).map(|(entry, cell, sig, _, _)| label(*entry, *cell, *sig).entry_name);
+            let entry_name = mine.first().map(|one| one.label.entry_name);
             on_board.board.show(Stage::Heads, board_label(entry_name, name), frame.used() as u64, on_board.board.now(on_board.clock))
         });
         let mut out = blaze_ids::Hasher::new(HEAD_OUT_DOMAIN);
@@ -1697,11 +2424,10 @@ fn heads_of(
         let mut failed: Option<&'static str> = None;
         // How long `worked.reads` was when it was last settled (`once_each`).
         let mut settled = 0usize;
-        let mine = &rows[from..from + rows[from..].iter().take_while(|(entry, _, _, _, _)| *entry == name).count()];
         // Two heads under one cell would be two values under one key (rule 21): the whole
         // entry is refused, the two heads named as its text names them.
-        if let Some(two) = mine.windows(2).find(|two| two[0].1 == two[1].1) {
-            let (one, other) = (label(two[0].0, two[0].1, two[0].2), label(two[1].0, two[1].1, two[1].2));
+        if let Some(two) = mine.windows(2).find(|two| two[0].cell == two[1].cell) {
+            let (one, other) = (two[0].label, two[1].label);
             failed = Some(crate::engine_head_notes::leak(g, format_args!("two heads of its entry fall under one cell: {one} and {other}, the same kind and name (engine_heads.rs `head_cell`)")));
         }
         let mine = if failed.is_some() { &mine[..0] } else { mine };
@@ -1711,8 +2437,7 @@ fn heads_of(
         // read even when they write no head yet, so a call that comes to write one reruns it.
         // A record the store lacks refuses the task by name: a head task never runs a macro
         // again (rule 3).
-        let at_calls = calls.partition_point(|(entry, _)| *entry < name);
-        for (_, call) in calls[at_calls..].iter().take_while(|(entry, _)| *entry == name) {
+        for (_, call) in listing.calls_of(name).iter() {
             if !expansion_reads {
                 break;
             }
@@ -1722,9 +2447,10 @@ fn heads_of(
             worked.reads.push(names_read(view, CellId { of: scope_name, cell: Cell(blaze_scope::names_cells::NameCell::Expansion { call: *call }.key()) }));
         }
         let mine = if failed.is_some() { &mine[..0] } else { mine };
-        for (_, cell, _, want, item) in mine.iter() {
-            worked.items.push((*item, job.prefix));
-            // Frozen through the job's one source, its reads its cells' own (engine_heads_once.rs
+        for head in mine.iter() {
+            let (cell, want) = (&head.cell, &head.want);
+            worked.items.push((head.item, job.prefix));
+            // Frozen through the split's one source, its reads its cells' own (engine_heads_once.rs
             // `one_head`; a head that does not freeze is frozen again alone, as before).
             let made = crate::engine_heads_once::one_head(&job_cx, &mut source, &mut owners, *want, name, &mut |id| worked.reads.push(id), &mut failed);
             // Each cell once so far, whenever the list has doubled since it last was.

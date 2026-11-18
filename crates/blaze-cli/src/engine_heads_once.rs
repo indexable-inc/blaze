@@ -45,10 +45,18 @@
 //! a cell): about 20,183 x 10k x 179 B = 36 GB. The table itself (one entry a distinct cell,
 //! keyed by the dependency's own key, never a reader's unit) holds each head's bytes once.
 //!
-//! NOT YET (engine_heads_once.rs's next piece): a frozen head's bytes put to the store when the
-//! phase commits and the table then holding only its key, readers taking the bytes in place from
-//! the snapshot (floor: 0 bytes held after the commit); a member head's bytes are in its task's
-//! payload as well as in the table (2 copies; floor 1).
+//! A CLOSED DEPENDENCY'S HEAD IS VALID BY ITS KEY (lane H9): a dependency none of whose closure
+//! is a member (engine_seeds.rs `CrateAt::closed`) has text a fetched pack's, named by its crate
+//! key, so its head's record is keyed before the freeze (engine_seeds.rs `dependency_key`: its
+//! names record's key, the cell, the form's version, the tool). The table finds it under that
+//! key in the store's committed snapshot, in place ([`KnownHeads::known`]); one frozen this
+//! command is put at the phase's commit ([`HeadsOnce::put_dependencies`]) and found by the next
+//! command, nothing frozen again. A reader's read of it is its crate's `WHOLE` cell alone
+//! ([`task_reads`]): no [`Cover`], which stays for a dependency that depends on a member.
+//!
+//! NOT YET: the committed bytes are still lent from the request's heap to its end (the floor
+//! is 0 held after each commit); a member head's bytes are in its task's payload as well as in
+//! the table (2 copies; floor 1).
 //!
 //! WHY IT IS SOUND: a frozen head is a function of its cell and the names it read (head.rs
 //! `freeze_seeded`); a reader's bytes are a function of its own reads and the bytes of the heads
@@ -57,20 +65,38 @@
 //! reader's bytes cannot move either (early cutoff). A cell whose digest is not its bytes'
 //! meaning (a text cell) proves nothing of the bytes: there the reads are followed.
 //!
-//! A HEAD THAT DOES NOT FREEZE ([`alone`]) is frozen again over a source of its own, as before:
-//! a failure a shared source kept is answered as `FreezeError::Again`, naming the cell that
-//! failed first, which is a fact of the order the job asked, so the failure's words (its cell's
-//! digest) and its reads come from the freeze alone (rule 25).
+//! A HEAD THAT DOES NOT FREEZE IS FAILED ONCE A REQUEST TOO (lane HF1; rule 77). THE CAUSE IT
+//! REMOVES (tempo, 2026-11-18: the Heads stage 577 s, 98.9% of it under [`alone`]): a shared
+//! source answered a failure by the order it was asked in, so every failed head was frozen again
+//! over a source of its own, every head it needed lowered again from nothing. Now the source keeps
+//! each cell's OWN failure (front2 tables/head.rs `SeededHeads::failure`: its typed reason, or its
+//! DIRECT need, the first of its own demand order that did not freeze; and its own reads), a
+//! function of the cell alone, so:
+//! - [`publish_since`] puts each cell that failed in the job's source into the table as a
+//!   [`FailedEntry`]: its words (engine_head_notes.rs `Reason` of its own reason, or of the
+//!   `Again` naming its need), the need, its own reads by owner, the heads it read. Two equal
+//!   failures of one cell: the first kept, the second counted (`failed_twice`); other words or
+//!   another need a typed refusal ([`OnceError::UnequalFailure`], rule 21); a cell both frozen and
+//!   failed too ([`OnceError::FrozenAndFailed`]).
+//! - the table answers a failed cell as `NotTheirs::Failed` with its words ([`KnownHeads::known`]),
+//!   so no worker freezes it again, and a cell that needs it fails naming it.
+//! - [`one_head`] answers a failed head from its entry, its reads the entry's and its heads'
+//!   followed as a frozen head's are ([`reads_from`]), and never calls [`alone`], which stays only
+//!   as the [`Sources::Head`] strategy (rule 78), its words from its own source's kept failure.
+//! A failure that is no cell's own (no text, a chain too deep, too many attempts: bounds of one
+//! ask) is not kept by the source and stays as the task's own, as before.
 //!
 //! THE MEASURE (rule 67, [`profile`]): cells frozen against freezes done (the floor: each once),
-//! signatures lowered, cells found in the table, freezes made twice by a race, and constants
-//! evaluated against distinct constants.
+//! cells failed against failures published (the floor: each once), heads frozen alone (the
+//! floor: 0 with the job sources), signatures lowered, cells found in the table, freezes made
+//! twice by a race, and constants evaluated against distinct constants.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use blaze_drive::Name;
+use blaze_cas::plain::Snapshot;
 use blaze_drive::key::Tool;
-use blaze_engine::{CellId, View};
+use blaze_drive::{Key, Name};
+use blaze_engine::{CellId, Stage, View};
 use blaze_id::ItemKey as LibKey;
 use blaze_ids::ContentId;
 use blaze_ladder::front2::consts::ConstFail;
@@ -78,17 +104,21 @@ use blaze_ladder::front2::heads::{Store, Want};
 use blaze_ladder::front2::index::Index;
 use blaze_ladder::front2::keys::Keys;
 use blaze_ladder::front2::source::{NamesSource, Records};
-use blaze_ladder::front2::tables::head::{ConstValues, HeadCells, HeadDone, Known, KnownHeads, SeededHeads, SeededHeadsOpts, WANT_BYTES, cell_id as head_cell_id, head_task, want_bytes};
+use blaze_ladder::front2::tables::head::{CellFailure, ConstValues, FreezeError, HeadCells, HeadDone, Known, KnownHeads, NotTheirs, SeededHeads, SeededHeadsOpts, WANT_BYTES, cell_id as head_cell_id, head_task, want_bytes};
 use blaze_ladder::front2::tables::owned_reads::{OwnedRecorder, ReadOwners as _};
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts, TableRead};
 use blaze_ladder::front2::tables::seeds::MOST_CELLS;
 use blaze_ladder::front2::tables::task::cell_id;
 use blaze_ladder::front2::tables::view::Tables;
-use blaze_own::{Alloc, Vec};
+use blaze_ladder::front2::receiver::Pointers;
+use blaze_own::{Alloc, SharedAlloc, Vec};
+use bstd::cx::Cx;
 use bstd::mem::Frame;
 
+use crate::CliError;
+use crate::engine_seeds::{DependencyFinder, HeadRecords, KEY_BYTES, Keyed};
 use crate::engine_head_consts::{HeadConsts, UnplacedIn, eval_reads, text_cell};
-use crate::engine_head_notes::leak;
+use crate::engine_head_notes::{Reason, leak};
 use crate::engine_heads::{HeadAt, MOST_HEAD_READS, Owners, Subjects, names_read};
 use crate::engine_tasks::{HEADS, WHOLE};
 
@@ -111,6 +141,41 @@ pub(crate) struct Entry {
     pub(crate) heads: &'static [Want],
     /// The constants' values its store held (head.rs `CellReads::consts`), sorted by key.
     pub(crate) consts: &'static [(LibKey, u128)],
+    /// A CLOSED dependency's head (lane H9; engine_seeds.rs `CrateAt::closed`): its record's key
+    /// and the names key it is made of. Its reads, heads and constants are then empty: a reader
+    /// reads its crate's `WHOLE` cell alone ([`task_reads`]), and the head is valid by its key.
+    pub(crate) record: Option<(Key, Key)>,
+}
+
+/// One cell in the request's table that did not freeze (lane HF1, module docs): its failure as a
+/// function of the cell, lent from the request's heap to every worker until the request ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FailedEntry {
+    pub(crate) want: Want,
+    /// Its failure's words, key-free (engine_head_notes.rs `Reason`): its cell's digest is made
+    /// of them (engine_heads.rs `HEAD_FAILED_DOMAIN`), and a later ask is answered them.
+    pub(crate) said: &'static str,
+    /// Its DIRECT need when it failed for a need (front2 tables/head.rs `CellFailure::Needs`);
+    /// `None`: it failed by itself.
+    pub(crate) needs: Option<Want>,
+    /// Its own reads as cells, sorted, each once (as [`Entry::reads`]): its attempts' names reads
+    /// and its constants' evaluation's, by owner.
+    pub(crate) reads: &'static [CellId],
+    /// The heads its last attempt read (its need among them), sorted by their bytes.
+    pub(crate) heads: &'static [Want],
+}
+
+/// What the table found of a closed dependency head under its key, on its first look this
+/// command (or since the last commit, [`HeadsOnce::committed`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Looked {
+    /// A record, checked (engine_seeds.rs `dependency_head`): read in place on every ask.
+    Found,
+    /// None: a worker freezes it, and the phase's commit puts it ([`HeadsOnce::put_dependencies`]).
+    Absent,
+    /// A record that is not the head its key names, or a store that could not read: the phase's
+    /// put stops the request by it (rule 3); the cell is frozen meanwhile, never taken.
+    Bad(&'static str),
 }
 
 /// What one put into the table did.
@@ -129,12 +194,20 @@ pub(crate) enum OnceError {
     Unequal { cell: Want },
     /// The table holds [`MOST_CELLS`] cells already.
     Full { cell: Want, most: usize },
+    /// Two failures of one cell said other words or named another need (lane HF1): a failure
+    /// is a function of its cell (front2 tables/head.rs `SeededHeads::failure`), so two differ
+    /// only by a fault (rule 21).
+    UnequalFailure { cell: Want },
+    /// One cell put both frozen and failed (lane HF1; rule 21).
+    FrozenAndFailed { cell: Want },
 }
 
 impl core::fmt::Display for OnceError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             OnceError::Unequal { cell } => write!(f, "two freezes of its head cell {cell:?} made other bytes (engine_heads_once.rs `HeadsOnce::put`, rule 21)"),
+            OnceError::UnequalFailure { cell } => write!(f, "two failures of its head cell {cell:?} said other words or named another need (engine_heads_once.rs `HeadsOnce::put_failed`, rule 21)"),
+            OnceError::FrozenAndFailed { cell } => write!(f, "its head cell {cell:?} was put both frozen and failed (engine_heads_once.rs `HeadsOnce::put_failed`, rule 21)"),
             OnceError::Full { cell, most } => write!(f, "the request's table of heads holds {most} cells, so {cell:?} is not put (engine_heads_once.rs, front2 seeds.rs `MOST_CELLS`)"),
         }
     }
@@ -147,7 +220,15 @@ pub(crate) enum OncePlant {
     Rule,
     /// PLANTED BUG, for tests only: a second put of other bytes replaces the first, unrefused.
     SecondWins,
+    /// PLANTED BUG, for tests only (lane H9): a dependency head put to the store is taken as
+    /// held there from the put on, before the commit makes it durable, so the table stops
+    /// answering it: a reader is sent to records that do not hold it (it is frozen again, and
+    /// after a crash between the put and the commit nothing holds it).
+    ForgetAtPut,
 }
+
+/// The command's records a dependency head is found in: the store's committed snapshot.
+pub(crate) type CommandRecords = Snapshot<SharedAlloc<'static>>;
 
 /// What a head task freezes its heads over (rule 78: the strategy at one seam, [`one_head`]; the
 /// engine-seam tests run both and compare the answers).
@@ -161,10 +242,32 @@ pub(crate) enum Sources {
 }
 
 /// The request's frozen heads of the Heads stage (module docs). `Sync`: every map only inserts
-/// and every count is an atomic.
-pub(crate) struct HeadsOnce {
+/// and every count is an atomic. `R`: the records a closed dependency head is found in by key
+/// (the command's snapshot; a test's model store).
+pub(crate) struct HeadsOnce<R = CommandRecords> {
+    /// The finder of closed dependency heads by key (`None`: none is found by key, as before
+    /// lane H9; the engine-seam tests without a store).
+    deps: Option<DependencyFinder<R>>,
+    /// Each closed dependency cell looked up under its key, by its bytes ([`Looked`]).
+    looked: blaze_core::SharedMap<[u8; WANT_BYTES], Looked, SharedAlloc<'static>>,
+    /// Closed dependency heads found under their keys (each once), and frozen here.
+    deps_found: AtomicU32,
+    deps_frozen: AtomicU32,
+    /// The keys this request put (sorted), for the root (engine_seeds.rs `RequestTable::list_too`).
+    put_keys: Vec<Key, SharedAlloc<'static>>,
+    /// The bytes of the dependency heads whose records were committed: answered from the store
+    /// since, though still lent from the heap to the request's end (module docs, "NOT YET").
+    committed_bytes: u64,
+    /// The cells the planted [`OncePlant::ForgetAtPut`] stopped answering.
+    forgot: blaze_core::SharedSet<[u8; WANT_BYTES], SharedAlloc<'static>>,
     sources: Sources,
     cells: blaze_core::SharedMap<[u8; WANT_BYTES], Entry, blaze_own::SharedAlloc<'static>>,
+    /// The cells that did not freeze (lane HF1), by their bytes: never a key of `cells` too.
+    failures: blaze_core::SharedMap<[u8; WANT_BYTES], FailedEntry, blaze_own::SharedAlloc<'static>>,
+    /// Failures published by the job sources (each put, kept or twice), and seconds of equal
+    /// words counted.
+    failed: AtomicU32,
+    failed_twice: AtomicU32,
     /// Each constant evaluated, by its key and the unit it was evaluated for.
     consts: blaze_core::SharedSet<([u8; 8], LibKey), blaze_own::SharedAlloc<'static>>,
     heap: &'static blaze_own::Heap,
@@ -178,7 +281,8 @@ pub(crate) struct HeadsOnce {
     lowered: AtomicU64,
     /// Cells a job source took from the table.
     found: AtomicU32,
-    /// Heads that did not freeze, frozen again alone ([`alone`]).
+    /// Heads frozen over a source of their own ([`alone`]): every head under [`Sources::Head`],
+    /// none under [`Sources::Job`] (lane HF1: the floor 0).
     alone: AtomicU32,
     /// Constants evaluated (each ask of an evaluator).
     evaluated: AtomicU32,
@@ -243,6 +347,13 @@ pub(crate) struct OnceCounts {
     pub(crate) twice: u32,
     pub(crate) reads_unequal: u32,
     pub(crate) alone: u32,
+    /// Distinct cells failed this request (the table's failed entries, lane HF1): the floor of
+    /// `failed`, failures published; `failed_twice` of them a second of equal words (a race).
+    /// The floor of every cell's work: `frozen + failed = cells + failed_cells + twice +
+    /// failed_twice`, each distinct cell frozen or failed once.
+    pub(crate) failed_cells: u32,
+    pub(crate) failed: u32,
+    pub(crate) failed_twice: u32,
     /// Distinct (unit, constant) evaluated: the floor of `evaluated`.
     pub(crate) consts: u32,
     pub(crate) evaluated: u32,
@@ -259,6 +370,13 @@ pub(crate) struct OnceCounts {
     /// Dependency covers kept, and covers made twice with other cells.
     pub(crate) covers: u32,
     pub(crate) covers_unequal: u32,
+    /// Closed dependency heads found under their keys, and frozen in this request (lane H9; the
+    /// floor of `deps_frozen` is 0 once a machine has run the workspace).
+    pub(crate) deps_found: u32,
+    pub(crate) deps_frozen: u32,
+    /// Dependency heads put to the store, and the bytes of those whose records are committed.
+    pub(crate) deps_put: u32,
+    pub(crate) committed_bytes: u64,
 }
 
 impl OnceCounts {
@@ -270,11 +388,52 @@ impl OnceCounts {
 
 impl HeadsOnce {
     /// An empty table over the request's heap (the phase's handed one, engine_heads.rs
-    /// `run_items`).
+    /// `run_items`), finding no dependency head by key until [`HeadsOnce::find_dependencies`].
     pub(crate) fn new(heap: &'static blaze_own::Heap, plant: OncePlant, sources: Sources) -> HeadsOnce {
+        HeadsOnce::empty(heap, plant, sources)
+    }
+
+    /// The Heads phase's commit, on the coordinator (lane H9): each closed dependency head frozen
+    /// now put to `store` under its key, sorted (rule 25), and counted in `ledger`; how many.
+    /// The caller commits the store, then hands the new snapshot to [`HeadsOnce::committed`].
+    /// A record found bad under its key stops the request here (rule 3).
+    pub(crate) fn put_dependencies(&mut self, cx: &Cx, store: &mut dyn crate::store::Store<'_>, ledger: &mut crate::engine_store::Ledger) -> Result<u32, CliError> {
+        if let Some(why) = self.bad() {
+            return Err(CliError::Text { what: why });
+        }
+        let g = self.heap.alloc();
+        let puts = self.pending_puts(g);
+        for (key, names_at, bytes) in puts.iter() {
+            let parts: [&[u8]; 2] = [&names_at.0.0, *bytes];
+            ledger.put(Stage::Heads, *key, &parts, 0);
+            store.put_parts(cx, *key, &parts)?;
+        }
+        let keys: Vec<Key, Alloc<'static>> = {
+            let mut keys = Vec::with_capacity_in(puts.len(), g);
+            keys.extend(puts.iter().map(|(key, _, _)| *key));
+            keys
+        };
+        self.mark_put(&keys);
+        Ok(u32::try_from(puts.len()).unwrap_or(u32::MAX))
+    }
+}
+
+impl<R: HeadRecords> HeadsOnce<R> {
+    /// [`HeadsOnce::new`] over any records (a test's model store).
+    pub(crate) fn empty(heap: &'static blaze_own::Heap, plant: OncePlant, sources: Sources) -> HeadsOnce<R> {
         HeadsOnce {
+            deps: None,
+            looked: blaze_core::SharedMap::new_in("engine.dependency heads looked up by key", heap.shared()),
+            deps_found: AtomicU32::new(0),
+            deps_frozen: AtomicU32::new(0),
+            put_keys: Vec::new_in(heap.shared()),
+            committed_bytes: 0,
+            forgot: blaze_core::SharedSet::new_in("engine.dependency heads forgotten at their put (planted)", heap.shared()),
             sources,
             cells: blaze_core::SharedMap::new_in("engine.heads frozen once a request, with their reads", heap.shared()),
+            failures: blaze_core::SharedMap::new_in("engine.heads failed once a request, with their reads", heap.shared()),
+            failed: AtomicU32::new(0),
+            failed_twice: AtomicU32::new(0),
             consts: blaze_core::SharedSet::new_in("engine.head constants evaluated, by unit", heap.shared()),
             heap,
             plant,
@@ -345,6 +504,9 @@ impl HeadsOnce {
     /// bytes refused (module docs). Two steps a race can interleave: the look, then the insert.
     pub(crate) fn put(&self, entry: Entry) -> Result<Put, OnceError> {
         let key = want_bytes(entry.want);
+        if self.failures.pin().get(&key).is_some() {
+            return Err(OnceError::FrozenAndFailed { cell: entry.want });
+        }
         let cells = self.cells.pin();
         if let Some(held) = cells.get(&key) {
             return self.again(held, entry);
@@ -381,6 +543,54 @@ impl HeadsOnce {
         Ok(Put::Twice)
     }
 
+    /// Cell `cell`'s failed entry, when some worker put it failed (lane HF1).
+    pub(crate) fn look_failed(&self, cell: Want) -> Option<FailedEntry> {
+        self.failures.pin().get(&want_bytes(cell)).copied()
+    }
+
+    /// Cell `cell`'s own reads and the heads it read, frozen or failed: what a reader of it
+    /// follows ([`reads_from`], [`cover`]).
+    fn read_of(&self, cell: Want) -> Option<(&'static [CellId], &'static [Want])> {
+        if let Some(entry) = self.look(cell) {
+            return Some((entry.reads, entry.heads));
+        }
+        self.look_failed(cell).map(|failed| (failed.reads, failed.heads))
+    }
+
+    /// `entry`, one worker's failure of its cell (lane HF1, module docs): the first kept, a second
+    /// of equal words and need counted, another a typed refusal; a cell the table holds frozen
+    /// refused too (rule 21). Two steps a race can interleave, as [`HeadsOnce::put`]'s.
+    pub(crate) fn put_failed(&self, entry: FailedEntry) -> Result<Put, OnceError> {
+        let key = want_bytes(entry.want);
+        self.failed.fetch_add(1, Ordering::Relaxed);
+        if self.cells.pin().get(&key).is_some() {
+            return Err(OnceError::FrozenAndFailed { cell: entry.want });
+        }
+        let failures = self.failures.pin();
+        if let Some(held) = failures.get(&key) {
+            return self.failed_again(held, entry);
+        }
+        if failures.len() >= MOST_CELLS {
+            return Err(OnceError::Full { cell: entry.want, most: MOST_CELLS });
+        }
+        match failures.try_insert(key, entry) {
+            Ok(_) => Ok(Put::Kept),
+            Err(occupied) => self.failed_again(occupied.current, entry),
+        }
+    }
+
+    /// One more failure of a cell the table holds failed as `held`.
+    fn failed_again(&self, held: &FailedEntry, entry: FailedEntry) -> Result<Put, OnceError> {
+        if held.said != entry.said || held.needs != entry.needs {
+            return Err(OnceError::UnequalFailure { cell: entry.want });
+        }
+        if held.reads != entry.reads || held.heads != entry.heads {
+            self.reads_unequal.fetch_add(1, Ordering::Relaxed);
+        }
+        self.failed_twice.fetch_add(1, Ordering::Relaxed);
+        Ok(Put::Twice)
+    }
+
     /// The counts so far.
     pub(crate) fn counts(&self) -> OnceCounts {
         OnceCounts {
@@ -391,6 +601,9 @@ impl HeadsOnce {
             twice: self.twice.load(Ordering::Relaxed),
             reads_unequal: self.reads_unequal.load(Ordering::Relaxed),
             alone: self.alone.load(Ordering::Relaxed),
+            failed_cells: u32::try_from(self.failures.len()).unwrap_or(u32::MAX),
+            failed: self.failed.load(Ordering::Relaxed),
+            failed_twice: self.failed_twice.load(Ordering::Relaxed),
             consts: u32::try_from(self.consts.len()).unwrap_or(u32::MAX),
             evaluated: self.evaluated.load(Ordering::Relaxed),
             read_lists: self.read_lists.load(Ordering::Relaxed),
@@ -401,6 +614,10 @@ impl HeadsOnce {
             bytes_held: self.bytes_held.load(Ordering::Relaxed),
             covers: u32::try_from(self.covers.len()).unwrap_or(u32::MAX),
             covers_unequal: self.covers_unequal.load(Ordering::Relaxed),
+            deps_found: self.deps_found.load(Ordering::Relaxed),
+            deps_frozen: self.deps_frozen.load(Ordering::Relaxed),
+            deps_put: u32::try_from(self.put_keys.len()).unwrap_or(u32::MAX),
+            committed_bytes: self.committed_bytes,
         }
     }
 
@@ -425,11 +642,161 @@ impl HeadsOnce {
         copy.extend_from_slice(items);
         copy.leak()
     }
+
+    /// Closed dependency head `cell` frozen by a worker (`bytes`, of meaning `out`), its record's
+    /// key `key` over names key `names_at`: put into the table with no reads (a reader reads its
+    /// crate's `WHOLE`), counted as a freeze of a dependency head, for the phase's put.
+    pub(crate) fn put_closed(&self, cell: Want, bytes: &[u8], out: ContentId, key: Key, names_at: Key) -> Result<Put, OnceError> {
+        let entry = Entry { want: cell, member: false, bytes: self.lend(bytes), out, reads: &[], heads: &[], consts: &[], record: Some((key, names_at)) };
+        self.frozen.fetch_add(1, Ordering::Relaxed);
+        self.deps_frozen.fetch_add(1, Ordering::Relaxed);
+        self.put(entry)
+    }
+
+    /// From now on, closed dependency heads are found by key through `finder` (lane H9; the
+    /// driver sets it before the Heads phase, engine_check.rs).
+    pub(crate) fn find_dependencies(&mut self, finder: DependencyFinder<R>) {
+        self.deps = Some(finder);
+    }
+
+    /// Cell `cell`'s standing to "valid by its key" ([`Keyed`]); `Unkeyed` with no finder.
+    pub(crate) fn keyed(&self, cell: Want) -> Keyed {
+        match &self.deps {
+            Some(finder) => finder.keyed(cell),
+            None => Keyed::Unkeyed,
+        }
+    }
+
+    /// Closed dependency head `cell`'s frozen bytes in place in the records, when a record is
+    /// under its key (checked on the first look, [`Looked`]); `None` for any other cell.
+    fn found_by_key(&self, cell: Want) -> Option<&[u8]> {
+        let finder = self.deps.as_ref()?;
+        let Keyed::Closed { key, names_at, .. } = finder.keyed(cell) else { return None };
+        let at = want_bytes(cell);
+        let looked = {
+            let pin = self.looked.pin();
+            match pin.get(&at) {
+                Some(looked) => *looked,
+                None => {
+                    let looked = look_up(&finder.records, key, names_at, cell);
+                    // Past the cap a look is made again on each ask, never kept (rule 18): the
+                    // answer is the same, its cost a probe of the store's index.
+                    if pin.len() >= MOST_CELLS {
+                        looked
+                    } else {
+                        match pin.try_insert(at, looked) {
+                            Ok(_) => {
+                                if looked == Looked::Found {
+                                    self.deps_found.fetch_add(1, Ordering::Relaxed);
+                                }
+                                looked
+                            }
+                            Err(occupied) => *occupied.current,
+                        }
+                    }
+                }
+            }
+        };
+        match looked {
+            Looked::Found => finder.records.record(key).ok().flatten().and_then(|bytes| bytes.get(KEY_BYTES..)),
+            Looked::Absent | Looked::Bad(_) => None,
+        }
+    }
+
+    /// The first bad look under a key, if any: what stops the request at the put.
+    fn bad(&self) -> Option<&'static str> {
+        self.looked.pin().iter().find_map(|(_, looked)| match looked {
+            Looked::Bad(why) => Some(*why),
+            Looked::Found | Looked::Absent => None,
+        })
+    }
+
+    /// Each closed dependency head frozen in this request and not yet put: (its key, its names
+    /// key, its frozen bytes), sorted by key, each once (rule 25). A cell found under its key
+    /// is the store's already and is not here.
+    pub(crate) fn pending_puts<A: core::alloc::Allocator>(&self, alloc: A) -> Vec<(Key, Key, &'static [u8]), A> {
+        let mut puts = Vec::new_in(alloc);
+        let looked = self.looked.pin();
+        for (at, entry) in self.cells.pin().iter() {
+            let Some((key, names_at)) = entry.record else { continue };
+            if looked.get(at) == Some(&Looked::Found) {
+                continue;
+            }
+            if self.put_keys.binary_search(&key).is_ok() {
+                continue;
+            }
+            puts.push((key, names_at, entry.bytes));
+        }
+        puts.sort_unstable_by_key(|(key, _, _)| *key);
+        puts.dedup_by_key(|(key, _, _)| *key);
+        puts
+    }
+
+    /// `keys` were put to the store (not yet committed): kept for the root. Under the planted
+    /// [`OncePlant::ForgetAtPut`] the table also stops answering their cells now.
+    pub(crate) fn mark_put(&mut self, keys: &[Key]) {
+        if self.plant == OncePlant::ForgetAtPut {
+            let forgot = self.forgot.pin();
+            for (at, entry) in self.cells.pin().iter() {
+                if entry.record.is_some_and(|(key, _)| keys.binary_search(&key).is_ok()) && !forgot.contains(at) {
+                    forgot.insert(*at);
+                }
+            }
+        }
+        self.put_keys.extend_from_slice(keys);
+        self.put_keys.sort_unstable();
+        self.put_keys.dedup();
+    }
+
+    /// The store committed what was put: `records` is its new snapshot. Each closed dependency
+    /// head is looked up again under its key (a cell absent before may be held now), so from now
+    /// on a reader takes it in place from the store, never from the table.
+    pub(crate) fn committed(&mut self, records: R) {
+        if let Some(finder) = &mut self.deps {
+            finder.records = records;
+        }
+        self.looked = blaze_core::SharedMap::new_in("engine.dependency heads looked up by key", self.heap.shared());
+        let mut bytes = 0u64;
+        for (_, entry) in self.cells.pin().iter() {
+            if entry.record.is_some_and(|(key, _)| self.put_keys.binary_search(&key).is_ok()) {
+                bytes = bytes.saturating_add(u64::try_from(entry.bytes.len()).unwrap_or(u64::MAX));
+            }
+        }
+        self.committed_bytes = bytes;
+    }
+
+    /// The keys this request put, sorted (engine_seeds.rs `RequestTable::list_too`).
+    pub(crate) fn put_keys(&self) -> &[Key] {
+        &self.put_keys
+    }
 }
 
-impl KnownHeads for HeadsOnce {
+/// The record under `key` in `records`, checked as `cell`'s head over `names_at`.
+fn look_up<R: HeadRecords>(records: &R, key: Key, names_at: Key, cell: Want) -> Looked {
+    match records.record(key) {
+        Ok(Some(bytes)) => match records.head(bytes, names_at, cell) {
+            Ok(_) => Looked::Found,
+            Err(why) => Looked::Bad(why),
+        },
+        Ok(None) => Looked::Absent,
+        Err(_) => Looked::Bad("the store's snapshot could not read a dependency head's record (engine_heads_once.rs `look_up`)"),
+    }
+}
+
+impl<R: HeadRecords> KnownHeads for HeadsOnce<R> {
+    /// A closed dependency's head found under its key, in place; else the table's entry; else
+    /// the asker freezes it (and puts it, [`publish_since`]).
     fn known(&self, cell: Want) -> Known<'_> {
+        if let Some(bytes) = self.found_by_key(cell) {
+            return Known::Bytes(bytes);
+        }
+        // A cell some worker failed (lane HF1): refused by its own words, never frozen again; a
+        // cell that needs it fails naming it (front2 tables/head.rs `CellFailure::Needs`).
+        if let Some(failed) = self.look_failed(cell) {
+            return Known::Refused(NotTheirs::Failed { said: failed.said });
+        }
         match self.look(cell) {
+            Some(_) if self.plant == OncePlant::ForgetAtPut && self.forgot.pin().contains(&want_bytes(cell)) => Known::Freeze,
             Some(entry) => Known::Bytes(entry.bytes),
             None => Known::Freeze,
         }
@@ -460,6 +827,25 @@ pub(crate) fn profile(counts: &OnceCounts, into: &mut blaze_own::String<&Frame>)
         counts.alone,
         counts.reads_unequal
     );
+    // THE BOUND of lane HF1 (rule 67): each distinct cell frozen or failed once a request; a
+    // failed head is never frozen again alone with the job sources. The ratio is the work done
+    // (freezes and failures published) over the floor (distinct cells frozen and failed).
+    let done = u64::from(counts.frozen) + u64::from(counts.failed);
+    let floor = u64::from(counts.cells) + u64::from(counts.failed_cells);
+    let hundredths = (done * 100).checked_div(floor).unwrap_or(100);
+    let _ = writeln!(
+        into,
+        "heads: failed: cells {} · failures published {} (floor {}) · failed twice at a race {} · frozen alone {} (floor 0 with the job sources) · frozen and failed {} over the floor {}: ratio {}.{:02}",
+        counts.failed_cells,
+        counts.failed,
+        counts.failed_cells,
+        counts.failed_twice,
+        counts.alone,
+        done,
+        floor,
+        hundredths / 100,
+        hundredths % 100
+    );
     // THE BOUND (rule 67, lane H8). The floor of the bytes held is 0 once the Heads phase's
     // records are committed (a reader then takes them in place from the store's snapshot); the
     // table holds them to the request's end today, and a member head's bytes are in its head
@@ -469,6 +855,22 @@ pub(crate) fn profile(counts: &OnceCounts, into: &mut blaze_own::String<&Frame>)
         into,
         "heads: table: entries {} (member {}, dependency {}), bytes held {} (floor: 0 after each commit) · copies of a head's bytes: member 2, dependency 1 (floor 1) · dependency covers {} (unequal at a race {})",
         counts.cells, counts.members, counts.dependencies, counts.bytes_held, counts.covers, counts.covers_unequal
+    );
+    // THE BOUNDS of lane H9 (rule 67): a closed dependency's head is found by its key, never
+    // frozen again once a machine has run the workspace; the table's bytes are the store's after
+    // the commit (still lent from the heap today: `committed`, module docs "NOT YET"); a task's
+    // read of such a head is one cell.
+    let _ = writeln!(
+        into,
+        "heads: dependency heads: found {}, frozen {} (floor: {} = 0 once a machine has run), put {} · table: bytes held {} (floor 0 after each commit; committed, still lent {}) · read list: mean {} cells, most {} (floor: a task's own cells + one a head read)",
+        counts.deps_found,
+        counts.deps_frozen,
+        counts.deps_frozen,
+        counts.deps_put,
+        counts.bytes_held,
+        counts.committed_bytes,
+        counts.read_mean(),
+        counts.read_most
     );
 }
 
@@ -510,6 +912,13 @@ pub(crate) struct JobCx<'j, 't, 'n, 'v, 'w> {
     /// What the job's lang index read, as cells (read by every cell that evaluates).
     pub(crate) lang_reads: &'j [CellId],
     pub(crate) sized: Option<LibKey>,
+    /// The program's receiver pointer types, found once a job (engine_heads.rs `heads_of`; front2
+    /// receiver.rs `Pointers::find`): every freeze's store is made with them.
+    pub(crate) pointers: Pointers,
+    /// What finding `pointers` read, as cells (the lang index's rows and alloc's `rc::Rc` and
+    /// `sync::Arc` paths), sorted: EVERY cell's read (rule 21), as any head's verdict on a
+    /// receiver may rest on them. A dependency's are its `WHOLE` ([`coarse`]): a few cells.
+    pub(crate) pointer_reads: &'j [CellId],
     pub(crate) frame: &'n Frame,
     pub(crate) g: Alloc<'static>,
     pub(crate) tool: Tool,
@@ -549,18 +958,38 @@ pub(crate) fn one_head<'n, 's: 'n>(
         return alone(job, owners, want, name, push, failed);
     }
     let mark = source.kept_len();
+    let fail_mark = source.failed_len();
     // The task's own lookups (its item's text, `cell_of`) are its cell's.
     job.names.enter(want);
     job.evals.enter(want);
-    let made = head_task(job.shared, source, want, job.tool, job.g);
+    let mut made = head_task(job.shared, source, want, job.tool, job.g);
     job.names.leave();
     job.evals.leave();
-    if let Err(why) = publish_since(job, source, mark) {
+    if let Err(why) = publish_since(job, source, mark, fail_mark) {
         failed.get_or_insert(why);
     }
     if made.failed.is_some() {
-        job.once.alone.fetch_add(1, Ordering::Relaxed);
-        return alone(job, owners, want, name, push, failed);
+        // A head that did not freeze (lane HF1): its failure the table's entry, put by this job
+        // or another, never frozen again (module docs).
+        match job.once.look_failed(want) {
+            Some(entry) => {
+                made.failed = Some(FreezeError::NotTheirs { want, why: NotTheirs::Failed { said: entry.said } });
+                if let Err(why) = reads_from(job, owners, want, name, entry.reads, entry.heads, push) {
+                    failed.get_or_insert(why);
+                }
+            }
+            // A failure no cell keeps (no text, a chain too deep, too many attempts; a need
+            // refused for an engine's lack): the task's own, with its own lookups.
+            None => {
+                for id in job.pointer_reads.iter() {
+                    push(*id);
+                }
+                if let Err(why) = reads_from(job, owners, want, name, &[], &[], push) {
+                    failed.get_or_insert(why);
+                }
+            }
+        }
+        return made;
     }
     if let Err(why) = task_reads(job, owners, want, name, push) {
         failed.get_or_insert(why);
@@ -568,14 +997,46 @@ pub(crate) fn one_head<'n, 's: 'n>(
     made
 }
 
-/// Every cell `source` froze itself from its kept index `mark` on, put into the table with its
-/// own reads (taken by owner from the job's recorders).
-fn publish_since<'n>(job: &JobCx<'_, '_, 'n, '_, '_>, source: &mut SeededHeads<'n, '_, Tables<'_, 'n>>, mark: usize) -> Result<(), &'static str> {
+/// The words cell `want`'s kept `failure` is answered and its cell's digest made of (lane HF1):
+/// its own reason's, or the `Again` naming its need's, both key-free (engine_head_notes.rs
+/// `Reason`); `None` for a need refused for an engine's lack, which stays the asker's.
+fn failure_words(g: Alloc<'static>, want: Want, failure: CellFailure<'_>) -> Option<&'static str> {
+    match failure {
+        CellFailure::Own(error) => Some(leak(g, format_args!("{}", Reason(error)))),
+        CellFailure::Needs(need) => Some(leak(g, format_args!("{}", Reason(&FreezeError::Again { want, failed: need })))),
+        CellFailure::Refused { .. } => None,
+    }
+}
+
+/// Every cell `source` froze itself from its kept index `mark` on, and every cell that failed in
+/// it from its failure mark `fail_mark` on (lane HF1), put into the table with its own reads
+/// (taken by owner from the job's recorders).
+fn publish_since<'n>(job: &JobCx<'_, '_, 'n, '_, '_>, source: &mut SeededHeads<'n, '_, Tables<'_, 'n>>, mark: usize, fail_mark: usize) -> Result<(), &'static str> {
     let g = job.g;
+    let mut gave_up: Vec<FailedEntry, Alloc<'static>> = Vec::new_in(g);
+    for (w, failure, heads) in source.failures_from(fail_mark) {
+        let Some(said) = failure_words(g, w, failure) else { continue };
+        let needs = match failure {
+            CellFailure::Needs(need) => Some(need),
+            CellFailure::Own(_) | CellFailure::Refused { .. } => None,
+        };
+        gave_up.push(FailedEntry { want: w, said, needs, reads: &[], heads: job.once.lend(heads) });
+    }
+    for entry in gave_up.iter_mut() {
+        let reads = cell_reads(job, entry.want, &[])?;
+        entry.reads = job.once.lend(&reads);
+        job.once.put_failed(*entry).map_err(|e| leak(g, format_args!("{e}")))?;
+    }
     let mut fresh: Vec<Want, Alloc<'static>> = Vec::new_in(g);
     fresh.extend(source.frozen_from(mark).map(|(w, _)| w));
     for w in fresh.iter().copied() {
         let (frozen, read) = source.cell(w).map_err(|_| "a cell its job's source froze could not be read back (front2 tables/head.rs `HeadCells::cell`)")?;
+        // A CLOSED dependency's head (lane H9): valid by its key, read as its crate's `WHOLE`
+        // cell, so its reads, heads and constants are kept nowhere; its record's key is.
+        if let Keyed::Closed { key, names_at, .. } = job.once.keyed(w) {
+            job.once.put_closed(w, frozen.bytes(), frozen.meaning(), key, names_at).map_err(|e| leak(g, format_args!("{e}")))?;
+            continue;
+        }
         let reads = cell_reads(job, w, read.consts)?;
         let entry = Entry {
             want: w,
@@ -585,6 +1046,7 @@ fn publish_since<'n>(job: &JobCx<'_, '_, 'n, '_, '_>, source: &mut SeededHeads<'
             reads: job.once.lend(&reads),
             heads: job.once.lend(read.heads),
             consts: job.once.lend(read.consts),
+            record: None,
         };
         job.once.frozen.fetch_add(1, Ordering::Relaxed);
         job.once.put(entry).map_err(|e| leak(g, format_args!("{e}")))?;
@@ -597,6 +1059,7 @@ fn publish_since<'n>(job: &JobCx<'_, '_, 'n, '_, '_>, source: &mut SeededHeads<'
 fn cell_reads(job: &JobCx<'_, '_, '_, '_, '_>, w: Want, consts: &[(LibKey, u128)]) -> Result<Vec<CellId, Alloc<'static>>, &'static str> {
     let g = job.g;
     let mut out: Vec<CellId, Alloc<'static>> = Vec::new_in(g);
+    out.extend_from_slice(job.pointer_reads);
     names_of(job, job.names, w, &mut out, "a names read of its head names a crate its scope does not hold (front2 tables/task.rs `cell_id`)")?;
     let mut raw: Vec<TableRead, Alloc<'static>> = Vec::new_in(g);
     job.evals.reads_of(w, &mut |one| raw.push(one)).map_err(|e| leak(g, format_args!("its constants' evaluation: {e}")))?;
@@ -640,11 +1103,26 @@ fn names_of(job: &JobCx<'_, '_, '_, '_, '_>, recorder: &OwnedRecorder<'_>, w: Wa
 /// Task `name`'s reads for its head `want`, frozen and in the table (module docs, "A TASK'S
 /// READ LIST"), given to `push` (the caller sorts the task's list, engine_heads.rs `once_each`).
 pub(crate) fn task_reads<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, want: Want, name: Name, push: &mut dyn FnMut(CellId)) -> Result<(), &'static str> {
-    let g = job.g;
     let Some(entry) = job.once.look(want) else {
         return Err("its head froze and is not in the request's table of heads (engine_heads_once.rs `HeadsOnce`)");
     };
-    for id in entry.reads.iter() {
+    reads_from(job, owners, want, name, entry.reads, entry.heads, push)
+}
+
+/// Task `name`'s reads for its head `want`, whose own reads are `reads` and whose freeze read
+/// `heads`, frozen or failed (lane HF1: a failed head's are its [`FailedEntry`]'s, followed as a
+/// frozen one's), given to `push`.
+fn reads_from<'n, 's: 'n>(
+    job: &JobCx<'_, '_, 'n, '_, '_>,
+    owners: &mut Owners<'s>,
+    want: Want,
+    name: Name,
+    reads: &[CellId],
+    heads: &[Want],
+    push: &mut dyn FnMut(CellId),
+) -> Result<(), &'static str> {
+    let g = job.g;
+    for id in reads.iter() {
         push(*id);
     }
     // Its task's own lookups in this job (its text, its `cell_of`): when another job froze it,
@@ -657,13 +1135,21 @@ pub(crate) fn task_reads<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &m
     let mut seen: blaze_hash::HashSet<[u8; WANT_BYTES], Alloc<'static>> = blaze_hash::HashSet::new_in(g);
     seen.insert(want_bytes(want));
     let mut next: Vec<Want, Alloc<'static>> = Vec::new_in(g);
-    next.extend_from_slice(entry.heads);
+    next.extend_from_slice(heads);
     while let Some(w) = next.pop() {
         if !seen.insert(want_bytes(w)) {
             continue;
         }
         if seen.len() > MOST_HEAD_READS {
             return Err("its head's freeze read more heads than a head task follows (engine_heads_once.rs `MOST_HEAD_READS`)");
+        }
+        // A CLOSED dependency's head (lane H9): its crate's `WHOLE` cell, and the read ends
+        // there. Its head is a function of that crate's names and its closure's (all fetched
+        // packs, named by the crate's key, which the scope name is of), so the one cell moves
+        // whenever the head could.
+        if let Keyed::Closed { scope, .. } = job.once.keyed(w) {
+            push(CellId { of: scope, cell: WHOLE });
+            continue;
         }
         let id = head_cell_id(w);
         // Placed as before (engine_heads.rs `heads_of`, lane BH1's census): another entry's head
@@ -693,13 +1179,14 @@ pub(crate) fn task_reads<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &m
             Some(HeadAt::OfTheBody(scope) | HeadAt::Unlisted { scope, .. }) => push(CellId { of: scope, cell: WHOLE }),
             None => push(id),
         }
-        let Some(read) = job.once.look(w) else {
-            return Err("a head its head's freeze read is not in the request's table of heads (engine_heads_once.rs `task_reads`)");
+        // Frozen or failed (lane HF1): a failed need's reads are its reader's as a frozen one's.
+        let Some((read, read_heads)) = job.once.read_of(w) else {
+            return Err("a head its head's freeze read is not in the request's table of heads (engine_heads_once.rs `reads_from`)");
         };
-        for id in read.reads.iter() {
+        for id in read.iter() {
             push(*id);
         }
-        next.extend_from_slice(read.heads);
+        next.extend_from_slice(read_heads);
     }
     Ok(())
 }
@@ -726,6 +1213,11 @@ fn cover<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w
         if seen.len() > MOST_COVER_HEADS {
             return Err("a dependency head it read reaches more heads than a cover walks (engine_heads_once.rs `MOST_COVER_HEADS`)");
         }
+        // A closed dependency's head met by the walk (lane H9): its crate's `WHOLE`, not followed.
+        if let Keyed::Closed { scope, .. } = job.once.keyed(x) {
+            cells.push(CellId { of: scope, cell: WHOLE });
+            continue;
+        }
         match owners.place(job.records, &head_cell_id(x), g) {
             Some(HeadAt::Dependency(scope)) => cells.push(CellId { of: scope, cell: WHOLE }),
             _ => {
@@ -741,11 +1233,11 @@ fn cover<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w
             next.extend_from_slice(held.members);
             continue;
         }
-        let Some(read) = job.once.look(x) else {
+        let Some((read, read_heads)) = job.once.read_of(x) else {
             return Err("a head a dependency head's freeze read is not in the request's table of heads (engine_heads_once.rs `cover`)");
         };
-        cells.extend(read.reads.iter().map(|id| coarse(job.members, *id)));
-        next.extend_from_slice(read.heads);
+        cells.extend(read.iter().map(|id| coarse(job.members, *id)));
+        next.extend_from_slice(read_heads);
     }
     cells.sort_unstable();
     cells.dedup();
@@ -759,7 +1251,8 @@ fn cover<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w
 }
 
 /// Head `want` frozen ALONE, over a source and recorders of its own, as every head was before
-/// the job's one source (module docs, "A HEAD THAT DOES NOT FREEZE"): its result and its reads,
+/// the job's one source: the [`Sources::Head`] strategy only (rule 78; lane HF1: never called by
+/// [`Sources::Job`], module docs "A HEAD THAT DOES NOT FREEZE"): its result and its reads,
 /// every names cell its freeze consulted and the cell of each head it read, transitively.
 fn alone<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, want: Want, name: Name, push: &mut dyn FnMut(CellId), failed: &mut Option<&'static str>) -> HeadDone<'static> {
     let g = job.g;
@@ -768,8 +1261,20 @@ fn alone<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w
     // The evaluator reads through a recorder of its own (engine_head_consts.rs).
     let evaluated = Recorder::new(RecorderOpts { alloc: g });
     let mut consts = HeadConsts::new(job.base.reading_into(&evaluated), job.index, g);
-    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized: job.sized, frame: job.frame, scratch: g, alloc: g, consts: Some(&mut consts as &mut dyn ConstValues<'_>), known: None, owners: None });
-    let made = head_task(names, &mut source, want, job.tool, g);
+    job.once.alone.fetch_add(1, Ordering::Relaxed);
+    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized: job.sized, pointers: job.pointers, frame: job.frame, scratch: g, alloc: g, consts: Some(&mut consts as &mut dyn ConstValues<'_>), known: None, owners: None });
+    let mut made = head_task(names, &mut source, want, job.tool, g);
+    // Its words from its own source's kept failure (lane HF1), as the job sources' table says
+    // them (`failure_words`), so the two strategies' rows are equal.
+    if made.failed.is_some()
+        && let Some((failure, _)) = source.failure(want)
+        && let Some(said) = failure_words(g, want, failure)
+    {
+        made.failed = Some(FreezeError::NotTheirs { want, why: NotTheirs::Failed { said } });
+    }
+    for id in job.pointer_reads.iter() {
+        push(*id);
+    }
     // Every head its freeze read, through the heads they read in turn, and each constant whose
     // value a cell it read holds.
     let mut seen: Vec<Want, Alloc<'static>> = Vec::new_in(g);

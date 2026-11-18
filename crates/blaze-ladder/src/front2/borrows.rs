@@ -30,7 +30,7 @@ use super::body::Body;
 use super::borrow_reads::{AdtAnswer, AskedAdts, HeadAnswer, adt_read, file_borrow_reads, head_read};
 use super::check::{Records, answer_impls, eval_len};
 use super::reads::Read;
-use super::borrows_nested::{FlowOf, NestedFacts, Requirements, closure_flow_of, closures_inner_first, nested_range, next_nested};
+use super::borrows_nested::{FlowOf, NestedFacts, Requirements, closure_flow_of, nested_inner_first, nested_range, next_nested};
 use super::stalled_goals::{AsyncInteriors, Decision, Stalls, decide_stalled_goals};
 use super::borrows_unmade::{AdtUnmade, HeadClass};
 use super::heads::{HeadError, Want, member_fn_want};
@@ -94,9 +94,10 @@ pub enum BorrowRefused {
     Bound(blaze_flow::Bound),
     /// A closure's or async block's body needs a lifetime relation among its captures,
     /// parameters and result that its owner would have to prove and that is no requirement on
-    /// the closure value's own regions (one that is becomes the owner's to prove:
-    /// borrows_nested.rs `Requirements`; an async block's are not mapped yet): at the
-    /// item-relative range of the first.
+    /// the closure's or future's value's own regions (one that is becomes the owner's to prove:
+    /// borrows_nested.rs `Requirements`, closures and async blocks alike; one that names a
+    /// closure's parameter or result, an async block's output or a closure's environment
+    /// reference is this): at the item-relative range of the first.
     NestedOutlives { start: u32, end: u32 },
     /// The lowering refused an ADT it has no facts for (`Form::UnknownAdt`, at the
     /// item-relative `start..end`) because the store could not make the ADT's row: the first
@@ -734,7 +735,8 @@ pub enum FactsPlant {
     /// own, no alias expanded).
     NoAliases,
     /// No closure requirement filed (borrows_nested.rs `Requirements` left empty): each
-    /// closure's outlives result is then the `NestedOutlives` refusal, as before the wiring.
+    /// closure's and nested async block's outlives result is then the `NestedOutlives`
+    /// refusal, as before the wiring (lanes B11, B14).
     NoClosureRequirements,
     /// No ADT's variances filed (`Facts::adt_variances` answers nothing): every parameter of
     /// every ADT is related both ways (invariant), as before piece B13.
@@ -1289,22 +1291,33 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
         }
     };
     let view = body.typeck.view(tys);
-    // Each closure's body first, innermost first (borrows_nested.rs `closures_inner_first`): an
-    // outlives result of one between two positions of the closure value (or `'static`) is a
-    // requirement its maker proves at the closure expression (borrows_nested.rs
-    // `Requirements`, blaze-flow-lower `requirement`); then the body's own flow and each async
-    // block's, in expression order, asked with those requirements. The verdict is all of them,
-    // and a refusal of any is the body's (findings already made are kept; never a pass).
+    // Each closure's and nested async block's body first, innermost first (borrows_nested.rs
+    // `nested_inner_first`): an outlives result of one between two positions of its value (or
+    // `'static`) is a requirement its maker proves at the expression (borrows_nested.rs
+    // `Requirements`, blaze-flow-lower `requirement`: one mechanism for both, lane B14); then
+    // the body's own flow (and an `async fn`'s root block), asked with those requirements. The
+    // verdict is all of them, and a refusal of any is the body's (findings already made are
+    // kept; never a pass).
     let mut requirements = Requirements::new_in(alloc);
     let mut needs: AVec<'a, Requirement> = AVec::new_in(alloc);
-    for &closure in closures_inner_first(&view, alloc).iter() {
-        let of = FlowOf::Closure(closure);
+    for &of in nested_inner_first(&view, alloc).iter() {
         let lowered = {
             let nested = NestedFacts::with_requirements(&facts, &requirements);
-            closure_flow_of(&view, done, closure, &nested, alloc)
+            match of {
+                FlowOf::Closure(closure) => {
+                    closure_flow_of(&view, done, closure, &nested, alloc).map(|cf| (cf.lowered.flow, cf.lowered.params, cf.externals))
+                }
+                // An async block's lowering also gives its exact interior when a goal stalled
+                // (stalled_goals.rs): lowered once, for both.
+                FlowOf::AsyncBlock(block) => blaze_flow_lower::lower_async(&view, done, block, &nested, alloc).map(|la| {
+                    interiors.keep(&la, done, block, alloc);
+                    (la.flow, AVec::new_in(alloc), la.externals)
+                }),
+                FlowOf::Owner => continue,
+            }
         };
-        let cf = match lowered {
-            Ok(cf) => cf,
+        let (flow, params, externals) = match lowered {
+            Ok(x) => x,
             Err(refusal) => {
                 verdict.refused = Some(lower_refused(r, &facts, refusal));
                 verdict.within = nested_range(&view, of);
@@ -1312,23 +1325,29 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
             }
         };
         if let Some(out) = show.as_deref_mut() {
-            let _ = show_flow(&cf.lowered.flow, of, out);
+            let _ = show_flow(&flow, of, out);
         }
         needs.clear();
         // The control (FactsPlant::NoClosureRequirements): no externals, so no requirement is
         // mapped and each outlives result stays the refusal.
-        let externals = if plant == FactsPlant::NoClosureRequirements { None } else { Some(&cf.externals[..]) };
-        if file_flow(&cf.lowered.flow, &cf.lowered.params, of, &view, externals, &mut needs, &mut verdict, alloc) {
+        let externals = if plant == FactsPlant::NoClosureRequirements { None } else { Some(&externals[..]) };
+        if file_flow(&flow, &params, of, &view, externals, &mut needs, &mut verdict, alloc) {
             break;
         }
+        let made = match of {
+            FlowOf::Closure(e) | FlowOf::AsyncBlock(e) => e,
+            FlowOf::Owner => continue,
+        };
         for &n in needs.iter() {
-            requirements.add(closure, n);
+            requirements.add(made, n);
         }
     }
     let nested = NestedFacts::with_requirements(&facts, &requirements);
     let mut next = if verdict.refused.is_some() { None } else { Some(FlowOf::Owner) };
     while let Some(of) = next {
-        if let FlowOf::Closure(_) = of {
+        // Checked above, innermost first: closures and every async block but an `async fn`'s
+        // root (whose placeholders are the signature's: its results are the fn's own).
+        if of.is_nested(&view) {
             next = next_nested(&view, of);
             continue;
         }

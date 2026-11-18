@@ -34,35 +34,51 @@
 //! Each entry carries what the keys of later records are made from:
 //!
 //! - [`Item::disambiguator`]: the number of earlier siblings with the same kind and the same
-//!   name (for an entry with no name: the same bytes of its signature from its first token
-//!   outside its attributes; for a tuple field: its position). Two builders of one text agree
-//!   on it, and an edit outside the item's earlier equals does not move it. It is the index
-//!   among equals the inherited layer's AST ids carry (`span::ast_id`).
-//! - [`Item::signature_hash`] and [`Item::hash`]: a Merkle step over the item's bytes, from its
-//!   first token (an outer attribute's or doc comment's) to its last, cut where the signature
-//!   ends (before the body, a direct `=` or a direct `;`). The item's own bytes are runs
-//!   between its child entries, each fed as the tag 0 and the run with its length
-//!   (`Hasher::part`; the runs before, between and after the children, empty ones too, and
-//!   the run that holds the cut as two runs, cut there); each child entry is fed as the tag 1
-//!   and the child's own `hash` (32 bytes). The signature hash, in [`SIGNATURE_DOMAIN`], takes
+//!   name (for an entry with no name: the same tokens of its signature from its first token
+//!   outside its attributes, hashed in `blaze v2 file item head 2`; for a tuple field: its
+//!   position). Two builders of one text agree on it, and an edit outside the item's earlier
+//!   equals does not move it; an `impl` inserted before its twin (one with the same head
+//!   tokens) moves the twin's, and so its chain (tests/outline/token_keys.rs). It is the index among
+//!   equals the inherited layer's AST ids carry (`span::ast_id`).
+//! - [`Item::signature_hash`] and [`Item::hash`]: a Merkle step over the item's tokens, from
+//!   its first (an outer attribute's or doc comment's) to its last, cut where the signature ends
+//!   (before the body, a direct `=` or a direct `;`). The item's own text is runs between its
+//!   child entries (the runs before, between and after the children, empty ones too, and the
+//!   run that holds the cut as two runs, cut there); each child entry is fed as the tag 1 and
+//!   the child's own `hash` (32 bytes). A run is fed as the tag 2, its count of tokens
+//!   (LEB128), then per token its `SyntaxKind` as a little-endian u16, the top bit set when it
+//!   is joined to the next token (`parser::token_key::joined`: punctuation right against
+//!   punctuation or a lifetime, so `&&` and `& &` differ), and unless it is punctuation its
+//!   lexeme's length (LEB128) and bytes. Whitespace and plain comments are no tokens; a doc
+//!   comment is one (its text is a `#[doc]`). The signature hash, in [`SIGNATURE_DOMAIN`], takes
 //!   the edition (one byte), then the runs and children before the cut; the hash, in
 //!   [`ITEM_DOMAIN`], takes the signature hash (32 bytes), then the runs and children after
-//!   it. So every byte is compressed once, by its innermost entry's one digest, and each digest
-//!   is one short input that can be hashed side by side with others (crate::digest); an
-//!   entry's hash changes whenever any byte under it does (a module's covers its items); an
-//!   edit to a child rehashes the child's own bytes and the 33 bytes it stands for in each
-//!   ancestor; and the signature hash covers none of the body. (Until 2026-11-16 the
-//!   signature hash was one hasher read at the cut and the hash the same hasher read at the
-//!   end, in `merkle 1`; it was split so that no prefix is compressed twice when hashed side by
-//!   side.)
+//!   it. So every token is compressed once, by its innermost entry's one digest, and each
+//!   digest is one short input that can be hashed side by side with others (crate::digest); an
+//!   entry's hash changes whenever any token under it does (a module's covers its items) and
+//!   never for a comment or a reformat; an edit to a child rehashes the child's own tokens and
+//!   the 33 bytes it stands for in each ancestor; and the signature hash covers none of the
+//!   body. (Until 2026-11-16 the signature hash was one hasher read at the cut and the hash the
+//!   same hasher read at the end, in `merkle 1`; it was split so that no prefix is compressed
+//!   twice when hashed side by side.)
+//! - The exception (keys cover every input, rule 21): an entry whose own tokens call a macro or
+//!   carry an attribute that is no inert built-in one ([`ItemFlags::MACRO_CALL`], its children's
+//!   tokens not counted) has its runs fed by bytes, the tag 0, the length as a u64 and the bytes
+//!   (`Hasher::part`): `stringify!`, `line!`, `column!`, a proc macro's `Span::source_text` and
+//!   the lines its spans print read the layout tokens leave out. Its children are fed by their
+//!   digests as ever, so a comment in a plain `fn` beside a `#[derive]` moves only that `fn`.
 //!
-//! ## Why bytes, not tokens (decided 2026-11-15 by the coordinator of the rebuild)
+//! ## Why tokens (decided 2026-11-18 by the coordinator of the rebuild, lane K1)
 //!
-//! The digests are of bytes, not of the token stream. The cost accepted: an edit to only the
-//! whitespace or a comment inside an item changes that item's digests, and the records keyed
-//! by them are made again, for that one item. What it buys: an entry's bytes go to BLAKE3 as
-//! slices of the text, with no token of a `fn` body read for its digest. Positions stay byte
-//! offsets relative to the item, which the diagnostics read anyway.
+//! From 2026-11-15 to 2026-11-18 the digests were of bytes: a comment or a reformat inside an
+//! item made every record keyed by it again, the item's head and body check among them, and the
+//! edit loop's commonest edit cost a body check for nothing. The tokens come from the one lex
+//! the walk already made (its columns; crate::digest `Lexed`), so a run costs one pass over its
+//! tokens' kinds and lexemes on top of the BLAKE3 the bytes cost; punctuation feeds two bytes
+//! where its text is one or two. Positions in records do not survive a trivia edit by the key
+//! alone: what reads them is in the crate's users (blaze-cli `engine_bodies`, where a finding
+//! is a token place, `parser::token_key::TokenPlace`). The numbers below are of the byte digests;
+//! the token digests' are not yet measured (examples/time.rs is the run that measures them).
 //!
 //! Since 2026-11-16 the text is lexed once, whole, and the item grammar itself decides what a
 //! `fn` body is and leaves it unparsed (crate::walk::rows; `Bodies::Skipped`): the path before
@@ -193,12 +209,14 @@ pub use walk::Bodies;
 pub use parser::SyntaxKind;
 
 /// The domain of [`Item::hash`]: the Merkle step over an item's signature digest, the rest of
-/// its own bytes and its children's digests (crate docs, "Identity").
-pub const ITEM_DOMAIN: &str = "blaze v2 file item merkle 2";
+/// its own tokens (or bytes) and its children's digests (crate docs, "Identity"). `3` since the
+/// runs are tokens.
+pub const ITEM_DOMAIN: &str = "blaze v2 file item merkle 3";
 
-/// The domain of [`Item::signature_hash`]: the edition, an item's own bytes before its body
-/// and the digests of its children there (crate docs, "Identity").
-pub const SIGNATURE_DOMAIN: &str = "blaze v2 file item signature 1";
+/// The domain of [`Item::signature_hash`]: the edition, an item's own tokens (or bytes) before
+/// its body and the digests of its children there (crate docs, "Identity"). `2` since the runs
+/// are tokens.
+pub const SIGNATURE_DOMAIN: &str = "blaze v2 file item signature 2";
 
 /// The domain of an entry's names digest ([`Outline::names_digest`]): what name resolution can
 /// observe of it without its types (crate::names_digest).
@@ -228,7 +246,14 @@ pub const SURFACE_DOMAIN: &str = "blaze-cli surface v3";
 /// A `fn` body is read only as far as it may hold an item or a macro call ([`Bodies::Skipped`]):
 /// the syntax errors are those outside the bodies it leaves unread.
 pub fn outline<'a>(text: &str, edition: Edition, alloc: Alloc<'a>) -> Outline<'a> {
-    walk::rows::outline::<SideBySide>(text, parser_edition(edition), Bodies::Skipped, alloc)
+    walk::rows::outline::<SideBySide, ByTokens>(text, parser_edition(edition), Bodies::Skipped, alloc)
+}
+
+/// [`outline`], each entry's text fed to its digests as `F` says: [`ByTokens`] is [`outline`];
+/// [`ByBytes`], every entry by its bytes, is the control that puts trivia back in the keys
+/// (tests/outline/token_keys.rs).
+pub fn outline_fed_by<'a, F: Feed>(text: &str, edition: Edition, alloc: Alloc<'a>) -> Outline<'a> {
+    walk::rows::outline::<SideBySide, F>(text, parser_edition(edition), Bodies::Skipped, alloc)
 }
 
 /// The outline of `text`, a text written from tokens (an expansion rendered), read back with no
@@ -248,7 +273,7 @@ pub fn outline_tokens<'a>(
     edition: Edition,
     alloc: Alloc<'a>,
 ) -> Result<Outline<'a>, TokensRefused> {
-    walk::rows::outline_tokens::<SideBySide>(text, tokens, parser_edition(edition), alloc)
+    walk::rows::outline_tokens::<SideBySide, ByTokens>(text, tokens, parser_edition(edition), alloc)
 }
 
 pub use walk::rows::{TokenColumns, TokensRefused};
@@ -272,21 +297,36 @@ pub fn outline_item<'a>(part: &str, edition: Edition, alloc: Alloc<'a>) -> Outli
 /// in every row (tests/outline.rs `skipping_bodies_outlines_as_parsing_them`; examples/oracle.rs
 /// over the corpora).
 pub fn outline_with<'a>(text: &str, edition: Edition, bodies: Bodies, alloc: Alloc<'a>) -> Outline<'a> {
-    walk::rows::outline::<SideBySide>(text, parser_edition(edition), bodies, alloc)
+    walk::rows::outline::<SideBySide, ByTokens>(text, parser_edition(edition), bodies, alloc)
 }
 
 /// [`outline_with`], its digests hashed by `C`: the seam [`SideBySide`] and its twin
 /// [`OneByOne`] are tested equal at.
 pub fn outline_hashed_by<'a, C: Compress>(text: &str, edition: Edition, bodies: Bodies, alloc: Alloc<'a>) -> Outline<'a> {
-    walk::rows::outline::<C>(text, parser_edition(edition), bodies, alloc)
+    walk::rows::outline::<C, ByTokens>(text, parser_edition(edition), bodies, alloc)
 }
 
-pub use digest::{Compress, OneByOne, SideBySide, part_digests};
+pub use digest::{ByBytes, ByTokens, Compress, Feed, OneByOne, SideBySide, part_digests};
 
 pub use split::{
     Assembled, PART_DOMAIN, Part, Resplit, Speculated, chunk_starts, common_prefix, common_suffix, join, part_digest,
     resplit, speculate, split_top_level,
 };
+
+/// Where a range of an item's text is as its tokens count it (`parser::token_key::TokenPlace`):
+/// `range` of `item`, the item's text from its first token, read in `edition`. What a record
+/// keyed by the item's tokens holds in place of bytes (rule 71): the key stands across a trivia
+/// edit, and so does this place, where a byte range would point at stale text. Refused, never
+/// clamped (rule 3): a range that starts or ends in trivia, or cuts a token it does not lie in.
+pub fn token_place(item: &str, edition: Edition, range: core::ops::Range<usize>) -> Result<parser::token_key::TokenPlace, parser::token_key::PlaceError> {
+    parser::token_key::TokenPlace::from_bytes(item, parser_edition(edition), range)
+}
+
+/// The bytes of `item` (an item's text today, from its first token, in `edition`) that `place`
+/// ([`token_place`]) covers: where a finding stored as tokens is printed.
+pub fn place_bytes(place: parser::token_key::TokenPlace, item: &str, edition: Edition) -> Result<core::ops::Range<usize>, parser::token_key::PlaceError> {
+    place.to_bytes(item, parser_edition(edition))
+}
 
 /// The schema's edition as the parser's.
 fn parser_edition(edition: Edition) -> parser::Edition {

@@ -61,8 +61,9 @@ pub fn lower_closure<A: Allocator + Clone, F: Facts>(
     lower_closure_external(body, ck, closure, facts, alloc).map(|c| c.lowered)
 }
 
-/// What a placeholder of a closure's flow stands for in the flow that makes the closure (its
-/// OWNER: the fn body, or the closure or async block whose body holds the expression).
+/// What a placeholder of a closure's or an async block's flow stands for in the flow that makes
+/// it (its OWNER: the fn body, or the closure or async block whose body holds the expression).
+/// One table for both (lane B14): an async block's captures are laid as a closure's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum External {
     /// Position `j` of the closure VALUE, counted as the owner lays it (`Lower::npos` of the
@@ -75,7 +76,8 @@ pub enum External {
     /// `FnMut` reaches a `&mut` capture through): bound per call, no position of the value.
     Env,
     /// A position of a parameter or of the return place: the closure's signature, bound per
-    /// call (the closure type holds no position for it; see [`requirement`]).
+    /// call (the closure type holds no position for it; see [`requirement`]); for an async
+    /// block (coroutine.rs `LoweredAsync::externals`), a position of its output.
     Sig,
 }
 

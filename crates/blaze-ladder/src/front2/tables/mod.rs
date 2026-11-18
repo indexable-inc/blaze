@@ -7,6 +7,8 @@
 //! Nothing mutable is shared between tasks and nothing is kept from one task to the next.
 
 pub mod cost;
+#[cfg(test)]
+mod failed_once_tests;
 pub mod goals;
 pub mod head;
 #[cfg(test)]
@@ -18,7 +20,7 @@ pub mod recorder;
 #[cfg(test)]
 mod recorder_tests;
 #[cfg(test)]
-mod seeded_failures_tests;
+mod receiver_freeze_tests;
 pub mod seeds;
 pub mod task;
 pub mod view;
