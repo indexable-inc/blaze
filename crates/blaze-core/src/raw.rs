@@ -486,6 +486,36 @@ mod unix {
         checked(read)?;
         Ok((info.ri_phys_footprint, info.ri_lifetime_max_phys_footprint))
     }
+
+    /// This process's physical footprint now and at most ([`footprint`] of itself).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn own_footprint() -> io::Result<(u64, u64)> {
+        // SAFETY: no arguments and no memory; `getpid` always succeeds.
+        footprint(unsafe { libc::getpid() })
+    }
+
+    /// This process's resident set now (`/proc/self/statm`'s second field, in pages, read into
+    /// a buffer on the stack) and the most it has been (`getrusage`'s `ru_maxrss`, in KiB on
+    /// Linux).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn own_footprint() -> io::Result<(u64, u64)> {
+        use std::io::Read as _;
+        let invalid = || io::Error::from(io::ErrorKind::InvalidData);
+        let mut bytes = [0u8; 256];
+        let read = std::fs::File::open("/proc/self/statm")?.read(&mut bytes)?;
+        let text = core::str::from_utf8(&bytes[..read]).map_err(|_| invalid())?;
+        let pages: u64 = text.split_ascii_whitespace().nth(1).and_then(|n| n.parse().ok()).ok_or_else(invalid)?;
+        // SAFETY: no arguments and no memory; -1 is its failure.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = u64::try_from(page).map_err(|_| io::Error::last_os_error())?;
+        // SAFETY: `rusage` is a C struct of integers, for which all-zero bytes is a valid value.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `usage` is a live local the call fills and does not keep.
+        checked(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) })?;
+        let most = u64::try_from(usage.ru_maxrss).unwrap_or(0).saturating_mul(1024);
+        let now = pages.saturating_mul(page);
+        Ok((now, most.max(now)))
+    }
 }
 
 #[cfg(test)]

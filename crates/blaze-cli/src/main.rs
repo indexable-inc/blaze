@@ -104,6 +104,7 @@ mod engine_head_notes;
 mod engine_lines;
 mod engine_lints;
 mod engine_memory;
+mod engine_status;
 mod engine_why;
 mod engine_names;
 mod engine_times;
@@ -340,6 +341,9 @@ struct Flags<'a> {
     /// `--workers N`: at most N of a batch's tasks at once (default: one per core). For
     /// measuring how the work scales; it never changes a record.
     workers: Option<core::num::NonZeroU32>,
+    /// `--status-every <seconds>`: `engine-check` writes one line of where it stands to stderr
+    /// each interval (engine_status.rs `line`).
+    status_every: Option<core::num::NonZeroU32>,
     /// `--view person|agent|json` (D70); none asked: by whether the output is a terminal.
     view: Option<View>,
     /// `--fix <selector>...`: the arguments that are its selectors, `start..end` of the list.
@@ -361,6 +365,7 @@ fn flags(args: &Args) -> Result<Flags<'_>, CliError> {
         grants: std::vec::Vec::new(),
         program: std::vec::Vec::new(),
         workers: None,
+        status_every: None,
         select: run_package::Select::NONE,
     };
     let mut at = 2;
@@ -406,6 +411,10 @@ fn flags(args: &Args) -> Result<Flags<'_>, CliError> {
             "--workers" => {
                 let n = value()?.parse::<core::num::NonZeroU32>().map_err(|_| CliError::Usage("--workers takes a count of at least 1"))?;
                 flags.workers = Some(n);
+            }
+            "--status-every" => {
+                let seconds = value()?.parse::<core::num::NonZeroU32>().map_err(|_| CliError::Usage("--status-every takes a count of seconds of at least 1"))?;
+                flags.status_every = Some(seconds);
             }
             "--color" => flags.color = choice(value()?)?,
             "--origin" => flags.origin = Some(value()?),
@@ -1927,6 +1936,7 @@ mod tests {
     mod engine_script_reads_tests;
     mod engine_script_reads_e2e_tests;
     mod engine_memory_tests;
+    mod engine_status_tests;
     mod engine_body_frames_tests;
     mod engine_seeds_tests;
     mod engine_answer_rows_tests;
@@ -1943,6 +1953,7 @@ mod tests {
     mod engine_member_heads_tests;
     mod engine_body_locals_tests;
     mod engine_borrow_forms_tests;
+    mod engine_expansion_heads_tests;
     mod engine_head_cells_tests;
     mod engine_scope_reads_tests;
     mod engine_scope_reads_tables_tests;

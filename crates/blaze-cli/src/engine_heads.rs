@@ -33,7 +33,7 @@
 //! freeze consulted, and for each head the freeze read (followed through the heads those read),
 //! that head's head task's cell (a same-stage read, entered after its definer; before lane BH1
 //! its file's `HEADS` cell, which every sibling head added moved)
-//! or, for a dependency's head or one a macro wrote, its crate's names record whole. A body's
+//! or, for a dependency's head, its crate's names record whole. A body's
 //! read of a member's head is the head's cell ([`Owners::place`], engine_bodies.rs `widen`). A
 //! head that cannot be frozen fails ALONE (A8): the task defines the heads it froze, and the
 //! failed head's cell is defined by its reason's digest ([`HEAD_FAILED_DOMAIN`]), so a reader
@@ -56,6 +56,22 @@
 //! reader finds the cell by its own key ([`Owners::place`]), so it is never handed bytes frozen
 //! under another unit's keys. The profile counts it: "heads frozen: N for M items in U units
 //! (K items held by 2+ units)" ([`UnitCounts`]).
+//!
+//! WRITTEN HEADS (lane RH4): a head a macro wrote at module level (a derive's impl, a
+//! `macro_rules!` call's struct, impl and fn, an attribute's output, a call nested in another's
+//! output, an impl in a body's block that the output holds: serde's `const _: () = { impl .. }`)
+//! is the head task's of the file entry its outermost call stands at, as a written head of that
+//! entry ([`heads_of_crate`]: the walk up its calls and blocks, body_types/covered.rs
+//! `written_path`, reads the crate's expansions directory alone). Its cell is [`head_cell`]'s
+//! with where under the entry it was written ([`Written`]: the steps down, item-relative, rule
+//! 71), so two derives at one struct and two calls of one macro are two cells; a file item's
+//! cell is unchanged. The task's reads add, for each call under its entry, that call's
+//! expansion record cell (blaze-scope names_cells.rs `NameCell::Expansion`: the record's key,
+//! its text and column), and the freeze's own reads hold the written items' `Item` cells, whose
+//! digests cover their text; an absent record refuses the task by name, the macro never run
+//! again. A written head is held by the units that hold its entry's file, as a file item is.
+//! A head whose walk fails or that no entry covers is [`HeadAt::Unlisted`]: its reader is
+//! refused by name, never left to freeze it (rule 3).
 
 use core::convert::Infallible;
 
@@ -89,6 +105,7 @@ use crate::engine_check::EngineCheckError;
 use crate::engine_names::NamesStage;
 use crate::engine_records::EngineRecords;
 use crate::engine_tasks::{CELLS, Outlined, WHOLE};
+use crate::names::expansion_texts::ExpansionTexts;
 use crate::run_names::Crate;
 use crate::work;
 
@@ -462,7 +479,7 @@ fn tables_of(
     let view = Tables::new(TablesOpts { records, impls: None, lang_crates: &[], reads: &unused });
     let mut reads: std::vec::Vec<CellId, Global> = std::vec::Vec::with_capacity_in(done.reads.len(), Global);
     let mut heads: std::vec::Vec<CellId, Global> = std::vec::Vec::new_in(Global);
-    let mut owners = subjects.map(Owners::new);
+    let mut owners = subjects.map(|subjects| Owners::new(subjects, &job.crates[..], g));
     for read in done.reads.iter() {
         match cell_id(view, *read) {
             // A names read: at cell grain its cell (the coordinator keeps it where its crate
@@ -476,7 +493,9 @@ fn tables_of(
             // records hold (or `Whole`) is left for the coordinator, which widens it.
             Ok(Some(id)) if id.of.kind == Kind::Signature => match owners.as_mut().and_then(|owners| owners.place(records, &id, g)) {
                 Some(HeadAt::Cell { cell, .. }) => heads.push(cell),
-                Some(HeadAt::Dependency(scope) | HeadAt::Unplaced(scope)) => heads.push(CellId { of: scope, cell: WHOLE }),
+                // A body's own item or a head no task holds: its crate's record whole (a header
+                // reading the latter is refused at its body, `HeadAt::Unlisted`).
+                Some(HeadAt::Dependency(scope) | HeadAt::OfTheBody(scope) | HeadAt::Unlisted { scope, .. }) => heads.push(CellId { of: scope, cell: WHOLE }),
                 None => reads.push(id),
             },
             Ok(Some(id)) => reads.push(id),
@@ -542,21 +561,45 @@ const HEAD_TOOL_DOMAIN: &str = "blaze-cli engine head task";
 /// from their own records' want, so a reader's want places the cell of ITS unit, by
 /// construction. Nothing of the machine (rule 25): a crate prefix is a hash of the crate's text.
 pub(crate) fn head_cell(want: Want, item: &str, member: Option<&str>, part: Cell) -> Cell {
+    head_cell_written(want, item, member, None, part)
+}
+
+/// [`head_cell`] of a head a macro (or a body's block) wrote under its entry: the cell holds
+/// where it was written ([`Written`]), so the heads of two derives at one struct, of two calls of
+/// one macro in an impl block or of two items of one expansion are two cells (rule 21). A file
+/// item's (`written: None`) is [`head_cell`]'s, unchanged: the written part is hashed only when
+/// there is one, after the fixed-size part, so no file item's cell moved and no domain is bumped.
+fn head_cell_written(want: Want, item: &str, member: Option<&str>, written: Option<Written>, part: Cell) -> Cell {
     let bytes = want_bytes(want);
     let mut h = blaze_ids::Hasher::new(HEAD_CELL_DOMAIN);
-    h.update(&bytes[1..9]).update(&head_item(want, item, member, part).0);
+    h.update(&bytes[1..9]).update(&head_item(want, item, member, written, part).0);
     let digest = h.finish();
     let mut cell = [0u8; 16];
     cell.copy_from_slice(&digest.0[..16]);
     Cell(cell)
 }
 
+/// Where under its covering entry a macro (or a body's block) wrote a head: the steps down from
+/// the outermost call (body_types/covered.rs `WrittenPath::steps`) and the outermost call's
+/// entry relative to the covering entry (0: the entry itself, a derive or an attribute on it, or
+/// the entry is the call; else its place among the entry's descendants, a call in an impl's
+/// block). Item-relative (rule 71): nothing of the file outside the entry.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Written {
+    steps: ContentId,
+    from_entry: u32,
+}
+
 /// A head's item as an entry's text names it, of no unit: the want's kind, the item's name, an
-/// impl fn's name and the part. Two units' cells of one item ([`head_cell`]) share it; the
-/// profile counts the items held by two units and more by it ([`UnitCounts`]).
-fn head_item(want: Want, item: &str, member: Option<&str>, part: Cell) -> Cell {
+/// impl fn's name, the part, and where a macro wrote it ([`Written`]). Two units' cells of one
+/// item ([`head_cell`]) share it; the profile counts the items held by two units and more by it
+/// ([`UnitCounts`]).
+fn head_item(want: Want, item: &str, member: Option<&str>, written: Option<Written>, part: Cell) -> Cell {
     let mut h = blaze_ids::Hasher::new(HEAD_ITEM_DOMAIN);
     h.update(&want_bytes(want)[..1]).part(item.as_bytes()).opt_part(member).update(&part.0);
+    if let Some(written) = written {
+        h.update(&written.steps.0).update(&written.from_entry.to_le_bytes());
+    }
     let digest = h.finish();
     let mut cell = [0u8; 16];
     cell.copy_from_slice(&digest.0[..16]);
@@ -575,6 +618,12 @@ pub(crate) enum HeadUnits {
     /// THE PLANT: under the last holding unit by crate prefix only.
     #[cfg_attr(not(test), expect(dead_code, reason = "the plant: only the tests take it (rule 23)"))]
     OnlyLast,
+    /// THE PLANT of a written head's reads: under each unit as [`HeadUnits::Each`], and no
+    /// expansion record's cell read (`heads_of`'s `CrateRow::Call` reads dropped), so a
+    /// `macro_rules!` body edited reruns no head task of its calls and the bodies read stale
+    /// heads (tests/engine_expansion_heads_tests.rs: the oracle, a whole check, must catch it).
+    #[cfg_attr(not(test), expect(dead_code, reason = "the plant: only the tests take it (rule 23)"))]
+    NoExpansionReads,
 }
 
 /// What the head tasks froze this request, by unit (the profile's "heads frozen" line, rule 53).
@@ -634,30 +683,49 @@ pub(crate) enum HeadAt {
     /// A dependency's head (its crate defines no cell table): its crate's names record, whole
     /// (nothing of a dependency moves unless its record does).
     Dependency(Name),
-    /// A member crate's head no entry of its files covers (a macro wrote it): its crate's names
-    /// record whole, which holds every expansion's text.
-    Unplaced(Name),
+    /// A member crate's item declared in a body (its key's `INNER` bit, front2 locals.rs): no
+    /// names row and no head task; the body that declares it makes its head in its own store
+    /// (front2 tables/seeds.rs `of_the_body`), from its own text, which its key covers. A read
+    /// of it from that body is placed as its crate's names record whole (engine_bodies.rs
+    /// `widen`), as before this placing.
+    OfTheBody(Name),
+    /// A member crate's head that no head task holds, and why, named (rule 19): its walk up the
+    /// calls that wrote it failed (a text that keeps no origins: a statement call's items), or no
+    /// outline entry covers where it stands. A body that needs it is refused by these words
+    /// (engine_seeds.rs `StretchHeads::known`), never frozen by the body (rule 3); a read of it
+    /// is its crate's names record whole, the reads of the refusal.
+    Unlisted { scope: Name, why: &'static str },
 }
 
 /// Each head of the member crates a task reads, by its item's head name, filled one crate at a
-/// time on first ask, over a task's own records.
+/// time on first ask, over a task's own records and its crates' expansion directories.
 pub(crate) struct Owners<'s> {
     subjects: &'s Subjects,
+    /// The crates the records were opened over, in the records' order (run_names.rs
+    /// `names_records`: crate `k` of the records is `crates[k]`): their expansion directories,
+    /// which the walk of a written head reads.
+    over: &'s [Crate<'s>],
     /// The crates (by key prefix) filled so far.
-    crates: std::vec::Vec<[u8; 8], Global>,
+    filled: Vec<[u8; 8], Alloc<'static>>,
     /// (head name, its entry's task, its file, its cell in that task), sorted by head name.
-    rows: std::vec::Vec<(Name, Name, Name, Cell), Global>,
+    rows: Vec<(Name, Name, Name, Cell), Alloc<'static>>,
+    /// (head name, why no head task holds it), sorted by head name ([`HeadAt::Unlisted`]).
+    unlisted: Vec<(Name, &'static str), Alloc<'static>>,
 }
 
 impl<'s> Owners<'s> {
-    pub(crate) fn new(subjects: &'s Subjects) -> Owners<'s> {
-        Owners { subjects, crates: std::vec::Vec::new_in(Global), rows: std::vec::Vec::new_in(Global) }
+    /// `over`: the crates the readers' records are opened over, in their order.
+    pub(crate) fn new(subjects: &'s Subjects, over: &'s [Crate<'s>], g: Alloc<'static>) -> Owners<'s> {
+        Owners { subjects, over, filled: Vec::new_in(g), rows: Vec::new_in(g), unlisted: Vec::new_in(g) }
     }
 
     /// Where the head read `id` is read from; `None`: its crate is none of `records`'. By the
     /// reader's OWN key: `id`'s crate prefix is the reader's unit's view of the item's crate,
     /// so a member's head is the cell its head task froze under THAT unit ([`head_cell`]).
-    pub(crate) fn place<'n>(&mut self, records: &'n Records<'n>, id: &CellId, g: Alloc<'static>) -> Option<HeadAt> {
+    pub(crate) fn place<'n>(&mut self, records: &'n Records<'n>, id: &CellId, g: Alloc<'static>) -> Option<HeadAt>
+    where
+        's: 'n,
+    {
         let mut prefix = [0u8; 8];
         prefix.copy_from_slice(&id.of.subject.0[..8]);
         let (k, key) = (0..NamesSource::crate_count(records)).find_map(|k| NamesSource::crate_key(records, k).filter(|key| key.prefix() == prefix).map(|key| (k, key)))?;
@@ -670,20 +738,44 @@ impl<'s> Owners<'s> {
         if self.subjects.get(from).is_none_or(|(p, _, _)| *p != prefix) {
             return Some(HeadAt::Dependency(scope));
         }
-        if !self.crates.contains(&prefix) {
-            self.crates.push(prefix);
-            let rows = &mut self.rows;
-            heads_of_crate(records, k, prefix, self.subjects, g, &mut |one| rows.push((one.sig, one.entry, one.file, one.cell)));
+        if !self.filled.contains(&prefix) {
+            let Some(texts) = self.over.get(k).filter(|one| one.records.key == key).map(|one| one.records.expansions) else {
+                return Some(HeadAt::Unlisted { scope, why: OVER_NOT_RECORDS });
+            };
+            self.filled.push(prefix);
+            let (rows, unlisted) = (&mut self.rows, &mut self.unlisted);
+            heads_of_crate(records, &texts, k, prefix, self.subjects, g, &mut |one| match one {
+                CrateRow::Head(one) => rows.push((one.sig, one.entry, one.file, one.cell)),
+                CrateRow::Unlisted { sig, why } => unlisted.push((sig, why)),
+                CrateRow::Call { .. } => {}
+            });
             rows.sort_unstable();
             rows.dedup_by_key(|(sig, _, _, _)| *sig);
+            unlisted.sort_unstable_by_key(|(sig, _)| *sig);
+            unlisted.dedup_by_key(|(sig, _)| *sig);
         }
         Some(match self.rows.binary_search_by_key(&id.of, |(sig, _, _, _)| *sig) {
             // The only part is the whole head (`WHOLE`, front2 head.rs `cell_id`).
             Ok(at) => HeadAt::Cell { cell: CellId { of: self.rows[at].1, cell: self.rows[at].3 }, file: self.rows[at].2 },
-            Err(_) => HeadAt::Unplaced(scope),
+            // A body's own item: its subject is the checker key's bytes (front2 head.rs
+            // `signature_name`), byte 8 its `INNER` mark.
+            Err(_) if id.of.subject.0[8] & blaze_id::ItemKey::INNER != 0 => HeadAt::OfTheBody(scope),
+            Err(_) => match self.unlisted.binary_search_by_key(&id.of, |(sig, _)| *sig) {
+                Ok(at) => HeadAt::Unlisted { scope, why: self.unlisted[at].1 },
+                Err(_) => HeadAt::Unlisted { scope, why: NO_HEAD_ROW },
+            },
         })
     }
 }
+
+/// [`HeadAt::Unlisted`]'s words for a crate the records hold and `Owners` was given no
+/// directory of: the engine's own inconsistency, named.
+const OVER_NOT_RECORDS: &str = "its crate is among the reader's records but not among the crates `Owners` was given (engine_heads.rs `Owners::new`: the two lists are one list, in one order)";
+
+/// [`HeadAt::Unlisted`]'s words for a member crate's head the crate lists no head of: no item
+/// of the crate's names records is the item read, or it has no head (engine_heads.rs
+/// `heads_of_crate`).
+const NO_HEAD_ROW: &str = "no item of its member crate's names records has this head (engine_heads.rs `heads_of_crate`: an item with no head, or a key the records do not hold)";
 
 /// One head cell [`heads_of_crate`] lists.
 struct HeadRow<'n> {
@@ -702,6 +794,24 @@ struct HeadRow<'n> {
     /// [`head_item`] hashed): the words a refusal of two heads under one cell prints.
     name: &'n str,
     member: Option<&'n str>,
+    /// Its covering entry's name as its file writes it (item_name.rs `shown_name`).
+    entry_name: &'n str,
+    /// A head a macro wrote: the innermost call's macro as written (`None`: a body's block's
+    /// module wrote it, no call); `None` outside: a head written in its file.
+    by: Option<Option<&'n str>>,
+}
+
+/// What [`heads_of_crate`] lists of a crate.
+enum CrateRow<'n> {
+    /// A head, and the entry whose head task freezes it.
+    Head(HeadRow<'n>),
+    /// A head no head task holds, and why ([`HeadAt::Unlisted`]).
+    Unlisted { sig: Name, why: &'static str },
+    /// A macro call whose walk up ends under the entry `entry` (its own, or a call or body's block
+    /// it stands in): the entry's head task reads its expansion record's cell (`heads_of`), so
+    /// an edit of what it expands to (a `macro_rules!` body, a derive's output) reruns exactly
+    /// the head tasks whose entries hold its calls.
+    Call { entry: Name, call: blaze_id::ItemKey },
 }
 
 /// What a head's want is, in words, for a refusal that names it ([`heads_of`]).
@@ -719,65 +829,143 @@ fn want_words(want: Want) -> &'static str {
 /// A head as its entry's text names it, for a refusal ([`heads_of`]): its want's kind in words,
 /// its item's name and an impl fn's name. `want: None`: no row of the head (never, as
 /// `heads_of` asks only of its own rows; said, not hidden).
+#[derive(Clone, Copy)]
 struct HeadLabel<'n> {
     want: Option<Want>,
     name: &'n str,
     member: Option<&'n str>,
+    /// Its covering entry's name and, for a head a macro wrote, the macro ([`HeadRow::by`]).
+    entry_name: &'n str,
+    by: Option<Option<&'n str>>,
 }
 
 impl core::fmt::Display for HeadLabel<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let words = self.want.map_or("a head with no row", want_words);
-        match self.member {
-            Some(member) => write!(f, "{words} `{}::{member}`", self.name),
-            None => write!(f, "{words} `{}`", self.name),
+        // "`Point` (written by `Serialize`): the impl header": the entry the user wrote first,
+        // so a head no name of its own says (an impl) is still found in the text.
+        match self.by {
+            Some(Some(by)) => write!(f, "`{}` (written by `{by}`): ", self.entry_name)?,
+            Some(None) => write!(f, "`{}` (written in a body's block): ", self.entry_name)?,
+            None => {}
+        }
+        match (self.member, self.name) {
+            (Some(member), "") => write!(f, "{words} `{member}`"),
+            (Some(member), name) => write!(f, "{words} `{name}::{member}`"),
+            (None, "") => write!(f, "{words}"),
+            (None, name) => write!(f, "{words} `{name}`"),
         }
     }
 }
 
-/// Every head cell of crate `k` of `records` whose item is written in a file of `subjects`, in
-/// file order. An item a macro wrote (its text an expansion's) or one no entry covers is not
-/// listed ([`HeadAt::Unplaced`]).
-fn heads_of_crate<'n>(records: &'n Records<'n>, k: usize, prefix: [u8; 8], subjects: &Subjects, g: Alloc<'static>, each: &mut dyn FnMut(HeadRow<'n>)) {
+/// [`CrateRow::Unlisted`]'s words for a head whose call (or body) stands where no outline entry
+/// of its file covers it.
+const NOT_COVERED: &str = "the call that wrote it (or the body whose block it is in) stands where no outline entry of its file has a head task (signature.rs `covering_entry`: inside a body, or no head)";
+
+/// Every head of crate `k` of `records` whose item is written in a file of `subjects`, or that a
+/// macro (or a body's block) wrote under an entry of one, in file order, with the entry whose
+/// head task freezes it (rule 30: the one listing of a crate's heads; the head tasks freeze
+/// these and the readers place their reads by these, engine_seeds.rs and engine_bodies.rs
+/// `widen`). A written head is walked up its calls and blocks to the file entry its outermost
+/// call stands at (body_types/covered.rs `written_path`, `texts`: the crate's directory, no
+/// expansion record read), and its cell holds where under that entry it was written
+/// ([`Written`]). A head whose walk fails, or that no entry covers, is listed as
+/// [`CrateRow::Unlisted`] with why, never left out (rule 3). Each call of the crate whose walk
+/// ends under an entry is listed as [`CrateRow::Call`].
+fn heads_of_crate<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>, k: usize, prefix: [u8; 8], subjects: &Subjects, g: Alloc<'static>, each: &mut dyn FnMut(CrateRow<'n>)) {
     let mut keys: Vec<blaze_id::ItemKey, Alloc<'static>> = Vec::new_in(g);
     NamesSource::each_item(records, k, &mut |key, _| keys.push(key));
-    // (file, item index, want, the item's name, an impl fn's name).
-    let mut placed: std::vec::Vec<(u32, u32, Want, &'n str, Option<&'n str>), Global> = std::vec::Vec::new_in(Global);
+    let krate = NamesSource::crate_key(records, k);
+    // (its text, its entry there, want, the item's name, an impl fn's name).
+    let mut wanted: Vec<(At, u32, Want, &'n str, Option<&'n str>), Alloc<'static>> = Vec::new_in(g);
+    // Each item's and member's block text key, with where its body is written
+    // (body_types/covered.rs `BlockHomes`): a key no block has is never asked.
+    let mut blocks: Vec<(blaze_id::ItemKey, At, ItemIndex), Alloc<'static>> = Vec::new_in(g);
     for key in keys.iter().copied() {
         let Ok(want) = by_origin::kind_of_lib(records, key).and_then(|kind| by_origin::item_want(records, kind)) else { continue };
         let Some(place) = NamesSource::place_of(records, key) else { continue };
-        let At::File(file) = place.at else { continue };
         let item = NamesSource::name_of(records, key).unwrap_or("");
-        placed.push((file, place.item.0, want, item, None));
-        if let Want::Impl(lib) = want {
+        wanted.push((place.at, place.item.0, want, item, None));
+        if let Some(krate) = krate {
+            blocks.push((crate::body_types::covered::block_key(krate, key), place.at, place.item));
+        }
+        if let Want::Impl(lib) | Want::Members(lib) = want {
             NamesSource::each_member(records, lib, &mut |m| {
-                if let (blaze_surface::ItemKind::Function, None, Some(name)) = (m.kind, m.written_by, m.name) {
-                    placed.push((file, m.item.0, Want::MemberFn(lib, member_key_of(checker_of(lib), MemberKind::Fn, name)), item, Some(name)));
+                // A member a call in the container's block wrote is in that call's text.
+                let text = m.written_by.map_or(place.at, At::Expansion);
+                if let Some(krate) = krate {
+                    blocks.push((crate::body_types::covered::block_key(krate, m.key), text, m.item));
+                }
+                if let (Want::Impl(_), blaze_surface::ItemKind::Function, Some(name)) = (want, m.kind, m.name) {
+                    wanted.push((text, m.item.0, Want::MemberFn(lib, member_key_of(checker_of(lib), MemberKind::Fn, name)), item, Some(name)));
                 }
             });
         }
     }
-    placed.sort_unstable_by_key(|(file, item, want, _, _)| (*file, *item, want_bytes(*want)));
+    blocks.sort_unstable_by_key(|(block, _, _)| *block);
+    blocks.dedup_by_key(|(block, _, _)| *block);
+    // (file, the file entry it or its outermost call is at, want, name, impl fn's name, the walk).
+    type Walk<'n> = Option<(ContentId, Option<&'n str>)>;
+    let mut placed: Vec<(u32, u32, Want, &'n str, Option<&'n str>, Walk<'n>), Alloc<'static>> = Vec::with_capacity_in(wanted.len(), g);
+    for &(at, item, want, name, member) in wanted.iter() {
+        match at {
+            At::File(file) => placed.push((file, item, want, name, member, None)),
+            At::Expansion(from) => match crate::body_types::covered::written_path(texts, &blocks, from, Some(ItemIndex(item)), &mut |_| {}) {
+                Ok(path) => placed.push((path.top.0, path.top.1.0, want, name, member, Some((path.steps, path.by)))),
+                Err(why) => each(CrateRow::Unlisted { sig: head_cell_id(want).of, why }),
+            },
+        }
+    }
+    placed.sort_unstable_by_key(|(file, item, want, _, _, walk)| (*file, *item, want_bytes(*want), walk.map(|(steps, _)| steps)));
+    // (file, the file entry the outermost call is at, the call): every call of the crate.
+    let mut calls: Vec<(u32, u32, blaze_id::ItemKey), Alloc<'static>> = Vec::with_capacity_in(texts.len(), g);
+    for at in 0..texts.len() {
+        let Ok(call) = texts.call_at(at) else { continue };
+        // A call whose walk fails (a call inside a body, whose text keeps no origins) is under
+        // no head task: the heads it wrote are each listed `Unlisted` above.
+        if let Ok(path) = crate::body_types::covered::written_path(texts, &blocks, call, None, &mut |_| {}) {
+            calls.push((path.top.0, path.top.1.0, call));
+        }
+    }
+    calls.sort_unstable_by_key(|(file, item, call)| (*file, *item, *call));
+    let mut files: Vec<u32, Alloc<'static>> = Vec::with_capacity_in(placed.len() + calls.len(), g);
+    files.extend(placed.iter().map(|one| one.0));
+    files.extend(calls.iter().map(|one| one.0));
+    files.sort_unstable();
+    files.dedup();
     let edition = NamesSource::edition_of(records, k);
-    for run in placed.chunk_by(|a, b| a.0 == b.0) {
-        let file = run[0].0;
+    for file in files.iter().copied() {
+        let heads = &placed[placed.partition_point(|one| one.0 < file)..placed.partition_point(|one| one.0 <= file)];
+        let at_calls = &calls[calls.partition_point(|one| one.0 < file)..calls.partition_point(|one| one.0 <= file)];
         let Ok(at) = subjects.binary_search_by(|(p, f, _)| (*p, *f).cmp(&(prefix, file))) else { continue };
         let outline_name = subjects[at].2;
         let (Some(text), Some(edition)) = (NamesSource::file_text(records, k, file), edition) else { continue };
         let outline = blaze_file_items::outline(text, edition, g);
-        for (_, item, want, name, member) in run.iter() {
-            let Some(cover) = crate::signature::covering_entry(&outline, ItemIndex(*item)) else { continue };
-            let entry = crate::signature::signature_name(outline_name.subject, &outline, outline.item(cover), text);
-            each(HeadRow {
-                sig: head_cell_id(*want).of,
+        let entry_of = |top: u32| crate::signature::covering_entry(&outline, ItemIndex(top)).map(|cover| (cover, crate::signature::signature_name(outline_name.subject, &outline, outline.item(cover), text)));
+        for &(_, top, call) in at_calls.iter() {
+            if let Some((_, entry)) = entry_of(top) {
+                each(CrateRow::Call { entry, call });
+            }
+        }
+        for &(_, top, want, name, member, walk) in heads.iter() {
+            let Some((cover, entry)) = entry_of(top) else {
+                let why = if walk.is_some() { NOT_COVERED } else { crate::signature::uncovered_why(&outline, ItemIndex(top)) };
+                each(CrateRow::Unlisted { sig: head_cell_id(want).of, why });
+                continue;
+            };
+            let written = walk.map(|(steps, _)| Written { steps, from_entry: top - cover.0 });
+            each(CrateRow::Head(HeadRow {
+                sig: head_cell_id(want).of,
                 entry,
                 file: outline_name,
-                cell: head_cell(*want, name, *member, WHOLE),
-                item: head_item(*want, name, *member, WHOLE),
-                want: *want,
-                name: *name,
-                member: *member,
-            });
+                cell: head_cell_written(want, name, member, written, WHOLE),
+                item: head_item(want, name, member, written, WHOLE),
+                want,
+                name,
+                member,
+                entry_name: crate::item_name::shown_name(outline.item(cover), text),
+                by: walk.map(|(_, by)| by),
+            }));
         }
     }
 }
@@ -1069,7 +1257,7 @@ impl HeadsStage {
             holding.extend(by_file[at..].iter().take_while(|(file, _)| *file == task.planned.file).filter_map(|(_, prefix)| jobs.binary_search_by_key(prefix, |job| job.prefix).ok()));
             // The plant (`HeadUnits`): one unit alone, as before the rule.
             match self.freeze {
-                HeadUnits::Each => {}
+                HeadUnits::Each | HeadUnits::NoExpansionReads => {}
                 HeadUnits::OnlyFirst => holding.truncate(1),
                 HeadUnits::OnlyLast => {
                     if let Some(last) = holding.last().copied() {
@@ -1143,6 +1331,7 @@ impl HeadsStage {
         let root = handles.root;
         let clock = handles.clock;
         let subjects = &subjects[..];
+        let expansion_reads = self.freeze != HeadUnits::NoExpansionReads;
         type Ran = Result<Result<std::vec::Vec<Result<WorkedHead, HeadFailed>, Global>, &'static str>, work::Panicked>;
         let mut worked: std::vec::Vec<(Ran, u64), Global> = std::vec::Vec::with_capacity_in(jobs.len(), Global);
         {
@@ -1153,7 +1342,7 @@ impl HeadsStage {
                 let clock = clock.clone();
                 running.push(scope.may_overlap("engine heads", HEADS_FRAME, move |cx: &Cx| {
                     let began = clock.now();
-                    let made = work::unwinding(|| heads_of(cx, root, packs, corrected, procs, job, subjects, view, heap));
+                    let made = work::unwinding(|| heads_of(cx, root, packs, corrected, procs, job, subjects, view, expansion_reads, heap));
                     Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns)))
                 }));
             }
@@ -1310,6 +1499,7 @@ fn heads_of(
     job: &ItemJob<'_>,
     subjects: &Subjects,
     view: View<'_, '_>,
+    expansion_reads: bool,
     heap: &'static blaze_own::Heap,
 ) -> Result<std::vec::Vec<Result<WorkedHead, HeadFailed>, Global>, &'static str> {
     let frame = cx.frame();
@@ -1343,20 +1533,32 @@ fn heads_of(
     let mut rows: std::vec::Vec<(Name, Cell, Name, Want, Cell), Global> = std::vec::Vec::new_in(Global);
     // Each row's words (want, item name, impl fn name) by the same (entry, cell, head name):
     // what a refusal of two heads under one cell names them by.
-    let mut labels: Vec<(Name, Cell, Name, Want, &str, Option<&str>), Alloc<'static>> = Vec::new_in(g);
-    heads_of_crate(records, 0, job.prefix, subjects, g, &mut |one| {
-        rows.push((one.entry, one.cell, one.sig, one.want, one.item));
-        labels.push((one.entry, one.cell, one.sig, one.want, one.name, one.member));
+    let mut labels: Vec<(Name, Cell, Name, HeadLabel<'_>), Alloc<'static>> = Vec::new_in(g);
+    // (entry, a call whose walk ends under it), sorted: the expansion records its task reads.
+    let mut calls: Vec<(Name, blaze_id::ItemKey), Alloc<'static>> = Vec::new_in(g);
+    let crate_key = NamesSource::crate_key(records, 0).ok_or("its crate has no key in its own records (front2 source.rs `crate_key`)")?;
+    let texts = job.crates.first().filter(|one| one.records.key == crate_key).map(|one| one.records.expansions).ok_or("its crate is not the first of the crates its records were opened over (run_names.rs `names_records`)")?;
+    heads_of_crate(records, &texts, 0, job.prefix, subjects, g, &mut |one| match one {
+        CrateRow::Head(one) => {
+            rows.push((one.entry, one.cell, one.sig, one.want, one.item));
+            labels.push((one.entry, one.cell, one.sig, HeadLabel { want: Some(one.want), name: one.name, member: one.member, entry_name: one.entry_name, by: one.by }));
+        }
+        CrateRow::Call { entry, call } => calls.push((entry, call)),
+        // A head no task holds is the reader's refusal (`Owners::place`), not this task's.
+        CrateRow::Unlisted { .. } => {}
     });
     rows.sort_unstable_by_key(|(entry, cell, sig, _, _)| (*entry, *cell, *sig));
     rows.dedup_by_key(|(entry, cell, sig, _, _)| (*entry, *cell, *sig));
-    labels.sort_unstable_by_key(|(entry, cell, sig, _, _, _)| (*entry, *cell, *sig));
-    labels.dedup_by_key(|(entry, cell, sig, _, _, _)| (*entry, *cell, *sig));
-    let label = |entry: Name, cell: Cell, sig: Name| match labels.binary_search_by_key(&(entry, cell, sig), |(e, c, s, _, _, _)| (*e, *c, *s)) {
-        Ok(at) => HeadLabel { want: Some(labels[at].3), name: labels[at].4, member: labels[at].5 },
-        Err(_) => HeadLabel { want: None, name: "", member: None },
+    labels.sort_unstable_by_key(|(entry, cell, sig, _)| (*entry, *cell, *sig));
+    labels.dedup_by_key(|(entry, cell, sig, _)| (*entry, *cell, *sig));
+    calls.sort_unstable();
+    calls.dedup();
+    let label = |entry: Name, cell: Cell, sig: Name| match labels.binary_search_by_key(&(entry, cell, sig), |(e, c, s, _)| (*e, *c, *s)) {
+        Ok(at) => labels[at].3,
+        Err(_) => HeadLabel { want: None, name: "", member: None, entry_name: "", by: None },
     };
-    let mut owners = Owners::new(subjects);
+    let scope_name = blaze_drive::key::crate_scope_name(&crate_key);
+    let mut owners = Owners::new(subjects, &job.crates[..], g);
     let tool = blaze_drive::key::Tool(ContentId::of(HEAD_TOOL_DOMAIN, b""));
     let mut done = std::vec::Vec::with_capacity_in(job.tasks.len(), Global);
     for task in job.tasks.iter() {
@@ -1373,6 +1575,23 @@ fn heads_of(
         if let Some(two) = mine.windows(2).find(|two| two[0].1 == two[1].1) {
             let (one, other) = (label(two[0].0, two[0].1, two[0].2), label(two[1].0, two[1].1, two[1].2));
             failed = Some(crate::engine_head_notes::leak(g, format_args!("two heads of its entry fall under one cell: {one} and {other}, the same kind and name (engine_heads.rs `head_cell`)")));
+        }
+        let mine = if failed.is_some() { &mine[..0] } else { mine };
+        // The expansion record of each call under its entry (`CrateRow::Call`): the heads its
+        // calls write are made from what the records hold, so a macro's new output (its
+        // `macro_rules!` body edited, a derive's crate changed) moves this task and no other;
+        // read even when they write no head yet, so a call that comes to write one reruns it.
+        // A record the store lacks refuses the task by name: a head task never runs a macro
+        // again (rule 3).
+        let at_calls = calls.partition_point(|(entry, _)| *entry < name);
+        for (_, call) in calls[at_calls..].iter().take_while(|(entry, _)| *entry == name) {
+            if !expansion_reads {
+                break;
+            }
+            if let Err(error) = texts.text(*call) {
+                failed.get_or_insert_with(|| crate::engine_head_notes::leak(g, format_args!("a macro call under its entry has no expansion record to make its heads from: {error} (a head task never runs a macro again; engine_heads.rs `heads_of`)")));
+            }
+            worked.reads.push(names_read(view, CellId { of: scope_name, cell: Cell(blaze_scope::names_cells::NameCell::Expansion { call: *call }.key()) }));
         }
         let mine = if failed.is_some() { &mine[..0] } else { mine };
         for (_, cell, _, want, item) in mine.iter() {
@@ -1457,7 +1676,10 @@ fn heads_of(
                     Some(HeadAt::Cell { cell, .. }) if cell.of == name => continue,
                     Some(HeadAt::Cell { cell, .. }) if rows.binary_search_by(|(entry, _, _, _, _)| entry.cmp(&cell.of)).is_ok() => cell,
                     Some(HeadAt::Cell { file, .. }) => CellId { of: file, cell: crate::engine_tasks::HEADS },
-                    Some(HeadAt::Dependency(scope) | HeadAt::Unplaced(scope)) => CellId { of: scope, cell: WHOLE },
+                    // A dependency's head, or one no head task holds (its reader is refused by
+                    // name, `HeadAt::Unlisted`): its crate's record whole. A body's own item is
+                    // never a head task's read (no head is declared in a body a head reads).
+                    Some(HeadAt::Dependency(scope) | HeadAt::OfTheBody(scope) | HeadAt::Unlisted { scope, .. }) => CellId { of: scope, cell: WHOLE },
                     None => id,
                 });
             }

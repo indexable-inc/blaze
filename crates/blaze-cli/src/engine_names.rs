@@ -60,6 +60,8 @@ pub(crate) struct Handles<'h, 'f> {
     pub(crate) side: Option<&'h crate::proc_runner::MacroSide<'h, 'h, 'h>>,
     pub(crate) outlined: &'h [Outlined<'h>],
     pub(crate) workers: core::num::NonZeroU32,
+    /// Where each crate's resolution says it runs (engine_status.rs).
+    pub(crate) board: &'h crate::engine_status::Board<'h>,
 }
 
 impl<'f> NamesStage<'f> {
@@ -134,6 +136,8 @@ impl<'f> NamesStage<'f> {
         let wave_frame: &Frame = &own;
         // 1. Each task's job, on this thread.
         let mut jobs: Vec<(usize, blaze_drive::Task<'_>, &crate::names::ScopeJob<'_>), &Frame> = Vec::new_in(wave_frame);
+        // Each job's crate as the status names it, beside `jobs`.
+        let mut labels: Vec<crate::engine_status::Label, &Frame> = Vec::new_in(wave_frame);
         let mut answered: Vec<(usize, Result<work::Made<'f>, Failure<'f>>), &Frame> = Vec::new_in(wave_frame);
         let mut closure: Vec<usize, &Frame> = Vec::new_in(wave_frame);
         // What each answered task was handed (its dependencies, script and surfaces), by task
@@ -146,6 +150,7 @@ impl<'f> NamesStage<'f> {
                 answered.push((i, Err(refusal(name, "a `CrateScope` task of a crate the world does not hold"))));
                 continue;
             };
+            let label = crate::engine_status::Label::of(names.crate_label(at).0);
             // Its build script's run, made in the `Scripts` stage (engine_scripts.rs), which
             // marked it here: handed by its out, or failed (the crate then fails `Waited`).
             let script = match names.script_of(at) {
@@ -183,7 +188,10 @@ impl<'f> NamesStage<'f> {
             let drive = drive_task(name, task.key, task.planned.source, inputs, failed, heap);
             let prepared = crate::names::prepare(&cx, handles.root, store, &mut exports, &mut self.names, handles.lock, handles.members, handles.env, handles.side, &drive, &mut round, frame)?;
             match prepared {
-                Prepared::Resolve(job) => jobs.push((i, drive, job)),
+                Prepared::Resolve(job) => {
+                    jobs.push((i, drive, job));
+                    labels.push(label);
+                }
                 Prepared::Answer(did) => {
                     saw.push((i, handed(&drive, wave_frame)));
                     answered.push((i, published(name, did)?));
@@ -203,12 +211,16 @@ impl<'f> NamesStage<'f> {
             let mut running = Vec::new_in(wave_frame);
             let root = handles.root;
             let clock = &handles.env.clock;
-            for (_, drive, job) in jobs.iter() {
+            let board = handles.board;
+            for ((_, drive, job), label) in jobs.iter().zip(labels.iter().copied()) {
                 let job: &crate::names::ScopeJob<'_> = job;
                 let name = drive.name;
                 running.push(scope.may_overlap("crate scope", crate::names::SCOPE_FRAME, move |cx: &Cx| {
                     let began = clock.now();
+                    // Begun with its wave, whatever is asked: a stop is the driver's after it.
+                    let shown = board.show(blaze_engine::Stage::Names, label, 0, board.now(clock));
                     let resolution = work::unwinding(|| crate::names::resolve(cx, root, job, cx.frame()).0);
+                    shown.end(board.now(clock));
                     // Read before the task ends and its frame goes: what it committed at most
                     // (a frame gives nothing back before its reset or drop).
                     let committed = cx.frame().committed() as u64;

@@ -244,9 +244,30 @@ impl<'l> BodyFrames<'l> {
 
 /// The profile's `memory (Stage)` lines: one a stage that ran, and for `Names` its frames'
 /// lines, each number in bytes. `names` labels a task by its crate.
+/// A stage's row at its end, no line's end: the profile's and the status's (engine_status.rs
+/// `write_status`) one form of it.
+pub(crate) fn at_end_row(stage: Stage, at: &AtEnd, into: &mut impl core::fmt::Write) -> core::fmt::Result {
+    const RAISED: [&str; 3] = ["regions", "frames", "heap"];
+    write!(
+        into,
+        "memory ({stage:?}) (bytes): at its end regions {} heap {} · the process's most so far regions {} frames {} heap {} (raised in this stage:",
+        at.regions, at.heap, at.regions_most, at.frames_most, at.heap_most
+    )?;
+    let mut any = false;
+    for (raised, what) in at.raised.iter().zip(RAISED) {
+        if *raised {
+            write!(into, " {what}")?;
+            any = true;
+        }
+    }
+    if !any {
+        write!(into, " none")?;
+    }
+    write!(into, ")")
+}
+
 pub(crate) fn profile(ledger: &Ledger, names: Option<&NamesStage<'_>>, into: &mut impl core::fmt::Write) {
     // A report: a full frame cuts it short where it stood (engine_check.rs `profile_text`).
-    const RAISED: [&str; 3] = ["regions", "frames", "heap"];
     let world = names.and_then(|stage| stage.names.as_ref());
     let label = |name: Name, into: &mut dyn core::fmt::Write| {
         let _ = match world.and_then(|world| world.crate_at(name.subject).map(|at| world.crate_label(at).0)) {
@@ -261,22 +282,8 @@ pub(crate) fn profile(ledger: &Ledger, names: Option<&NamesStage<'_>>, into: &mu
         }
         let put = ledger.lines[stage.index()];
         let read = ledger.reads[stage.index()];
-        let _ = write!(
-            into,
-            "memory ({stage:?}) (bytes): at its end regions {} heap {} · the process's most so far regions {} frames {} heap {} (raised in this stage:",
-            at.regions, at.heap, at.regions_most, at.frames_most, at.heap_most
-        );
-        let mut any = false;
-        for (raised, what) in at.raised.iter().zip(RAISED) {
-            if *raised {
-                let _ = write!(into, " {what}");
-                any = true;
-            }
-        }
-        if !any {
-            let _ = write!(into, " none");
-        }
-        let _ = write!(into, ") · records put {} (copied {}) · records read {} (copied {})", put.bytes, put.copy_bytes, read.bytes, read.copied);
+        let _ = at_end_row(stage, &at, into);
+        let _ = write!(into, " · records put {} (copied {}) · records read {} (copied {})", put.bytes, put.copy_bytes, read.bytes, read.copied);
         if let (Stage::Names, Some(stage)) = (stage, names) {
             let m = &stage.memory;
             let _ = write!(

@@ -482,6 +482,8 @@ pub(crate) struct Handles<'h, 'e, 'n, 'o> {
     pub(crate) outlined: &'h [Outlined<'o>],
     pub(crate) workers: NonZeroU32,
     pub(crate) clock: &'h Clock,
+    /// Where each body says it runs (engine_status.rs); a stop refuses the bodies not begun.
+    pub(crate) board: &'h crate::engine_status::Board<'h>,
 }
 
 /// Why the Bodies stage checks no body this command, and the cells that stop is a function of
@@ -734,7 +736,7 @@ impl<'f> BodiesStage<'f> {
         self.uncovered = found.uncovered;
         let (packs, corrected) = found.trees;
         let procs = handles.names.and_then(|stage| stage.names.as_ref()).and_then(|names| names.procs());
-        let shared = Shared { root: handles.root, packs, corrected, procs, groups: &found.groups, heads: &found.heads, view, heap, shelf: &self.shelf, seeds: request_heads, heads_failed: &self.heads_failed, scope_reads: self.scope_reads };
+        let shared = Shared { root: handles.root, packs, corrected, procs, groups: &found.groups, heads: &found.heads, view, heap, shelf: &self.shelf, seeds: request_heads, heads_failed: &self.heads_failed, scope_reads: self.scope_reads, board: handles.board };
         // Each run's counts of its seeded bodies, summed after the join.
         let mut tallies: Vec<crate::engine_seeds::SeedTally, Global> = Vec::new_in(Global);
         tallies.resize(runs.len(), crate::engine_seeds::SeedTally::default());
@@ -1255,6 +1257,7 @@ struct Shared<'s, 'a, 'f, 'r> {
     heads_failed: &'s crate::engine_head_notes::Failed,
     /// How a body's names reads are kept (engine_scope_reads.rs).
     scope_reads: crate::engine_scope_reads::ScopeReadsAs,
+    board: &'s crate::engine_status::Board<'s>,
 }
 
 /// A gauge that reads nothing: a body's [`Cost`] counts its rounds alone here (the profile's
@@ -1334,6 +1337,13 @@ fn run_bodies<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>],
     let mut at = 0;
     while at < run.len() {
         let rest = &run[at..];
+        // Stopped (engine_status.rs): the bodies not begun are refused, each named, and the
+        // driver stops before the merge.
+        if shared.board.stopping().is_some() {
+            shared.board.refused(Stage::Bodies, rest.len() as u64);
+            refuse(rest, "not checked: the command was stopped by a signal before this body began (engine_status.rs)", out, ran, alloc);
+            return;
+        }
         let took = match Frame::with_reserve(BODIES_FRAME, bstd::mem::Tag::Other) {
             Ok(stretch) => run_stretch(cx, shared, rest, &stretch, clock, out, ran, tally, alloc),
             Err(_) => refuse(rest, "the frame of its run's stretch could not be reserved (engine_bodies.rs `BODIES_FRAME`)", out, ran, alloc),
@@ -1384,7 +1394,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
     // frame runs no drop: the freezer's lists are in the frame too, through `fa`). A want is
     // placed by this stretch's names the one way `widen` places a read (engine_seeds.rs
     // `StretchHeads`), on the stack so its `Owners` is dropped with the stretch.
-    let stretch_heads = shared.seeds.map(|table| crate::engine_seeds::StretchHeads::new(table, shared.heads_failed, opened.records, shared.heads, g));
+    let stretch_heads = shared.seeds.map(|table| crate::engine_seeds::StretchHeads::new(table, shared.heads_failed, opened.records, shared.heads, &group.crates[..], g));
     // The seed freezer's constant evaluator: the head tasks' own (engine_head_consts.rs), its
     // lang index built by the one function a head task builds it by, once a stretch, and what
     // it reads kept as it grows (`EvalSink`), so each body's read list takes it ([`add_eval_reads`]).
@@ -1421,10 +1431,15 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
     // seeded (runtime.md point 3).
     let cost: &Cost<'_> = frame.alloc(Cost::new(&NO_GAUGE));
     let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed, sources: Some(opened.sources), goals: None };
-    let mut owners = crate::engine_heads::Owners::new(shared.heads);
+    let mut owners = crate::engine_heads::Owners::new(shared.heads, &group.crates[..], g);
     let mut taken = 0usize;
     for one in run {
         if taken > 0 && frame.used() > STRETCH_FULL {
+            break;
+        }
+        // The workers' scheduling point (engine_status.rs): stopped, the stretch ends, and
+        // `run_bodies` refuses the rest.
+        if taken > 0 && shared.board.stopping().is_some() {
             break;
         }
         taken += 1;
@@ -1435,6 +1450,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
         let at_start = frame.used();
         let _body = cx.span("engine: one body");
         let began = clock.now();
+        let running = shared.board.show(Stage::Bodies, crate::engine_status::Label::of(one.label), at_start as u64, shared.board.now(clock));
         let name = one.task.planned.name;
         // Each body the task checks (one; or each an expansion at its entry wrote), merged into
         // the task's one result: its reads the union, its verdict the digest of theirs.
@@ -1526,6 +1542,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
         }
         let ns = clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
         let bytes = frame.used().saturating_sub(at_start) as u64;
+        running.end(shared.board.now(clock));
         if seed_refused {
             // Refused at a seed; never checked by lowering instead (rule 3). A head that cannot
             // be made is reported once, at the head (its head task's refusal, or `check`'s), and
@@ -1761,11 +1778,11 @@ enum Own {
 /// for it: its head task's, placed as `widen` places a head read; else the request's first
 /// freeze's (`seeds`, the one home of a seed failure's reason: every stretch and worker tells
 /// it at the failure, front2 tables/seeds.rs `RequestSeed::seed`).
-fn own_reason<'n>(
+fn own_reason<'n, 's: 'n>(
     want: Want,
     seeds: Option<&crate::engine_seeds::RequestTable>,
     heads_failed: &crate::engine_head_notes::Failed,
-    owners: &mut crate::engine_heads::Owners<'_>,
+    owners: &mut crate::engine_heads::Owners<'s>,
     records: &'n blaze_ladder::front2::source::Records<'n>,
     g: blaze_own::Alloc<'static>,
 ) -> Own {
@@ -1822,11 +1839,11 @@ fn add_eval_reads<'a, 'n>(
 /// [`widen`] by the command's strategy (engine_scope_reads.rs, rule 78): the one dispatch from
 /// the runtime choice to a [`crate::engine_scope_reads::ScopeReads`] instantiation.
 #[expect(clippy::too_many_arguments, reason = "the strategy, a body's reads and every table that names them")]
-fn widen_as<'a, 'n>(
+fn widen_as<'a, 'n, 's: 'n>(
     reads_as: crate::engine_scope_reads::ScopeReadsAs,
     reads: &[(CellId, ContentId)],
     group: &Group<'_, '_>,
-    owners: &mut crate::engine_heads::Owners<'_>,
+    owners: &mut crate::engine_heads::Owners<'s>,
     records: &'n blaze_ladder::front2::source::Records<'n>,
     view: View<'_, 'a>,
     heads_failed: &crate::engine_head_notes::Failed,
@@ -1846,10 +1863,10 @@ fn widen_as<'a, 'n>(
 /// holds, sorted and one each; and the first head it read that was not frozen (its head task
 /// failed whole, or that head of it: engine_head_notes.rs), by task and cell.
 #[expect(clippy::too_many_arguments, reason = "a body's reads and every table that names them")]
-fn widen<'a, 'n, S: crate::engine_scope_reads::ScopeReads>(
+fn widen<'a, 'n, 's: 'n, S: crate::engine_scope_reads::ScopeReads>(
     reads: &[(CellId, ContentId)],
     group: &Group<'_, '_>,
-    owners: &mut crate::engine_heads::Owners<'_>,
+    owners: &mut crate::engine_heads::Owners<'s>,
     records: &'n blaze_ladder::front2::source::Records<'n>,
     view: View<'_, 'a>,
     heads_failed: &crate::engine_head_notes::Failed,
@@ -1876,8 +1893,10 @@ fn widen<'a, 'n, S: crate::engine_scope_reads::ScopeReads>(
             // The whole graph's bucket fact: the strategy's (engine_scope_reads.rs).
             Kind::ImplBucket if id.of.subject == ABSENT => S::incoherent_fact(&group.scope, &mut push),
             // A head (engine_heads.rs `Owners::place`): a member's, the cell of the head task of
-            // the entry that covers it; a dependency's, or one a macro wrote, its crate's names
-            // record whole. A head of a crate none of the records holds is read as read.
+            // the entry that covers it, a macro-written head's included; a dependency's, a body's
+            // own item's or one no head task holds (the body is refused by its words), its
+            // crate's names record whole. A head of a crate none of the records holds is read as
+            // read.
             Kind::Signature => match owners.place(records, id, g) {
                 Some(crate::engine_heads::HeadAt::Cell { cell, .. }) => {
                     if unfrozen.is_none() && (view.row(cell.of).is_some_and(|row| row.failed) || heads_failed.has(cell.of, cell.cell)) {
@@ -1885,7 +1904,7 @@ fn widen<'a, 'n, S: crate::engine_scope_reads::ScopeReads>(
                     }
                     push(cell.of, cell.cell);
                 }
-                Some(crate::engine_heads::HeadAt::Dependency(scope) | crate::engine_heads::HeadAt::Unplaced(scope)) => push(scope, WHOLE),
+                Some(crate::engine_heads::HeadAt::Dependency(scope) | crate::engine_heads::HeadAt::OfTheBody(scope) | crate::engine_heads::HeadAt::Unlisted { scope, .. }) => push(scope, WHOLE),
                 None => push(id.of, id.cell),
             },
             // A crate's bucket: its cell as the crate's Heads task defined it (engine_heads.rs),

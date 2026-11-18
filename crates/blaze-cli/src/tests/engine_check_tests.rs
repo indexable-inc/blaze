@@ -50,6 +50,7 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
         scope_reads: crate::engine_scope_reads::ScopeReadsAs::DEFAULT,
         unreadable: None,
         body_locals: blaze_ladder::front2::tables::seeds::BodyLocals::Lowered,
+        status: crate::engine_status::Asking::NONE,
     }
 }
 

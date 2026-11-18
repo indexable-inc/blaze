@@ -29,6 +29,7 @@ use blaze_cas::plain::{Lent, Settings, Snapshot};
 use blaze_core::Driver;
 use blaze_own::Alloc;
 use blaze_remote::PublicKey;
+use blaze_remote::published::set::SetCheck;
 use blaze_remote::read::{Answer, BatchError, Ed25519Keys, HeadCheck, Limits, Namespace, Object, Origin, OriginError, Reader, SignatureWhy, Unfetched, fetch};
 use bstd::Stopped;
 use bstd::clock::Clock;
@@ -53,6 +54,10 @@ pub use plain_place::{AfterAnswer, Checked, Counts, Facts, Held, PlaceError, Pla
 
 /// What keeps a record after its command: one typed root per lifetime class.
 pub(crate) mod roots;
+
+/// The published set: the toolchain root's walk, a publish to a folder origin, and the
+/// rollback floor a home keeps for each set it reads.
+pub(crate) mod published;
 
 /// The seam the request reads and writes records through. `'m` is the borrow of the command's
 /// [`Lent`]: a [`Held<'m>`] outlives every later get and put (blaze-cas plain/lent.rs).
@@ -153,6 +158,8 @@ pub enum StoreFailure {
     TwoValues { key: Key, lent: blaze_cas::plain::LentError, clash: Clash },
     /// A class root of store/roots.rs could not be set (the toolchain's, from the engine's answer).
     Root(roots::RootError),
+    /// The published set (store/published.rs): its walk, its floor, or its folder's write.
+    Published(published::PublishedError),
 }
 
 /// A drive record's form, as [`record::open`](blaze_drive::record::open) reads it.
@@ -447,6 +454,7 @@ impl fmt::Display for StoreFailure {
             StoreFailure::Copy(stopped) => write!(f, "a record read from the store: {stopped}"),
             StoreFailure::Look { folder, error } => write!(f, "looking for the old store folder {folder}: {error}"),
             StoreFailure::Root(error) => write!(f, "{error}"),
+            StoreFailure::Published(error) => write!(f, "{error}"),
             StoreFailure::TwoValues { key, lent, clash } => {
                 write!(f, "the store under the home's .blaze/v2/store: two values under one key {key}: the record of ")?;
                 clash.write_subject(f)?;
@@ -646,12 +654,18 @@ impl<'m, 'r, D: Driver> CommandStore<'m, 'r, D, ToolchainCrates> {
     pub fn new(cx: &Cx, lent: &'m Lent<D, StoreAlloc>, public_writer: bool, open_ns: u64, origin: Option<&'r NamedOrigin>, clock: Clock, err: &'r Out, alloc: Alloc<'r>) -> Result<CommandStore<'m, 'r, D>, CliError> {
         let remote = origin.map(|named| Remote {
             named,
-            reader: Reader::new_in(Namespace::PUBLIC, &named.check, Limits::DEFAULT, alloc),
+            // The prefix on (published.md): a batch's head, manifest and summaries in one read,
+            // so three waves. blaze-h1's `Response::ranged` takes the 206 that ends at the
+            // object's end for an ask past it (blaze-h1 tests.rs), so HTTP reads it too.
+            reader: Reader::new_in(Namespace::PUBLIC, &named.check, Limits::PUBLISHED, alloc),
             clock,
             err,
             alloc,
             spent_ns: 0,
             said: 0,
+            kept: 0,
+            kept_bytes: 0,
+            floored: false,
         });
         let (_, named) = lent.mapped_of_named();
         if named > plain_place::SEGMENTS_NAMED_MOST {
@@ -934,10 +948,23 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
         };
         fetched.map_err(|error| CliError::Remote(RemoteError::Batch(error)))?;
         let found = match remote.reader.answer(0) {
-            Answer::Found { .. } => {
+            Answer::Found { tag, .. } => {
                 let bytes = remote.reader.found(0).unwrap_or(&[]);
-                // Put before it is answered, and answered from the arena: lent for `'m`.
-                self.place.put(key, false, bytes)?;
+                // Verified once, by the read machine, up from the signed head; then kept as this
+                // home's own record (`LOCAL`, its own tag), so the next lookup is a local hit
+                // that checks nothing again. Put before it is answered, and answered from the
+                // arena: lent for `'m`.
+                self.place.put_record(key, false, tag, bytes)?;
+                remote.kept += 1;
+                remote.kept_bytes += bytes.len() as u64;
+                // The set's floor rises to the head just taken, once a command (the rollback
+                // rule: blaze-remote published/set.rs).
+                if let (Some(set), Some(head), false) = (remote.named.check.set, remote.reader.head(), remote.floored)
+                    && head.generation > set.seen
+                {
+                    published::keep_floor(&mut self.place, &set.id, head.generation)?;
+                    remote.floored = true;
+                }
                 self.place.get(key)?
             }
             Answer::Absent | Answer::Pending => None,
@@ -1014,7 +1041,7 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
             remote.err.line(
                 cx,
                 format_args!(
-                    "blaze: origin: {} keys asked, {} found, {} absent, {} not fetched; {} range reads (head {}, manifest {}, summary {}, index {}, payload {}), {} late; {} bytes fetched for {} used; {:.3} ms",
+                    "blaze: origin: {} keys asked, {} found, {} absent, {} not fetched; {} range reads (head {}, manifest {}, summary {}, index {}, payload {}), {} late; {} bytes fetched for {} used; {} records verified and kept ({} bytes); {:.3} ms fetching and verifying",
                     r.keys,
                     r.found,
                     r.absent,
@@ -1028,6 +1055,8 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
                     r.late,
                     r.bytes_fetched,
                     r.bytes_used,
+                    remote.kept,
+                    remote.kept_bytes,
                     remote.spent_ns as f64 / 1e6,
                 ),
             )?;
@@ -1058,14 +1087,28 @@ pub struct HttpAt {
     net: Net,
 }
 
-/// The one trusted key of a named origin, owned, as the read path's head check.
+/// The one trusted key of a named origin, owned, as the read path's head check; for a published
+/// set, its id the head's signature is bound to and the floor this home has taken for it.
 struct OneKey {
     keys: [PublicKey; 1],
+    set: Option<PublishedSet>,
+}
+
+/// A published set a named origin is read as (blaze-remote published/set.rs): its id, and the
+/// highest generation this home has taken for it (store/published.rs `floor`).
+#[derive(Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code, reason = "made by `NamedOrigin::published`, which main.rs names next"))]
+struct PublishedSet {
+    id: ContentId,
+    seen: u64,
 }
 
 impl HeadCheck for OneKey {
     fn check(&self, namespace: Namespace, signer: &PublicKey, domain: &'static str, message: &[u8], signature: &[u8; 64]) -> Result<(), SignatureWhy> {
-        Ed25519Keys { namespace: Namespace::PUBLIC, keys: &self.keys }.check(namespace, signer, domain, message, signature)
+        match self.set {
+            None => Ed25519Keys { namespace: Namespace::PUBLIC, keys: &self.keys }.check(namespace, signer, domain, message, signature),
+            Some(set) => SetCheck { set: set.id, keys: &self.keys, seen: set.seen }.check(namespace, signer, domain, message, signature),
+        }
     }
 }
 
@@ -1085,10 +1128,29 @@ impl NamedOrigin {
                 } else {
                     OriginAt::Folder(fs.open_dir(cx, &Path::new(folder)?)?)
                 };
-                Ok(Some(NamedOrigin { at, check: OneKey { keys: [key] } }))
+                Ok(Some(NamedOrigin { at, check: OneKey { keys: [key], set: None } }))
             }
             _ => Err(CliError::Usage("--origin and --origin-key are named together")),
         }
+    }
+
+    /// The published set `set` of the folder origin `folder` (its `public/<toolchain>/<target>`),
+    /// believed when its head is `key`'s over the set's id at a generation no lower than the
+    /// floor `lent` holds for it. An `http://` origin is NOT DONE here (its base joined with the
+    /// set's folder): refused by name.
+    #[cfg_attr(not(test), allow(dead_code, reason = "named by main.rs once the toolchain manifest pins the published keys (the report's NOT DONE); the e2e test reads through it"))]
+    pub fn published<D: Driver>(cx: &Cx, fs: &Fs, folder: &str, key: &str, set: blaze_remote::published::set::SetName<'_>, lent: &Lent<D, StoreAlloc>) -> Result<NamedOrigin, CliError> {
+        if folder.starts_with("http://") || folder.starts_with("https://") {
+            return Err(CliError::Usage("a published set is read from a folder origin for now; an http:// one is not joined to the set's folder yet"));
+        }
+        let key = PublicKey::from_hex(key).ok_or(CliError::Usage("--origin-key is not 64 hex digits (an Ed25519 public key)"))?;
+        let mut dir = fs.open_dir(cx, &Path::new(folder)?)?;
+        for part in set.dir() {
+            dir = dir.subdir(&Path::new(part)?);
+        }
+        let id = set.id();
+        let seen = published::floor(lent, &id)?;
+        Ok(NamedOrigin { at: OriginAt::Folder(dir), check: OneKey { keys: [key], set: Some(PublishedSet { id, seen }) } })
     }
 }
 
@@ -1250,6 +1312,11 @@ struct Remote<'r> {
     spent_ns: u64,
     /// One bit for each kind of "not fetched" already said.
     said: u8,
+    /// Records fetched, verified and kept as local records, and their bytes.
+    kept: u32,
+    kept_bytes: u64,
+    /// Whether this command has raised its published set's floor.
+    floored: bool,
 }
 
 impl Remote<'_> {
@@ -1312,6 +1379,12 @@ mod sharing_tests;
 #[cfg(test)]
 #[path = "store/snapshot_tests.rs"]
 mod snapshot_tests;
+
+/// The published set end to end: only publishable records leave home A, home B reads each once,
+/// each planted fault refused by name, a publish stopped anywhere (DST), equal bytes from two homes.
+#[cfg(test)]
+#[path = "store/published_e2e_tests.rs"]
+mod published_e2e_tests;
 
 /// Every record a later command reads is reached from a root, under a reach sweep: two
 /// checkouts' programs over one store, one checkout let expire (store/roots.rs).

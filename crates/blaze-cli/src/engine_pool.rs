@@ -10,13 +10,15 @@
 use core::convert::Infallible;
 use core::num::NonZeroU32;
 
-use blaze_engine::{Buffer, Pool, Task};
+use blaze_engine::{Buffer, Pool, Stage, Task};
 use blaze_own::Vec;
 use bstd::clock::Clock;
 use bstd::cx::Cx;
 use std::alloc::Global;
 use bstd::mem::{Frame, TASK_FRAME};
 use bstd::task::{Class, TaskError};
+
+use crate::engine_status::Label;
 
 /// The pool: the command's context, how many workers it may use, the first failure, and each
 /// task's time of the last phase it ran.
@@ -26,6 +28,7 @@ pub(crate) struct Workers<'c> {
     clock: &'c Clock,
     failed: Option<TaskError>,
     times: std::vec::Vec<u64, Global>,
+    board: &'c crate::engine_status::Board<'c>,
 }
 
 /// What a [`Workers`] is made from.
@@ -36,11 +39,14 @@ pub(crate) struct WorkersOpts<'c> {
     pub(crate) clock: &'c Clock,
     /// At most this many runs at once (`--workers N`, else one per core).
     pub(crate) workers: NonZeroU32,
+    /// Where each task says it runs (engine_status.rs): its start is the workers' scheduling
+    /// point, refused once a stop is asked. The pool runs the `Outlines` phases alone.
+    pub(crate) board: &'c crate::engine_status::Board<'c>,
 }
 
 impl<'c> Workers<'c> {
     pub(crate) fn new(opts: WorkersOpts<'c>) -> Workers<'c> {
-        Workers { cx: opts.cx, workers: opts.workers, clock: opts.clock, failed: None, times: std::vec::Vec::new_in(Global) }
+        Workers { cx: opts.cx, workers: opts.workers, clock: opts.clock, failed: None, times: std::vec::Vec::new_in(Global), board: opts.board }
     }
 
     /// Each task's time on its worker in the last [`Pool::run`], in the order of its tasks.
@@ -81,11 +87,15 @@ impl<'a> Pool<'a> for Workers<'_> {
         let mut runs = Vec::new_in(frame);
         for ((run, buffer), times) in tasks.chunks(per).zip(buffers.iter_mut()).zip(self.times.chunks_mut(per)) {
             let clock = self.clock.clone();
+            let board = self.board;
             runs.push(scope.may_overlap("engine run", TASK_FRAME, move |cx: &Cx| {
                 for (task, time) in run.iter().zip(times.iter_mut()) {
+                    // Not run once a stop is asked: the driver stops before the merge.
+                    let Some(running) = board.start(Stage::Outlines, || Label::debug(&task.planned.name), cx.frame().used() as u64, board.now(&clock)) else { break };
                     let began = clock.now();
                     work(cx, task, buffer);
                     *time = clock.now().since(began).map_or(0, crate::engine_times::ns);
+                    running.end(board.now(&clock));
                 }
                 Ok::<(), Infallible>(())
             }));

@@ -135,6 +135,17 @@ pub(crate) fn verify_sig(key: &PublicKey, domain: &str, body: &[u8], signature: 
     blaze_ed25519::verify_parts(&key.0, &[domain.as_bytes(), &[0], body], signature)
 }
 
+/// Whether `signature` is `key`'s over `domain || 0x00 || bound || body`: a signature bound to
+/// what `bound` names (a published set's id, published/set.rs), so it stands for that alone.
+/// Counted once, as [`verify_sig`].
+pub(crate) fn verify_bound(key: &PublicKey, domain: &str, bound: &[u8], body: &[u8], signature: &[u8; 64]) -> Result<(), blaze_ed25519::Refused> {
+    note(Check::Signature, signature[..32].try_into().expect("32 bytes"));
+    if crate::planted(crate::Plant::SkipSignature) {
+        return Ok(());
+    }
+    blaze_ed25519::verify_parts(&key.0, &[domain.as_bytes(), &[0], bound, body], signature)
+}
+
 /// What a check was of.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Check {

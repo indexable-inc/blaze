@@ -150,7 +150,7 @@ fn both(lies: bool) -> (StdVec<Option<StdVec<u8>>>, StdVec<Option<StdVec<u8>>>, 
 /// simulated server serving that folder (a liar when `lies`): the bytes each found.
 fn through(cx: &Cx, io: &Io, folder: &Dir<ReadWrite>, signer: &Signer, keys: &[ContentId], lies: bool) -> (StdVec<Option<StdVec<u8>>>, StdVec<Option<StdVec<u8>>>) {
     let net = io.need_net().expect("a network");
-    let check = OneKey { keys: [signer.public()] };
+    let check = OneKey { keys: [signer.public()], set: None };
     let global = Erased::new(Global);
     let clock = io.need_clock().expect("a clock");
     let mut now = || u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);

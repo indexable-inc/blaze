@@ -77,6 +77,13 @@ pub enum EngineCheckError {
     OutlineBack(crate::engine_store::OutlineBack),
     /// A body's findings cannot be placed for printing (engine_bodies.rs `lines`): never dropped.
     Unplaced { body: Name, what: &'static str },
+    /// Stopped by a signal at a scheduling point, in `stage` (none: before the first), `at_ms`
+    /// after the check began: its status is in the profile and on stderr (engine_status.rs).
+    Stopped { by: bstd::procs::By, stage: Option<Stage>, at_ms: u64 },
+    /// The command's stop and status signals were not caught (blaze-core run_signals.rs `Asked`).
+    Signals(bstd::procs::SignalError),
+    /// The status watcher did not run (engine_status.rs `watched`).
+    Watcher(crate::engine_status::StatusError),
 }
 
 impl EngineCheckError {
@@ -110,6 +117,12 @@ impl fmt::Display for EngineCheckError {
                 write!(f, "{name:?}: the outline at {key:?} is no whole drive record of it ({why:?}) (engine_store.rs `outline_from`)")
             }
             EngineCheckError::Unplaced { body, what } => write!(f, "{body:?}: its findings cannot be placed for printing: {what} (engine_bodies.rs `lines`)"),
+            EngineCheckError::Stopped { by, stage, at_ms } => match stage {
+                Some(stage) => write!(f, "stopped by {} at {at_ms} ms in stage {stage:?}; where it stood is in {} (engine_status.rs)", by.name(), print::PROFILE),
+                None => write!(f, "stopped by {} at {at_ms} ms before the first stage; where it stood is in {} (engine_status.rs)", by.name(), print::PROFILE),
+            },
+            EngineCheckError::Signals(error) => write!(f, "its stop and status signals: {error} (engine_check.rs `serve`)"),
+            EngineCheckError::Watcher(error) => write!(f, "{error}"),
         }
     }
 }
@@ -128,7 +141,12 @@ impl From<EngineCheckError> for CliError {
 
 /// The command: its arguments are `check`'s.
 pub(crate) fn run(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_own::Heap) -> Result<Status, CliError> {
-    serve(cx, io, out, phases, heap, None)
+    match serve(cx, io, out, phases, heap, None) {
+        // Its words are on stderr and in the profile already: the status a shell gives a
+        // process the signal ended (128 and its number).
+        Err(CliError::EngineCheck(EngineCheckError::Stopped { by, .. })) => Ok(Status(128 + by.number())),
+        other => other,
+    }
 }
 
 /// `blaze why <file or file::item>` (engine.md E11), in the checkout blaze stands in: why its
@@ -202,7 +220,24 @@ fn serve(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_
     let mut shown = print::Shown::new(caps, view, shown_root.as_str(), frame);
     shown.each = flags.each;
     phases.mark_in("open checkout", frame);
+    // The check's stop and status signals, caught until it answers (engine_status.rs);
+    // `why` answers from the stored answer at once, and keeps the default ones.
+    #[cfg(unix)]
+    let asked = match why {
+        None => Some(bstd::procs::Asked::hold().map_err(EngineCheckError::Signals)?),
+        Some(_) => None,
+    };
+    #[cfg(unix)]
+    let requests = asked.as_ref().map(bstd::procs::Asked::requests);
+    #[cfg(not(unix))]
+    let requests = None;
+    let status = crate::engine_status::Asking {
+        requests,
+        every: flags.status_every.map(|seconds| core::time::Duration::from_secs(u64::from(seconds.get()))),
+        plant: crate::engine_status::Plant::None,
+    };
     let opts = Opts {
+        status,
         tools,
         workers,
         toolchain: blaze_toolchain::PINNED,
@@ -273,6 +308,9 @@ pub(crate) struct Opts<'f> {
     /// `BodyLocals`): the command's is `Lowered`, in the body's own store; a test plants
     /// `AskTheRequest` (rule 23, engine_body_locals_tests.rs).
     pub(crate) body_locals: blaze_ladder::front2::tables::seeds::BodyLocals,
+    /// What may ask the check for its status or stop it (engine_status.rs): the command's
+    /// signals and `--status-every`; a test's plant; `Asking::NONE` in the other tests.
+    pub(crate) status: crate::engine_status::Asking<'f>,
 }
 
 /// The most one request's frame takes: its blocks are taken as it is used (blaze-mem
@@ -342,7 +380,18 @@ pub(crate) struct Checked {
 /// `err`.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
 pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, shown: &mut print::Shown<'f>, phases: &mut Phases, out: &Out, err: &Out) -> Result<Checked, CliError> {
-    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, frame, scope_reads, unreadable: planted_unreadable, body_locals } = opts;
+    // Where the check stands, said when asked or stopped (engine_status.rs), the watcher
+    // beside it when anything can ask.
+    let asking = opts.status;
+    let board = crate::engine_status::Board::new(&asking, phases.now().since_start());
+    let clock = phases.clock().clone();
+    crate::engine_status::watched(io, root, err, &clock, &board, asking.every, || checking(cx, io, root, opts, shown, phases, out, err, &board)).map_err(EngineCheckError::Watcher)?
+}
+
+/// [`check`] under its board.
+#[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
+fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, shown: &mut print::Shown<'f>, phases: &mut Phases, out: &Out, err: &Out, board: &crate::engine_status::Board<'_>) -> Result<Checked, CliError> {
+    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _ } = opts;
     let began = phases.now();
     let erased = blaze_own::Erased::new(frame);
     // The lint step and rules the root manifest names, as `check` reads them (lints.rs
@@ -600,7 +649,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
 
     // 2. Drive: each phase run, merged, its records put.
     let mut engine = Engine::new_in(tools, start, &Edit { files: &files }, Everything, blaze_engine::Plant::None, alloc)?;
-    let mut pool = Workers::new(WorkersOpts { cx, clock: &env.clock, workers });
+    let mut pool = Workers::new(WorkersOpts { cx, clock: &env.clock, workers, board });
     let mut buffers: SVec<'_, Buffer<'_>> = SVec::new_in(alloc);
     for _ in 0..pool.runs() {
         buffers.push(Buffer::new_in(alloc));
@@ -612,7 +661,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
         place: crate::macros::Place { home: env.home, checkout: env.checkout, members, rows: &rows },
         heap,
     });
-    let handles = Handles { root, lock: laid.lock.as_ref().map(|lockfile| lockfile.lock), members, env: &env, side: side.as_ref(), outlined: &outlined, workers };
+    let handles = Handles { root, lock: laid.lock.as_ref().map(|lockfile| lockfile.lock), members, env: &env, side: side.as_ref(), outlined: &outlined, workers, board };
     let mut ran = blaze_own::Vec::new_in(heap.alloc());
     let mut puts = 0u32;
     // What each stage's records cost this process (engine_store.rs `Ledger`).
@@ -628,8 +677,14 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     // The request's frozen heads, counted at the Bodies phase's merge (engine_seeds.rs).
     let mut seed_counts = crate::engine_seeds::SeedCounts::default();
     while let Some(phase) = engine.next_phase()? {
+        // The driver's scheduling point (engine_status.rs): a stop asked during the last
+        // merge or put.
+        if let Some(by) = board.stopping() {
+            return Err(stopped(cx, root, err, board, by, &ledger, names.as_ref(), phases, clock, frame)?);
+        }
         let mut entered: SVec<'_, Task> = SVec::new_in(alloc);
         entered.extend_from_slice(engine.tasks());
+        let mark = board.phase_began(phase.stage, entered.len() as u64, board.now(clock));
         let began = clock.now();
         match phase.stage {
             Stage::Outlines => {
@@ -653,7 +708,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
                 None => buffers[0].done.extend(entered.iter().map(|task| crate::engine_tasks::failed(task, alloc))),
             },
             Stage::Bodies => {
-                let handles = crate::engine_bodies::Handles { root, env: &env, graph, names: names.as_ref(), outlined: &outlined, workers, clock: phases.clock() };
+                let handles = crate::engine_bodies::Handles { root, env: &env, graph, names: names.as_ref(), outlined: &outlined, workers, clock: phases.clock(), board };
                 // The tables of crates whose Heads task stands, from the store: one shelf of all.
                 if let Some(stage) = names.as_ref() {
                     heads.read_back += crate::engine_heads::complete(cx, &mut store, stage, &mut bodies.shelf, &|name| records.get(&name).copied(), engine.view(), frame)?;
@@ -692,11 +747,23 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
                 None => buffers[0].done.extend(entered.iter().map(|task| crate::engine_tasks::failed(task, alloc))),
             },
             Stage::Heads => {
-                let handles = crate::engine_bodies::Handles { root, env: &env, graph, names: names.as_ref(), outlined: &outlined, workers, clock: phases.clock() };
+                let handles = crate::engine_bodies::Handles { root, env: &env, graph, names: names.as_ref(), outlined: &outlined, workers, clock: phases.clock(), board };
                 let crate::engine_bodies::BodiesStage { kept, shelf, .. } = &mut bodies;
                 heads.run_phase(cx, &mut store, &mut read, &handles, kept, shelf, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame)?;
             }
             Stage::Lints => lints.run_phase(cx, root, &outlined, workers, phases.clock(), &entered, &mut buffers[0], &mut times, alloc)?,
+        }
+        board.phase_ended(mark, entered.len() as u64, board.now(clock));
+        // Stopped while the phase ran: its tasks not begun have no result, so no merge.
+        if let Some(by) = board.stopping() {
+            return Err(stopped(cx, root, err, board, by, &ledger, names.as_ref(), phases, clock, frame)?);
+        }
+        // A status asked during the phase, written here when no watcher took it first (a
+        // plant's always: a planted run starts none).
+        if let Some(by) = board.take_status() {
+            let mut text = blaze_own::String::new_in(frame);
+            let _ = crate::engine_status::write_status(board, crate::engine_status::Heading::Asked { by }, board.now(clock), &mut text);
+            crate::engine_status::put(cx, root, err, text.as_bytes())?;
         }
         let wall = clock.now().since(began).map_or(0, crate::engine_times::ns);
         let merging = clock.now();
@@ -781,6 +848,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
             ledger.released(phase.stage, freed);
         }
         ledger.merged(phase.stage, crate::store::Store::kept(&store));
+        board.merged(phase.stage, ledger.memory.stages[phase.stage.index()]);
         ledger.read(phase.stage, read.counts());
         // What later phases read each entry by (a failed one its driver marked failed).
         for (name, made) in marks.drain(..) {
@@ -1007,6 +1075,8 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     };
     crate::engine_times::write(&phase_times, &label, &mut text);
     ledger.write(&mut text);
+    // Each stage's tasks, times and memory, by the status's printer (engine_status.rs).
+    let _ = crate::engine_status::write_status(board, crate::engine_status::Heading::End, board.now(clock), &mut text);
     {
         use core::fmt::Write as _;
         let from = if read_from_last { "started from the stored answer" } else { "started from no answer" };
@@ -1089,6 +1159,39 @@ const BECAUSE_SHOWN: usize = 20;
 /// The most entered tasks the profile names under one group line (their kind and subject), in
 /// the order the engine entered them.
 const BECAUSE_TASKS_SHOWN: usize = 3;
+
+/// Stopped by `by` at a scheduling point: the status, each stage's memory and records and the
+/// phases so far, to the profile (replaced whole by a rename) and to stderr; the typed stop.
+/// When the watcher claimed the stop first (the workers were late), it writes it and ends the
+/// process, so this writes nothing.
+#[expect(clippy::too_many_arguments, reason = "the stop's edge: each argument one handle of it")]
+fn stopped(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    err: &Out,
+    board: &crate::engine_status::Board<'_>,
+    by: bstd::procs::By,
+    ledger: &crate::engine_store::Ledger,
+    names: Option<&NamesStage<'_>>,
+    phases: &Phases,
+    clock: &bstd::clock::Clock,
+    frame: &Frame,
+) -> Result<CliError, CliError> {
+    use core::fmt::Write as _;
+    let now = board.now(clock);
+    let error = EngineCheckError::Stopped { by, stage: board.stage(), at_ms: now / 1_000_000 };
+    if !board.claim(crate::engine_status::Claim::Driver) {
+        return Ok(error.into());
+    }
+    let mut text = blaze_own::String::new_in(frame);
+    // A report: a full frame cuts it short where it stood (as `profile_text`).
+    let _ = crate::engine_status::write_status(board, crate::engine_status::Heading::Stopped { by, stuck: false }, now, &mut text);
+    crate::engine_memory::profile(ledger, names, &mut text);
+    ledger.write(&mut text);
+    let _ = write!(text, "{phases}");
+    crate::engine_status::put(cx, root, err, text.as_bytes())?;
+    Ok(error.into())
+}
 
 /// The profile's text: each phase's tasks planned and entered, each stage's entries and how many
 /// came out the bytes they had (a wasted entry), the top groups of why tasks were entered, then

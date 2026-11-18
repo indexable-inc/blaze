@@ -21,7 +21,7 @@ pub use form::{Ed25519Keys, Head, HeadCheck, Object, Refused, SignatureWhy};
 pub use machine::{Answer, Ask, BatchError, Limits, OriginError, Poll, Reader, Report, Unfetched};
 pub use origin::{Origin, fetch};
 #[cfg(feature = "sign")]
-pub use publish::{PublishError, Sealed, publish};
+pub use publish::{PublishError, Sealed, publish, publish_bound};
 
 /// The store's namespace, which every head names: re-exported for a caller holding no store.
 pub use blaze_cas::plain::Namespace;

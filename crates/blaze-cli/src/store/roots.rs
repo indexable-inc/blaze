@@ -129,6 +129,14 @@ impl RootName {
         RootName::of(b"tool.", &toolchain.0)
     }
 
+    /// The floor root of the published set `set` (blaze-remote published/set.rs `SetName::id`):
+    /// `pubf.` and the 64 hex of the id. It names the one record holding the highest
+    /// generation this home has taken for the set (store/published.rs `keep_floor`), kept as
+    /// long as the toolchain's records are.
+    pub(crate) fn published_floor(set: &blaze_ids::ContentId) -> RootName {
+        RootName::of(b"pubf.", &set.0)
+    }
+
     fn of(word: &[u8; 5], id: &[u8; 32]) -> RootName {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut name = [0u8; ROOT_NAME_LEN];

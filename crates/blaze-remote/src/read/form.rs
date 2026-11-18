@@ -183,6 +183,9 @@ pub enum SignatureWhy {
     UnknownSigner,
     /// The signature is not the signer's over the head: blaze-ed25519's reason.
     Invalid(blaze_ed25519::Refused),
+    /// The signature stands, but the head's generation is below one this reader has taken for
+    /// its set (a rollback to an older published set: blaze-remote published/set.rs).
+    Stale { generation: u64, seen: u64 },
 }
 
 impl fmt::Display for SignatureWhy {
@@ -190,6 +193,9 @@ impl fmt::Display for SignatureWhy {
         match self {
             SignatureWhy::UnknownSigner => f.write_str("a key this blaze was not given for the namespace"),
             SignatureWhy::Invalid(why) => write!(f, "the signature is not its signer's over the head: {why}"),
+            SignatureWhy::Stale { generation, seen } => {
+                write!(f, "its generation {generation} is below the {seen} this home has taken for the set: an older set served again (a rollback), not read")
+            }
         }
     }
 }

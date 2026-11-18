@@ -56,6 +56,21 @@ pub struct Sealed<'a> {
 /// `generation`, signed by `signer`; the segments themselves are among them, unchanged. Each
 /// segment is checked whole first; one that fails, or is of another namespace, stops it by name.
 pub fn publish<'a>(namespace: Namespace, generation: u64, signer: &Signer, segments: &[&[u8]], page_entries: u32, alloc: Alloc<'a>) -> Result<Vec<Sealed<'a>, Alloc<'a>>, PublishError> {
+    publish_bound(namespace, generation, signer, None, segments, page_entries, alloc)
+}
+
+/// [`publish`], the head's signature bound to `bound` when given (a published set's id,
+/// blaze-remote published/set.rs `SetName::id`): signed over `bound || head[..HEAD_SIGNED]`, so
+/// the head stands only for the set it was made for and a head of another set is refused.
+pub fn publish_bound<'a>(
+    namespace: Namespace,
+    generation: u64,
+    signer: &Signer,
+    bound: Option<&ContentId>,
+    segments: &[&[u8]],
+    page_entries: u32,
+    alloc: Alloc<'a>,
+) -> Result<Vec<Sealed<'a>, Alloc<'a>>, PublishError> {
     assert!((1..=PAGE_ENTRIES_MOST).contains(&page_entries), "entries a page is 1..={PAGE_ENTRIES_MOST}");
     let mut out: Vec<Sealed<'a>, Alloc<'a>> = Vec::new_in(alloc);
     let mut rows: Vec<Row, Alloc<'_>> = Vec::new_in(alloc);
@@ -112,7 +127,15 @@ pub fn publish<'a>(namespace: Namespace, generation: u64, signer: &Signer, segme
     form::encode_manifest(namespace, generation, &rows, &mut manifest);
     let digest = ContentId::of(form::MANIFEST_DOMAIN, &manifest);
     let head = Head { namespace, generation, manifest: digest, manifest_len: manifest.len() as u64, signer: signer.public() };
-    let head = head.encode(|domain, body| signer.sign(domain, body));
+    let head = head.encode(|domain, body| match bound {
+        None => signer.sign(domain, body),
+        Some(bound) => {
+            let mut message = [0u8; 32 + form::HEAD_SIGNED];
+            message[..32].copy_from_slice(&bound.0);
+            message[32..].copy_from_slice(body);
+            signer.sign(domain, &message)
+        }
+    });
     // The prefix (published.md): the head, the manifest, then each row's summary in row order,
     // the same bytes as the three objects, so each part is checked as they are.
     let mut prefix = Vec::new_in(alloc);

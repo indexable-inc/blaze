@@ -19,7 +19,11 @@ use blaze_cas::plain::Namespace;
 use blaze_ids::ContentId;
 
 #[cfg(feature = "sign")]
-pub use lay::{Candidate, Laid, LayOutError, Layout, lay_out};
+pub use lay::{Candidate, Laid, LayOutError, Layout, lay_out, lay_out_bound};
+
+/// A published set's name, its id the head's signature is bound to, the reader's check of a
+/// set's head (trusted keys and the rollback floor) and the order its objects are written in.
+pub mod set;
 
 /// The lifetime class a record is rooted under (blaze-cli store/roots.rs), as the publish job
 /// is told it by the walk that found the record.
@@ -110,7 +114,7 @@ mod lay {
 
     use super::{Class, Publishable, publishable};
     use crate::read::form::PAGE_ENTRIES_MOST;
-    use crate::read::{PublishError, Sealed, publish};
+    use crate::read::{PublishError, Sealed, publish_bound};
     use crate::trust::Signer;
 
     /// One record a walk of the roots found: its key, tag, namespace, class and bytes.
@@ -179,6 +183,12 @@ mod lay {
     /// a record given twice is one), signed by `signer`: the same bytes for the same set
     /// whatever its order (rule 25).
     pub fn lay_out<'a>(candidates: &[Candidate<'_>], layout: Layout, signer: &Signer, alloc: Alloc<'a>) -> Result<Laid<'a>, LayOutError> {
+        lay_out_bound(candidates, layout, None, signer, alloc)
+    }
+
+    /// [`lay_out`], the head's signature bound to `bound` when given (a published set's id,
+    /// [`super::set::SetName::id`]; `read::publish_bound`).
+    pub fn lay_out_bound<'a>(candidates: &[Candidate<'_>], layout: Layout, bound: Option<&ContentId>, signer: &Signer, alloc: Alloc<'a>) -> Result<Laid<'a>, LayOutError> {
         if layout.segment_bytes == 0 {
             return Err(LayOutError::Layout { what: "segment bytes", value: 0 });
         }
@@ -240,7 +250,7 @@ mod lay {
         for segment in segments.iter() {
             refs.push(segment.as_slice());
         }
-        let objects = publish(Namespace::PUBLIC, layout.generation, signer, &refs, layout.page_entries, alloc).map_err(LayOutError::Publish)?;
+        let objects = publish_bound(Namespace::PUBLIC, layout.generation, signer, bound, &refs, layout.page_entries, alloc).map_err(LayOutError::Publish)?;
         Ok(Laid { objects, published: run.len() as u32, left_out, segments: segments.len() as u32 })
     }
 

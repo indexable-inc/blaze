@@ -105,7 +105,7 @@ pub mod reaped;
 )]
 pub mod shared;
 pub mod reserve;
-#[allow(unsafe_code, reason = "sigaction of SIGINT, SIGQUIT and SIGTERM in the run parent, each call behind a safe function")]
+#[allow(unsafe_code, reason = "sigaction of SIGINT, SIGQUIT and SIGTERM in the run parent, and of the stop and status signals of a command that answers, each call behind a safe function")]
 pub mod run_signals;
 pub mod signal;
 pub mod sim;
@@ -2183,6 +2183,21 @@ pub type Native = threads::Threads;
 /// in batch B1 (port27/bstd-capabilities.md), its callers then taking `&Os` from their entry.
 pub fn native(root: &std::path::Path, threads: usize) -> std::io::Result<Native> {
     os::native_in(Os::process(), root, threads)
+}
+
+/// This process's footprint now and the most it has been, in bytes, as the system counts it
+/// (macOS: its physical footprint, what Activity Monitor and memory pressure go by; Linux: its
+/// resident set now and at most): what a command's status names. `None` where the system did
+/// not answer, and off macOS and Linux.
+pub fn own_footprint() -> Option<(u64, u64)> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        raw::own_footprint().ok()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
 }
 
 #[cfg(test)]

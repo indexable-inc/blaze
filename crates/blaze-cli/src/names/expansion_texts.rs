@@ -163,6 +163,13 @@ impl<'s> ExpansionTexts<'s> {
         self.directory.len()
     }
 
+    /// The call of the directory's row `at` (`at < len()`), in the directory's order (by call
+    /// key): what a reader that lists every call of the crate walks (engine_heads.rs
+    /// `heads_of_crate`). No record is read.
+    pub(crate) fn call_at(&self, at: usize) -> Result<ItemKey, ExpansionRecordsError> {
+        Ok(self.directory.entry_at(at)?.call)
+    }
+
     /// The row of `call` and its served record: `None` when the call made no text; refused by
     /// [`ExpansionRecordsError::Missing`] when the store held no record under the row's key.
     fn row(&self, call: ItemKey) -> Result<Option<(Entry<'s>, ExpansionRecord<'s>)>, ExpansionRecordsError> {

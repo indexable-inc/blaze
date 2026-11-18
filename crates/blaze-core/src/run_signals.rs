@@ -38,6 +38,7 @@
 //! loop's next look: within one of its ticks.
 
 use core::fmt;
+use core::sync::atomic::{AtomicU8, Ordering};
 use core::time::Duration;
 
 use crate::wait::Deadline;
@@ -204,15 +205,107 @@ impl fmt::Display for SignalError {
 
 impl core::error::Error for SignalError {}
 
+/// Which signal asked a command that answers and exits (`blaze engine-check`, its
+/// engine_status.rs): a stop (SIGTERM from `timeout` or a supervisor, SIGINT from Ctrl-C) or a
+/// status (SIGINFO, the terminal's Ctrl-T on macOS; SIGUSR1, which Linux has in its place).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum By {
+    Interrupt = 1,
+    Terminate = 2,
+    Info = 3,
+    User1 = 4,
+}
+
+impl By {
+    /// The request's word back as its signal; 0 is none.
+    const fn of_code(code: u8) -> Option<By> {
+        match code {
+            1 => Some(By::Interrupt),
+            2 => Some(By::Terminate),
+            3 => Some(By::Info),
+            4 => Some(By::User1),
+            _ => None,
+        }
+    }
+
+    /// The signal's name as `kill -l` prints it, with its `SIG`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            By::Interrupt => "SIGINT",
+            By::Terminate => "SIGTERM",
+            By::Info => "SIGINFO",
+            By::User1 => "SIGUSR1",
+        }
+    }
+
+    /// The signal's number on this system: a stop's status is 128 and it, as a shell reports a
+    /// process a signal ended (POSIX.1-2017 2.8.2). SIGINFO is macOS's alone (29 there).
+    pub const fn number(self) -> u8 {
+        match self {
+            By::Interrupt => 2,
+            By::Terminate => 15,
+            By::Info => 29,
+            #[cfg(target_os = "linux")]
+            By::User1 => 10,
+            #[cfg(not(target_os = "linux"))]
+            By::User1 => 30,
+        }
+    }
+}
+
+/// The requests a command is asked by its signals while it works: two words a handler stores
+/// (a lock-free atomic store, async-signal-safe) and the command's driver reads at its
+/// scheduling points (rule 14: the driver is handed this value; no core reads a global). Made
+/// by [`Asked`] for the process's own signals, or by a test, which asks it itself.
+#[derive(Debug, Default)]
+pub struct Requests {
+    stop: AtomicU8,
+    status: AtomicU8,
+}
+
+impl Requests {
+    pub const fn new() -> Requests {
+        Requests { stop: AtomicU8::new(0), status: AtomicU8::new(0) }
+    }
+
+    /// Asked to stop by `by`. The first ask is kept: a Ctrl-C after a SIGTERM still names the
+    /// SIGTERM, which is what began the stop.
+    pub fn ask_stop(&self, by: By) {
+        let _first = self.stop.compare_exchange(0, by as u8, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// Asked for the status by `by`; asked twice before a look, it is written once.
+    pub fn ask_status(&self, by: By) {
+        self.status.store(by as u8, Ordering::Release);
+    }
+
+    /// The stop asked, if one was: it stays asked.
+    pub fn stop(&self) -> Option<By> {
+        By::of_code(self.stop.load(Ordering::Acquire))
+    }
+
+    /// The status asked since the last take, taken.
+    pub fn take_status(&self) -> Option<By> {
+        By::of_code(self.status.swap(0, Ordering::AcqRel))
+    }
+
+    /// Nothing asked: a new hold's start.
+    fn clear(&self) {
+        self.stop.store(0, Ordering::Release);
+        self.status.store(0, Ordering::Release);
+    }
+}
+
 #[cfg(unix)]
-pub use self::native::Held;
+pub use self::native::{Asked, Held};
 
 #[cfg(unix)]
 mod native {
     use core::ptr;
     use core::sync::atomic::{AtomicBool, Ordering};
 
-    use super::{ParentSignals, SignalError};
+    use super::{By, ParentSignals, Requests, SignalError};
 
     /// A SIGTERM came while held and was not taken yet. Written by [`on_terminate`] (a
     /// lock-free store, async-signal-safe), read and cleared by [`Held::take_terminate`].
@@ -254,7 +347,8 @@ mod native {
         let mut old: libc::sigaction = unsafe { core::mem::zeroed() };
         let new = new.map_or(ptr::null(), |it| it as *const libc::sigaction);
         // SAFETY: `new` is null or a `sigaction` that lives across the call; `old` is one on
-        // the stack to write. `signal` is SIGINT, SIGQUIT or SIGTERM, each catchable.
+        // the stack to write. `signal` is SIGINT, SIGQUIT, SIGTERM, SIGUSR1 or SIGINFO, each
+        // catchable.
         let done = unsafe { libc::sigaction(signal, new, &mut old) };
         match done {
             0 => Ok(old),
@@ -357,6 +451,110 @@ mod native {
         }
     }
 
+    /// The requests the process's signals make while an [`Asked`] lives: the one word a
+    /// handler can reach (a handler takes no argument). Read only through [`Asked::requests`],
+    /// which hands it to the command's driver.
+    static ASKED: Requests = Requests::new();
+
+    /// The stop signals' handler while asked: notes the request, nothing else (signal-safety(7):
+    /// a lock-free atomic compare-exchange is async-signal-safe; the match is pure).
+    extern "C" fn on_stop(signal: libc::c_int) {
+        match signal {
+            libc::SIGINT => ASKED.ask_stop(By::Interrupt),
+            libc::SIGTERM => ASKED.ask_stop(By::Terminate),
+            _ => {}
+        }
+    }
+
+    /// The status signals' handler while asked: as [`on_stop`], a store and nothing else.
+    extern "C" fn on_status(signal: libc::c_int) {
+        match signal {
+            libc::SIGUSR1 => ASKED.ask_status(By::User1),
+            #[cfg(target_os = "macos")]
+            libc::SIGINFO => ASKED.ask_status(By::Info),
+            _ => {}
+        }
+    }
+
+    /// A command's own signals while it works (engine_status.rs in blaze-cli): SIGINT and
+    /// SIGTERM caught as a stop request, SIGUSR1 (and SIGINFO on macOS) as a status request,
+    /// each into [`Asked::requests`]; the drop puts back every disposition it changed, on every
+    /// path. One holder per process with [`Held`] (dispositions are the process's): a second is
+    /// [`SignalError::AlreadyHeld`]. A stop signal this process was started with ignored stays
+    /// ignored (whoever started it asked for that: a `nohup` or a background job's SIGINT).
+    pub struct Asked {
+        interrupt: Option<libc::sigaction>,
+        terminate: Option<libc::sigaction>,
+        user1: Option<libc::sigaction>,
+        info: Option<libc::sigaction>,
+    }
+
+    /// `signal` caught by `handler`, its disposition before returned; `None` (nothing changed)
+    /// for a stop signal found ignored.
+    fn catch(signal: libc::c_int, handler: extern "C" fn(libc::c_int), keep_ignored: bool) -> Result<Option<libc::sigaction>, SignalError> {
+        let before = sigaction(signal, None)?;
+        if keep_ignored && before.sa_sigaction == libc::SIG_IGN {
+            return Ok(None);
+        }
+        let caught = disposition(handler as libc::sighandler_t);
+        sigaction(signal, Some(&caught)).map(Some)
+    }
+
+    impl Asked {
+        /// The stop and status signals caught until the drop. Refused while a [`Held`] or
+        /// another [`Asked`] lives; a `sigaction` that fails puts back what this one changed
+        /// (the drop of the part made).
+        pub fn hold() -> Result<Asked, SignalError> {
+            if HELD.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                return Err(SignalError::AlreadyHeld);
+            }
+            ASKED.clear();
+            let mut asked = Asked { interrupt: None, terminate: None, user1: None, info: None };
+            asked.interrupt = catch(libc::SIGINT, on_stop, true)?;
+            asked.terminate = catch(libc::SIGTERM, on_stop, true)?;
+            asked.user1 = catch(libc::SIGUSR1, on_status, false)?;
+            #[cfg(target_os = "macos")]
+            {
+                asked.info = catch(libc::SIGINFO, on_status, false)?;
+            }
+            Ok(asked)
+        }
+
+        /// What the signals asked: handed to the command's driver, which reads it at its
+        /// scheduling points.
+        pub fn requests(&self) -> &'static Requests {
+            &ASKED
+        }
+    }
+
+    impl Drop for Asked {
+        fn drop(&mut self) {
+            if let Some(old) = &self.info {
+                #[cfg(target_os = "macos")]
+                put_back(libc::SIGINFO, old);
+                #[cfg(not(target_os = "macos"))]
+                let _never_set = old;
+            }
+            if let Some(old) = &self.user1 {
+                put_back(libc::SIGUSR1, old);
+            }
+            if let Some(old) = &self.terminate {
+                put_back(libc::SIGTERM, old);
+            }
+            if let Some(old) = &self.interrupt {
+                put_back(libc::SIGINT, old);
+            }
+            ASKED.clear();
+            HELD.store(false, Ordering::Release);
+        }
+    }
+
+    impl core::fmt::Debug for Asked {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "Asked(interrupt caught: {}, terminate caught: {})", self.interrupt.is_some(), self.terminate.is_some())
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         //! The rules (D103 and POSIX): an ignored signal is discarded (sigaction(2): "SIG_IGN
@@ -417,9 +615,31 @@ mod native {
             drop(Held::hold_with(Plant::RestoreSkipsQuit).expect("a planted hold"));
             let planted_caught = handler(libc::SIGQUIT) != mine;
             assert!(planted_caught, "the planted drop that skips SIGQUIT is seen by the after-check");
-            sigaction(libc::SIGINT, Some(&first_int)).expect("the test's SIGINT back");
             sigaction(libc::SIGQUIT, Some(&first_quit)).expect("the test's SIGQUIT back");
-            println!("run signals: held ignores INT and QUIT, catches TERM, restores on return and unwind; the planted skipped restore is caught");
+            // A command's own signals (`Asked`), in this one function for the same reason:
+            // SIGINT and SIGTERM are a stop (the first kept), SIGUSR1 a status taken once.
+            let first_usr1 = sigaction(libc::SIGUSR1, None).expect("SIGUSR1 read");
+            {
+                let asked = Asked::hold().expect("an asked hold");
+                assert_eq!(Held::hold().map(drop), Err(SignalError::AlreadyHeld), "one holder of the dispositions: Held beside Asked");
+                assert_eq!(Asked::hold().map(drop), Err(SignalError::AlreadyHeld), "one Asked");
+                let requests = asked.requests();
+                assert_eq!(requests.stop(), None);
+                // SAFETY: SIGUSR1 is caught by `on_status` (set above), which only stores.
+                assert_eq!(unsafe { libc::raise(libc::SIGUSR1) }, 0);
+                assert_eq!(requests.take_status(), Some(By::User1), "a status asked by SIGUSR1");
+                assert_eq!(requests.take_status(), None, "taken once");
+                // SAFETY: SIGTERM is caught by `on_stop` (not ignored before), which only stores.
+                assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+                // SAFETY: SIGINT is caught by `on_stop` (the test set its own handler, not SIG_IGN).
+                assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+                assert_eq!(requests.stop(), Some(By::Terminate), "the first stop is kept");
+            }
+            assert_eq!(handler(libc::SIGINT), mine, "SIGINT back after an asked hold");
+            assert_eq!(handler(libc::SIGTERM), first_term.sa_sigaction, "SIGTERM back after an asked hold");
+            assert_eq!(handler(libc::SIGUSR1), first_usr1.sa_sigaction, "SIGUSR1 back after an asked hold");
+            sigaction(libc::SIGINT, Some(&first_int)).expect("the test's SIGINT back");
+            println!("run signals: held ignores INT and QUIT, catches TERM, restores on return and unwind; the planted skipped restore is caught; asked takes INT and TERM as a stop, USR1 as a status, and restores");
         }
     }
 }

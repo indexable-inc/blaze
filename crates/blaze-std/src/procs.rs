@@ -187,5 +187,7 @@ pub use self::linked::{
 /// The run parent's own signals while its program runs (decision D103): SIGINT and SIGQUIT
 /// ignored, SIGTERM forwarded and then the program's end waited for a bounded grace.
 pub use blaze_core::run_signals::{Arrived, GRACE, ParentSignals, Relay, RelayAct, Scripted, SignalError};
+/// A command's own stop and status requests while it works (`blaze engine-check`).
+pub use blaze_core::run_signals::{By, Requests};
 #[cfg(unix)]
-pub use blaze_core::run_signals::Held;
+pub use blaze_core::run_signals::{Asked, Held};

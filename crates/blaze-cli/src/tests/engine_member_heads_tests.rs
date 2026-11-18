@@ -3,9 +3,10 @@
 //! typed. A child of main.rs's tests, over the fixtures and helpers of its siblings.
 //!
 //! THE INVARIANT (rule 53), stated once: on a FRESH request of a workspace that checks clean,
-//! - the count "frozen now and not put: N a member's" equals the number of macro-written items'
-//!   heads asked (the one hole the rule leaves open until head tasks freeze expansions' items:
-//!   engine_seeds.rs `Placed::Unplaced`), each said "a macro wrote it", and
+//! - no member crate's head is frozen at a seed (the count "frozen now and not put: N a member
+//!   crate's" is 0): a macro-written item's head is its entry's head task's too (lane RH4,
+//!   engine_heads.rs "WRITTEN HEADS"; before it the fixtures `module-facts` and `unnamed-calls`
+//!   counted 1 and 2 here), and
 //! - no body is refused at a seed (no member head refused: none of another unit, none with no
 //!   cell, none its head task failed),
 //!
@@ -25,9 +26,6 @@ type Ids = std::vec::Vec<(std::string::String, std::string::String)>;
 /// `could_not_freeze`): none is printed on a workspace that checks clean.
 const REFUSED: [&str; 2] = ["and not under this body's unit", "a body never freezes a member's head"];
 
-/// What the member counter says each head was frozen at a seed for (engine_seeds.rs `publish`).
-const MACRO_WROTE: &str = "a macro wrote it";
-
 /// One request on `workers`: its ids, what it printed and its counts.
 fn run(io: &Io, workers: u32, fresh: bool) -> (Ids, std::string::String, engine_check::Checked) {
     let before = stdout(io).len();
@@ -35,12 +33,10 @@ fn run(io: &Io, workers: u32, fresh: bool) -> (Ids, std::string::String, engine_
     (ids, stdout(io).split_off(before), checked)
 }
 
-/// One fixture of the invariant: its name, how it is written, and the macro-written items whose
-/// heads its bodies ask (by the fixture's text: each written fn's body asks its own head).
+/// One fixture of the invariant: its name and how it is written.
 struct Fixture {
     name: &'static str,
     write: fn(&Io),
-    macro_heads: u32,
 }
 
 /// The words of a head task refused whole for two heads under one cell (engine_heads.rs
@@ -96,29 +92,29 @@ fn unnamed_calls(io: &Io) {
 }
 
 const FIXTURES: [Fixture; 7] = [
-    Fixture { name: "three_crates", write: three_crates, macro_heads: 0 },
+    Fixture { name: "three_crates", write: three_crates },
     // `#[macro_use]` on `a`, but no macro: every head is an outline entry's.
-    Fixture { name: "scope-reads (meters)", write: meters, macro_heads: 0 },
-    Fixture { name: "unit-files", write: unit_files, macro_heads: 0 },
-    // `mac`, written by `mk!()` in `app`.
-    Fixture { name: "module-facts", write: super::engine_module_facts_tests::three_members, macro_heads: 1 },
-    // `p` and `q`, written by `write_p!()` and `write_q!()`.
-    Fixture { name: "unnamed-calls", write: unnamed_calls, macro_heads: 2 },
+    Fixture { name: "scope-reads (meters)", write: meters },
+    Fixture { name: "unit-files", write: unit_files },
+    // `mac`, written by `mk!()` in `app`: its head is the head task's of the `mk!()` entry.
+    Fixture { name: "module-facts", write: super::engine_module_facts_tests::three_members },
+    // `p` and `q`, written by `write_p!()` and `write_q!()`: each call's entry's.
+    Fixture { name: "unnamed-calls", write: unnamed_calls },
     // Two impls of one trait in one file (lane RU3).
-    Fixture { name: "edit-rows (R11's two impls)", write: edit_rows, macro_heads: 0 },
+    Fixture { name: "edit-rows (R11's two impls)", write: edit_rows },
     // A toolchain head with a constant, frozen at the body's seed: not a member's.
-    Fixture { name: "refusal-causes (toolchain constant)", write: super::engine_refusal_causes_tests::toolchain_constant, macro_heads: 0 },
+    Fixture { name: "refusal-causes (toolchain constant)", write: super::engine_refusal_causes_tests::toolchain_constant },
 ];
 
 /// The invariant on one answer (module docs).
-fn holds(what: &str, text: &str, checked: &engine_check::Checked, macro_heads: u32) {
+fn holds(what: &str, text: &str, checked: &engine_check::Checked) {
     let seeds = &checked.seeds;
-    println!("{what}: member counter {} (macro-written heads asked {macro_heads}); {}\n{}", seeds.not_put.member, entries(checked), seeds_line(checked));
+    println!("{what}: member counter {}; {}\n{}", seeds.not_put.member, entries(checked), seeds_line(checked));
     // Before any assertion, on any sign of a refusal: EVERY body's note (a refused body's
     // names the head, its kind, the reader's unit and the reason: `NotTheirs`' words, or the
     // head's own freeze error) and everything the request printed (each head task's notes,
     // one a head it could not freeze, with its reason: engine_head_notes.rs).
-    if seeds.bodies.refused > 0 || seeds.not_put.member != macro_heads || checked.status.0 == Status::FAILED.0 || REFUSED.iter().any(|words| text.contains(words)) {
+    if seeds.bodies.refused > 0 || seeds.not_put.member != 0 || checked.status.0 == Status::FAILED.0 || REFUSED.iter().any(|words| text.contains(words)) {
         println!("{what}: {} body note(s), {} clean:", checked.bodies.0.len(), checked.bodies.1);
         for (at, note) in checked.bodies.0.iter().enumerate() {
             println!("{what}: note {at}: {note}");
@@ -132,10 +128,7 @@ fn holds(what: &str, text: &str, checked: &engine_check::Checked, macro_heads: u
         assert!(!text.contains(words), "{what}: no body refused for a member head ({words:?}):\n{text}");
     }
     assert_eq!(seeds.bodies.refused, 0, "{what}: no body refused at a seed:\n{}", seeds_line(checked));
-    assert_eq!(seeds.not_put.member, macro_heads, "{what}: the member counter is the macro-written items' heads asked:\n{}", seeds_line(checked));
-    for one in seeds.member_shown.iter().flatten() {
-        assert!(one.contains(MACRO_WROTE), "{what}: a member head frozen at a seed is a macro-written item's, never another: {one}");
-    }
+    assert_eq!(seeds.not_put.member, 0, "{what}: no member crate's head frozen at a seed, a macro-written one's neither:\n{}", seeds_line(checked));
 }
 
 /// THE INVARIANT on every fixture, fresh, on 1 and 8 workers; the heads line and the member
@@ -149,7 +142,7 @@ fn engine_member_heads_counted_on_fresh_requests() {
             let io = Io::simulated(SimWorld::new(23, Limits::USUAL));
             (fixture.write)(&io);
             let (_, text, checked) = run(&io, workers, true);
-            holds(&format!("{}, {workers} worker(s)", fixture.name), &text, &checked, fixture.macro_heads);
+            holds(&format!("{}, {workers} worker(s)", fixture.name), &text, &checked);
         }
     }
 }
@@ -185,13 +178,13 @@ fn engine_member_heads_follow_a_cfg_off_and_back() {
             let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
             super::engine_unit_files_tests::units_fixture(&io, false, from);
             let (_, cold_text, cold) = run(&io, workers, true);
-            holds(&format!("{what}, cold, {workers} worker(s)"), &cold_text, &cold, 0);
+            holds(&format!("{what}, cold, {workers} worker(s)"), &cold_text, &cold);
             super::engine_unit_files_tests::units_fixture(&io, false, to);
             let (moved_ids, moved_text, moved) = run(&io, workers, false);
             let (fresh_ids, fresh_text, fresh) = run(&io, workers, true);
             let what = format!("{what}, {workers} worker(s)");
-            holds(&format!("{what}, incremental"), &moved_text, &moved, 0);
-            holds(&format!("{what}, fresh"), &fresh_text, &fresh, 0);
+            holds(&format!("{what}, incremental"), &moved_text, &moved);
+            holds(&format!("{what}, fresh"), &fresh_text, &fresh);
             assert!(moved.stages[blaze_engine::Stage::Heads.index()].entered > 0, "{what}: the moved file's head tasks are entered again: {}", entries(&moved));
             assert_eq!((&moved_ids, moved.status.0), (&fresh_ids, fresh.status.0), "{what}: the incremental answer is a fresh run's: {}", entries(&moved));
             // Without the closing line, as engine_check_tests.rs `said` compares two answers.
