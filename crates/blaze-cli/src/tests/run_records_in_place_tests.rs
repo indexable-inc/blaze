@@ -6,7 +6,6 @@
 //! code_store_tests.rs opens it): each crate's whole `CrateScope` record put, committed into a
 //! segment, and read back through the one reader `blaze check` reads through.
 
-use std::alloc::Global;
 
 use blaze_cas::plain::{Lent, NotInPlace, Settings as StoreSettings};
 use blaze_core::FileName;
@@ -30,7 +29,7 @@ use crate::body_types::{LazyTrees, OpenTree, TreesSeen};
 use crate::engine_records::{EngineRecords, InPlace, ReadError, Route};
 use crate::job_texts::Packs;
 use crate::names::sections;
-use crate::store::plain_place::{Facts, PlainPlace, config, open};
+use crate::store::plain_place::{Facts, PlainPlace, StoreAlloc, config, open};
 use crate::store::{Held, Store, StoreKept};
 
 const RUST: Implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
@@ -118,9 +117,9 @@ fn stored() -> std::vec::Vec<Stored> {
 }
 
 /// Process `n` of one boot over `sim`: the command's store as `open_for_command` opens it.
-fn process(sim: Sim, n: u64) -> Lent<Sim, Global> {
+fn process(sim: Sim, n: u64) -> Lent<Sim, StoreAlloc> {
     let cfg = config(FileName::new("store").expect("a name"), &StoreSettings::default(), Facts { boot: Some(1), nonce: 9100 + n });
-    open(sim, cfg).expect("the store opens")
+    open(sim, cfg, blaze_own::testing::heap().alloc()).expect("the store opens")
 }
 
 /// The command's store over the simulation, counting its gets.

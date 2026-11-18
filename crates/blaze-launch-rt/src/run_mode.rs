@@ -1600,6 +1600,8 @@ fn stop_with(args: fmt::Arguments<'_>) -> ! {
 
 /// Writes all of `bytes` to the parent's socket, each part after a bounded wait for room.
 fn send(fd: i32, mut bytes: &[u8]) -> Result<(), RunModeError> {
+    // The socket held for the whole write, so a crash report's frame never lands inside it.
+    let _held = fault_report::hold_channel()?;
     while !bytes.is_empty() {
         let mut poll = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
         // The wait "run mode: room on the parent's socket", bounded by the ask's own bound.
@@ -1804,6 +1806,9 @@ fn control<S: RecordSource>(
         Ok(memory) => memory,
         Err(why) => return ready.put(Err(why)),
     };
+    // The crash report tells the parent where the program struck on this socket (its frame
+    // and `send`'s never interleave: `fault_report::hold_channel`).
+    fault_report::channel(fd);
     let shared = std::sync::Arc::clone(&memory.shared);
     let reader_shared = std::sync::Arc::clone(&shared);
     let reader = std::thread::Builder::new().name("blaze-run-read".to_owned()).spawn(move || read_socket(fd, reader_shared));
@@ -1934,6 +1939,8 @@ pub use thread_locals::ThreadKey;
 
 #[cfg(test)]
 mod entry_tests;
+#[cfg(test)]
+mod fault_wire_tests;
 #[cfg(test)]
 mod personality_tests;
 #[cfg(test)]

@@ -120,7 +120,12 @@ fn hello_world_runs_from_first_calls() {
         let mut used = 0;
         let mut answer = Vec::new();
         while let Some((item, took)) = split(&bytes[used..]).expect("a frame of the launcher's") {
-            let (_, Up::Need { need, .. }) = Up::decode(item).expect("a run-wire message");
+            let (_, up) = Up::decode(item).expect("a run-wire message");
+            // A fault's report is no ask: the program dies after it, and its end is the test's.
+            let Up::Need { need, .. } = up else {
+                used += took;
+                continue;
+            };
             parent.answer(need, &mut answer);
             used += took;
         }

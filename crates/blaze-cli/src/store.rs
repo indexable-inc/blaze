@@ -49,7 +49,7 @@ use crate::CliError;
 
 /// The command's store on blaze-cas's plain store: `Lent`, `PlainPlace`, the proof.
 pub(crate) mod plain_place;
-pub use plain_place::{AfterAnswer, Checked, Counts, Facts, Held, PlaceError, PlainPlace};
+pub use plain_place::{AfterAnswer, Checked, Counts, Facts, Held, PlaceError, PlainPlace, StoreAlloc};
 
 /// What keeps a record after its command: one typed root per lifetime class.
 pub(crate) mod roots;
@@ -517,17 +517,17 @@ impl Home {
 
     /// The command's store, opened lazily on the world's driver lent to [`plain_place::STORE_DIR`]
     /// (one driver a process, drive.md ruling 5): nothing is mapped until a get probes.
-    pub fn open_store(&self, settings: &Settings, facts: Facts) -> Result<Lent<bstd::io::LentDriver, Global>, CliError> {
+    pub fn open_store(&self, settings: &Settings, facts: Facts, alloc: StoreAlloc) -> Result<Lent<bstd::io::LentDriver, StoreAlloc>, CliError> {
         let driver = self.dir.lend(&Path::new(plain_place::STORE_DIR)?);
         let dir = driver.dir().clone();
-        Ok(plain_place::open(driver, plain_place::config(dir, settings, facts))?)
+        Ok(plain_place::open(driver, plain_place::config(dir, settings, facts), alloc)?)
     }
 }
 
 /// The old forms' folders, each reported by name once (one line a folder), never read, migrated
 /// or deleted. Looked for once in the home's life and once in each checkout's: the look is
 /// recorded as a root, committed with this command's records after the answer.
-pub fn old_home<D: Driver>(cx: &Cx, home: &Home, root: &Dir<ReadWrite>, checkout: &str, lent: &Lent<D, Global>, err: &Out) -> Result<u32, CliError> {
+pub fn old_home<D: Driver>(cx: &Cx, home: &Home, root: &Dir<ReadWrite>, checkout: &str, lent: &Lent<D, StoreAlloc>, err: &Out) -> Result<u32, CliError> {
     let roots = lent.roots();
     let mut checkout_root = std::string::String::with_capacity(OLD_CHECKOUT_LOOKED.len() + 16);
     checkout_root.push_str(OLD_CHECKOUT_LOOKED);
@@ -643,7 +643,7 @@ impl<'m, 'r, D: Driver> CommandStore<'m, 'r, D, ToolchainCrates> {
     /// The handle over `lent`, opened in `open_ns`, then `origin` when one is named. Past
     /// [`plain_place::SEGMENTS_NAMED_MOST`] segments named, one line says compaction is behind.
     #[expect(clippy::too_many_arguments, reason = "the store's edge: each argument one handle or fact of it")]
-    pub fn new(cx: &Cx, lent: &'m Lent<D, Global>, public_writer: bool, open_ns: u64, origin: Option<&'r NamedOrigin>, clock: Clock, err: &'r Out, alloc: Alloc<'r>) -> Result<CommandStore<'m, 'r, D>, CliError> {
+    pub fn new(cx: &Cx, lent: &'m Lent<D, StoreAlloc>, public_writer: bool, open_ns: u64, origin: Option<&'r NamedOrigin>, clock: Clock, err: &'r Out, alloc: Alloc<'r>) -> Result<CommandStore<'m, 'r, D>, CliError> {
         let remote = origin.map(|named| Remote {
             named,
             reader: Reader::new_in(Namespace::PUBLIC, &named.check, Limits::DEFAULT, alloc),
@@ -662,7 +662,7 @@ impl<'m, 'r, D: Driver> CommandStore<'m, 'r, D, ToolchainCrates> {
 }
 
 /// The command's store: the plain store on the world's lent driver.
-pub type CommandLent = Lent<bstd::io::LentDriver, Global>;
+pub type CommandLent = Lent<bstd::io::LentDriver, StoreAlloc>;
 
 /// The one store as the command's function holds it, from before the request to after the
 /// answer is printed.
@@ -676,8 +676,10 @@ pub struct Opened {
 /// The one store a user, opened as a command opens it (drive.md, "The store under the
 /// command"): the home from `HOME` (none: the typed refusal), the boot fact (none: one line,
 /// and every segment of an earlier command is checked once), the nonce from the granted `Rng`;
-/// the open maps nothing. Then the old forms are reported once ([`old_home`]).
-pub fn open_for_command(cx: &Cx, io: &bstd::io::Io, home: Option<&str>, checkout_root: &Dir<ReadWrite>, checkout: &str, clock: &Clock, err: &Out) -> Result<Opened, CliError> {
+/// the open maps nothing; the store lives in `heap`, the process's heap `main` was handed. Then
+/// the old forms are reported once ([`old_home`]).
+#[expect(clippy::too_many_arguments, reason = "the store's edge: each argument one handle or fact of it")]
+pub fn open_for_command(cx: &Cx, io: &bstd::io::Io, home: Option<&str>, checkout_root: &Dir<ReadWrite>, checkout: &str, clock: &Clock, err: &Out, heap: &'static blaze_own::Heap) -> Result<Opened, CliError> {
     let home = Home::of(cx, &io.need_fs()?, home)?;
     let boot = match io.boot() {
         Ok(boot) => {
@@ -693,7 +695,7 @@ pub fn open_for_command(cx: &Cx, io: &bstd::io::Io, home: Option<&str>, checkout
     let nonce = nonce(&mut io.need_rng()?);
     let ns = |clock: &Clock| u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
     let began = ns(clock);
-    let lent = home.open_store(&Settings::default(), Facts { boot, nonce })?;
+    let lent = home.open_store(&Settings::default(), Facts { boot, nonce }, heap.alloc())?;
     let open_ns = ns(clock).saturating_sub(began);
     old_home(cx, &home, checkout_root, checkout, &lent, err)?;
     Ok(Opened { home, lent, open_ns })
@@ -797,7 +799,7 @@ pub fn seed_root(units: &ContentId, pointer: &blaze_drive::pointers::PointerName
 /// root `root` ([`last_root`]) names (main.rs seals it with `seal::seal`). Read before the
 /// request's handle is made and never asked of an origin: a root is `LOCAL`. `None`: no root
 /// yet, or a root naming no single record (the request answers in full).
-pub fn last<'m, D: Driver>(lent: &'m Lent<D, Global>, root: &str) -> Result<Option<Held<'m>>, CliError> {
+pub fn last<'m, D: Driver>(lent: &'m Lent<D, StoreAlloc>, root: &str) -> Result<Option<Held<'m>>, CliError> {
     let place = PlainPlace::new(lent, false);
     let Some(named) = place.root(root)? else { return Ok(None) };
     let Ok(key) = <[u8; 32]>::try_from(named.bytes) else { return Ok(None) };
@@ -867,9 +869,10 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
     /// for every checkout on `toolchain` (store/roots.rs `keep_toolchain`), renewed by every
     /// command that answers with them.
     pub fn keep_toolchain(&mut self, toolchain: blaze_toolchain::ToolchainId, records: &[Key]) -> Result<(), CliError> {
-        let mut made = std::vec::Vec::with_capacity_in(records.len(), Global);
+        let alloc = *self.place.lent().alloc();
+        let mut made = std::vec::Vec::with_capacity_in(records.len(), alloc);
         made.extend(records.iter().map(|key| blaze_cas::Key(key.0)));
-        let mut beside = std::vec::Vec::new_in(Global);
+        let mut beside = std::vec::Vec::new_in(alloc);
         for record in records {
             if let Some(index) = self.place.beside(*record)? {
                 beside.push(index);
@@ -960,7 +963,7 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
             Err(PlaceError::Lent(lent @ blaze_cas::plain::LentError::TwoValues { .. })) => {
                 let held = self.place.get(key)?;
                 // A refusal alone joins the parts, to name the first differing byte.
-                let mut bytes = Vec::new_in(Global);
+                let mut bytes = Vec::new_in(*self.place.lent().alloc());
                 for part in parts {
                     bytes.extend_from_slice(part);
                 }

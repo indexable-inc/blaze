@@ -44,8 +44,8 @@ use blaze_typeck::{PNode, PTy};
 
 use crate::layout::{LayoutCx, LayoutError, LayoutId, Layouts, Prim, Tail, TagEncoding, Variants};
 
-/// The trap code of `abort_immediate`: `brk #0xfe00` on AArch64.
-pub const ABORT_TRAP: u32 = 0xfe00;
+/// The trap code of `abort_immediate`: `brk #0xfe00` on AArch64 (one home: blaze-code trap.rs).
+pub const ABORT_TRAP: u32 = blaze_code::trap::ABORT;
 
 /// An intrinsic of the table.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

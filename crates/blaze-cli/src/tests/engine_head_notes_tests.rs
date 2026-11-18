@@ -47,12 +47,14 @@ fn a_head_holding_a_constant_is_frozen_and_moves_with_its_value() {
 
 /// One package `heads`: an impl of two fns, `bad`'s signature holding a constant whose value
 /// cannot be evaluated (its initializer calls a fn that does not exist), and a caller of each.
+/// `calls_bad` names no `BAD` of its own (its argument is a parameter): a `[0; BAD]` in its body
+/// was its own lowering's refusal, before it read `bad`'s head, so its note was not `bad`'s.
 fn member_crate(io: &Io) {
     write(io, "Cargo.toml", "[package]\nname = \"heads\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
     write(
         io,
         "src/lib.rs",
-        "pub struct S;\n\npub const BAD: usize = not_defined();\n\nimpl S {\n    pub fn good(&self) -> u8 {\n        1\n    }\n\n    pub fn bad(&self, x: [u8; BAD]) -> u8 {\n        x[0]\n    }\n}\n\npub fn calls_good(s: &S) -> u8 {\n    s.good()\n}\n\npub fn calls_bad(s: &S) -> u8 {\n    s.bad([0; BAD])\n}\n",
+        "pub struct S;\n\npub const BAD: usize = not_defined();\n\nimpl S {\n    pub fn good(&self) -> u8 {\n        1\n    }\n\n    pub fn bad(&self, x: [u8; BAD]) -> u8 {\n        x[0]\n    }\n}\n\npub fn calls_good(s: &S) -> u8 {\n    s.good()\n}\n\npub fn calls_bad(s: &S, x: [u8; 4]) -> u8 {\n    s.bad(x)\n}\n",
     );
 }
 
@@ -65,7 +67,6 @@ fn member_crate(io: &Io) {
 /// "its head task failed (engine_heads.rs; the Heads stage's refusals name it)" with no head
 /// and no reason, and the failed head task's row was among the "not printed" tasks.
 #[test]
-#[ignore = "half shown (2026-11-17): the closing line prints `heads: 1 head(s) failed: the value of a constant its type holds: a body its value needs did not check: first heads::<impl>::bad`, but `calls_bad`'s note is its own lowering's `array length constant refused: Length(Check { .. cannot find function not_defined .. })` without naming `bad`, and `bad`'s body says `refused at a seed for a constant: the freeze has no constant evaluator`: the bodies' seed freezer (engine_bodies.rs `run_stretch`, `consts: None`) needs the head tasks' evaluator (engine_head_consts.rs): the next piece"]
 fn one_member_fails_alone_and_its_reason_is_printed() {
     let io = Io::simulated(SimWorld::new(19, Limits::USUAL));
     member_crate(&io);
@@ -77,7 +78,11 @@ fn one_member_fails_alone_and_its_reason_is_printed() {
         println!("{round}: {}\n{text}", entries(&checked));
         let note = lines.iter().find(|line| line.contains("body `calls_bad`")).unwrap_or_else(|| panic!("{round}: `calls_bad` is refused with a note:\n{text}"));
         assert!(note.contains("::bad` it reads could not be frozen") && note.contains(quoted), "{round}: the note names `bad` and quotes its head's reason: {note}");
-        assert!(!text.contains("body `calls_good`"), "{round}: `calls_good` is checked (`good`'s head is frozen):\n{text}");
+        // Checked: its only note may be the borrow check's (this fixture's core has no `Copy`
+        // lang item, so borrows are "not checked: a trait fact of an ADT is not known"), never
+        // a refusal of the body.
+        let refused = lines.iter().any(|line| line.contains("body `calls_good`") && !line.contains("body `calls_good`: borrows not checked"));
+        assert!(!refused, "{round}: `calls_good` is checked (`good`'s head is frozen):\n{text}");
         assert!(!text.contains("kept no reason"), "{round}: every failed head kept its reason:\n{text}");
         let grouped: std::vec::Vec<&std::string::String> = lines.iter().filter(|line| line.contains("heads: ")).collect();
         assert_eq!(grouped.len(), 1, "{round}: one reason grouped:\n{text}");

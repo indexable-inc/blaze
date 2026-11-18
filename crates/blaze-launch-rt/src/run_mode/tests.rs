@@ -225,7 +225,7 @@ fn scenario(plant: Plant) -> Seen {
     let mut needs = Vec::new_in(alloc);
     let mut up = mode.outbox();
     while let Some((item, took)) = split(up).expect("a frame") {
-        let (_, Up::Need { need, thread }) = Up::decode(item).expect("a run-wire message");
+        let (_, Up::Need { need, thread }) = Up::decode(item).expect("a run-wire message") else { panic!("the outbox holds a fault report, and nothing crashed") };
         needs.push((need, thread));
         up = &up[took..];
     }

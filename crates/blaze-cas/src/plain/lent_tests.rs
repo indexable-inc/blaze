@@ -55,7 +55,7 @@ fn big(n: u32) -> Vec<u8> {
 }
 
 /// Three committed segments (keys 0..10, 10..30, 30..60) and a lazy store over them, in a Lent.
-fn lent(seed: u64, plant: LentPlant) -> Lent<Sim, Global> {
+fn lent(seed: u64, plant: LentPlant, root: &blaze_mem::Frame) -> Lent<Sim, &blaze_mem::Frame> {
     let mut w = Driven::with(Sim::new(seed, Faults::default()), Path::new("/sim"), cfg(0)).expect("the writer opens");
     for range in [0..10u32, 10..30, 30..60] {
         for n in range {
@@ -64,17 +64,18 @@ fn lent(seed: u64, plant: LentPlant) -> Lent<Sim, Global> {
         w.commit_with(&[]).unwrap();
     }
     let r = Driven::with(w.into_driver(), Path::new("/sim"), cfg(1)).expect("the reader opens");
-    Lent::planted(r, Global, plant)
+    Lent::planted(r, root, plant)
 }
 
 /// The address of `n`'s bytes as `lent` lends them now.
-fn address(lent: &Lent<Sim, Global>, k: &Key) -> usize {
+fn address(lent: &Lent<Sim, &blaze_mem::Frame>, k: &Key) -> usize {
     lent.get(k).unwrap().expect("held").bytes.as_ptr() as usize
 }
 
 #[test]
 fn lends_keep_their_address_and_bytes_across_maps_and_chunks() {
-    let lent = lent(21, LentPlant::None);
+    let root = super::super::test_root();
+    let lent = lent(21, LentPlant::None, &root);
     // Early lends: a small own put and a record of one segment.
     lent.put(&key(1000), Namespace::LOCAL, TAG, &value(1000)).unwrap();
     let mut early = Vec::new();
@@ -102,7 +103,8 @@ fn lends_keep_their_address_and_bytes_across_maps_and_chunks() {
 
 #[test]
 fn the_planted_one_buffer_arena_moves_a_lend() {
-    let lent = lent(22, LentPlant::OneBuffer);
+    let root = super::super::test_root();
+    let lent = lent(22, LentPlant::OneBuffer, &root);
     lent.put(&key(1000), Namespace::LOCAL, TAG, &value(1000)).unwrap();
     let first = address(&lent, &key(1000));
     for n in 0..5 {
@@ -122,7 +124,8 @@ fn the_planted_one_buffer_arena_moves_a_lend() {
 fn equal_bytes_under_one_key_are_kept_and_other_bytes_refused_by_offset() {
     use super::LentError;
     use blaze_keyed::store::{Holder, Put, TwoValues};
-    let lent = lent(23, LentPlant::None);
+    let root = super::super::test_root();
+    let lent = lent(23, LentPlant::None, &root);
     // Committed by the first commit and by the second: equal bytes are the same value.
     for n in [5u32, 15] {
         assert!(matches!(lent.put(&key(n), Namespace::LOCAL, TAG, &value(n)), Ok(Put::Same)), "equal bytes of committed key {n} refused");
@@ -155,7 +158,8 @@ fn equal_bytes_under_one_key_are_kept_and_other_bytes_refused_by_offset() {
 fn a_put_of_parts_is_the_put_of_their_concatenation() {
     use super::LentError;
     use blaze_keyed::store::Put;
-    let lent = lent(24, LentPlant::None);
+    let root = super::super::test_root();
+    let lent = lent(24, LentPlant::None, &root);
     for n in 2000u32..2040 {
         let whole = value(n);
         let at = (n as usize - 2000) % whole.len();
@@ -184,8 +188,9 @@ fn a_put_of_parts_is_the_put_of_their_concatenation() {
 #[test]
 fn a_commit_frees_every_put_no_get_lent() {
     use blaze_keyed::store::Put;
+    let root = super::super::test_root();
     for plant in [LentPlant::None, LentPlant::FreesLent] {
-        let lent = lent(25, plant);
+        let lent = lent(25, plant, &root);
         // One put read before the commit (its chunk kept), then many puts no one read: a big one
         // in a chunk of its own, and small ones in a fresh chunk after the lent one.
         lent.put(&key(3000), Namespace::LOCAL, TAG, &value(3000)).unwrap();

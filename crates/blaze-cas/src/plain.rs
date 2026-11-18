@@ -6,6 +6,14 @@
 //! sync on the edit path, compaction never stops a build. Chosen per store root by
 //! `<root>/store.json` ([`settings`]); [`Opened`] is either form.
 //!
+//! # Allocation (rule 75)
+//!
+//! The store names no heap of its own: what it keeps takes its allocator as a type parameter
+//! with no default (`A: Allocator + Clone`, as [`Lent`] and [`Snapshot`] do, `Send + Sync` where
+//! a pool shares it), handed to its constructor by the caller; scratch that dies within one call
+//! takes `alloc: A` as an argument. No type here has `Default`, an allocator-less `new` or an
+//! impl fixed to one allocator, and a test makes its allocator at its top and hands it down.
+//!
 //! # On disk (`<root>/plain/`), little-endian
 //!
 //! - `head`, 4160 bytes: two 64-byte slots at 0 and 4096 (a sector apart, so a torn write of
@@ -173,6 +181,15 @@ mod pointer_tests;
 mod root_commit_tests;
 #[cfg(test)]
 mod tests;
+
+/// A test's allocator: a frame the test makes at its top and owns, handed down to every helper
+/// that builds the test's world (rule 75: no test reaches for the process's heap). Its blocks
+/// come from blaze-mem's own regions and go back when the frame drops, after everything made in
+/// it; a bump frame frees nothing before that, which no test's assertion reads.
+#[cfg(test)]
+pub(crate) fn test_root() -> blaze_mem::Frame {
+    blaze_mem::Frame::new(blaze_mem::Tag::Store).expect("a test's frame")
+}
 
 pub use self::core::{
     Batch, CACHEDIR_SIGNATURE, CACHEDIR_TAG, CARRY_ROUNDS, Committed, Found, GRACE_NS, Got, INDEX_KEYS_MOST, INDEX_TAG, INDEXED_ROOT_TAG, LEASE_NS, Liveness, Lost, Named, POINTER_LEN, POINTER_TAG,

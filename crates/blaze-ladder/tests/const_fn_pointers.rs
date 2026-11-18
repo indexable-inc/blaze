@@ -414,9 +414,9 @@ pub extern \"C-unwind\" fn main() -> i32 {
 
 /// A non-capturing CLOSURE coerced to a fn pointer in a constant item: the record names its
 /// `call_once` at `[{closure}, (u8,)]`, the instance blaze-build's `closure_fn_addr` takes for
-/// the same coercion in a body. `41 + 1` = 42.
+/// the same coercion in a body. The closure's owner is the constant `C` (reach/initializers.rs,
+/// the body-owner rule): a row of the program like a fn's. `41 + 1` = 42.
 #[test]
-#[ignore = "the next gap (2026-11-17): the evaluator and the record now name the closure's `call_once`, and the whole run stops at: `main` calls trait fn `ladder::FnOnce::call_once` with Self a closure whose owner fn no row tables ... the built-in rule for a closure whose owner fn no row tables is not built on this path (fn_shim.rs `builtin_shape`): a closure owned by a CONST item has no fn row (lane RF6)"]
 fn a_closure_coerced_in_a_const_item() {
     row(
         "closure in a const item",
@@ -482,9 +482,85 @@ pub extern \"C-unwind\" fn main() -> i32 {
 ";
 
 #[test]
-#[ignore = "the next gap (2026-11-17): a closure owned by a CONST item has no fn row: `the built-in rule for a closure whose owner fn no row tables is not built on this path (fn_shim.rs builtin_shape)` (lane RF6)"]
 fn the_thread_local_shape() {
     row("thread-local shape", THREAD_LOCAL, 3);
+}
+
+/// A closure in a STATIC initializer, coerced to a fn pointer: its owner is the static `S` (the
+/// body-owner rule). `40 + 2` = 42.
+#[test]
+#[ignore = "the static half's gap, not the owner's: the lazy path's static entry refuses a fn word (crates/blaze-ladder/src/static_entry.rs:177 `StaticRecordError::Fn`), as `a_static_holding_a_fn_pointer` shows"]
+fn a_closure_in_a_static_initializer() {
+    row(
+        "closure in a static",
+        "
+static S: fn(u8) -> u8 = |x| x + 2;
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    S(40) as i32
+}
+",
+        42,
+    );
+}
+
+/// A closure as an anonymous const's value, called at once: `const { || 9 }` is part of
+/// `main`'s body, so `main` owns the closure (the body-owner rule). 9.
+#[test]
+fn a_closure_in_an_anonymous_const_called_at_once() {
+    row(
+        "closure in an anonymous const",
+        "
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    (const { || 9u8 })() as i32
+}
+",
+        9,
+    );
+}
+
+/// A closure in an ASSOCIATED constant of an impl, coerced to a fn pointer: its owner is the
+/// impl's constant `Ops::F` (the body-owner rule; its row's target is `LowerTarget::Member`).
+/// `double(5) + 1` = 11.
+#[test]
+fn a_closure_in_an_associated_const() {
+    row(
+        "closure in an associated const",
+        "
+struct Ops;
+
+impl Ops {
+    const F: fn(u8) -> u8 = |x| double(x) + 1;
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    Ops::F(5) as i32
+}
+",
+        11,
+    );
+}
+
+/// A non-capturing closure coerced to a fn in a constant, called through the constant TWICE:
+/// one instance (the closure's `call_once` at `(u8,)`), made by the first walk and found by key
+/// on the second. `C(1) + C(2)` = `11 + 12` = 23.
+#[test]
+fn a_const_closure_called_twice_is_one_instance() {
+    twice(
+        "const closure called twice",
+        "
+const C: fn(u8) -> u8 = |x| x + 10;
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    (C(1) + C(2)) as i32
+}
+",
+        23,
+    );
 }
 
 /// The coordinator's shape 2: a `const { .. }` block whose value is a closure coerced to a fn
@@ -533,7 +609,6 @@ fn twice(name: &str, tail: &str, want: u8) {
 }
 
 #[test]
-#[ignore = "half shown (2026-11-17): its const-item half printed `second code records: reached 2, found 2, made 0`; its thread-local half stops at the const-owned closure gap (fn_shim.rs builtin_shape; lane RF6)"]
 fn a_second_run_makes_nothing_and_still_resolves() {
     twice(
         "const item",

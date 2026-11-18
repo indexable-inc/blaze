@@ -83,7 +83,7 @@ const TRAIT: &str = "pub trait Tr {\n    fn first(&self) -> u8;\n    fn bad(&sel
 
 /// Expected line: `member gaps: Tr frozen with `bad` a gap (<why>); `first` and `third` heads; BAD = 4: three heads`.
 #[test]
-#[ignore = "the fixture, not the rule (2026-11-17): `Tr`'s members cell was refused whole: `the supertrait ItemKey(..) has no library key`: this no_core fixture's trait has a supertrait the names records hold no library key for; the next piece gives the fixture its lang traits"]
+#[ignore = "the fixture, not the rule (2026-11-17, lane RH3, read not run): `Tr`'s members cell was refused whole: `the supertrait ItemKey(..) has no library key` (front2 heads.rs, the supertraits loop): the clause is the trait's implied self-size bound on `Self`, and `Keys::library_in` asks the solved `&Names` source, whose `key_beginning` is `None` by contract (source.rs, `Front2::new` files every key into ITS key map), while `SeededHeads` keys over a map of its own that starts empty. Not lang traits: the fixture must freeze over a source whose key map is filled (the engine's `&Records`, or `SeededHeadsOpts` taking `front.keys`); the next piece"]
 fn one_members_constant_is_that_members_gap() {
     let failing = format!("pub const BAD: usize = not_defined();\n{TRAIT}fn main() {{}}\n");
     let got = members_of(&failing);

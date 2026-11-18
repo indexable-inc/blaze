@@ -404,7 +404,6 @@ fn via_macro() -> i32 {
 /// writes a const block whose closure declares a `#[thread_local]` static spelling `$crate` in
 /// its type and initializer; the constant is the closure as a fn pointer.
 #[test]
-#[ignore = "the next gap (2026-11-17): `main` calls trait fn `ladder::FnOnce::call_once` with Self a closure whose owner fn no row tables (fn_shim.rs builtin_shape): the constant's closure is owned by a CONST item (lane RF6); the `$crate` cause itself passes in `a_static_a_body_macro_writes_with_dollar_crate`"]
 fn the_thread_local_shape_with_dollar_crate() {
     runs_to_three(
         "thread_local shape with dollar crate",

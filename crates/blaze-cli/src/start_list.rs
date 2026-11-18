@@ -67,7 +67,7 @@
 //! | 65 | 32 | the code record's id | zero | zero |
 
 use core::fmt;
-use std::alloc::Global;
+use std::alloc::Allocator;
 
 use blaze_cas::Key as CasKey;
 use blaze_cas::plain::{Lent, LentError, Namespace, Tag};
@@ -639,7 +639,7 @@ impl core::error::Error for ListError {}
 /// was ever written, or the store let its record go (compaction over the cap keeps a pointer's
 /// newest value, not its target): a hint lost costs a start, and the list is written again at
 /// exit.
-pub(crate) fn held<'m, D: Driver>(lent: &'m Lent<D, Global>, name: &ListName) -> Result<Option<&'m [u8]>, ListError> {
+pub(crate) fn held<'m, D: Driver, A: Allocator + Clone>(lent: &'m Lent<D, A>, name: &ListName) -> Result<Option<&'m [u8]>, ListError> {
     let target = match lent.pointed(START_LIST_TAG, &CasKey(name.0)) {
         Ok(Some(target)) => target,
         Ok(None) | Err(LentError::TargetGone { .. }) => return Ok(None),
@@ -660,7 +660,7 @@ pub(crate) enum Wrote {
 
 /// `bytes` (an [`encode`]d list) as the list `name` points at, unless `held` (what [`held`]
 /// read at the start) is these bytes already: then nothing is written.
-pub(crate) fn write<D: Driver>(lent: &Lent<D, Global>, name: &ListName, held: Option<&[u8]>, bytes: &[u8]) -> Result<Wrote, ListError> {
+pub(crate) fn write<D: Driver, A: Allocator + Clone>(lent: &Lent<D, A>, name: &ListName, held: Option<&[u8]>, bytes: &[u8]) -> Result<Wrote, ListError> {
     if held == Some(bytes) {
         return Ok(Wrote::Nothing);
     }
@@ -677,7 +677,7 @@ pub(crate) fn write<D: Driver>(lent: &Lent<D, Global>, name: &ListName, held: Op
 /// whose key has no target the store holds: named by key alone and counted, never dropped
 /// quietly (rule 3); the next run builds them again. A row's record id is a file in the records
 /// folder, not a store record: it is not the store's to keep.
-pub(crate) fn rooted_keys<D: Driver>(lent: &Lent<D, Global>, name: &ListName, bytes: &[u8], out: &mut std::vec::Vec<CasKey, Global>) -> Result<u32, ListError> {
+pub(crate) fn rooted_keys<D: Driver, A: Allocator + Clone, B: Allocator>(lent: &Lent<D, A>, name: &ListName, bytes: &[u8], out: &mut std::vec::Vec<CasKey, B>) -> Result<u32, ListError> {
     out.push(CasKey(name.0));
     out.push(CasKey(ContentId::of(RECORD_DOMAIN, bytes)));
     let mut stale = 0u32;

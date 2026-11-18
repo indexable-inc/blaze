@@ -164,8 +164,9 @@ pub trait NamesSource<'n>: Copy {
     /// Question 2: the traits method resolution may use in `module`, sorted.
     fn traits_in_scope<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError>;
 
-    /// Question 3: an enum's variants, in declaration order.
-    fn variants(self, owner: ItemKey) -> Option<&'n [Variant<&'n str>]>;
+    /// Question 3: an enum's variants, in declaration order, as the source holds them: read in
+    /// place, never copied per question ([`VariantRows`]).
+    fn variants(self, owner: ItemKey) -> Option<VariantRows<'n>>;
 
     /// The enum a variant is of and its index there (`Resolver::variant_of`).
     fn variant_of(self, variant: ItemKey) -> Option<(ItemKey, u32)>;
@@ -439,9 +440,9 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
         Names::traits_in_scope(self, module, alloc)
     }
 
-    fn variants(self, owner: ItemKey) -> Option<&'n [Variant<&'n str>]> {
+    fn variants(self, owner: ItemKey) -> Option<VariantRows<'n>> {
         let c: &'n blaze_scope::resolve::CrateNames<'n> = self.krate(Names::crate_of(self, owner)?);
-        c.tables.enums.get(&owner).map(|vs| &vs[..])
+        c.tables.enums.get(&owner).map(|vs| VariantRows::Solved(&vs[..]))
     }
 
     fn variant_of(self, variant: ItemKey) -> Option<(ItemKey, u32)> {
@@ -797,6 +798,79 @@ pub struct Opened {
     pub items: ItemsDecoded,
 }
 
+/// An enum's variants as a [`NamesSource`] holds them, in declaration order: the solve's list
+/// in memory, or the names record's rows read in place. Handed out by value (`Copy`), so no
+/// question copies a list anywhere: a per-call copy into the command's frame was a leak by
+/// design (it grew the frame by every enum every body matched on, never reset).
+#[derive(Clone, Copy)]
+pub enum VariantRows<'n> {
+    /// The solved names' list ([`Solved`]).
+    Solved(&'n [Variant<&'n str>]),
+    /// The names record's rows ([`Records`]), each decoded when it is read.
+    Record(blaze_scope::names_record::Variants<'n>),
+}
+
+impl<'n> VariantRows<'n> {
+    pub fn len(&self) -> usize {
+        match self {
+            VariantRows::Solved(list) => list.len(),
+            VariantRows::Record(rows) => rows.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Variant `i`, `None` past the last.
+    pub fn get(&self, i: usize) -> Option<Variant<&'n str>> {
+        match self {
+            VariantRows::Solved(list) => list.get(i).copied(),
+            VariantRows::Record(rows) => rows.get(i),
+        }
+    }
+
+    /// Every variant, in declaration order. The iterator borrows nothing of `self`.
+    pub fn iter(&self) -> VariantIter<'n> {
+        VariantIter { rows: *self, at: 0, end: self.len() }
+    }
+}
+
+/// Prints as the list it is (`[Variant { .. }, ..]`), whichever source holds it: a reader
+/// that compares two sources' answers by their text sees equal lists as equal.
+impl core::fmt::Debug for VariantRows<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// [`VariantRows::iter`]: each variant by value, in declaration order.
+pub struct VariantIter<'n> {
+    rows: VariantRows<'n>,
+    at: usize,
+    end: usize,
+}
+
+impl<'n> Iterator for VariantIter<'n> {
+    type Item = Variant<&'n str>;
+
+    fn next(&mut self) -> Option<Variant<&'n str>> {
+        if self.at >= self.end {
+            return None;
+        }
+        let one = self.rows.get(self.at);
+        self.at += 1;
+        one
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.end - self.at;
+        (left, Some(left))
+    }
+}
+
+impl ExactSizeIterator for VariantIter<'_> {}
+
 /// Every crate's names through its two records: the second [`NamesSource`] (as `&Records`).
 pub struct Records<'n> {
     paths: RecordNames<'n, Loader<'n>>,
@@ -805,8 +879,10 @@ pub struct Records<'n> {
     /// The caller's loader, for an expansion's text and origins ([`NamesSource::text_marks`]).
     load: &'n dyn Load<'n>,
     log: &'n Log<'n>,
-    /// The command's frame: a path's segments are copied into it for the walk (the names
-    /// record's `World` is over `&'n str`, and a caller's segments live less long).
+    /// The command's frame: what is made ONCE per records and kept for them (the lang crates'
+    /// list, [`Records::name_lang_crates`]). Nothing is put here per question: a frame is never
+    /// reset under the records, so a per-lookup copy would grow it by every body checked over
+    /// them (the guard: blaze-cli engine_bodies.rs measures it per body).
     frame: &'n blaze_mem::Frame,
     /// What [`NamesSource::key_beginning`] answered, by the 16 bytes asked: one search per key
     /// per command.
@@ -905,7 +981,8 @@ impl<'n> Records<'n> {
     /// read-only view (front2 tables/view.rs) answers a path from.
     pub fn walk_logged(&'n self, sink: &dyn blaze_scope::names_cells::CellSink, module: ItemKey, ns: Namespace, written: Written<'_, &str>) -> Result<Resolved, PathError> {
         let logged = blaze_scope::names_cells::Logged { world: &self.paths, log: sink };
-        names::path(&logged, module, ns, self.kept(written), self.alloc)
+        // The segments are read for the call alone ([`Records::walk`]'s note).
+        names::path(&logged, module, ns, written, self.alloc)
     }
 
     /// [`NamesSource::written_module`] with every cell consulted put in `sink`.
@@ -952,17 +1029,6 @@ impl<'n> Records<'n> {
                 None
             }
         }
-    }
-
-    /// `written` with its segments copied into the command's frame, so they live as long as
-    /// the names records' `World` wants (`RecordNames` is invariant in its lifetime).
-    fn kept<'w>(&self, written: Written<'w, &str>) -> Written<'n, &'n str> {
-        let frame: &'n blaze_mem::Frame = self.frame;
-        let segments: &'n [&'n str] = frame.alloc_slice_fill_with(written.segments.len(), |i| {
-            let s: &'n str = frame.alloc_str(written.segments[i]);
-            s
-        });
-        Written { kind: written.kind, segments }
     }
 
     /// In a table of `count` rows sorted by key (`key_at(i)` is row `i`'s key, `None` where the
@@ -1239,8 +1305,12 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         Some(self.items_of(krate)?.may_write_incoherent())
     }
 
+    /// The segments are read for this call alone, never kept: `RecordNames` answers
+    /// `World<N>` for EVERY name type `N` (blaze-scope names_record.rs: its scope and variant
+    /// views compare the name's bytes in place), so the walk's `N` is the caller's `&'w str` and
+    /// no segment is copied to the records' lifetime; `Resolved` and `PathError` hold none.
     fn walk(self, module: ItemKey, ns: Namespace, written: Written<'_, &str>) -> Result<Resolved, PathError> {
-        names::path(&self.paths, module, ns, self.kept(written), self.alloc)
+        names::path(&self.paths, module, ns, written, self.alloc)
     }
 
     fn written_module(self, module: ItemKey, n: u8) -> Result<ItemKey, PathError> {
@@ -1251,13 +1321,11 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         names::traits_in_scope::<&'n str, _>(&self.paths, module, alloc)
     }
 
-    fn variants(self, owner: ItemKey) -> Option<&'n [Variant<&'n str>]> {
+    fn variants(self, owner: ItemKey) -> Option<VariantRows<'n>> {
         let krate = self.paths.crate_of(owner)?;
-        // Read in place; copied into the command's frame because `NamesSource::variants` hands
-        // out a slice (a port of the trait to `Variants` removes the copy).
-        let variants = self.names_of(krate)?.variants(owner)?;
-        let frame: &'n blaze_mem::Frame = self.frame;
-        Some(frame.alloc_slice_from_iter(variants.iter()))
+        // The record's rows, read in place: nothing is copied per question (a copy into the
+        // command's frame per call grew it by every enum every body matched on: tempo, 2026-11-17).
+        Some(VariantRows::Record(self.names_of(krate)?.variants(owner)?))
     }
 
     fn variant_of(self, variant: ItemKey) -> Option<(ItemKey, u32)> {

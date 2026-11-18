@@ -22,15 +22,22 @@
 //! stays 128 + the signal and the system's crash report is still made.
 //!
 //! The names are the symbols' and records' first eight bytes in hex: the child knows no paths.
-//! The parent knows each symbol's item (TO BUILD: the line sent over the socket so the parent
-//! prints the paths; this module's [`describe`] is the one place both would read).
+//! The parent knows each symbol's item and each record's bytes, so the handler ALSO tells it
+//! where it struck ([`fault_of`]: blaze-launch wire/fault.rs `Up::Fault`, one frame with id 0)
+//! on the parent's socket ([`channel`]), and the parent says the line that names the function
+//! by its path and a trap by its reason (blaze-cli run_fault.rs). The frame is encoded on the
+//! handler's stack (`blaze_own::Inline`) and written with `write(2)`; the socket's one other
+//! writer, the control thread's `send`, holds [`hold_channel`] for each of its writes, so the
+//! fault's frame never lands inside one of its frames.
 
 use core::ffi::{c_int, c_void};
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use blaze_code::record::Symbol as CodeSymbol;
 use blaze_launch::wire::RecordId;
+use blaze_launch::wire::fault::{Fault, Placed, Signal, Spot};
+use blaze_launch::wire::run::{Symbol as WireSymbol, Up};
 
 use super::RunModeError;
 
@@ -181,11 +188,164 @@ extern "C" fn on_signal(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void
     for (i, edge) in EDGES.iter().enumerate() {
         edges[i] = edge.load(Ordering::Relaxed);
     }
+    let struck = Struck { sig, pc, address, write };
     let mut line = Line::new();
-    report(&mut line, Struck { sig, pc, address, write }, placed, &Regions { edges }, DROPPED.load(Ordering::Relaxed));
+    report(&mut line, struck, placed, &Regions { edges }, DROPPED.load(Ordering::Relaxed));
     // SAFETY: `at` live bytes of the buffer to descriptor 2; `write` is async-signal-safe.
     unsafe { libc::write(2, line.bytes.as_ptr().cast(), line.at) };
+    if let Some(fault) = fault_of(struck, placed) {
+        let told = tell_parent(&fault);
+        if let Err(why) = told {
+            let mut said = Line::new();
+            said.put(b"blaze run: (the parent was not told where: ");
+            said.put(why.as_bytes());
+            said.put(b")\n");
+            // SAFETY: as the write above.
+            unsafe { libc::write(2, said.bytes.as_ptr().cast(), said.at) };
+        }
+    }
     hand_on(sig, info, ctx);
+}
+
+/// The parent's socket, once [`channel`] named it (-1 before: no frame is sent).
+static CHANNEL: AtomicI32 = AtomicI32::new(-1);
+/// Held by whoever writes the socket: the control thread's `send`, or the handler's one frame.
+static CHANNEL_HELD: AtomicBool = AtomicBool::new(false);
+/// How many 1 ms waits a holder of the socket is waited for (rule 18): 2 s.
+const HOLD_WAITS: u32 = 2000;
+/// The room a fault's frame is encoded in on the handler's stack (a frame is under 400 bytes:
+/// two spots of 32-byte ids and short keys).
+const FRAME_ROOM: usize = 1024;
+
+/// Names the parent's socket for the crash report's frame. Called once, by the control thread,
+/// before any program code runs.
+pub fn channel(fd: c_int) {
+    CHANNEL.store(fd, Ordering::Release);
+}
+
+/// The socket held for one write by the control thread; released on drop.
+pub struct ChannelHeld(());
+
+impl Drop for ChannelHeld {
+    fn drop(&mut self) {
+        CHANNEL_HELD.store(false, Ordering::Release);
+    }
+}
+
+/// Takes the socket for one of the control thread's writes, waiting at most [`HOLD_WAITS`] ms
+/// for a crash report's frame to be written (the process then ends by its signal).
+pub fn hold_channel() -> Result<ChannelHeld, RunModeError> {
+    match take_channel() {
+        true => Ok(ChannelHeld(())),
+        false => Err(RunModeError::Socket { call: "the parent's socket, held by a crash report past 2 s (rule 18)", errno: libc::ETIMEDOUT }),
+    }
+}
+
+/// One take of [`CHANNEL_HELD`], bounded: async-signal-safe (an atomic and `poll(2)` as a 1 ms
+/// sleep).
+fn take_channel() -> bool {
+    for _ in 0..HOLD_WAITS {
+        if CHANNEL_HELD.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            return true;
+        }
+        // SAFETY: no descriptors, a 1 ms timeout: a sleep; `poll` is async-signal-safe.
+        unsafe { libc::poll(ptr::null_mut(), 0, 1) };
+    }
+    false
+}
+
+/// Where the program struck, as the parent is told it: `None` for a signal this handler does
+/// not report. Pure, so it is tested without a signal.
+pub fn fault_of(struck: Struck, rows: &[Row]) -> Option<Fault> {
+    let signal = match struck.sig {
+        libc::SIGSEGV => Signal::Segv,
+        libc::SIGBUS => Signal::Bus,
+        libc::SIGILL => Signal::Ill,
+        libc::SIGTRAP => Signal::Trap,
+        _ => return None,
+    };
+    Some(Fault {
+        signal,
+        pc: struck.pc,
+        at: struck.pc.and_then(|pc| spot(pc, rows)),
+        address: struck.address,
+        touched: spot(struck.address, rows),
+        write: struck.write,
+    })
+}
+
+/// The latest row holding `at` (rows never overlap; the latest is the one placed last).
+fn holding(at: u64, rows: &[Row]) -> Option<&Row> {
+    rows.iter().rev().find(|row| row.at <= at && at - row.at < row.len)
+}
+
+fn spot(at: u64, rows: &[Row]) -> Option<Spot> {
+    let row = holding(at, rows)?;
+    let placed = match row.kind {
+        Kind::Code => Placed::Code,
+        Kind::Relro => Placed::Relro,
+        Kind::ReadOnlyDatum => Placed::ReadOnlyDatum,
+        Kind::WritableDatum => Placed::WritableDatum,
+    };
+    Some(Spot { placed, symbol: WireSymbol(row.symbol), record: RecordId(row.record), offset: at - row.at })
+}
+
+/// `fault`'s frame (id 0) onto `out`, which must hold [`FRAME_ROOM`] bytes already reserved so
+/// the encoder never asks the allocator again.
+pub fn fault_frame<A: core::alloc::Allocator>(fault: &Fault, out: &mut std::vec::Vec<u8, A>) -> Result<(), &'static str> {
+    Up::Fault { fault: *fault }.encode(0, out).map_err(|_| "the fault's frame is longer than a frame carries")?;
+    match out.len() <= FRAME_ROOM {
+        true => Ok(()),
+        false => Err("the fault's frame outgrew its room on the handler's stack"),
+    }
+}
+
+/// Writes `fault`'s frame on the parent's socket, async-signal-safely: encoded on this stack,
+/// written whole under [`CHANNEL_HELD`], each wait bounded. `Err` says why it was not.
+fn tell_parent(fault: &Fault) -> Result<(), &'static str> {
+    let fd = CHANNEL.load(Ordering::Acquire);
+    if fd < 0 {
+        return Err("no socket named");
+    }
+    let room = blaze_own::Inline::<FRAME_ROOM>::new();
+    let mut frame: std::vec::Vec<u8, &blaze_own::Inline<FRAME_ROOM>> = match std::vec::Vec::try_with_capacity_in(FRAME_ROOM, &room) {
+        Ok(frame) => frame,
+        Err(_) => return Err("no room on the handler's stack"),
+    };
+    fault_frame(fault, &mut frame)?;
+    if !take_channel() {
+        return Err("the socket stayed held past 2 s");
+    }
+    let mut bytes: &[u8] = &frame;
+    let mut tries = 0u32;
+    let wrote = loop {
+        if bytes.is_empty() {
+            break Ok(());
+        }
+        tries += 1;
+        if tries > 64 {
+            break Err("the socket took no more bytes in 64 tries");
+        }
+        // SAFETY: `bytes` is live for the call; `write` is async-signal-safe.
+        let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if n > 0 {
+            bytes = &bytes[n as usize..];
+            continue;
+        }
+        let errno = super::errno();
+        if n < 0 && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK) {
+            let mut poll = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+            // SAFETY: one live pollfd, a 100 ms bound; `poll` is async-signal-safe.
+            unsafe { libc::poll(&mut poll, 1, 100) };
+            continue;
+        }
+        if n < 0 && errno == libc::EINTR {
+            continue;
+        }
+        break Err("the socket refused the frame");
+    };
+    CHANNEL_HELD.store(false, Ordering::Release);
+    wrote
 }
 
 /// Hands the signal to the action before ours, or puts the default back: a fault then repeats
@@ -284,8 +444,7 @@ pub fn report(line: &mut Line, struck: Struck, rows: &[Row], regions: &Regions, 
 /// What is at `at`: a placed row's `+offset in <kind> of <symbol> (record <id>)`, else the
 /// region of the reservation, else outside it.
 pub fn describe(line: &mut Line, at: u64, rows: &[Row], regions: &Regions) {
-    // The latest row holding `at` (rows never overlap; the latest is the one placed last).
-    if let Some(row) = rows.iter().rev().find(|row| row.at <= at && at - row.at < row.len) {
+    if let Some(row) = holding(at, rows) {
         line.put(b"+");
         line.hex(at - row.at);
         let what: &[u8] = match row.kind {

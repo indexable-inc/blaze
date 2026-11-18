@@ -140,7 +140,7 @@ fn run(tape: &Tape, reader: &mut Reader<'_>, world: &World, keys: &[ContentId], 
             };
             let mut delay = tape.below(1_000_000, "delay");
             let kind = match ask.object {
-                Object::Head => 1,
+                Object::Head | Object::Prefix => 1,
                 Object::Manifest(_) => 2,
                 Object::Summary(_) => 3,
                 Object::Index(_) => 4,

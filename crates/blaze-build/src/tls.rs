@@ -39,7 +39,7 @@ use blaze_typeck::ItemKey;
 use crate::data::DataError;
 
 /// The trap code of a failed allocation of a thread's table or copy ([`index`]'s getter).
-pub const NO_MEMORY_TRAP: u32 = 0xfe01;
+pub const NO_MEMORY_TRAP: u32 = blaze_code::trap::NO_MEMORY;
 
 /// A thread-local's initialiser that points into its own value: one thread's block would
 /// point into another's.

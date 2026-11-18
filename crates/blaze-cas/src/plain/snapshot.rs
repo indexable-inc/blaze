@@ -58,7 +58,7 @@
 //! it under [`super::SEGMENTS_MOST`], 16, per generation) times one index search.
 
 use core::fmt;
-use std::alloc::{Allocator, Global};
+use std::alloc::Allocator;
 
 use blaze_core::{Driver, Mapping};
 use blaze_ids::ContentId;
@@ -142,7 +142,7 @@ struct Listed {
 ///   [`tests::a_snapshot_reads_what_was_committed_before_it_through_commits_compactions_and_crashes`].
 /// - Read from many threads at once, it answers as from one. Evidence:
 ///   [`tests::a_snapshot_is_read_from_eight_threads_at_once`].
-pub struct Snapshot<A: Allocator = Global> {
+pub struct Snapshot<A: Allocator> {
     /// In probe order: the namespaces read, in order; within one, the generation's probe order.
     listed: Vec<Listed, A>,
     generation: u64,
@@ -150,10 +150,11 @@ pub struct Snapshot<A: Allocator = Global> {
 }
 
 // `Snapshot` is `Send + Sync` (the pool's workers share `&Snapshot`): a field that is not breaks
-// the build here, not a caller.
+// the build here, not a caller. Checked over blaze-mem's `Kept`, a `Send + Sync` allocator of
+// the kind a pool's caller hands it.
 const _: fn() = || {
     fn send_sync<T: Send + Sync>() {}
-    send_sync::<Snapshot<Global>>();
+    send_sync::<Snapshot<blaze_mem::Kept>>();
 };
 
 impl<A: Allocator> Snapshot<A> {

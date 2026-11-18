@@ -31,15 +31,20 @@ use blaze_core::{
 };
 use blaze_ids::ContentId;
 use blaze_keyed::kind::{Namespace, Tag};
+use blaze_mem::Frame;
 use blaze_sim::{Broke, Config as SimConfig, Tape};
 
 use super::super::{
     core::{Liveness, PlainConfig, SEGMENTS_MOST, TAGS},
     driven::{Cut, Driven},
     lent::Lent,
+    test_root,
 };
 use super::{Snapshot, SnapshotPlant};
 use crate::Key;
+
+/// A process's store, its arena in the run's frame.
+type Store<'f> = Lent<Sim, &'f Frame>;
 
 const TAG: Tag = Tag(1);
 /// The keys a history draws from: `0..KEYS`.
@@ -106,9 +111,9 @@ fn value(n: u32) -> Vec<u8> {
     bytes
 }
 
-fn open(sim: Sim, process: u64, boot: u64) -> Result<Lent<Sim, Global>, Broke> {
+fn open(sim: Sim, process: u64, boot: u64, root: &Frame) -> Result<Store<'_>, Broke> {
     let store = Driven::with(sim, Path::new("/sim"), cfg(process, boot)).map_err(|why| Broke::Oracle(format!("the store did not open in process {process}: {why}")))?;
-    Ok(Lent::new(store, Global))
+    Ok(Lent::new(store, root))
 }
 
 #[derive(Clone, Debug)]
@@ -150,14 +155,14 @@ fn op(tape: &Tape) -> Op {
 }
 
 /// A reader's snapshot and the keys committed when it was taken.
-struct Reader {
-    snapshot: Snapshot<Global>,
+struct Reader<'f> {
+    snapshot: Snapshot<&'f Frame>,
     committed: BTreeSet<u32>,
 }
 
 /// The invariant for one snapshot: `committed` (at its take) read exactly, everything else
 /// absent. `now`: what is committed now, to mark a key committed since that it does not see.
-fn sweep(tape: &Tape, reader: &Reader, now: &BTreeSet<u32>) -> Result<(), Broke> {
+fn sweep(tape: &Tape, reader: &Reader<'_>, now: &BTreeSet<u32>) -> Result<(), Broke> {
     for n in 0..=ALL {
         let got = reader.snapshot.get(&key(n)).map_err(|why| Broke::Oracle(format!("a snapshot read of key {n} was refused: {why}")))?;
         let was = reader.committed.contains(&n);
@@ -177,12 +182,14 @@ fn sweep(tape: &Tape, reader: &Reader, now: &BTreeSet<u32>) -> Result<(), Broke>
     Ok(())
 }
 
-fn take(lent: &Lent<Sim, Global>, plant: SnapshotPlant) -> Result<Snapshot<Global>, Broke> {
-    lent.snapshot_planted(Global, plant).map_err(|why| Broke::Oracle(format!("a snapshot could not be taken: {why}")))
+/// A snapshot of `lent`, its list in the same frame as the store's arena.
+fn take<'f>(lent: &Store<'f>, plant: SnapshotPlant) -> Result<Snapshot<&'f Frame>, Broke> {
+    lent.snapshot_planted(*lent.alloc(), plant).map_err(|why| Broke::Oracle(format!("a snapshot could not be taken: {why}")))
 }
 
 /// The process gone (every snapshot with it), the machine after `power`, the next process.
-fn reopen(lent: Lent<Sim, Global>, power: bool, process: &mut u64, boot: &mut u64) -> Result<Lent<Sim, Global>, Broke> {
+fn reopen<'f>(lent: Store<'f>, power: bool, process: &mut u64, boot: &mut u64) -> Result<Store<'f>, Broke> {
+    let root: &'f Frame = *lent.alloc();
     let mut sim = lent.into_store().into_driver();
     if power {
         sim.crash();
@@ -192,22 +199,24 @@ fn reopen(lent: Lent<Sim, Global>, power: bool, process: &mut u64, boot: &mut u6
         sim.processes_died();
     }
     *process += 1;
-    open(sim, *process, *boot)
+    open(sim, *process, *boot, root)
 }
 
-/// One history under `plant`: see the module's docs.
+/// One history under `plant`: see the module's docs. Each history is a run of its own: its
+/// processes' arenas and its snapshots in a frame of that run, given back before the next.
 fn history(tape: &Tape, plant: SnapshotPlant) -> Result<(), Broke> {
     let seed = tape.next_u64("sim seed");
     let ops = tape.vec(1..=80, "ops", op);
     let (mut process, mut boot) = (1u64, 1u64);
-    let mut lent = open(Sim::new(seed, Faults::default()), process, boot)?;
+    let root = test_root();
+    let mut lent = open(Sim::new(seed, Faults::default()), process, boot, &root)?;
     let mut committed: BTreeSet<u32> = BTreeSet::new();
     let mut pending: BTreeSet<u32> = BTreeSet::new();
-    let mut readers: Vec<Option<Reader>> = (0..READERS).map(|_| None).collect();
+    let mut readers: Vec<Option<Reader<'_>>> = (0..READERS).map(|_| None).collect();
     // No commit, put or compaction since the open: the store may not be whole yet.
     let mut fresh = false;
     let mut fills = 0u32;
-    let put = |lent: &Lent<Sim, Global>, n: u32, committed: &BTreeSet<u32>, pending: &mut BTreeSet<u32>| -> Result<(), Broke> {
+    let put = |lent: &Store<'_>, n: u32, committed: &BTreeSet<u32>, pending: &mut BTreeSet<u32>| -> Result<(), Broke> {
         lent.put(&key(n), Namespace::LOCAL, TAG, &value(n)).map_err(|why| Broke::Oracle(format!("a put of key {n} was refused: {why}")))?;
         if !committed.contains(&n) {
             pending.insert(n);
@@ -342,14 +351,17 @@ fn the_oracle_catches_a_snapshot_over_a_lazy_store() {
 /// committed after the take, and a key never put, read absent.
 #[test]
 fn a_snapshot_is_read_from_eight_threads_at_once() {
-    let lent = open(Sim::new(7, Faults::default()), 1, 1).expect("the store opens");
+    let root = test_root();
+    let lent = open(Sim::new(7, Faults::default()), 1, 1, &root).expect("the store opens");
     for phase in 0..4u32 {
         for n in phase * 10..phase * 10 + 10 {
             lent.put(&key(n), Namespace::LOCAL, TAG, &value(n)).expect("a put");
         }
         lent.commit().expect("a phase's commit");
     }
-    let snapshot = lent.snapshot_in(Global).expect("a snapshot after the commits");
+    // Shared by eight threads, the snapshot's list needs a `Sync` allocator, which a frame is
+    // not: blaze-mem's class pools, counted to the store's tag.
+    let snapshot = lent.snapshot_in(blaze_mem::Kept(blaze_mem::Tag::Store)).expect("a snapshot after the commits");
     // After the take: put and committed, absent through the snapshot.
     for n in 40..KEYS {
         lent.put(&key(n), Namespace::LOCAL, TAG, &value(n)).expect("a put after the snapshot");

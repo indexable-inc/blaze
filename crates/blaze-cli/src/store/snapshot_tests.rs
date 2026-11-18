@@ -14,7 +14,6 @@ use blaze_ids::ContentId;
 use bstd::io::{Io, Limits, SimWorld};
 use bstd::mem::TASK_FRAME;
 use bstd::test::BUDGET;
-use std::alloc::Global;
 
 use super::{CommandStore, Facts, Home, Store};
 
@@ -41,7 +40,8 @@ fn a_snapshot_after_a_phase_commit_reads_its_records_from_eight_threads() {
     let err = io.need_err().expect("err");
     let clock = io.need_clock().expect("a clock");
     let home = Home::of(&cx, &fs, Some(HOME)).expect("the home");
-    let lent = home.open_store(&Settings::default(), Facts { boot: Some(1), nonce: 31 }).expect("the store opens");
+    let heap = blaze_own::testing::heap();
+    let lent = home.open_store(&Settings::default(), Facts { boot: Some(1), nonce: 31 }, heap.alloc()).expect("the store opens");
     let frame = cx.frame();
     let erased = blaze_own::Erased::new(frame);
     let mut store = CommandStore::new(&cx, &lent, false, 0, None, clock, &err, erased.handle()).expect("the command's store");
@@ -49,7 +49,7 @@ fn a_snapshot_after_a_phase_commit_reads_its_records_from_eight_threads() {
         store.put(&cx, key(n), &value(n)).expect("a put");
     }
     store.commit_puts().expect("the phase's commit");
-    let snapshot = store.snapshot_in(Global).expect("a snapshot after the phase's commit");
+    let snapshot = store.snapshot_in(heap.shared()).expect("a snapshot after the phase's commit");
     // What `Store::get` reads on the command's thread: what every thread must read.
     let mut want: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
     for n in 0..RECORDS {

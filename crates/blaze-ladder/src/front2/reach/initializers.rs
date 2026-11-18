@@ -15,7 +15,21 @@
 //! [`super::queue_targets`] (a `const fn` the initializer calls, `Atom::new(1)`), its fns
 //! named as values and what the builder calls on its own by [`BackNeeds::read`], and each
 //! static or constant it names in turn (a work list, no recursion). An initializer's body is
-//! never a fn of the census (it is not built as code: the evaluator makes its bytes).
+//! never a fn of the census (it is not built as code: the evaluator makes its bytes), except
+//! as its closures' owner:
+//!
+//! THE BODY-OWNER RULE (one rule for both programs): a closure is built at its OWNER's row,
+//! and its owner is the item whose body it is written in, any item with a body: a fn, a
+//! `const` or `static` initializer, an associated constant (an anonymous `const { .. }` block
+//! is part of its enclosing body and owned by that body's item). So an initializer that
+//! writes a closure (`const C: fn(u8) -> u8 = |x| x + 1;`, std's `thread_local!` `Key { get:
+//! || .. }`) is handed back to the walk with its checked body ([`Initializers::round`]'s
+//! `owners`), and the program tables it as a row like a fn's (program.rs `make_from`, tabled.rs
+//! `table_one`: a const's head is a fn head with no inputs, by_origin.rs `Want::Fn`): run.rs
+//! `closure_owner` then finds it by `fn_index`. Its own instance is never made (nothing calls
+//! a constant: a use reads its value); only its closures' `Fn*` instances are. The lazy program
+//! tables the same owner on demand (lazy/fill.rs `target_of`, reached through fn_shim.rs
+//! `untabled_owner`).
 //!
 //! An initializer that does not lower or check is not followed here: the evaluator checks the
 //! same body when the static's value is made (consts.rs `Consts::value`, statics.rs
@@ -72,19 +86,24 @@ impl Initializers {
 
     /// Reads the initializers the bodies checked since the last round (and the entries' first
     /// bodies, once) name; queues what they reach. Whether it queued anything: the walk then
-    /// drains its list again before it asks the instances' round.
+    /// drains its list again before it asks the instances' round. Each initializer that
+    /// writes a closure is added to `bodies` (the census's) with its checked body: its
+    /// closures' owner row (the module's body-owner rule).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn round<'n>(
+    pub(super) fn round<'n, B>(
         &mut self,
         r: &mut Records<'_, 'n>,
         prepared: &Prepares<'n>,
         firsts: &[&Checked<'_>],
-        bodies: &[(Body<'n>, Checked<'static>)],
+        bodies: &mut B,
         needs: &mut BackNeeds,
         queue: &mut Vec<(ItemKey, Option<Reached>), Global>,
         fns: &mut Vec<(ItemKey, Reached), Global>,
         edges: &mut Vec<(ItemKey, ItemKey), Global>,
-    ) -> bool {
+    ) -> bool
+    where
+        B: core::ops::Deref<Target = [(Body<'n>, Checked<'static>)]> + Extend<(Body<'n>, Checked<'static>)>,
+    {
         let mut todo: Vec<(ItemKey, ItemKey), Global> = Vec::new_in(Global);
         if !self.firsts_read {
             self.firsts_read = true;
@@ -111,20 +130,33 @@ impl Initializers {
                 None => lower_member(r.names, prepared, r.keys, r.store, k),
             };
             let Ok(body) = lowered else { continue };
-            let view = body.lowered.view();
-            let Ok(spell) = Spelling::of(&view) else { continue };
-            let scope = body.scope(&spell);
-            let Ok(mut c) = check_body(r, &body, &scope) else { continue };
-            let (q, f) = (queue.len(), fns.len());
-            queue_targets(r, &scope, body.owner, &mut c, queue);
-            needs.read(r, body.owner, Some(&body), &c, queue, fns);
+            // The view, spelling and scope borrow `body`: they end with this block, so the
+            // body can be handed on below.
+            let checked = {
+                let view = body.lowered.view();
+                let Ok(spell) = Spelling::of(&view) else { continue };
+                let scope = body.scope(&spell);
+                let Ok(mut c) = check_body(r, &body, &scope) else { continue };
+                let (q, f) = (queue.len(), fns.len());
+                queue_targets(r, &scope, body.owner, &mut c, queue);
+                needs.read(r, body.owner, Some(&body), &c, queue, fns);
+                note_edges(edges, k, &queue[q..], &fns[f..]);
+                c
+            };
+            let c = checked;
             self.coerced.read(&c);
-            note_edges(edges, k, &queue[q..], &fns[f..]);
             let mut more: Vec<(ItemKey, ItemKey), Global> = Vec::new_in(Global);
             self.note(k, &c, &mut more);
             more.sort_unstable_by(|a, b| b.1.cmp(&a.1));
             todo.extend(more);
+            // The body-owner rule (module docs): an initializer that writes a closure is its
+            // closures' owner row.
+            if !c.closures.is_empty() {
+                bodies.extend(core::iter::once((body, c)));
+            }
         }
+        // An owner added here was noted above already (rule 77).
+        self.bodies_read = bodies.len();
         queue.len() > before
     }
 }

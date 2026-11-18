@@ -25,14 +25,13 @@
 //! stale entry's rebuild replaces it), committed with the entry it names.
 
 use core::cell::RefCell;
-use std::alloc::Global;
 
 use blaze_cas::Key as CasKey;
 use blaze_cas::plain::{INDEX_KEYS_MOST, Lent, LentError, Namespace, Tag};
 use blaze_core::Driver;
 use blaze_ladder::code_records::{CodeClass, CodeKey, CodeStore, StoreError};
 
-use crate::store::plain_place::COMMIT_BYTES;
+use crate::store::plain_place::{COMMIT_BYTES, StoreAlloc};
 
 /// The tag every code entry is filed under in the plain store's index: its own number, apart
 /// from the store's roots (`u16::MAX`), the startup image (`u16::MAX - 1`) and the drive's
@@ -43,7 +42,7 @@ pub(crate) const CODE_TAG: Tag = Tag(u16::MAX - 3);
 /// The code index over the command's store (the module doc). `'m` is the borrow of the
 /// command's [`Lent`]; every byte a get returns lives as long.
 pub(crate) struct HomeCodeStore<'m, D: Driver> {
-    lent: &'m Lent<D, Global>,
+    lent: &'m Lent<D, StoreAlloc>,
     /// Commits made on the command's path (the arena past `COMMIT_BYTES`).
     #[allow(dead_code, reason = "read by the tests; the profile row that shows it is owed")]
     pub commits: u32,
@@ -54,9 +53,9 @@ pub(crate) struct HomeCodeStore<'m, D: Driver> {
     /// toolchain-class write goes to `toolchain` instead (store/roots.rs `keep_toolchain`); a
     /// hit of either class is the program's too (a get does not know its class, and naming a
     /// toolchain record from the program root as well only keeps it longer).
-    reached: RefCell<std::vec::Vec<CasKey, Global>>,
+    reached: RefCell<std::vec::Vec<CasKey, StoreAlloc>>,
     /// The toolchain-class keys this run wrote: entries and pointers with their targets.
-    toolchain: std::vec::Vec<CasKey, Global>,
+    toolchain: std::vec::Vec<CasKey, StoreAlloc>,
 }
 
 /// The most keys one run's code may reach: one index's (blaze-cas `INDEX_KEYS_MOST`); one more
@@ -64,13 +63,14 @@ pub(crate) struct HomeCodeStore<'m, D: Driver> {
 const REACHED_MOST: usize = INDEX_KEYS_MOST;
 
 impl<'m, D: Driver> HomeCodeStore<'m, D> {
-    pub(crate) fn new(lent: &'m Lent<D, Global>) -> HomeCodeStore<'m, D> {
-        HomeCodeStore { lent, commits: 0, reached: RefCell::new(std::vec::Vec::new_in(Global)), toolchain: std::vec::Vec::new_in(Global) }
+    pub(crate) fn new(lent: &'m Lent<D, StoreAlloc>) -> HomeCodeStore<'m, D> {
+        let alloc = *lent.alloc();
+        HomeCodeStore { lent, commits: 0, reached: RefCell::new(std::vec::Vec::new_in(alloc)), toolchain: std::vec::Vec::new_in(alloc) }
     }
 
     /// The toolchain-class keys this run wrote, sorted, each once (the toolchain root's new
     /// index, store/roots.rs `keep_toolchain`).
-    pub(crate) fn toolchain_made(&self) -> std::vec::Vec<CasKey, Global> {
+    pub(crate) fn toolchain_made(&self) -> std::vec::Vec<CasKey, StoreAlloc> {
         let mut keys = self.toolchain.clone();
         keys.sort_unstable();
         keys.dedup();
@@ -92,7 +92,7 @@ impl<'m, D: Driver> HomeCodeStore<'m, D> {
     }
 
     /// The keys this run's code reached, sorted, each once (the program root's walk half).
-    pub(crate) fn reached(&self) -> std::vec::Vec<CasKey, Global> {
+    pub(crate) fn reached(&self) -> std::vec::Vec<CasKey, StoreAlloc> {
         let mut keys = self.reached.borrow().clone();
         keys.sort_unstable();
         keys.dedup();

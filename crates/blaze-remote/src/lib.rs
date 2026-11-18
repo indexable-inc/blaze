@@ -111,6 +111,11 @@ pub mod http;
 pub mod http3;
 pub mod name;
 pub mod privacy;
+pub mod published;
+// The published set's simulation (published.md), outside the sans-IO module it drives.
+#[cfg(all(test, feature = "sign"))]
+#[path = "published/tests.rs"]
+mod published_tests;
 pub mod pull;
 #[cfg(feature = "sign")]
 pub mod push;
@@ -162,6 +167,10 @@ pub enum Plant {
     SizeFromWire,
     /// The read path: a payload range is asked one byte late.
     RangeOffByOne,
+    /// The read path: a segment's second and later payload ranges are answered unchecked.
+    SecondRangeUnverified,
+    /// The published set: a record of a namespace other than the public one is admitted.
+    PrivateAdmitted,
 }
 
 #[cfg(test)]

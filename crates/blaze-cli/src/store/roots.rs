@@ -51,7 +51,6 @@
 
 use core::fmt;
 use core::marker::PhantomData;
-use std::alloc::Global;
 
 use blaze_cas::Key as CasKey;
 use blaze_cas::plain::{INDEX_TAG, INDEXED_ROOT_TAG, Lent, LentError, ROOT_LIFE_NS, Sliced};
@@ -59,6 +58,7 @@ use blaze_core::Driver;
 use blaze_toolchain::ToolchainId;
 
 use crate::start_list;
+use crate::store::plain_place::StoreAlloc;
 
 /// A lifetime class: which root names a record of it, so which event lets it go.
 pub(crate) trait Class {
@@ -187,9 +187,9 @@ pub(crate) struct ProgramKept {
 /// `today.name` ([`RootName::program`]) for blaze-cas `ROOT_LIFE_NS` (renewed by each run that
 /// names it again). Called once a run, after the list is written and before the commit after
 /// the answer: the index, the root and the run's records ride that one flip.
-pub(crate) fn keep_program<D: Driver>(lent: &Lent<D, Global>, today: &start_list::Today, list: Option<&[u8]>, walked: &[CasKey]) -> Result<(Rooted<Program>, ProgramKept), RootError> {
+pub(crate) fn keep_program<D: Driver>(lent: &Lent<D, StoreAlloc>, today: &start_list::Today, list: Option<&[u8]>, walked: &[CasKey]) -> Result<(Rooted<Program>, ProgramKept), RootError> {
     let root = RootName::program(&today.name);
-    let mut keys: std::vec::Vec<CasKey, Global> = std::vec::Vec::with_capacity_in(walked.len() + 64, Global);
+    let mut keys: std::vec::Vec<CasKey, StoreAlloc> = std::vec::Vec::with_capacity_in(walked.len() + 64, *lent.alloc());
     keys.extend_from_slice(walked);
     keys.extend_from_slice(&today.tables);
     let mut kept = ProgramKept::default();
@@ -222,11 +222,11 @@ pub(crate) const TOOLCHAIN_INDEXES_FOLD: usize = 64;
 /// to name: no earlier root and nothing made. `beside`: index records made with records of
 /// `made` (blaze-cas `Plain::index_beside`: a names record's expansion records), named by the
 /// root as they are, so reach keeps what they hold too (one level).
-pub(crate) fn keep_toolchain<D: Driver>(lent: &Lent<D, Global>, toolchain: ToolchainId, made: &[CasKey], beside: &[CasKey]) -> Result<Option<Rooted<Toolchain>>, RootError> {
+pub(crate) fn keep_toolchain<D: Driver>(lent: &Lent<D, StoreAlloc>, toolchain: ToolchainId, made: &[CasKey], beside: &[CasKey]) -> Result<Option<Rooted<Toolchain>>, RootError> {
     let root = RootName::toolchain(toolchain);
     let store = |why| RootError::Store { class: Toolchain::WHAT, root, why };
     let not_indexed = |key| RootError::NotIndexed { class: Toolchain::WHAT, root, key };
-    let mut indexes: std::vec::Vec<CasKey, Global> = std::vec::Vec::new_in(Global);
+    let mut indexes: std::vec::Vec<CasKey, StoreAlloc> = std::vec::Vec::new_in(*lent.alloc());
     if let Some(key) = lent.root_named(root.as_str()) {
         let Some(held) = lent.get(&key).map_err(store)? else { return Err(not_indexed(key)) };
         if held.tag != INDEXED_ROOT_TAG {
@@ -246,7 +246,7 @@ pub(crate) fn keep_toolchain<D: Driver>(lent: &Lent<D, Global>, toolchain: Toolc
     }
     if indexes.len() > TOOLCHAIN_INDEXES_FOLD {
         // One index of every key the indexes hold: its cap is the store's refusal.
-        let mut keys: std::vec::Vec<CasKey, Global> = std::vec::Vec::new_in(Global);
+        let mut keys: std::vec::Vec<CasKey, StoreAlloc> = std::vec::Vec::new_in(*lent.alloc());
         for index in &indexes {
             let Some(held) = lent.get(index).map_err(store)? else { return Err(not_indexed(*index)) };
             if held.tag != INDEX_TAG {
@@ -298,7 +298,7 @@ impl CleanupLine {
     /// the keys they name (blaze-cas `Plain::named`), its folded slice (`slice`, the commit's
     /// `take_sliced`: an aborted one swept nothing), what its commits carried forward, and the
     /// leases the head names (each flip drops the expired ones).
-    pub(crate) fn of<D: Driver>(lent: &Lent<D, Global>, slice: Option<Sliced>) -> CleanupLine {
+    pub(crate) fn of<D: Driver>(lent: &Lent<D, StoreAlloc>, slice: Option<Sliced>) -> CleanupLine {
         let named = lent.named();
         let (swept_bytes, slices) = match slice {
             Some(slice) if slice.segments > 0 && !slice.aborted => (slice.bytes_in.saturating_sub(slice.bytes_out), 1),
@@ -320,7 +320,7 @@ impl CleanupLine {
     /// the keys they name, and the leases. The slice and what the commit carries are known only
     /// after it: on `--stats` after the commit, and whole in a profile written after it (the
     /// engine's, engine_check.rs).
-    pub(crate) fn before_commit<D: Driver>(lent: &Lent<D, Global>) -> BeforeCommit {
+    pub(crate) fn before_commit<D: Driver>(lent: &Lent<D, StoreAlloc>) -> BeforeCommit {
         BeforeCommit(CleanupLine::of(lent, None))
     }
 }

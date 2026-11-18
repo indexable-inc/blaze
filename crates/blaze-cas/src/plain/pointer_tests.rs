@@ -22,13 +22,18 @@ use blaze_core::{
 };
 use blaze_ids::ContentId;
 use blaze_keyed::kind::{Namespace, Tag};
+use blaze_mem::Frame;
 
 use super::{
     core::{Batch, POINTER_TAG, Plain, PlainConfig, Plant, TAGS},
     driven::{Cut, Driven},
     lent::{Lent, LentError, LentPlant},
+    test_root,
 };
 use crate::Key;
+
+/// A process's store, its arena in the run's frame.
+type Store<'f> = Lent<Sim, &'f Frame>;
 
 const TAG: Tag = Tag(1);
 
@@ -64,13 +69,13 @@ fn value(n: u32) -> Vec<u8> {
     (0..24 + n as usize % 100).map(|i| (n as usize).wrapping_mul(29).wrapping_add(i) as u8).collect()
 }
 
-fn process(sim: Sim, n: u64, lent: LentPlant, core: Plant) -> Lent<Sim, Global> {
-    Lent::planted(Driven::planted(sim, Path::new("/sim"), cfg(n), core).expect("the store opens"), Global, lent)
+fn process(sim: Sim, n: u64, lent: LentPlant, core: Plant, root: &Frame) -> Store<'_> {
+    Lent::planted(Driven::planted(sim, Path::new("/sim"), cfg(n), core).expect("the store opens"), root, lent)
 }
 
 /// The targets `ns` put and committed by a process of their own.
-fn targets(sim: Sim, n: u64, ns: &[u32]) -> Sim {
-    let lent = process(sim, n, LentPlant::None, Plant::None);
+fn targets(sim: Sim, n: u64, ns: &[u32], root: &Frame) -> Sim {
+    let lent = process(sim, n, LentPlant::None, Plant::None, root);
     for &t in ns {
         lent.put(&target(t), Namespace::LOCAL, TAG, &value(t)).expect("a target put");
     }
@@ -79,25 +84,27 @@ fn targets(sim: Sim, n: u64, ns: &[u32]) -> Sim {
 }
 
 /// What names 0, 1 and 2 point at in a store opened on `sim`.
-fn read_names(lent: &Lent<Sim, Global>) -> Result<[Option<Key>; 3], LentError> {
+fn read_names(lent: &Store<'_>) -> Result<[Option<Key>; 3], LentError> {
     Ok([lent.pointed(TAG, &name(0))?, lent.pointed(TAG, &name(1))?, lent.pointed(TAG, &name(2))?])
 }
 
 /// The second command's commit cut at every completion, each cut followed by the process's
 /// death alone and by a power cut, then a reopen: how many reopens broke the oracle, of how
-/// many cuts.
+/// many cuts. Each cut is a run of its own, its processes' arenas in a frame of that run, given
+/// back before the next.
 fn torn(lent_plant: LentPlant, core: Plant) -> (u32, u32) {
     let old = [Some(target(0)), Some(target(1)), None];
     let new = [Some(target(10)), Some(target(1)), Some(target(11))];
     let (mut bad, mut cuts) = (0, 0);
     for at in 0..256u32 {
         for power in [false, true] {
-            let sim = targets(Sim::new(41, Faults::default()), 1, &[0, 1]);
-            let first = process(sim, 2, LentPlant::None, Plant::None);
+            let root = test_root();
+            let sim = targets(Sim::new(41, Faults::default()), 1, &[0, 1], &root);
+            let first = process(sim, 2, LentPlant::None, Plant::None, &root);
             first.point(TAG, &name(0), &target(0)).expect("a point");
             first.point(TAG, &name(1), &target(1)).expect("a point");
             first.commit().expect("the first command's commit");
-            let second = process(first.into_store().into_driver(), 3, lent_plant, core);
+            let second = process(first.into_store().into_driver(), 3, lent_plant, core, &root);
             second.cut(Some(Cut::After(at)));
             let command = || -> Result<(), LentError> {
                 for t in [10, 11] {
@@ -113,7 +120,7 @@ fn torn(lent_plant: LentPlant, core: Plant) -> (u32, u32) {
             if power {
                 sim.crash();
             }
-            let after = process(sim, 4, LentPlant::None, core);
+            let after = process(sim, 4, LentPlant::None, core, &root);
             let fine = match read_names(&after) {
                 Ok(read) => read == new || (!reached && read == old),
                 Err(error) => {
@@ -201,8 +208,8 @@ fn settle(sim: &mut Sim, procs: &mut [Proc]) {
 }
 
 /// What `name(0)` points at, read by a new process `n`.
-fn pointed_now(sim: Sim, n: u64) -> (Sim, Option<Key>) {
-    let lent = process(sim, n, LentPlant::None, Plant::None);
+fn pointed_now(sim: Sim, n: u64, root: &Frame) -> (Sim, Option<Key>) {
+    let lent = process(sim, n, LentPlant::None, Plant::None, root);
     let got = lent.pointed(TAG, &name(0)).expect("a pointer read");
     (lent.into_store().into_driver(), got)
 }
@@ -213,14 +220,15 @@ fn pointed_now(sim: Sim, n: u64) -> (Sim, Option<Key>) {
 /// than the other's commit: the later commit won 4 times, a value pointed again included`.
 #[test]
 fn of_two_processes_the_later_commit_wins() {
-    let mut sim = targets(Sim::new(43, Faults::default()), 1, &[0, 1, 2, 3]);
+    let root = test_root();
+    let mut sim = targets(Sim::new(43, Faults::default()), 1, &[0, 1, 2, 3], &root);
     let mut a = Proc::open(&mut sim, 2);
     let mut b = Proc::open(&mut sim, 3);
     let mut won = 0;
     for (n, (writer, t)) in [(0u8, 0u32), (1, 1), (0, 0), (1, 2)].into_iter().enumerate() {
         let p = if writer == 0 { &mut a } else { &mut b };
         p.point(&mut sim, t);
-        let (back, got) = pointed_now(sim, 10 + n as u64);
+        let (back, got) = pointed_now(sim, 10 + n as u64, &root);
         sim = back;
         assert_eq!(got, Some(target(t)), "commit {n}, by process {writer}, to target {t}: not the newest value");
         won += 1;
@@ -236,8 +244,9 @@ fn of_two_processes_the_later_commit_wins() {
 #[test]
 fn compaction_between_commits_keeps_the_newest_value() {
     let all: [u32; 20] = std::array::from_fn(|i| i as u32);
-    let sim = targets(Sim::new(47, Faults::default()), 1, &all);
-    let lent = process(sim, 2, LentPlant::None, Plant::None);
+    let root = test_root();
+    let sim = targets(Sim::new(47, Faults::default()), 1, &all, &root);
+    let lent = process(sim, 2, LentPlant::None, Plant::None, &root);
     let mut merges = 0;
     let mut last = 0;
     for round in 0..48u32 {
@@ -251,7 +260,7 @@ fn compaction_between_commits_keeps_the_newest_value() {
         }
     }
     assert!(merges > 0, "no compaction merged: the test did not cover a merge");
-    let (_, got) = pointed_now(lent.into_store().into_driver(), 3);
+    let (_, got) = pointed_now(lent.into_store().into_driver(), 3, &root);
     assert_eq!(got, Some(target(last)), "after a reopen");
     println!("pointer: {merges} merges between 48 commits kept the newest value of the name");
 }

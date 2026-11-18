@@ -21,6 +21,7 @@
 
 pub mod cbor;
 pub mod data;
+pub mod fault;
 mod native;
 mod personality;
 pub mod run;

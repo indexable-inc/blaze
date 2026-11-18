@@ -15,13 +15,18 @@ use blaze_core::{
 };
 use blaze_ids::ContentId;
 use blaze_keyed::kind::{Namespace, Tag};
+use blaze_mem::Frame;
 
 use super::{
     core::{Liveness, PlainConfig, Plant, TAGS},
     driven::{Cut, Driven},
     lent::{Aligned16, Lent, LentPlant, NotInPlace},
+    test_root,
 };
 use crate::Key;
+
+/// A process's store, its arena in the run's frame.
+type Store<'f> = Lent<Sim, &'f Frame>;
 
 const TAG: Tag = Tag(1);
 
@@ -55,11 +60,11 @@ fn value(n: u32) -> Vec<u8> {
     (0..1 + n as usize % 97).map(|i| (n as usize).wrapping_mul(31).wrapping_add(i) as u8).collect()
 }
 
-fn process(sim: Sim, n: u64, core: Plant) -> Lent<Sim, Global> {
-    Lent::planted(Driven::planted(sim, Path::new("/sim"), cfg(n), core).expect("the store opens"), Global, LentPlant::None)
+fn process(sim: Sim, n: u64, core: Plant, root: &Frame) -> Store<'_> {
+    Lent::planted(Driven::planted(sim, Path::new("/sim"), cfg(n), core).expect("the store opens"), root, LentPlant::None)
 }
 
-fn command(lent: &Lent<Sim, Global>, range: std::ops::Range<u32>) -> Result<(), super::lent::LentError> {
+fn command(lent: &Store<'_>, range: std::ops::Range<u32>) -> Result<(), super::lent::LentError> {
     for n in range {
         lent.put(&key(n), Namespace::LOCAL, TAG, &value(n))?;
     }
@@ -77,7 +82,7 @@ enum Read {
     Wrong,
 }
 
-fn read(lent: &Lent<Sim, Global>, n: u32) -> Read {
+fn read(lent: &Store<'_>, n: u32) -> Read {
     match lent.get(&key(n)) {
         Ok(None) => Read::Absent,
         Ok(Some(lend)) => match lend.in_place() {
@@ -114,13 +119,14 @@ fn aligned16_takes_only_bytes_at_a_multiple_of_sixteen() {
 /// from the segment's mapping, aligned.
 #[test]
 fn an_own_put_is_refused_in_place_until_its_commit() {
-    let lent = process(Sim::new(51, Faults::default()), 1, Plant::None);
+    let root = test_root();
+    let lent = process(Sim::new(51, Faults::default()), 1, Plant::None, &root);
     lent.put(&key(1), Namespace::LOCAL, TAG, &value(1)).expect("a put");
     assert_eq!(read(&lent, 1), Read::NotInPlace(NotInPlace::Arena { len: value(1).len() }));
     // The lend above marked its chunk kept; a key no get lent from is freed by the commit.
     lent.put(&key(2), Namespace::LOCAL, TAG, &value(2)).expect("a put");
     lent.commit().expect("the commit");
-    let lent = process(lent.into_store().into_driver(), 2, Plant::None);
+    let lent = process(lent.into_store().into_driver(), 2, Plant::None, &root);
     assert_eq!((read(&lent, 1), read(&lent, 2)), (Read::InPlace, Read::InPlace));
 }
 
@@ -132,7 +138,8 @@ fn an_own_put_is_refused_in_place_until_its_commit() {
 /// the names records beside it in the arena, and every reader of them was refused.
 #[test]
 fn asking_whether_a_put_is_held_keeps_no_chunk_past_its_commit() {
-    let lent = process(Sim::new(61, Faults::default()), 1, Plant::None);
+    let root = test_root();
+    let lent = process(Sim::new(61, Faults::default()), 1, Plant::None, &root);
     lent.put(&key(1), Namespace::LOCAL, TAG, &value(1)).expect("a put");
     lent.put(&key(2), Namespace::LOCAL, TAG, &value(2)).expect("a put");
     assert!(lent.holds(&key(1), &value(1)).expect("asked"), "an own put is held with its bytes");
@@ -143,7 +150,7 @@ fn asking_whether_a_put_is_held_keeps_no_chunk_past_its_commit() {
     assert!(lent.holds(&key(1), &value(1)).expect("asked"), "a committed record is held with its bytes");
     assert!(!lent.holds(&key(1), &value(2)).expect("asked"), "and not with other bytes");
 
-    let control = process(Sim::new(63, Faults::default()), 1, Plant::None);
+    let control = process(Sim::new(63, Faults::default()), 1, Plant::None, &root);
     control.put(&key(1), Namespace::LOCAL, TAG, &value(1)).expect("a put");
     control.put(&key(2), Namespace::LOCAL, TAG, &value(2)).expect("a put");
     assert!(control.get(&key(1)).expect("a get").is_some_and(|lend| lend.bytes == &value(1)[..]), "the same question, asked by a get");
@@ -157,7 +164,8 @@ fn asking_whether_a_put_is_held_keeps_no_chunk_past_its_commit() {
 /// after a reopen.
 #[test]
 fn every_record_is_aligned_after_commits_and_compactions() {
-    let lent = process(Sim::new(53, Faults::default()), 1, Plant::None);
+    let root = test_root();
+    let lent = process(Sim::new(53, Faults::default()), 1, Plant::None, &root);
     let mut merges = 0;
     let mut upto = 0u32;
     for round in 0..40u32 {
@@ -171,7 +179,7 @@ fn every_record_is_aligned_after_commits_and_compactions() {
         }
     }
     assert!(merges > 0, "no compaction merged: the test did not cover a merge");
-    let lent = process(lent.into_store().into_driver(), 2, Plant::None);
+    let lent = process(lent.into_store().into_driver(), 2, Plant::None, &root);
     let bad: Vec<u32> = (0..upto).filter(|n| read(&lent, *n) != Read::InPlace).collect();
     assert!(bad.is_empty(), "after a reopen: keys not in place {bad:?}");
     println!("aligned: {upto} records of every length mod 16 in place and aligned after 40 commits and {merges} merges, and a reopen");
@@ -179,21 +187,23 @@ fn every_record_is_aligned_after_commits_and_compactions() {
 
 /// Every cut of the second command's commit, each with and without a power cut after it: how
 /// many recoveries read a record of either command misaligned, refused or with other bytes (a
-/// second command's record may be absent when its commit did not finish).
+/// second command's record may be absent when its commit did not finish). Each cut is a run of
+/// its own, its three processes' arenas in a frame of that run, given back before the next.
 fn broken(core: Plant) -> (u32, u32) {
     let (mut broken, mut cuts) = (0, 0);
     for at in 0..256u32 {
         for power in [false, true] {
-            let first = process(Sim::new(57, Faults::default()), 1, Plant::None);
+            let root = test_root();
+            let first = process(Sim::new(57, Faults::default()), 1, Plant::None, &root);
             command(&first, 0..40).expect("the first command");
-            let second = process(first.into_store().into_driver(), 2, core);
+            let second = process(first.into_store().into_driver(), 2, core, &root);
             second.cut(Some(Cut::After(at)));
             let reached = command(&second, 100..160).is_ok();
             let mut sim = second.into_store().into_driver();
             if power {
                 sim.crash();
             }
-            let after = process(sim, 3, Plant::None);
+            let after = process(sim, 3, Plant::None, &root);
             let first_bad = (0..40).any(|n| read(&after, n) != Read::InPlace);
             let second_bad = (100..160).any(|n| match read(&after, n) {
                 Read::InPlace => false,

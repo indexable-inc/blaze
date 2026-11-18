@@ -4,7 +4,6 @@
 //! named by what they are; and writing a list equal to the one held writes nothing. The oracle is
 //! the model rows `row(n)` (rule 8), never another reader's answer.
 
-use std::alloc::Global;
 
 use blaze_cas::plain::{Lent, Settings as StoreSettings};
 use blaze_core::FileName;
@@ -16,7 +15,7 @@ use blaze_launch::wire::run::Symbol;
 use blaze_own::{AVec, Vec};
 
 use super::*;
-use crate::store::plain_place::{Facts, after_answer, config, open};
+use crate::store::plain_place::{Facts, StoreAlloc, after_answer, config, open};
 
 /// Model row `n`: every word distinct from every other row's.
 fn row(n: u32) -> Row {
@@ -32,12 +31,12 @@ fn rows(count: u32) -> std::vec::Vec<Row> {
     (0..count).map(row).collect()
 }
 
-fn process(sim: Sim, n: u64) -> Lent<Sim, Global> {
+fn process(sim: Sim, n: u64) -> Lent<Sim, StoreAlloc> {
     let cfg = config(FileName::new("store").expect("a name"), &StoreSettings::default(), Facts { boot: Some(1), nonce: 9000 + n });
-    open(sim, cfg).expect("the store opens")
+    open(sim, cfg, blaze_own::testing::heap().alloc()).expect("the store opens")
 }
 
-fn back(lent: Lent<Sim, Global>) -> Sim {
+fn back(lent: Lent<Sim, StoreAlloc>) -> Sim {
     lent.into_store().into_driver()
 }
 

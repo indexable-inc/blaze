@@ -33,10 +33,11 @@ mod wide;
 pub(crate) use float_width::FloatWidth;
 
 /// `brk` immediates of the traps the pass makes itself; a LIR `trap`'s code is its own `brk`
-/// immediate, so codes from here up are refused.
-pub(crate) const BRK_DIV_ZERO: u32 = 0xff00;
-pub(crate) const BRK_DIV_OVERFLOW: u32 = 0xff01;
-pub(crate) const BRK_UNREACHABLE: u32 = 0xff02;
+/// immediate, so codes from here up are refused. Their one home is blaze-code trap.rs, which
+/// says what each means when a run stops on it.
+pub(crate) const BRK_DIV_ZERO: u32 = blaze_code::trap::DIV_ZERO;
+pub(crate) const BRK_DIV_OVERFLOW: u32 = blaze_code::trap::DIV_OVERFLOW;
+pub(crate) const BRK_UNREACHABLE: u32 = blaze_code::trap::UNREACHABLE;
 
 /// The frame's bound: every `sp` offset is reached by at most two `add`s of 12 bits.
 const FRAME_LIMIT: u64 = 1 << 24;

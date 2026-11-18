@@ -23,6 +23,7 @@ use core::marker::PhantomData;
 use std::alloc::{Allocator, Global};
 
 use blaze_cas::Key as CasKey;
+use blaze_own::Alloc;
 use blaze_cas::plain::{Driven, Lent, LentCounts, LentError, Liveness, PlainConfig, Probes, ROOT_LIFE_NS, Settings, Snapshot, SnapshotError};
 use blaze_core::{Driver, FileName};
 use blaze_drive::Key;
@@ -30,6 +31,11 @@ use blaze_keyed::kind::{Namespace, Tag};
 use blaze_keyed::store::StoreError;
 
 use super::roots::{Answer, Rooted};
+
+/// The allocator the command's store lives in: the process's heap, as the handle `main` was
+/// handed (`heap.alloc()` of its `&'static blaze_own::Heap`, D120), passed down to [`open`].
+/// The `Lent`'s arena and every scratch list about the store are made in it.
+pub type StoreAlloc = Alloc<'static>;
 
 /// The store's folder under blaze's folder in the home (drive.md ruling 1).
 pub(crate) const STORE_DIR: &str = "v2/store";
@@ -124,11 +130,11 @@ pub(crate) fn config(dir: FileName, settings: &Settings, facts: Facts) -> PlainC
 }
 
 /// The store opened lazily over `driver` (nothing mapped: a segment is mapped at its first
-/// probe), owned by a [`Lent`] whose arena is on the global heap, named (rule 11).
-pub fn open<D: Driver>(driver: D, cfg: PlainConfig) -> Result<Lent<D, Global>, PlaceError> {
+/// probe), owned by a [`Lent`] whose arena is in `alloc`, the caller's (rule 75).
+pub fn open<D: Driver>(driver: D, cfg: PlainConfig, alloc: StoreAlloc) -> Result<Lent<D, StoreAlloc>, PlaceError> {
     // The root path is read only by the native pread path, which this module never takes.
     let store = Driven::with(driver, std::path::Path::new("/"), cfg).map_err(|why| PlaceError::Open { why })?;
-    Ok(Lent::new(store, Global))
+    Ok(Lent::new(store, alloc))
 }
 
 /// The proof that [`Held::bytes`] are the bytes filed under the key asked (rule 74). Only this
@@ -181,7 +187,7 @@ pub struct Counts {
 /// The store handle the command's `Store` seam is implemented on: the namespace a record goes
 /// to is decided here (drive.md ruling 2), every byte lives in the `Lent`.
 pub struct PlainPlace<'m, D: Driver> {
-    lent: &'m Lent<D, Global>,
+    lent: &'m Lent<D, StoreAlloc>,
     /// Whether this machine may write [`Namespace::PUBLIC`] (a trusted builder).
     public_writer: bool,
     plant: PlacePlant,
@@ -191,11 +197,11 @@ pub struct PlainPlace<'m, D: Driver> {
 
 impl<'m, D: Driver> PlainPlace<'m, D> {
     /// `public_writer`: whether the settings name this machine a trusted writer.
-    pub fn new(lent: &'m Lent<D, Global>, public_writer: bool) -> PlainPlace<'m, D> {
+    pub fn new(lent: &'m Lent<D, StoreAlloc>, public_writer: bool) -> PlainPlace<'m, D> {
         PlainPlace::planted(lent, public_writer, PlacePlant::None)
     }
 
-    pub(crate) fn planted(lent: &'m Lent<D, Global>, public_writer: bool, plant: PlacePlant) -> PlainPlace<'m, D> {
+    pub(crate) fn planted(lent: &'m Lent<D, StoreAlloc>, public_writer: bool, plant: PlacePlant) -> PlainPlace<'m, D> {
         PlainPlace { lent, public_writer, plant, commits: 0, segments_written: 0 }
     }
 
@@ -214,7 +220,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// The record under `key`, in place, for `'m`: this command's own put, else the committed
     /// record of the first namespace read that holds it. `None`: absent.
     pub fn get(&self, key: Key) -> Result<Option<Held<'m>>, PlaceError> {
-        let lent: &'m Lent<D, Global> = self.lent;
+        let lent: &'m Lent<D, StoreAlloc> = self.lent;
         Ok(lent.get(&CasKey(key.0))?.map(|lend| Held { bytes: lend.bytes, proof: Checked { _private: PhantomData }, place: lend.in_place() }))
     }
 
@@ -273,7 +279,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         if self.plant == PlacePlant::ForgetsPin {
             return Ok(Rooted::new(CasKey(blaze_ids::ContentId([0; 32]))));
         }
-        let mut cas = Vec::with_capacity_in(keys.len(), Global);
+        let mut cas = Vec::with_capacity_in(keys.len(), *self.lent.alloc());
         cas.extend(keys.iter().map(|key| CasKey(key.0)));
         Ok(Rooted::new(self.lent.root_for(name, &cas, ROOT_LIFE_NS)?))
     }
@@ -287,9 +293,9 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         if self.plant == PlacePlant::ForgetsPin {
             return Ok(Rooted::new(CasKey(blaze_ids::ContentId([0; 32]))));
         }
-        let mut cas = Vec::with_capacity_in(keys.len(), Global);
+        let mut cas = Vec::with_capacity_in(keys.len(), *self.lent.alloc());
         cas.extend(keys.iter().map(|key| CasKey(key.0)));
-        let mut indexes = Vec::with_capacity_in(owners.len() + 1, Global);
+        let mut indexes = Vec::with_capacity_in(owners.len() + 1, *self.lent.alloc());
         indexes.push(self.lent.index(&cas)?);
         for owner in owners {
             if let Some(beside) = self.beside(*owner)? {
@@ -309,7 +315,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         let Some(key) = self.lent.root_named(name) else { return Ok(false) };
         let Some(held) = self.lent.get(&key)? else { return Ok(false) };
         let indexed = held.tag == blaze_cas::plain::INDEXED_ROOT_TAG;
-        let mut named: Vec<CasKey, Global> = Vec::with_capacity_in(held.bytes.len() / 32, Global);
+        let mut named: Vec<CasKey, StoreAlloc> = Vec::with_capacity_in(held.bytes.len() / 32, *self.lent.alloc());
         named.extend(held.bytes.chunks_exact(32).map(|it| CasKey(blaze_ids::ContentId(it.try_into().expect("32 bytes")))));
         if indexed {
             self.lent.root_through(name, &named, life_ns)?;
@@ -322,7 +328,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// The index of the records `owner` was put with, filed beside it (blaze-cas
     /// `Plain::index_beside`): put with its owner, before any root names it.
     pub(crate) fn index_beside(&self, owner: Key, keys: &[Key]) -> Result<CasKey, PlaceError> {
-        let mut cas = Vec::with_capacity_in(keys.len(), Global);
+        let mut cas = Vec::with_capacity_in(keys.len(), *self.lent.alloc());
         cas.extend(keys.iter().map(|key| CasKey(key.0)));
         Ok(self.lent.index_beside(CasKey(owner.0), &cas)?)
     }
@@ -336,7 +342,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
 
     /// The store's owner, for a class root of store/roots.rs written beside the engine's
     /// (the toolchain's, [`super::roots::keep_toolchain`]).
-    pub(crate) fn lent(&self) -> &'m Lent<D, Global> {
+    pub(crate) fn lent(&self) -> &'m Lent<D, StoreAlloc> {
         self.lent
     }
 
@@ -386,7 +392,7 @@ pub struct AfterAnswer {
 /// roots, set before, keep what it made); the commit of what is left as one segment a namespace
 /// and ONE flip, which names the slice too; then the exit tail's seal. No lock is taken for
 /// cleanup, so no command waits on it (blaze-cas `Driven::fold_slice`).
-pub fn after_answer<D: Driver>(lent: &Lent<D, Global>, slices: u32) -> Result<AfterAnswer, PlaceError> {
+pub fn after_answer<D: Driver>(lent: &Lent<D, StoreAlloc>, slices: u32) -> Result<AfterAnswer, PlaceError> {
     if slices > 0 {
         lent.fold_slice()?;
     }

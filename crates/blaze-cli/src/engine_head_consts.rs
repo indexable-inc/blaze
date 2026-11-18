@@ -27,11 +27,12 @@ use blaze_engine::CellId;
 use blaze_id::ItemKey as LibKey;
 use blaze_ladder::front2::consts::ConstFail;
 use blaze_ladder::front2::heads::{Store, Want};
-use blaze_ladder::front2::index::Index;
+use blaze_ladder::front2::index::{Index, LangTwice};
 use blaze_ladder::front2::keys::{Keys, MemberKind, checker_of, member_key_of};
 use blaze_ladder::front2::source::{NamesSource, Records};
 use blaze_ladder::front2::tables::head::{ConstValues, StoreConsts};
-use blaze_ladder::front2::tables::recorder::TableRead;
+use blaze_ladder::front2::tables::recorder::{MOST_READS, ReadSink, ReadsFull, TableRead};
+use blaze_ladder::front2::tables::view::Tables;
 use blaze_own::Alloc;
 use blaze_scope::names_cells::NameCell;
 use blaze_scope::prepares::Prepares;
@@ -67,31 +68,160 @@ impl<'n, S: NamesSource<'n>> ConstValues<'n> for HeadConsts<'_, 'n, S> {
     }
 }
 
-/// Why an evaluation's read could not be placed (rule 21: a read no edit can move is refused).
+/// The lang index a freeze's constant evaluator reads (front2 index.rs `Index`), over the view
+/// `tables` with its reads into `reads`: the one home of the evaluator's index, which a head
+/// task (engine_heads.rs `heads_of`, once a job) and a body stretch's seed freezer
+/// (engine_bodies.rs `run_stretch`, once a stretch) both build by it, each then evaluating
+/// through [`HeadConsts`].
+pub(crate) fn lang_index<'n>(tables: Tables<'_, 'n>, reads: &dyn ReadSink, lang: &[usize]) -> Result<Index<'n>, LangTwice> {
+    Index::from_source(tables.reading_into(reads), lang)
+}
+
+/// What a body stretch's evaluator read (engine_bodies.rs `run_stretch`), kept as it grows so
+/// each body's read list can take what was read up to its end: a stretch's [`HeadConsts`]
+/// serves every body of it, and its prepared set is the stretch's, so a body takes every read
+/// the evaluator made until then (a superset of its own: never a read missed, rule 21). At
+/// most [`MOST_READS`] reads (rule 18); past it, [`EvalSink::reads`] refuses.
+pub(crate) struct EvalSink<'a> {
+    reads: core::cell::RefCell<blaze_own::Vec<TableRead, Alloc<'a>>>,
+    full: core::cell::Cell<bool>,
+}
+
+impl<'a> EvalSink<'a> {
+    pub(crate) fn new(alloc: Alloc<'a>) -> EvalSink<'a> {
+        EvalSink { reads: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)), full: core::cell::Cell::new(false) }
+    }
+
+    /// How many reads it holds.
+    pub(crate) fn len(&self) -> usize {
+        self.reads.borrow().len()
+    }
+
+    /// Each read it holds, in order, or [`ReadsFull`] past its cap.
+    pub(crate) fn reads(&self, each: &mut dyn FnMut(TableRead)) -> Result<(), ReadsFull> {
+        if self.full.get() {
+            return Err(ReadsFull { most: MOST_READS });
+        }
+        for one in self.reads.borrow().iter() {
+            each(*one);
+        }
+        Ok(())
+    }
+}
+
+impl ReadSink for EvalSink<'_> {
+    fn read(&self, read: TableRead) {
+        let mut reads = self.reads.borrow_mut();
+        // The same read again (an evaluation reads one cell many times): kept once in a row.
+        if reads.last() == Some(&read) {
+            return;
+        }
+        if reads.len() >= MOST_READS {
+            self.full.set(true);
+            return;
+        }
+        reads.push(read);
+    }
+}
+
+/// Why an evaluation's read of item `key`'s text could not be placed (rule 21: a read no edit
+/// can move is refused, rule 19: naming the item).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Unplaced;
+pub(crate) struct Unplaced {
+    pub(crate) key: LibKey,
+    pub(crate) why: UnplacedWhy,
+}
+
+/// Which step of [`text_cell`] found no crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnplacedWhy {
+    /// Its key's crate prefix (its first 8 bytes) is no crate's of the records: an item of a
+    /// crate outside the scope (a proc-macro crate, another unit's), or a key made with no
+    /// crate's prefix.
+    NoCrate,
+    /// Its crate is the records' crate `at`, which has no crate key.
+    NoCrateKey { at: usize },
+}
+
+/// [`Unplaced`] with the names of the scope's crates it was looked for in: what a refusal
+/// prints (`crates` cut to the first [`MOST_NAMED_CRATES`]).
+pub(crate) struct UnplacedIn<'u, 'c> {
+    pub(crate) unplaced: &'u Unplaced,
+    pub(crate) crates: &'c [crate::run_names::Crate<'c>],
+}
+
+/// The most scope crates an [`UnplacedIn`] names; past it, their count.
+const MOST_NAMED_CRATES: usize = 8;
+
+impl core::fmt::Display for UnplacedIn<'_, '_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let key = self.unplaced.key;
+        let prefix = u64::from_be_bytes(key.crate_prefix());
+        match self.unplaced.why {
+            UnplacedWhy::NoCrate => write!(f, "the item of key {key:x} (crate prefix {prefix:016x}) is of no crate of its scope's {} crate(s)", self.crates.len())?,
+            UnplacedWhy::NoCrateKey { at } => write!(f, "the item of key {key:x} is of its scope's crate {at}, which has no crate key")?,
+        }
+        for (i, one) in self.crates.iter().take(MOST_NAMED_CRATES).enumerate() {
+            let sep = if i == 0 { ": " } else { ", " };
+            write!(f, "{sep}`{}` ({:016x})", one.name, u64::from_be_bytes(one.records.key.prefix()))?;
+        }
+        if self.crates.len() > MOST_NAMED_CRATES {
+            write!(f, " and {} more", self.crates.len() - MOST_NAMED_CRATES)?;
+        }
+        f.write_str(" (engine_head_consts.rs `text_cell`)")
+    }
+}
 
 /// Each cell that moves when a text the evaluation read moves (module docs), given to `each`.
 pub(crate) fn eval_reads<'n>(records: &'n Records<'n>, subjects: &Subjects, reads: &[TableRead], each: &mut dyn FnMut(CellId)) -> Result<(), Unplaced> {
     for one in reads.iter() {
         if let TableRead::Names(NameCell::Item { key }) = one {
-            each(text_cell(records, subjects, *key).ok_or(Unplaced)?);
+            if let Some(cell) = text_cell(records, subjects, *key)? {
+                each(cell);
+            }
         }
     }
     Ok(())
 }
 
-/// The cell that moves when item `key`'s text does: its file's outline `WHOLE` when a member's
-/// file holds it, else its crate's names record whole (a dependency's text, or one a macro
-/// wrote). `None`: its crate is none of `records`'.
-pub(crate) fn text_cell<'n>(records: &'n Records<'n>, subjects: &Subjects, key: LibKey) -> Option<CellId> {
-    let k = NamesSource::crate_of(records, key)?;
-    let krate = NamesSource::crate_key(records, k)?;
+/// The cell that moves when item `key`'s text does, by where the text is:
+/// - an item of a member's file (`At::File` of a file the members' outlines hold): that file's
+///   outline `WHOLE`;
+/// - a dependency crate's item (its constant, a const fn it calls): its crate's names record
+///   `WHOLE`, which holds every text of that crate;
+/// - an item a macro expansion wrote (`At::Expansion`), and an anonymous constant (front2
+///   anon.rs `need_key`, of its module's crate prefix, with no place): its crate's names record
+///   `WHOLE`, which holds the expansion's text (coarse: any edit of that crate moves it).
+///
+/// `None`: a builtin type (`u8`, `usize`, `str`: blaze-scope builtin.rs, a key of the prefix
+/// `builtin\0`): it has no text and no crate, and is the same in every crate and on every
+/// machine, so reading it is a function of the tool alone, which every task's key holds: no
+/// cell. (On real projects every head whose constants' evaluation named a primitive was refused
+/// here as "of no crate of its scope": clap, serde, thiserror and a plain crate, 2026-11-17.)
+///
+/// Refused, naming the item, only when no crate of `records` holds it ([`Unplaced`]).
+pub(crate) fn text_cell<'n>(records: &'n Records<'n>, subjects: &Subjects, key: LibKey) -> Result<Option<CellId>, Unplaced> {
+    if has_no_text(key) {
+        return Ok(None);
+    }
+    text_cell_of(records, subjects, key).map(Some)
+}
+
+/// Whether `key` is a builtin type's (its first eight bytes are blaze-scope's `BUILTIN_PREFIX`,
+/// where an item's key holds its crate's prefix): an item with no text ([`text_cell`]).
+pub(crate) fn has_no_text(key: LibKey) -> bool {
+    key.0.0[..8] == blaze_scope::BUILTIN_PREFIX
+}
+
+/// [`text_cell`] of an item that is some crate's.
+fn text_cell_of<'n>(records: &'n Records<'n>, subjects: &Subjects, key: LibKey) -> Result<CellId, Unplaced> {
+    let k = NamesSource::crate_of(records, key).ok_or(Unplaced { key, why: UnplacedWhy::NoCrate })?;
+    let krate = NamesSource::crate_key(records, k).ok_or(Unplaced { key, why: UnplacedWhy::NoCrateKey { at: k } })?;
     let whole = CellId { of: crate_scope_name(&krate), cell: WHOLE };
-    let Some(place) = NamesSource::place_of(records, key) else { return Some(whole) };
-    let At::File(file) = place.at else { return Some(whole) };
+    let Some(place) = NamesSource::place_of(records, key) else { return Ok(whole) };
+    let At::File(file) = place.at else { return Ok(whole) };
     let prefix = krate.prefix();
-    Some(match subjects.binary_search_by(|(p, f, _)| (*p, *f).cmp(&(prefix, file))) {
+    Ok(match subjects.binary_search_by(|(p, f, _)| (*p, *f).cmp(&(prefix, file))) {
         Ok(at) => CellId { of: subjects[at].2, cell: WHOLE },
         Err(_) => whole,
     })

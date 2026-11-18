@@ -21,6 +21,9 @@
 //! - `idx-<segment digest>`: the segment's index entries, each the store's own 48 bytes
 //!   (blaze-cas `Entry`) and the value's digest (32, [`crate::segment::value_digest`]), in key
 //!   order, read a page at a time. A page's digest is in the summary.
+//! - `prefix`: the head's bytes, then the manifest's, then each row's summary in the manifest's
+//!   row order (published.md): nothing of its own, so each part passes its own check above, and
+//!   its length is the sum the head and the rows say ([`decode_prefix`]).
 
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
@@ -64,11 +67,17 @@ pub const REMOTE_ENTRY: usize = ENTRY + 32;
 pub const PAGE_ENTRIES_MOST: u32 = ((64 << 10) / REMOTE_ENTRY) as u32;
 /// Records a segment holds at most, as a manifest row may say.
 pub const COUNT_MOST: u32 = 1 << 26;
+/// A prefix's bytes at most, whatever a reader's `Limits::prefix_most` says: the head, a
+/// manifest and the summaries of a published set of some millions of records.
+pub const PREFIX_MOST: u64 = 16 << 20;
 
 /// An object of an origin, by what it is. Its name is spelt from a digest's hex alone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Object {
     Head,
+    /// The head, the manifest and every summary in one object (published.md, "The origin's
+    /// layout"): what a fresh reader asks first, in one read.
+    Prefix,
     Manifest(ContentId),
     Segment(ContentId),
     Summary(ContentId),
@@ -102,6 +111,7 @@ impl Object {
         let mut bytes = [0u8; 73];
         let (prefix, digest): (&[u8], Option<&ContentId>) = match self {
             Object::Head => (b"head", None),
+            Object::Prefix => (b"prefix", None),
             Object::Manifest(id) => (b"manifest-", Some(id)),
             Object::Segment(id) => (b"seg-", Some(id)),
             Object::Summary(id) => (b"sum-", Some(id)),
@@ -127,6 +137,7 @@ impl fmt::Display for Object {
         let text = name.as_str();
         f.write_str(&text[..text.len().min(match self {
             Object::Head => 4,
+            Object::Prefix => 6,
             Object::Manifest(_) => 9 + 12,
             Object::Segment(_) | Object::Summary(_) | Object::Index(_) => 4 + 12,
         })])
@@ -519,4 +530,53 @@ pub fn lookup(page: &[u8], row: &Row, page_no: u32, key: &ContentId) -> Result<O
         return Err(Refused::Malformed { object, what: "an entry places its payload outside the segment's payloads", at });
     }
     Ok(Some((entry, id_at(bytes, ENTRY))))
+}
+
+/// What a prefix holds, every part checked: the head, the manifest's rows, and each row's
+/// summary in the rows' order.
+pub struct Prefixed<'a> {
+    pub head: Head,
+    pub rows: Vec<Row, Alloc<'a>>,
+    pub summaries: Vec<Summary<'a>, Alloc<'a>>,
+}
+
+/// The prefix `bytes` are, read by a reader that takes at most `most` bytes of one (and never
+/// more than [`PREFIX_MOST`]). The head's signature is checked before any other field is
+/// believed, the manifest against the head's digest, each summary against its row; the
+/// prefix's length must be exactly the sum the head and the rows say, so a cut or a padded one
+/// is refused, and a declared length past `most` is refused before a summary is read.
+pub fn decode_prefix<'a>(bytes: &[u8], most: u64, namespace: Namespace, check: &dyn HeadCheck, alloc: Alloc<'a>) -> Result<Prefixed<'a>, Refused> {
+    let object = Object::Prefix;
+    let most = most.min(PREFIX_MOST);
+    let got = bytes.len() as u64;
+    if got < HEAD_LEN as u64 {
+        return Err(Refused::Malformed { object, what: "shorter than a head", at: got });
+    }
+    let head = Head::decode(&bytes[..HEAD_LEN], namespace, check)?;
+    // `manifest_len` is at most MANIFEST_MOST (`Head::decode`): no overflow.
+    let manifest_end = HEAD_LEN as u64 + head.manifest_len;
+    if manifest_end > most {
+        return Err(Refused::TooLarge { object, what: "its head and manifest", len: manifest_end, most });
+    }
+    if got < manifest_end {
+        return Err(Refused::Malformed { object, what: "cut inside its manifest", at: got });
+    }
+    let mut rows = Vec::new_in(alloc);
+    decode_manifest(&bytes[HEAD_LEN..manifest_end as usize], &head, &mut rows)?;
+    // At most ROWS_MOST rows of at most SUMMARY_MOST each (`Row::decode`): no overflow.
+    let total = rows.iter().fold(manifest_end, |sum, row| sum + row.summary_len);
+    if total > most {
+        return Err(Refused::TooLarge { object, what: "its length, as its head and rows say", len: total, most });
+    }
+    if got != total {
+        return Err(Refused::Malformed { object, what: "not the length its head and rows say", at: got });
+    }
+    let mut summaries = Vec::with_capacity_in(rows.len(), alloc);
+    let mut at = manifest_end as usize;
+    for row in rows.iter() {
+        let end = at + row.summary_len as usize;
+        summaries.push(Summary::decode(&bytes[at..end], row, alloc)?);
+        at = end;
+    }
+    Ok(Prefixed { head, rows, summaries })
 }

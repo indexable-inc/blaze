@@ -15,7 +15,7 @@ use blaze_drive::Key;
 use blaze_ids::ContentId;
 use std::alloc::Global;
 
-use super::{Facts, PlaceError, PlacePlant, PlainPlace, after_answer, config, open};
+use super::{Facts, PlaceError, PlacePlant, PlainPlace, StoreAlloc, after_answer, config, open};
 
 fn key(n: u32) -> Key {
     Key(ContentId::of("plain place test key", &n.to_le_bytes()))
@@ -27,7 +27,7 @@ fn value(n: u32) -> Vec<u8> {
 }
 
 /// Process `n` of the first boot over `sim`, with the store's cap at `cap_bytes`.
-fn process(sim: Sim, n: u64, cap_bytes: u64) -> Lent<Sim, Global> {
+fn process(sim: Sim, n: u64, cap_bytes: u64) -> Lent<Sim, StoreAlloc> {
     process_in_boot(sim, n, cap_bytes, 1)
 }
 
@@ -36,13 +36,13 @@ fn process(sim: Sim, n: u64, cap_bytes: u64) -> Lent<Sim, Global> {
 /// again (blaze-cas plain/tests.rs takes `boot + 1` after each crash). Opened in the same boot,
 /// the store takes its own segments as proved by their rows (no byte read) and a torn one is
 /// `StoreError::Changed` (something outside blaze changed it), not a loss.
-fn process_in_boot(sim: Sim, n: u64, cap_bytes: u64, boot: u64) -> Lent<Sim, Global> {
+fn process_in_boot(sim: Sim, n: u64, cap_bytes: u64, boot: u64) -> Lent<Sim, StoreAlloc> {
     let mut cfg = config(FileName::new("store").expect("a name"), &Settings::default(), Facts { boot: Some(boot), nonce: 9000 + n });
     cfg.cap_bytes = cap_bytes;
-    open(sim, cfg).expect("the store opens")
+    open(sim, cfg, blaze_own::testing::heap().alloc()).expect("the store opens")
 }
 
-fn back(lent: Lent<Sim, Global>) -> Sim {
+fn back(lent: Lent<Sim, StoreAlloc>) -> Sim {
     lent.into_store().into_driver()
 }
 

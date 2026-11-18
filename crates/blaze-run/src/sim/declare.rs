@@ -227,7 +227,8 @@ impl Sim {
         let cut = tape.index(item.len(), "cut");
         oracle(Up::decode(&item[..cut]).is_err(), || format!("an up frame cut to {cut} bytes was read"))?;
         drop(self.up.drain(..took));
-        let Up::Need { need, thread } = up;
+        // The modelled program never crashes: a fault frame here is the harness's own error.
+        let Up::Need { need, thread } = up else { return Err(harness("the modelled program sent a fault report (Up::Fault)")) };
         let thread = ThreadId(thread.0);
         let now = Nanos(0);
         match need {

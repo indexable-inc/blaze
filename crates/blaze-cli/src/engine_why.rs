@@ -31,7 +31,7 @@ pub(crate) fn explain(cx: &Cx, io: &Io, root: &Dir<ReadWrite>, opts: &Opts<'_>, 
     let frame = cx.frame();
     let erased = blaze_own::Erased::new(frame);
     let place = &opts.place;
-    let opened = crate::store::open_for_command(cx, io, place.home, root, place.checkout, phases.clock(), err)?;
+    let opened = crate::store::open_for_command(cx, io, place.home, root, place.checkout, phases.clock(), err, opts.heap)?;
     let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
     let answer_root = crate::engine_answer::root_name(place.checkout, &opts.tools, frame);
     let mut text = blaze_own::String::new_in(frame);
@@ -258,7 +258,7 @@ pub(crate) fn with_kept<R>(cx: &Cx, io: &Io, root: &Dir<ReadWrite>, opts: &Opts<
     let frame = cx.frame();
     let erased = blaze_own::Erased::new(frame);
     let place = &opts.place;
-    let opened = crate::store::open_for_command(cx, io, place.home, root, place.checkout, phases.clock(), err)?;
+    let opened = crate::store::open_for_command(cx, io, place.home, root, place.checkout, phases.clock(), err, opts.heap)?;
     let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
     let answer_root = crate::engine_answer::root_name(place.checkout, &opts.tools, frame);
     let got = match crate::engine_answer::load_pointer(cx, &mut store, &answer_root)? {

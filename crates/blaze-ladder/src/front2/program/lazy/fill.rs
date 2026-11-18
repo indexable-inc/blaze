@@ -127,6 +127,17 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
                 let want = if self.store.impls.contains_key(&container) { Want::MemberFn(c, key) } else { Want::Members(c) };
                 Ok((LowerTarget::Member(key), want))
             }
+            // An associated constant with a body is a body owner (reach/initializers.rs, the
+            // body-owner rule): its closures are built at its row. Its head is filed with its
+            // container's (heads.rs: an impl's constants with the impl's head, a trait's with
+            // its members), as a fn head with no inputs; consts.rs `check_as` lowers it so too.
+            Some(Origin::Member { container, kind: MemberKind::Const, .. }) => {
+                let container = *container;
+                let Some(c) = self.front.keys.library_in(self.front.names, container) else {
+                    return Err(LazyRefusal::NotFound { key, krate: self.refused_shown(key), searched: format!("its container {:032x} is filed with no library key", container.0).into_boxed_str() });
+                };
+                Ok((LowerTarget::Member(key), self.store.need(c)))
+            }
             Some(Origin::Member { kind, .. }) => Err(LazyRefusal::NotFound { key, krate: self.refused_shown(key), searched: format!("it is a member of kind {kind:?}, not a fn with a body").into_boxed_str() }),
             Some(Origin::Item(_)) | None => Err(LazyRefusal::NotFound { key, krate: self.refused_shown(key), searched: Box::from("the key map filed it with no library key") }),
         }

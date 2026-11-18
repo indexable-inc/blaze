@@ -23,7 +23,7 @@ use blaze_own::{AVec, Alloc};
 use blaze_scope::names::{PathError, Resolved, Written};
 use blaze_scope::names_cells::{NameCell, Section};
 use blaze_scope::resolve::{Names, Place};
-use blaze_scope::task::{ItemText, MacroBody, Variant};
+use blaze_scope::task::{ItemText, MacroBody};
 use blaze_surface::{Edition, ItemDetail, ItemKind, Namespace};
 
 use super::super::buckets::TableSet;
@@ -231,7 +231,7 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.traits_in_scope_logged(&NamesInto(self.reads), module, alloc)
     }
 
-    fn variants(self, owner: ItemKey) -> Option<&'n [Variant<&'n str>]> {
+    fn variants(self, owner: ItemKey) -> Option<source::VariantRows<'n>> {
         self.cell(NameCell::Variants { owner });
         self.records.variants(owner)
     }

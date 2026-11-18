@@ -6,7 +6,6 @@
 //! caught by the store's two-values refusal. The oracle is the model `entry(n)` under its key
 //! (rule 8), never another store's answer.
 
-use std::alloc::Global;
 
 use blaze_cas::Key as CasKey;
 use blaze_cas::plain::{Lent, Namespace, Settings as StoreSettings, Tag};
@@ -26,15 +25,15 @@ use blaze_ladder::code_records::TierName;
 use blaze_toolchain::ToolchainId;
 
 use super::{CODE_TAG, HomeCodeStore};
-use crate::store::plain_place::{Facts, after_answer, config, open};
+use crate::store::plain_place::{Facts, StoreAlloc, after_answer, config, open};
 
 /// Process `n` of one boot over `sim`: the command's store as `open_for_command` opens it.
-fn process(sim: Sim, n: u64) -> Lent<Sim, Global> {
+fn process(sim: Sim, n: u64) -> Lent<Sim, StoreAlloc> {
     let cfg = config(FileName::new("store").expect("a name"), &StoreSettings::default(), Facts { boot: Some(1), nonce: 7000 + n });
-    open(sim, cfg).expect("the store opens")
+    open(sim, cfg, blaze_own::testing::heap().alloc()).expect("the store opens")
 }
 
-fn back(lent: Lent<Sim, Global>) -> Sim {
+fn back(lent: Lent<Sim, StoreAlloc>) -> Sim {
     lent.into_store().into_driver()
 }
 

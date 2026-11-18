@@ -77,6 +77,10 @@ pub enum Up {
     /// Answered by a [`Down::Publish`] of the slot (after the [`Down::Declare`] that numbers it,
     /// for a symbol) or a [`Down::Failed`] naming the same need.
     Need { need: Needed, thread: Thread },
+    /// The program dies on a fault or a trap, struck where `fault` says (wire/fault.rs): sent
+    /// by the crash handler with id 0, once, just before the process ends by the signal. Nothing
+    /// answers it; the parent keeps it to name the place by path and the trap by its reason.
+    Fault { fault: super::fault::Fault },
 }
 
 /// What the parent says to the program.
@@ -224,6 +228,7 @@ impl Up {
                 to.text("thread");
                 to.uint(thread.0);
             }
+            Up::Fault { fault } => super::fault::write(to, &fault),
         })
     }
 
@@ -241,6 +246,7 @@ impl Up {
                 let thread = Thread(from.uint()?);
                 Up::Need { need, thread }
             }
+            super::fault::NAME => Up::Fault { fault: super::fault::read(&mut from)? },
             _ => return Err(WireError::Variant { at: named }),
         };
         from.end()?;

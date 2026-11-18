@@ -16,13 +16,18 @@ use blaze_core::{
 };
 use blaze_ids::ContentId;
 use blaze_keyed::kind::{Namespace, Tag};
+use blaze_mem::Frame;
 
 use super::{
     core::{PlainConfig, TAGS},
     driven::{Cut, Driven},
     lent::{Lent, LentPlant},
+    test_root,
 };
 use crate::Key;
+
+/// A process's store, its arena in the run's frame.
+type Store<'f> = Lent<Sim, &'f Frame>;
 
 const TAG: Tag = Tag(1);
 const ROOT: &str = "last";
@@ -62,12 +67,12 @@ fn model(k: &Key) -> Option<Vec<u8>> {
     (0..200u32).find(|n| key(*n) == *k).map(value)
 }
 
-fn process(sim: Sim, n: u64, plant: LentPlant) -> Lent<Sim, Global> {
-    Lent::planted(Driven::with(sim, Path::new("/sim"), cfg(n)).expect("the store opens"), Global, plant)
+fn process(sim: Sim, n: u64, plant: LentPlant, root: &Frame) -> Store<'_> {
+    Lent::planted(Driven::with(sim, Path::new("/sim"), cfg(n)).expect("the store opens"), root, plant)
 }
 
 /// One command: the records of `range` put, the root `last` set to name them, one commit.
-fn command(lent: &Lent<Sim, Global>, range: std::ops::Range<u32>) -> Result<(), super::lent::LentError> {
+fn command(lent: &Store<'_>, range: std::ops::Range<u32>) -> Result<(), super::lent::LentError> {
     let mut keys = Vec::new();
     for n in range {
         lent.put(&key(n), Namespace::LOCAL, TAG, &value(n))?;
@@ -79,7 +84,7 @@ fn command(lent: &Lent<Sim, Global>, range: std::ops::Range<u32>) -> Result<(), 
 
 /// The keys the root `last` names in the store `lent` opened, each read back: the keys whose
 /// bytes are absent, refused by the read path, or not their model's. `None`: no root `last`.
-fn unreadable(lent: &Lent<Sim, Global>) -> Option<Vec<Key>> {
+fn unreadable(lent: &Store<'_>) -> Option<Vec<Key>> {
     let (_, at) = lent.roots().into_iter().find(|(name, _)| name == ROOT)?;
     let read = |k: &Key| match lent.get(k) {
         Ok(found) => Ok(found.map(|lend| lend.bytes.to_vec())),
@@ -99,21 +104,23 @@ fn unreadable(lent: &Lent<Sim, Global>) -> Option<Vec<Key>> {
 }
 
 /// Every cut point of the second command's commit, each with and without a power cut after
-/// it: how many recoveries left the root naming a record that does not read back.
+/// it: how many recoveries left the root naming a record that does not read back. Each cut is a
+/// run of its own, its processes' arenas in a frame of that run, given back before the next.
 fn broken(plant: LentPlant) -> (u32, u32) {
     let (mut broken, mut cuts) = (0, 0);
     for at in 0..256u32 {
         for power in [false, true] {
-            let first = process(Sim::new(31, Faults::default()), 1, LentPlant::None);
+            let root = test_root();
+            let first = process(Sim::new(31, Faults::default()), 1, LentPlant::None, &root);
             command(&first, 0..10).expect("the first command");
-            let second = process(first.into_store().into_driver(), 2, plant);
+            let second = process(first.into_store().into_driver(), 2, plant, &root);
             second.cut(Some(Cut::After(at)));
             let reached = command(&second, 100..140).is_ok();
             let mut sim = second.into_store().into_driver();
             if power {
                 sim.crash();
             }
-            let after = process(sim, 3, LentPlant::None);
+            let after = process(sim, 3, LentPlant::None, &root);
             if unreadable(&after).is_some_and(|keys| !keys.is_empty()) {
                 broken += 1;
             }

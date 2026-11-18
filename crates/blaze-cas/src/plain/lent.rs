@@ -18,7 +18,7 @@
 
 use core::cell::RefCell;
 use core::fmt;
-use std::alloc::{Allocator, Global};
+use std::alloc::Allocator;
 
 use blaze_core::Driver;
 use blaze_hash::{BuildKeyHasher, Map, MapOpts};
@@ -140,10 +140,10 @@ fn parts_equal(bytes: &[u8], parts: &[&[u8]]) -> bool {
     rest.is_empty()
 }
 
-/// The concatenation of `parts`, on the global heap: only for a refusal, which names the first
-/// byte where a put differs from what its key holds (rule 19).
-fn joined(parts: &[&[u8]]) -> Vec<u8, Global> {
-    let mut all = Vec::new_in(Global);
+/// The concatenation of `parts`, in the `Lent`'s allocator: only for a refusal, which names the
+/// first byte where a put differs from what its key holds (rule 19).
+fn joined<A: Allocator>(parts: &[&[u8]], alloc: A) -> Vec<u8, A> {
+    let mut all = Vec::new_in(alloc);
     for part in parts {
         all.extend_from_slice(part);
     }
@@ -478,7 +478,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
                 return Ok(Put::Same);
             }
             let held = Held { namespace: at.namespace, tag: at.tag, bytes: kept, own: true };
-            return Err(held.against(key, namespace, tag, &joined(parts)));
+            return Err(held.against(key, namespace, tag, &joined(parts, self.alloc.clone())));
         }
         if let Some(found) = inner.store.get(key).map_err(stopped("checking a put against the store"))? {
             let got = inner.store.got(found);
@@ -487,7 +487,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
                 return Ok(Put::Same);
             }
             let held = Held { namespace: got.namespace, tag: got.tag, bytes: got.bytes, own: false };
-            return Err(held.against(key, namespace, tag, &joined(parts)));
+            return Err(held.against(key, namespace, tag, &joined(parts, self.alloc.clone())));
         }
         let (chunk, block, len) = self.copy_in(inner, parts)?;
         let at = PutAt { chunk, block, len, tag, namespace, order: inner.order.len() as u32 };
@@ -638,6 +638,12 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         decode(got.bytes).map(Some)
     }
 
+    /// The allocator the caller handed this `Lent` (its arena's): what a caller's scratch about
+    /// this store is made in, so nothing about it reaches for another heap.
+    pub fn alloc(&self) -> &A {
+        &self.alloc
+    }
+
     /// Bytes put and not yet committed: the caller commits between tasks past its bound.
     pub fn uncommitted_bytes(&self) -> u64 {
         self.inner.borrow().uncommitted_bytes
@@ -664,9 +670,9 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
             inner.store.commit_with(&[]).map_err(stopped("committing the roots first (planted)"))?;
         }
         let upto = inner.order.len();
-        let mut writes: Vec<Namespace, Global> = Vec::with_capacity_in(inner.store.core().writes().len(), Global);
+        let mut writes: Vec<Namespace, A> = Vec::with_capacity_in(inner.store.core().writes().len(), self.alloc.clone());
         writes.extend_from_slice(inner.store.core().writes());
-        let mut batches: Vec<Batch, Global> = Vec::with_capacity_in(writes.len(), Global);
+        let mut batches: Vec<Batch, A> = Vec::with_capacity_in(writes.len(), self.alloc.clone());
         batches.extend(writes.iter().map(|namespace| Batch::new(*namespace)));
         let mut first = Batch::new(Namespace::LOCAL);
         for key in &inner.order[inner.committed..upto] {
@@ -685,7 +691,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         if !first.is_empty() {
             inner.store.commit_with(&[&first]).map_err(stopped("committing the pointers first (planted)"))?;
         }
-        let mut refs: Vec<&Batch, Global> = Vec::with_capacity_in(batches.len(), Global);
+        let mut refs: Vec<&Batch, A> = Vec::with_capacity_in(batches.len(), self.alloc.clone());
         refs.extend(batches.iter().filter(|batch| !batch.is_empty()));
         let committed = inner.store.commit_with(&refs).map_err(stopped("committing"))?;
         inner.committed = upto;

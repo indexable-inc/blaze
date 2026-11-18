@@ -21,6 +21,8 @@ pub enum PublishError {
     Namespace { segment: ContentId, found: Namespace, wanted: Namespace },
     Entry { segment: ContentId, index: u32, what: &'static str },
     TooMany { segments: u64 },
+    /// The prefix would be past what any reader takes (`form::PREFIX_MOST`).
+    PrefixTooLarge { len: u64 },
 }
 
 impl From<StoreError> for PublishError {
@@ -37,6 +39,7 @@ impl core::fmt::Display for PublishError {
             PublishError::Namespace { segment, found, wanted } => write!(f, "segment {}: of namespace {:#x}, not {:#x}", hex(segment), found.0, wanted.0),
             PublishError::Entry { segment, index, what } => write!(f, "segment {}, entry {index}: {what}", hex(segment)),
             PublishError::TooMany { segments } => write!(f, "{segments} segments, past the {} a manifest names", form::ROWS_MOST),
+            PublishError::PrefixTooLarge { len } => write!(f, "a prefix of {len} bytes, past the {} a reader takes", form::PREFIX_MOST),
         }
     }
 }
@@ -110,9 +113,22 @@ pub fn publish<'a>(namespace: Namespace, generation: u64, signer: &Signer, segme
     let digest = ContentId::of(form::MANIFEST_DOMAIN, &manifest);
     let head = Head { namespace, generation, manifest: digest, manifest_len: manifest.len() as u64, signer: signer.public() };
     let head = head.encode(|domain, body| signer.sign(domain, body));
+    // The prefix (published.md): the head, the manifest, then each row's summary in row order,
+    // the same bytes as the three objects, so each part is checked as they are.
+    let mut prefix = Vec::new_in(alloc);
+    prefix.extend_from_slice(&head);
+    prefix.extend_from_slice(&manifest);
+    for row in rows.iter() {
+        let summary = out.iter().find(|sealed| sealed.object == Object::Summary(row.segment)).expect("each row's summary was sealed above");
+        prefix.extend_from_slice(&summary.bytes);
+    }
+    if prefix.len() as u64 > form::PREFIX_MOST {
+        return Err(PublishError::PrefixTooLarge { len: prefix.len() as u64 });
+    }
     out.push(Sealed { object: Object::Manifest(digest), bytes: manifest });
     let mut bytes = Vec::with_capacity_in(head.len(), alloc);
     bytes.extend_from_slice(&head);
     out.push(Sealed { object: Object::Head, bytes });
+    out.push(Sealed { object: Object::Prefix, bytes: prefix });
     Ok(out)
 }

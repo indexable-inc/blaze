@@ -1,0 +1,215 @@
+//! Every refusal says its cause (lane RH3): a check scope cut or not read names the crate and
+//! why (engine_bodies.rs `scope_of`, `CutCause`, `ScopeRefusal`); a body refused at planning
+//! prints its label (`planned_label`); a head's constant from a dependency or a macro expansion
+//! is placed (engine_head_consts.rs `text_cell`); the bodies' seed freezer evaluates constants
+//! (engine_bodies.rs `run_stretch`, `add_eval_reads`); a body refused for a head that failed
+//! when first frozen quotes that head's own reason (`own_reason`); and whether types and
+//! borrows were checked whole is a fact of the answer, never of this request's work alone
+//! (engine_check.rs, engine_lines.rs `not_checked_whole`). A child of main.rs's tests, over
+//! engine_check_tests.rs's helpers.
+
+use super::engine_check_tests::{engine_opts, entries, failed_dep, opts, said, three_crates};
+use super::*;
+
+/// One request with `opts` as given: its whole printed text and its counts.
+fn printed_with(io: &Io, opts: engine_check::Opts<'static>) -> (std::string::String, engine_check::Checked) {
+    let before = stdout(io).len();
+    let (_, checked) = engine_opts(io, opts);
+    (stdout(io).split_off(before), checked)
+}
+
+/// The note lines of `text` that say a body was not checked.
+fn body_notes(text: &str) -> std::vec::Vec<&str> {
+    text.lines().filter(|line| line.contains("the body of `") && line.contains("was not checked")).collect()
+}
+
+/// (a) A DEPENDENCY'S NAMES RECORD THAT CANNOT BE READ IS NAMED, WITH ITS ERROR: `a`'s names
+/// record planted unreadable (engine_records.rs `scope_records`) in the chain `c` -> `b` -> `a`:
+/// every refused body's note names `a` and says its record could not be read, and no line says
+/// "has no names record" (the words of a crate with no record at all). Rule 23: without
+/// piece 1 `scope_of` cut the scope at `a` with no cause (engine_bodies.rs `scope_of`, the
+/// `Err(_) => break` of the records read) and the notes said "has no names record".
+/// (c) A BODY REFUSED AT PLANNING PRINTS ITS LABEL: `a`'s own bodies are refused before any
+/// record named them (its own scope not read) and print `f` and `k`, never "the body of ``".
+/// Rule 23: without piece 2 the refusal pushed in `run_phase` kept the planned task's empty label.
+#[test]
+fn an_unreadable_dependency_record_is_named_with_its_error() {
+    let io = Io::simulated(SimWorld::new(41, Limits::USUAL));
+    three_crates(&io);
+    let mut planted = opts(&io, 2, true);
+    planted.unreadable = Some("a");
+    let (text, checked) = printed_with(&io, planted);
+    println!("`a` unreadable: {}\n{text}", entries(&checked));
+    let notes = body_notes(&text);
+    for member in ["b/src/lib.rs", "c/src/lib.rs"] {
+        let mine: std::vec::Vec<&&str> = notes.iter().filter(|line| line.contains(member)).collect();
+        assert!(!mine.is_empty(), "{member}'s bodies are refused (`a` is in its scope):\n{text}");
+        for line in mine {
+            assert!(line.contains("`a`") && line.contains("could not be read"), "{member}'s note names `a` and the read error: {line}");
+        }
+    }
+    assert!(!text.contains("has no names record"), "a record that was there but did not read is not said as none:\n{text}");
+    // (c) `a`'s own bodies, refused at planning.
+    let own: std::vec::Vec<&&str> = notes.iter().filter(|line| line.contains("a/src/lib.rs") || line.contains("a/src/m.rs")).collect();
+    assert!(!own.is_empty(), "`a`'s own bodies are refused (its own record did not read):\n{text}");
+    assert!(!text.contains("the body of `` "), "a body refused at planning prints its label:\n{text}");
+    assert!(own.iter().any(|line| line.contains("the body of `f`")) && own.iter().any(|line| line.contains("the body of `k`")), "`a`'s bodies by their labels: {own:?}");
+    // CONTROL: unplanted, the same project checks clean (the plant is the cause).
+    let (clean, _) = printed_with(&io, opts(&io, 2, true));
+    assert!(body_notes(&clean).is_empty(), "control: no body refused without the plant:\n{clean}");
+}
+
+/// (b) A CRATE WHOSE NAMES TASK REALLY FAILED IS SAID AS SUCH: `p` (a proc-macro crate the
+/// shelf cannot build) fails; its dependents' notes name `p` and its `CrateScope` task. Rule 23:
+/// without piece 1 the note said only "has no names record" (engine_bodies.rs `CutCause`,
+/// `CutWhy::NoNamesRecord { failed: true }`).
+#[test]
+fn a_failed_names_task_is_named_in_its_dependents_notes() {
+    let io = Io::simulated(SimWorld::new(43, Limits::USUAL));
+    failed_dep(&io);
+    let (text, checked) = printed_with(&io, opts(&io, 2, true));
+    println!("p fails: {}\n{text}", entries(&checked));
+    let notes = body_notes(&text);
+    for member in ["b/src/lib.rs", "c/src/lib.rs"] {
+        assert!(
+            notes.iter().any(|line| line.contains(member) && line.contains("holds `p`") && line.contains("its `CrateScope` task failed")),
+            "{member}'s note names `p` and its failed task:\n{text}"
+        );
+    }
+}
+
+/// (d) A MEMBER HEAD'S CONSTANT FROM A DEPENDENCY AND FROM A MACRO EXPANSION IS PLACED:
+/// `takes_dep(x: [u8; ::core::FIXTURE_LEN])` (a toolchain crate's constant) and
+/// `takes_mac(x: [u8; M])` (`M` written by `make!`) are both frozen, and `uses` checks clean.
+/// Rule 23: without piece 3 the evaluation's read of either text had no cell
+/// (engine_head_consts.rs `text_cell`, "a constant its head holds is of no crate of its scope").
+#[test]
+fn a_head_constant_of_a_dependency_or_an_expansion_is_placed() {
+    let io = Io::simulated(SimWorld::new(47, Limits::USUAL));
+    write(&io, "Cargo.toml", "[package]\nname = \"heads\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(
+        &io,
+        "src/lib.rs",
+        "macro_rules! make {\n    () => {\n        pub const M: usize = 3;\n    };\n}\n\nmake!();\n\npub fn takes_dep(x: [u8; ::core::FIXTURE_LEN]) -> u8 {\n    x[0]\n}\n\npub fn takes_mac(x: [u8; M]) -> u8 {\n    x[0]\n}\n\npub fn uses() -> u8 {\n    takes_dep([1; 2]) + takes_mac([1; 3])\n}\n",
+    );
+    let (_, lines, checked) = said(&io, true);
+    let text = lines.join("\n");
+    println!("{}\n{text}", entries(&checked));
+    assert!(!text.contains("could not be frozen"), "both heads frozen:\n{text}");
+    assert!(!text.contains("no crate of its scope"), "both constants placed:\n{text}");
+    assert!(checked.bodies.0.is_empty(), "every body checked clean: {:?}\n{text}", checked.bodies.0);
+}
+
+/// One package `seeded`: `uses` calls the toolchain's `fixture_len`, whose head holds a
+/// constant (blaze-world fixture.rs `CORE`): a head the body's seed freezes, never a head task.
+fn toolchain_constant(io: &Io) {
+    write(io, "Cargo.toml", "[package]\nname = \"seeded\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(io, "src/lib.rs", "pub fn uses() -> u8 {\n    ::core::fixture_len([1; 2])\n}\n");
+}
+
+/// (e) THE SEED FREEZER EVALUATES A CONSTANT, UNDER BOTH STRATEGIES (rule 78): `fixture_len`'s
+/// head is frozen at the body's seed (`HeadsFrom::Frozen`) or lowered by the body
+/// (`HeadsFrom::Lowered`), and `uses` checks clean under each, with equal notes. Rule 23:
+/// without piece 4 the Frozen side said "refused at a seed for a constant: ... the freeze has
+/// no constant evaluator" (engine_bodies.rs `run_stretch`, `consts: None`).
+#[test]
+fn the_seed_freezer_evaluates_a_constant_under_both_strategies() {
+    let io = Io::simulated(SimWorld::new(53, Limits::USUAL));
+    toolchain_constant(&io);
+    let statuses: std::vec::Vec<_> = [(crate::engine_seeds::HeadsFrom::Frozen, "Frozen"), (crate::engine_seeds::HeadsFrom::Lowered, "Lowered")]
+        .into_iter()
+        .map(|(from, shown)| {
+            let mut each = opts(&io, 2, true);
+            each.heads_from = from;
+            let (text, checked) = printed_with(&io, each);
+            println!("{shown}: {}\n{text}", entries(&checked));
+            assert!(!text.contains("no constant evaluator"), "{shown}: the freeze has its evaluator:\n{text}");
+            assert!(checked.bodies.0.is_empty(), "{shown}: `uses` checks clean: {:?}\n{text}", checked.bodies.0);
+            checked.status.0
+        })
+        .collect();
+    assert_eq!(statuses[0], statuses[1], "both strategies end with one status");
+}
+
+/// One package `again`: `bad`'s signature holds a constant with no value, and two other
+/// members of its impl call it, each body asking `bad`'s head in one stretch (one worker).
+fn asked_twice(io: &Io) {
+    write(io, "Cargo.toml", "[package]\nname = \"again\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(
+        io,
+        "src/lib.rs",
+        "pub struct S;\n\npub const BAD: usize = not_defined();\n\nimpl S {\n    pub fn bad(&self, x: [u8; BAD]) -> u8 {\n        x[0]\n    }\n\n    pub fn one(&self, x: [u8; 4]) -> u8 {\n        self.bad(x)\n    }\n\n    pub fn two(&self, x: [u8; 4]) -> u8 {\n        self.bad(x)\n    }\n}\n",
+    );
+}
+
+/// (f) A BODY REFUSED FOR A HEAD THAT FAILED WHEN FIRST FROZEN QUOTES THAT HEAD'S OWN REASON:
+/// every note of a body that reads `bad`'s head carries the constant's reason ("the value of a
+/// constant its type holds", or the first freeze's "needs the value of constant `BAD`"), and
+/// none says only that it "failed when first frozen". Rule 23: without piece 5 the second ask's
+/// note was `FreezeError::Again`'s own words, "not made again, as cell .. failed when first
+/// frozen" (engine_bodies.rs `run_stretch`, the seed-refused words), with no reason.
+#[test]
+fn a_head_asked_again_quotes_its_own_reason() {
+    let io = Io::simulated(SimWorld::new(59, Limits::USUAL));
+    asked_twice(&io);
+    let (text, checked) = printed_with(&io, opts(&io, 1, true));
+    println!("{}\n{text}", entries(&checked));
+    // A body refused at a seed prints "body `one`: not checked because ..", not `body_notes`'s
+    // planning form ("the body of `..` was not checked").
+    let notes: std::vec::Vec<&str> = text.lines().collect();
+    let readers: std::vec::Vec<&&str> = notes.iter().filter(|line| line.contains("body `one`: not checked") || line.contains("body `two`: not checked")).collect();
+    assert!(!readers.is_empty(), "control: the bodies that call `bad` are refused:\n{text}");
+    for line in readers {
+        assert!(line.contains("the value of a constant its type holds") || line.contains("needs the value of constant `"), "the note quotes `bad`'s own reason: {line}");
+        assert!(!line.contains("failed when first frozen"), "never only that it failed before: {line}");
+    }
+}
+
+/// The coverage fixture: one body refused (`calls_bad`, its head's constant has no value) and
+/// clean ones, in `src/lib.rs` as `text`.
+const COVERAGE: &str = "pub struct S;\n\npub const BAD: usize = not_defined();\n\nimpl S {\n    pub fn good(&self) -> u8 {\n        1\n    }\n\n    pub fn bad(&self, x: [u8; BAD]) -> u8 {\n        x[0]\n    }\n}\n\npub fn calls_good(s: &S) -> u8 {\n    s.good()\n}\n\npub fn calls_bad(s: &S, x: [u8; 4]) -> u8 {\n    s.bad(x)\n}\n\npub fn other() -> u8 {\n    7\n}\n";
+/// (a) a blank line added above `other`.
+const COVERAGE_BLANK: &str = "pub struct S;\n\npub const BAD: usize = not_defined();\n\nimpl S {\n    pub fn good(&self) -> u8 {\n        1\n    }\n\n    pub fn bad(&self, x: [u8; BAD]) -> u8 {\n        x[0]\n    }\n}\n\npub fn calls_good(s: &S) -> u8 {\n    s.good()\n}\n\npub fn calls_bad(s: &S, x: [u8; 4]) -> u8 {\n    s.bad(x)\n}\n\n\npub fn other() -> u8 {\n    7\n}\n";
+/// (b) a clean body's literal edited (`other` returns 8).
+const COVERAGE_LITERAL: &str = "pub struct S;\n\npub const BAD: usize = not_defined();\n\nimpl S {\n    pub fn good(&self) -> u8 {\n        1\n    }\n\n    pub fn bad(&self, x: [u8; BAD]) -> u8 {\n        x[0]\n    }\n}\n\npub fn calls_good(s: &S) -> u8 {\n    s.good()\n}\n\npub fn calls_bad(s: &S, x: [u8; 4]) -> u8 {\n    s.bad(x)\n}\n\n\npub fn other() -> u8 {\n    8\n}\n";
+
+/// The lines that say a stage was not checked whole.
+fn not_checked(lines: &[std::string::String]) -> std::vec::Vec<std::string::String> {
+    // The notes alone: the closing line also says "NOT checked: ..", beside this request's
+    // time and count of tasks, which differ between an incremental and a fresh request.
+    lines.iter().filter(|line| line.starts_with("note: NOT checked: ")).cloned().collect()
+}
+
+/// AN INCREMENTAL REQUEST NEVER PRINTS A PASS FOR A STAGE THAT DID NOT RUN WHOLE (the owner's
+/// rule; engine_check.rs `bodies_whole`): after a cold request of a project with one refused
+/// body, (a) a blank line added above another fn, (b) a clean body's literal edited and (c)
+/// nothing changed (the certificate) each print exactly the fresh run's "NOT checked: types" /
+/// "NOT checked: borrows" lines and its status, while `calls_bad`'s refusal stands from the
+/// stored answer. Rule 23: with `whole()` reading only this request's bodies (engine_bodies.rs
+/// `BodiesStage::whole`, before the standing rows were counted), (a) and (b) entered only clean
+/// bodies and printed no "NOT checked" line (lane RX5's run 214226).
+#[test]
+fn a_standing_refusal_keeps_its_stage_not_whole() {
+    let io = Io::simulated(SimWorld::new(61, Limits::USUAL));
+    write(&io, "Cargo.toml", "[package]\nname = \"cover\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(&io, "src/lib.rs", COVERAGE);
+    let (_, cold_lines, cold) = said(&io, false);
+    println!("cold: {}\n{}", entries(&cold), cold_lines.join("\n"));
+    let cold_not = not_checked(&cold_lines);
+    assert!(!cold_not.is_empty(), "control: the cold request has a stage not checked whole:\n{}", cold_lines.join("\n"));
+    for (row, text) in [("(a) a blank line", Some(COVERAGE_BLANK)), ("(b) a literal edited", Some(COVERAGE_LITERAL)), ("(c) nothing changed", None)] {
+        if let Some(text) = text {
+            write(&io, "src/lib.rs", text);
+        }
+        let (_, now_lines, now) = said(&io, false);
+        let (_, fresh_lines, fresh) = said(&io, true);
+        println!("{row}: {}\n{}\nfresh:\n{}", entries(&now), now_lines.join("\n"), fresh_lines.join("\n"));
+        assert!(now_lines.iter().any(|line| line.contains("calls_bad")), "{row}: `calls_bad`'s refusal stands:\n{}", now_lines.join("\n"));
+        assert_eq!(not_checked(&now_lines), not_checked(&fresh_lines), "{row}: the fresh run's NOT-checked lines, no fewer");
+        assert_eq!(now.status.0, fresh.status.0, "{row}: the fresh run's status");
+    }
+    // (c) after the fresh request: nothing changed is the certificate.
+    let (_, cert_lines, cert) = said(&io, false);
+    assert_eq!(not_checked(&cert_lines), cold_not, "the certificate prints the cold request's NOT-checked lines");
+    println!("certificate: {} (certified {})", entries(&cert), cert.certified);
+}

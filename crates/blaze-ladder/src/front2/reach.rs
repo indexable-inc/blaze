@@ -725,7 +725,9 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
     }
     // What a reached static's or constant's initializer names is reached too
     // (reach/initializers.rs): its fns are walked before the instances' round.
-    if !census.capped && inits.round(r, prepared, &firsts, &census.bodies, &mut needs, &mut queue, &mut census.fns, &mut census.edges) {
+    // An initializer that writes a closure is added to the census's bodies as its closures'
+    // owner, a body like a fn's (reach/initializers.rs, the body-owner rule).
+    if !census.capped && inits.round(r, prepared, &firsts, &mut census.bodies, &mut needs, &mut queue, &mut census.fns, &mut census.edges) {
         continue;
     }
     if census.capped || !instances.round(r, &firsts, &mut census, &needs, &inits.coerced, &mut queue) {

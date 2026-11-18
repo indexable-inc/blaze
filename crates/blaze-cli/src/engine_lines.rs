@@ -332,6 +332,20 @@ pub(crate) fn head_notes<'m>(block: &'m [u8], each: &mut dyn FnMut(&'m str)) -> 
     Ok(())
 }
 
+/// Whether `block` holds a note that says its task's item was not checked whole: a
+/// [`Class::Failure`], [`Class::Unchecked`] or [`Class::Waited`] note (a body refused, failed,
+/// panicked or not checked whole, engine_bodies.rs `note`). A finding of a checked body is not.
+/// What a standing body row says of the answer's coverage (engine_check.rs `check`).
+pub(crate) fn not_checked_whole(block: &[u8]) -> Result<bool, LinesError> {
+    let mut reader = Reader { bytes: block, at: 0 };
+    while reader.at < block.len() {
+        if let Entry::Note { class: Class::Failure | Class::Unchecked | Class::Waited, .. } = entry(&mut reader)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// What [`print_all`] counted, for the command's status.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Tally {

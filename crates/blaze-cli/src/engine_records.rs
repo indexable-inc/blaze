@@ -204,11 +204,32 @@ pub(crate) struct Exports<'j> {
 pub(crate) struct EngineRecords<'r> {
     read: std::vec::Vec<(Name, Key, CrateRecords<'r>), Global>,
     counts: ReadCounts,
+    /// The crate (by its name) a test plants unreadable for a check scope's read
+    /// ([`EngineRecords::scope_records`]; engine_check.rs `Opts::unreadable`, rule 23). The
+    /// command's is `None`.
+    unreadable: Option<&'static str>,
 }
 
 impl<'r> EngineRecords<'r> {
     pub(crate) fn new() -> EngineRecords<'r> {
-        EngineRecords { read: std::vec::Vec::new_in(Global), counts: ReadCounts::default() }
+        EngineRecords { read: std::vec::Vec::new_in(Global), counts: ReadCounts::default(), unreadable: None }
+    }
+
+    /// Plants crate `krate`'s records unreadable for every check scope read
+    /// ([`EngineRecords::scope_records`]): a test's cause (rule 23), never the command's.
+    pub(crate) fn plant_unreadable(&mut self, krate: Option<&'static str>) {
+        self.unreadable = krate;
+    }
+
+    /// Crate `krate`'s records for a check scope (engine_bodies.rs `scope_of`), as
+    /// [`EngineRecords::records`] reads them; the crate a test planted unreadable reads as a
+    /// record gone from the store ([`LoadError::NotInStore`]), the error a refusal then names.
+    #[expect(clippy::too_many_arguments, reason = "the read's handles, each named")]
+    pub(crate) fn scope_records(&mut self, cx: &Cx, store: &mut dyn Store<'r>, input: &Input, key: CrateItemKey, krate: &str, alloc: Alloc<'r>) -> Result<CrateRecords<'r>, ReadError> {
+        if self.unreadable.is_some_and(|planted| planted == krate) {
+            return Err(LoadError::NotInStore { name: input.name, at: input.at }.into());
+        }
+        self.records(cx, store, input, key, alloc)
     }
 
     /// Crate `key`'s records from the record `input` names: opened in place at the first ask,

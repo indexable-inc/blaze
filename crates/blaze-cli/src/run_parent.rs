@@ -594,6 +594,17 @@ fn file_name(id: &[u8; 32], out: &mut [u8; 64]) -> Result<Path, ParentError> {
     Path::new(name).map_err(ParentError::Path)
 }
 
+impl RecordsDir<'_> {
+    /// The bytes of `record`'s file into `into` (a crash report reads the record the pc is in,
+    /// run_fault.rs): a file not there is the store's refusal, named.
+    pub(crate) fn read(&self, record: &RecordId, into: &mut bstd::mem::Bytes<'_>) -> Result<(), ParentError> {
+        let mut name = [0u8; 64];
+        let path = file_name(&record.0, &mut name)?;
+        self.dir.read_all(self.cx, &path, into).map_err(ParentError::Fs)?;
+        Ok(())
+    }
+}
+
 impl Folder for RecordsDir<'_> {
     fn holds(&self, record: &RecordId) -> Result<bool, ParentError> {
         let mut name = [0u8; 64];
@@ -815,6 +826,22 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
 
     pub(crate) fn folder(&self) -> &D {
         &self.folder
+    }
+
+    /// What names `symbol` in a crash report (run_fault.rs): the walk's row for it is the
+    /// instance's tabled item, and the names records give its path. A symbol with no row this
+    /// run is a special record (the C entry shim, the thread-local getter or ender) or a row
+    /// placed from today's start list and never stepped.
+    pub(crate) fn name_of(&mut self, symbol: [u8; 32]) -> crate::run_fault::Named {
+        use crate::run_fault::Named;
+        let item = match self.started.as_ref().and_then(|started| started.walk.row_of(&CodeSymbol(symbol)).map(|row| started.walk.tabled(row))) {
+            Some(item) => item,
+            None => return Named::NoRow,
+        };
+        match self.front.path_of(item) {
+            Some(path) => Named::Path(path),
+            None => Named::Item(item),
+        }
     }
 
     /// `lines` placed ahead from today's start list: each code row's symbol among the placed
@@ -1222,6 +1249,9 @@ pub(crate) struct Needs<'a> {
     placed_data: usize,
     answered: usize,
     resolved: usize,
+    /// Where the program struck, as its crash handler told it (`Up::Fault`): the first one
+    /// read, said by name once the program has ended (run_fault.rs).
+    fault: Option<blaze_launch::wire::fault::Fault>,
 }
 
 /// What a `Publish` stands on ([`Needs::publish`]): how the statics its record names are on the
@@ -1256,7 +1286,13 @@ impl<'a> Needs<'a> {
             placed_data: 0,
             answered: 0,
             resolved: 0,
+            fault: None,
         }
+    }
+
+    /// Where the program struck, when its crash handler told the parent (the first report).
+    pub(crate) fn fault(&self) -> Option<blaze_launch::wire::fault::Fault> {
+        self.fault
     }
 
     /// The start list's line of the closing count: what was placed, answered and asked, with
@@ -1474,6 +1510,12 @@ impl<'a> Needs<'a> {
             let (_, up) = Up::decode(item)?;
             match up {
                 Up::Need { need, .. } => self.answer(need, resolve, out)?,
+                // No ask: nothing answers it; the first is kept to be said by name.
+                Up::Fault { fault } => {
+                    if self.fault.is_none() {
+                        self.fault = Some(fault);
+                    }
+                }
             }
             taken += len;
         }

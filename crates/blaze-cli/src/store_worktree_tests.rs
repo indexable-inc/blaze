@@ -119,8 +119,9 @@ pub(super) fn check_with(io: &Io, at: &'static str, keys: Keys, home: &'static s
     let said = words(command.0, &out, &err);
     let toolchain = shelf(io, home);
     let before = stdout(io).len();
-    let opened = super::open_for_command(&cx, io, Some(home), &root, at, phases.clock(), &err).expect("the one store opens");
-    let finished = request(&cx, &root, (at, None, None, Some(home), None, Some("/"), toolchain, crate::sdk::NONE_IN_TESTS, Err(crate::fetch::ExeDirWhy::NotRead)), origin, (&opened.home, &opened.lent, opened.open_ns), command, 1, &producers_for(at, keys), work::Sizes::USUAL, &launch, &blaze_screen::Unwatched, frame, said, &err, &mut ran, &mut shown, &mut phases, blaze_own::testing::heap(), false)
+    let heap = blaze_own::testing::heap();
+    let opened = super::open_for_command(&cx, io, Some(home), &root, at, phases.clock(), &err, heap).expect("the one store opens");
+    let finished = request(&cx, &root, (at, None, None, Some(home), None, Some("/"), toolchain, crate::sdk::NONE_IN_TESTS, Err(crate::fetch::ExeDirWhy::NotRead)), origin, (&opened.home, &opened.lent, opened.open_ns), command, 1, &producers_for(at, keys), work::Sizes::USUAL, &launch, &blaze_screen::Unwatched, frame, said, &err, &mut ran, &mut shown, &mut phases, heap, false)
         .expect("the request answers");
     let status = close(&cx, command.0, &finished, &shown, ran, 0, frame, said).ok().map(|status| status.0);
     super::after_answer_printed(&cx, opened.lent, false, phases.clock(), &err).expect("the commit after the answer");

@@ -67,6 +67,8 @@ mod run_parent;
 // The run parent's driver loop over bstd's run child; `run_program` is called from program.rs `run` next.
 #[allow(dead_code, reason = "program.rs `run` calls run_program in the next step (wiring run-parent-io-1, 'Not wired')")]
 mod run_loop;
+// What a run that died on a fault or a trap says by name: the function's path, the trap's reason.
+mod run_fault;
 mod run_ids;
 // `blaze run`'s live status line on stderr: blaze-screen's `RunStatus` driven by the run's events.
 mod run_line;
@@ -586,7 +588,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
     // The one store a user (drive.md, "The store under the command"), opened here, outside the
     // request: every record lent from it outlives the request, and its ONE commit, carrying the
     // records and the roots, comes after the answer is printed (below).
-    let opened = store::open_for_command(cx, io, var("HOME"), &root, checkout_at, phases.clock(), err)?;
+    let opened = store::open_for_command(cx, io, var("HOME"), &root, checkout_at, phases.clock(), err, heap)?;
     // The request as this command makes it; it takes what it prints into and gives it back.
     let mut ask = |mut shown, ran: &mut Option<u8>, phases: &mut Phases, watch: &dyn blaze_screen::Watch| {
         let exe_dir = exe_dir.as_ref().map(|dir| dir.as_str()).map_err(|why| *why);
@@ -1925,16 +1927,20 @@ mod tests {
     mod engine_script_reads_tests;
     mod engine_script_reads_e2e_tests;
     mod engine_memory_tests;
+    mod engine_body_frames_tests;
     mod engine_seeds_tests;
     mod engine_answer_rows_tests;
     mod engine_module_facts_tests;
     mod engine_unnamed_calls_tests;
     mod engine_expansion_tests;
     mod engine_head_notes_tests;
+    mod engine_refusal_causes_tests;
+    mod engine_builtin_reads_tests;
     mod engine_unit_heads_tests;
     mod engine_unit_files_tests;
     mod engine_scope_reads_tests;
     mod engine_scope_reads_tables_tests;
+    mod engine_edit_rows_tests;
     mod native_image_tests;
     mod include_data_tests;
     mod include_outside_tests;
@@ -2049,10 +2055,11 @@ mod tests {
             _ => blaze_ids::producer::Producers::for_tests(b"test"),
         };
         let toolchain = shelf(io);
-        let opened = store::open_for_command(&cx, io, Some("/h"), &root, "ws", phases.clock(), &err)?;
+        let heap = blaze_own::testing::heap();
+        let opened = store::open_for_command(&cx, io, Some("/h"), &root, "ws", phases.clock(), &err, heap)?;
         let mut run = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
             let workers = WORKERS.with(core::cell::Cell::get);
-            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), None, Some("/"), toolchain, crate::sdk::NONE_IN_TESTS, Err(fetch::ExeDirWhy::NotRead)), None, (&opened.home, &opened.lent, opened.open_ns), command, workers, &producers, sizes, &launch, &blaze_screen::Unwatched, frame, said, &err, ran, &mut shown, phases, blaze_own::testing::heap(), false);
+            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), None, Some("/"), toolchain, crate::sdk::NONE_IN_TESTS, Err(fetch::ExeDirWhy::NotRead)), None, (&opened.home, &opened.lent, opened.open_ns), command, workers, &producers, sizes, &launch, &blaze_screen::Unwatched, frame, said, &err, ran, &mut shown, phases, heap, false);
             finished.map(|finished| (finished, shown))
         };
         let (finished, shown) = match fix {

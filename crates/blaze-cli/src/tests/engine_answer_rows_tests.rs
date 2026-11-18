@@ -34,7 +34,7 @@ fn with_store<R>(io: &Io, f: impl for<'m, 'r, 's> FnOnce(&bstd::Cx, &'s mut crat
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let err = io.need_err().expect("err");
     let phases = Phases::new(io.need_clock().expect("a clock"));
-    let opened = crate::store::open_for_command(&cx, io, opts.place.home, &root, opts.place.checkout, phases.clock(), &err).expect("the store opens");
+    let opened = crate::store::open_for_command(&cx, io, opts.place.home, &root, opts.place.checkout, phases.clock(), &err, opts.heap).expect("the store opens");
     let mut store = crate::store::CommandStore::new(&cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), &err, erased.handle()).expect("the command's store");
     let out = f(&cx, &mut store, &opts);
     crate::store::Store::after_answer(&mut store, &cx, &mut blaze_drive::profile::Profile::default()).expect("the store commits");

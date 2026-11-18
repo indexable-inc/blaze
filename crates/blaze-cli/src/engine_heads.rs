@@ -64,7 +64,6 @@ use blaze_ladder::front2::by_origin;
 use blaze_ladder::front2::heads::Want;
 use blaze_ladder::front2::keys::{MemberKind, checker_of, member_key_of};
 use blaze_ladder::front2::source::{NamesSource, Records};
-use blaze_ladder::front2::index::Index;
 use blaze_ladder::front2::tables::head::{ConstValues, HeadCells, SeededHeads, SeededHeadsOpts, cell_id as head_cell_id, head_task, want_bytes};
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts};
 use blaze_ladder::front2::tables::task::cell_id;
@@ -263,7 +262,7 @@ impl HeadsStage {
             };
             let at = by_name[found].1;
             match crate::engine_bodies::scope_of(read, &cx, store, names, &list, at, heap) {
-                Some((scope, true)) => {
+                Ok((scope, true)) => {
                     let cells = scope_cells(graph.name, &list, at, Some(&scope));
                     let own = names.input_of(blaze_drive::key::crate_scope_name(&list.key(at))).map(|input| input.name);
                     let Some(own) = own else {
@@ -275,10 +274,17 @@ impl HeadsStage {
                 // The crate's names cell and each scope crate's that had records, and the first
                 // that had none read ABSENT (`Scope::cut`): its task that comes, or its fix,
                 // moves the row (engine_bodies.rs `scope_of`).
-                Some((scope, false)) => refuse(task, "a crate of its check scope has no names record this command (its `Names` task failed)", &scope_cells(graph.name, &list, at, Some(&scope)), buffer),
+                // The cut's cause printed, typed, the crate named (rule 19).
+                Ok((scope, false)) => {
+                    let why = match scope.cut_cause(&list) {
+                        Some(cause) => crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's {cause}")),
+                        None => "its crate's check scope was cut and `scope_of` kept no cut (engine_bodies.rs `scope_of`)",
+                    };
+                    refuse(task, why, &scope_cells(graph.name, &list, at, Some(&scope)), buffer);
+                }
                 // `scope_of` reads the crate's own names record (ABSENT when its task failed)
-                // and the check scope the graph makes: both cells.
-                None => refuse(task, "its crate's names record or check scope could not be read (engine_bodies.rs `scope_of`)", &scope_cells(graph.name, &list, at, None), buffer),
+                // and the check scope the graph makes: both cells. Its cause printed, typed.
+                Err(cause) => refuse(task, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), &scope_cells(graph.name, &list, at, None), buffer),
             }
         }
         // At cell grain, the members' files a header's head read is placed by (`Owners::place`).
@@ -746,7 +752,11 @@ fn member_subjects<'r>(
     let g = heap.alloc();
     let mut subjects: std::vec::Vec<([u8; 8], u32, Name), Global> = std::vec::Vec::new_in(Global);
     for member in (0..CrateGraph::len(list)).filter(|at| list.member(*at)) {
-        let Some((scope, _)) = crate::engine_bodies::scope_of(read, cx, store, names, list, member, heap) else { continue };
+        // A member whose scope is refused lists no file here (its heads placed as a
+        // dependency's, coarser, never missed); its typed cause is printed by the refusal of
+        // that member's own head tasks and bodies ([`HeadsStage::run_items`], engine_bodies.rs
+        // `groups`), which call `scope_of` for it the same way: nothing is dropped unsaid.
+        let Ok((scope, _)) = crate::engine_bodies::scope_of(read, cx, store, names, list, member, heap) else { continue };
         let Ok(items) = ItemsRecord::open(scope.own_records.items, g) else { continue };
         let prefix = list.key(member).prefix();
         for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
@@ -770,6 +780,9 @@ struct ItemJob<'r> {
     lang: Vec<usize, Global>,
     /// Every crate of its scope had records (else its tasks are refused by name).
     whole: bool,
+    /// When not `whole`: the cut's cause in words, the crate named (engine_bodies.rs
+    /// `Scope::cut_cause`), what its tasks' refusal prints.
+    cut_words: Option<&'static str>,
     /// The cells a refusal of its tasks is a function of ([`scope_cells`]): at 0 the graph's,
     /// at 1 the member's own names cell.
     cells: std::vec::Vec<CellId, Global>,
@@ -937,15 +950,27 @@ impl HeadsStage {
         // Every member's items record was read: then a file none lists is no unit's (a `cfg` on
         // its `mod` cut it in every unit, engine_body_plan.rs), not a refusal.
         let mut every_member_read = true;
+        // Why the first member whose records could not be read was not (its typed cause, the
+        // crate named) and how many were not: what a task no unit holds then prints (rule 19).
+        let mut unread: Option<&'static str> = None;
+        let mut unread_count = 0u32;
         for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at)) {
             no_member.push(CellId { of: blaze_drive::key::crate_scope_name(&list.key(member)), cell: WHOLE });
-            let Some((scope, whole)) = crate::engine_bodies::scope_of(read, cx, store, names, &list, member, heap) else {
-                every_member_read = false;
-                continue;
+            let (scope, whole) = match crate::engine_bodies::scope_of(read, cx, store, names, &list, member, heap) {
+                Ok(made) => made,
+                Err(cause) => {
+                    every_member_read = false;
+                    unread_count = unread_count.saturating_add(1);
+                    unread.get_or_insert_with(|| crate::engine_head_notes::leak(g, format_args!("its check scope was not read: {cause}")));
+                    continue;
+                }
             };
             let cells = scope_cells(graph.name, &list, member, Some(&scope));
+            let cut_words = scope.cut_cause(&list).map(|cause| crate::engine_head_notes::leak(g, format_args!("its crate's {cause}")));
             let Ok(items) = ItemsRecord::open(scope.own_records.items, g) else {
                 every_member_read = false;
+                unread_count = unread_count.saturating_add(1);
+                unread.get_or_insert_with(|| crate::engine_head_notes::leak(g, format_args!("the items record of crate `{}` does not open (blaze-scope items_record.rs `ItemsRecord::open`)", CrateGraph::name(&list, member))));
                 continue;
             };
             let prefix = list.key(member).prefix();
@@ -957,7 +982,7 @@ impl HeadsStage {
                     subjects.push((prefix, file, one.name));
                 }
             }
-            jobs.push(ItemJob { prefix, crates: scope.crates, lang: scope.lang, whole, cells, tasks: std::vec::Vec::new_in(Global) });
+            jobs.push(ItemJob { prefix, crates: scope.crates, lang: scope.lang, whole, cut_words, cells, tasks: std::vec::Vec::new_in(Global) });
         }
         subjects.sort_unstable();
         jobs.sort_unstable_by_key(|job| job.prefix);
@@ -998,10 +1023,23 @@ impl HeadsStage {
                     let out = no_units_out(task.planned.name);
                     buffer.done.push(Done { name: task.planned.name, key: task.key, out, defines: SVec::new_in(alloc), reads, findings: 0, failed: false });
                 }
-                (None, _) => refuse(task, "its file is in no member crate's items record, and a member's records could not be read (engine_heads.rs `run_items`)", &no_member, buffer),
+                (None, _) => {
+                    let why = crate::engine_head_notes::leak(
+                        g,
+                        format_args!(
+                            "its file is in no member crate's items record, and {unread_count} member(s)' records could not be read, the first because {} (engine_heads.rs `run_items`)",
+                            unread.unwrap_or("of no cause kept (engine_heads.rs `run_items` keeps the first)")
+                        ),
+                    );
+                    refuse(task, why, &no_member, buffer);
+                }
                 // Its member's names cell, each scope crate's that had records, and the one the
                 // scope was cut at, read ABSENT: its task that comes, or its fix, moves the row.
-                (Some(at), None) => refuse(task, "a crate of its crate's check scope has no names record this command (its `Names` task failed)", &jobs[at].cells, buffer),
+                // The cut's cause printed, the crate named (rule 19).
+                (Some(at), None) => {
+                    let why = jobs[at].cut_words.unwrap_or("its crate's check scope was cut and `scope_of` kept no cut (engine_bodies.rs `scope_of`)");
+                    refuse(task, why, &jobs[at].cells, buffer);
+                }
                 // Frozen under each whole unit; a unit whose scope lacks a names record defines
                 // no cell (its readers read it ABSENT), and the row reads that unit's refusal
                 // cells, so the fix that makes it whole enters the task again (rule 21).
@@ -1214,7 +1252,7 @@ fn heads_of(
     // The constant evaluator's lang index, once a job; what it read is read by every head that
     // evaluates (engine_head_consts.rs).
     let lang_recorder = Recorder::new(RecorderOpts { alloc: g });
-    let index = Index::from_source(base.reading_into(&lang_recorder), lang).map_err(|_| "two crates of its scope declare one lang item, so its constants have no index (front2 index.rs `LangTwice`)")?;
+    let index = crate::engine_head_consts::lang_index(base, &lang_recorder, lang).map_err(|_| "two crates of its scope declare one lang item, so its constants have no index (front2 index.rs `LangTwice`)")?;
     let mut lang_reads: std::vec::Vec<CellId, Global> = std::vec::Vec::new_in(Global);
     for one in lang_recorder.finish().map_err(|_| "its lang index read more names cells than the recorder holds (front2 tables/recorder.rs)")?.iter() {
         if let Some(id) = cell_id(base, *one).map_err(|_| "a names read of its lang index names a crate its scope does not hold (front2 tables/task.rs `cell_id`)")? {
@@ -1286,8 +1324,9 @@ fn heads_of(
                                 }
                             }
                         }
-                        if crate::engine_head_consts::eval_reads(records, subjects, &read, &mut |id| worked.reads.push(id)).is_err() {
-                            failed.get_or_insert("its constants' evaluation read the text of an item of no crate its records hold (engine_head_consts.rs `text_cell`)");
+                        if let Err(unplaced) = crate::engine_head_consts::eval_reads(records, subjects, &read, &mut |id| worked.reads.push(id)) {
+                            let shown = crate::engine_head_consts::UnplacedIn { unplaced: &unplaced, crates: &job.crates[..] };
+                            failed.get_or_insert_with(|| crate::engine_head_notes::leak(g, format_args!("its constants' evaluation read a text no crate of its scope holds: {shown}")));
                         }
                     }
                     Err(_) => {
@@ -1299,9 +1338,12 @@ fn heads_of(
             values.dedup();
             for c in values.iter() {
                 match crate::engine_head_consts::text_cell(records, subjects, *c) {
-                    Some(id) => worked.reads.push(id),
-                    None => {
-                        failed.get_or_insert("a constant its head holds is of no crate its records hold (engine_head_consts.rs `text_cell`)");
+                    Ok(Some(id)) => worked.reads.push(id),
+                    // A builtin type: no text, no cell (`text_cell`).
+                    Ok(None) => {}
+                    Err(unplaced) => {
+                        let shown = crate::engine_head_consts::UnplacedIn { unplaced: &unplaced, crates: &job.crates[..] };
+                        failed.get_or_insert_with(|| crate::engine_head_notes::leak(g, format_args!("a constant its head holds is of no crate of its scope: {shown}")));
                     }
                 }
             }

@@ -174,6 +174,74 @@ impl NamesMemory {
     }
 }
 
+/// Where a body's check stood in its stretch (engine_bodies.rs `run_stretch`): under which part
+/// of [`BodyFrames`] its growth of the stretch's frame is counted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum InStretch {
+    /// Not checked in a stretch: refused before its check (no frame, no records, no group).
+    No,
+    /// Its stretch's first body: its growth holds what a stretch makes once on first use (a
+    /// head frozen on its first read, a list the records make once) beside its own.
+    First,
+    /// A later body of its stretch: its growth is the guard's (rule 54, the class "a per-item
+    /// allocation into a longer-lived frame"): what a question copied into the stretch's frame
+    /// and kept past its body, or what the body keeps there (its local items' rows).
+    Later,
+}
+
+/// How much body checking grew the stretches' frames, body by body (engine_bodies.rs `Ran`'s
+/// `bytes`, one load of the frame's `used` before and after each check): the profile's
+/// `bodies: the stretch frames grew` line. A stretch's frame is never reset under its records,
+/// so what a body leaves there stays to the stretch's end: before the per-question copies went
+/// (front2 source.rs `Records::kept`, `variants`), every path a body resolved and every enum it
+/// matched on was copied there and kept, and tempo's workers used their 1 GiB frames up
+/// (2026-11-17, ten workers panicked at source.rs `kept`).
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct BodyFrames<'l> {
+    /// Bytes summed over every body checked in a stretch, and how many.
+    pub(crate) grew: u64,
+    pub(crate) bodies: u64,
+    /// The most one body grew its frame by, and its label (the first in the rows' order of
+    /// the most: rule 25).
+    pub(crate) most: Option<(u64, &'l str)>,
+    /// The same sum over the bodies past each stretch's first ([`InStretch::Later`]), and how
+    /// many: 0 bytes is the floor for bodies with no local items.
+    pub(crate) later_grew: u64,
+    pub(crate) later: u64,
+}
+
+impl<'l> BodyFrames<'l> {
+    /// Each body's (growth in bytes, where it stood, label), in the stage's order.
+    pub(crate) fn of(rows: impl IntoIterator<Item = (u64, InStretch, &'l str)>) -> BodyFrames<'l> {
+        let mut sum = BodyFrames::default();
+        for (bytes, at, label) in rows {
+            if at == InStretch::No {
+                continue;
+            }
+            sum.grew = sum.grew.saturating_add(bytes);
+            sum.bodies += 1;
+            if sum.most.is_none_or(|(most, _)| bytes > most) {
+                sum.most = Some((bytes, label));
+            }
+            if at == InStretch::Later {
+                sum.later_grew = sum.later_grew.saturating_add(bytes);
+                sum.later += 1;
+            }
+        }
+        sum
+    }
+
+    /// The profile's line (nothing when no body was checked in a stretch).
+    pub(crate) fn line(&self, into: &mut impl core::fmt::Write) {
+        let Some((most, label)) = self.most else { return };
+        let _ = writeln!(
+            into,
+            "bodies: the stretch frames grew {} bytes over {} bodies (most by one body {most}, body `{label}`); past each stretch's first body {} bytes over {} bodies (engine_memory.rs `BodyFrames`: 0 is the floor for bodies with no local items)",
+            self.grew, self.bodies, self.later_grew, self.later
+        );
+    }
+}
+
 /// The profile's `memory (Stage)` lines: one a stage that ran, and for `Names` its frames'
 /// lines, each number in bytes. `names` labels a task by its crate.
 pub(crate) fn profile(ledger: &Ledger, names: Option<&NamesStage<'_>>, into: &mut impl core::fmt::Write) {

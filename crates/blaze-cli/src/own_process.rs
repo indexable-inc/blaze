@@ -258,6 +258,16 @@ pub(crate) fn run_own<F: Front>(
     };
     let tally = lazy.tally();
     *counted = Some(run_parent::RunTally { codes: tally, start: needs.start_tally(lazy.built(), listed) });
+    // A crash the program's handler told by place, named while the walk is alive (rule 19,
+    // run_fault.rs): the fn by its path, the trap by the instruction in its record.
+    let mut struck_in = bstd::mem::Bytes::new_in(frame, "the code record a crash struck in");
+    let crash = needs.fault().map(|fault| {
+        let record = match fault.at {
+            Some(spot) if spot.placed == blaze_launch::wire::fault::Placed::Code => Some(lazy.folder().read(&spot.record, &mut struck_in).map(|()| struck_in.as_slice())),
+            _ => None,
+        };
+        crate::run_fault::report(fault, &mut |symbol| lazy.name_of(symbol), record)
+    });
     // The walk is over: what the code store served and made is final (the program root's half).
     drop(lazy);
     let walked = codes.reached();
@@ -271,6 +281,9 @@ pub(crate) fn run_own<F: Front>(
         },
         other => OwnError::Loop(other),
     })?;
+    if let Some(crash) = &crash {
+        err.line(cx, format_args!("{crash}")).map_err(OwnError::Out)?;
+    }
     // The closing line on the error stream, when a first call cost work (a run answered from
     // the store alone is quiet: its output is the program's); the profile has it on every run.
     if tally.made + tally.unkeyed > 0 {

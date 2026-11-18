@@ -213,6 +213,7 @@ fn serve(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_
         head_units: crate::engine_heads::HeadUnits::Each,
         frame,
         scope_reads: crate::engine_scope_reads::ScopeReadsAs::DEFAULT,
+        unreadable: None,
     };
     let err = io.need_err()?;
     match why {
@@ -263,6 +264,10 @@ pub(crate) struct Opts<'f> {
     /// How a body's names reads are kept (engine_scope_reads.rs, rule 78): `Whole` until
     /// `Cells` is admitted on the acceptance projects.
     pub(crate) scope_reads: crate::engine_scope_reads::ScopeReadsAs,
+    /// The crate (by its name) whose records a check scope reads as unreadable
+    /// (engine_records.rs `EngineRecords::scope_records`): a test plants one (rule 23); the
+    /// command's is `None`.
+    pub(crate) unreadable: Option<&'static str>,
 }
 
 /// The most one request's frame takes: its blocks are taken as it is used (blaze-mem
@@ -332,7 +337,7 @@ pub(crate) struct Checked {
 /// `err`.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
 pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, shown: &mut print::Shown<'f>, phases: &mut Phases, out: &Out, err: &Out) -> Result<Checked, CliError> {
-    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, frame, scope_reads } = opts;
+    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, frame, scope_reads, unreadable: planted_unreadable } = opts;
     let began = phases.now();
     let erased = blaze_own::Erased::new(frame);
     // The lint step and rules the root manifest names, as `check` reads them (lints.rs
@@ -340,7 +345,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     let linting = crate::lints::of_root(cx, root, frame)?;
     shown.lints = linting.step;
     // The one store, opened as `check` opens it (main.rs), committed after the answer.
-    let opened = crate::store::open_for_command(cx, io, place.home, root, place.checkout, phases.clock(), err)?;
+    let opened = crate::store::open_for_command(cx, io, place.home, root, place.checkout, phases.clock(), err, heap)?;
     let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
     phases.mark_in("store open", frame);
     // 0. The stored answer (engine_answer.rs): its pointer, then the sweep of what it read.
@@ -610,6 +615,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     // The Heads and Bodies stages' reader of the crates' records, in place in the store's
     // mapping for the store's borrow (engine_records.rs): dropped with the store, never in a stage.
     let mut read = crate::engine_records::EngineRecords::new();
+    read.plant_unreadable(planted_unreadable);
     // Each phase's wall, its tasks' times, its merge and its put (engine_times.rs).
     let clock = &env.clock;
     let mut times = crate::engine_times::Times::new();
@@ -821,11 +827,27 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     let mut unprinted = 0u32;
     // The first such task (by name), so the note names one (rule 19).
     let mut first_unprinted: Option<Name> = None;
+    // Whether types and borrows were checked whole is a fact of THE ANSWER, never of this
+    // request's work: a standing body row (not entered now) whose kept block says its body was
+    // not checked whole (refused, failed, not checked), or that has no block to say, makes the
+    // stage not whole as a body entered now would (`bodies.whole()`). Read here, over the rows
+    // with findings alone (a clean body has none), so O(rows with findings).
+    let mut standing_bodies_whole = true;
     for (name, _) in finished.answer.prints(&Everything, erased.handle()).iter() {
         if !entered_now.contains(name) {
             match last_lines.as_ref().and_then(|last| last.block(*name)) {
-                Some(block) => lines.keep(*name, block),
+                Some(block) => {
+                    // A block that does not decode is not known to be of a whole check: not
+                    // whole (a pass is never implied, rule 3); `print_all` says its error.
+                    if name.kind == blaze_drive::Kind::BodyCheck && crate::engine_lines::not_checked_whole(block).unwrap_or(true) {
+                        standing_bodies_whole = false;
+                    }
+                    lines.keep(*name, block);
+                }
                 None => {
+                    if name.kind == blaze_drive::Kind::BodyCheck {
+                        standing_bodies_whole = false;
+                    }
                     unprinted += 1;
                     first_unprinted.get_or_insert(*name);
                 }
@@ -916,8 +938,9 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     if let Some(why) = &unreadable {
         print::note(cx, bstd::mem::format_in!(frame, "{why}").as_str(), shown, frame, out)?;
     }
-    // Types and borrows are checked whole when every body was (engine_bodies.rs `whole`).
-    let bodies_whole = names.is_some() && bodies.whole();
+    // Types and borrows are checked whole when every body of the answer was: those entered now
+    // (engine_bodies.rs `whole`) and those that stand (`standing_bodies_whole`, above).
+    let bodies_whole = names.is_some() && bodies.whole() && standing_bodies_whole;
     let (ran_stages, not_stages) = crate::check_coverage(names.is_some(), bodies_whole, bodies_whole, frame);
     let coverage = (!not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
     not_checked_notes(cx, &not_stages, shown, frame, out)?;

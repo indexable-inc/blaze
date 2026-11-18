@@ -15,6 +15,10 @@
 //!    within [`Limits::gap_most`] of each other are one range, up to [`Limits::range_most`];
 //!    each payload is checked against its value digest before it is answered.
 //!
+//! With [`Limits::prefix_most`] above 0 (the published set's reader, published.md), waves 1 to 3
+//! are one: the `prefix` object, the head, the manifest and every summary in one read, each
+//! part checked as its own object is. A batch is then at most three waves.
+//!
 //! A failure (an origin's error, a short read, an ask past its deadline, a refused object) is
 //! kept for the rest of the command against what it was about (the head, the manifest, or one
 //! segment), so it is never asked again (no retry, rule 3); each key it leaves unknown is
@@ -58,6 +62,12 @@ pub struct Limits {
     pub batch_ns: u64,
     /// Index pages held for the command.
     pub pages_most: u32,
+    /// Bytes of the `prefix` object asked in place of the head, the manifest and the summaries
+    /// (published.md, "The reader's waves"): 0 asks those three one wave each, as an origin
+    /// without a prefix needs; above 0 they come in one wave, so a batch is at most three
+    /// (prefix, index pages, payloads). A prefix longer than this, or than `form::PREFIX_MOST`,
+    /// is refused.
+    pub prefix_most: u32,
 }
 
 impl Limits {
@@ -72,7 +82,11 @@ impl Limits {
         ask_ns: 2_000_000_000,
         batch_ns: 10_000_000_000,
         pages_most: 4096,
+        prefix_most: 0,
     };
+
+    /// The published set's reader: [`Limits::DEFAULT`] with the prefix asked, 1 MiB of it.
+    pub const PUBLISHED: Limits = Limits { prefix_most: 1 << 20, ..Limits::DEFAULT };
 }
 
 /// How an origin failed one read.
@@ -177,6 +191,10 @@ pub struct Report {
     pub summary_asks: u32,
     pub page_asks: u32,
     pub payload_asks: u32,
+    pub prefix_asks: u32,
+    /// Round trips: waves that made at least one ask (each wave's asks go out together, up to
+    /// `in_flight_most` at once).
+    pub waves: u32,
 }
 
 enum Held<T> {
@@ -188,6 +206,7 @@ enum Held<T> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Want {
     Head,
+    Prefix,
     Manifest,
     Summary(u32),
     Page { row: u32, page: u32 },
@@ -198,6 +217,7 @@ enum Want {
 enum Phase {
     Idle,
     Head,
+    Prefix,
     Manifest,
     Summaries,
     Pages,
@@ -376,6 +396,9 @@ impl<'a> Reader<'a> {
             self.queue.clear();
             self.queued = 0;
             self.advance();
+            if !self.queue.is_empty() {
+                self.report.waves += 1;
+            }
         }
         let batch_deadline = self.began_ns.saturating_add(self.limits.batch_ns);
         while self.slots.len() < self.limits.in_flight_most as usize && self.queued < self.queue.len() {
@@ -389,6 +412,7 @@ impl<'a> Reader<'a> {
             self.report.asks += 1;
             match want {
                 Want::Head => self.report.head_asks += 1,
+                Want::Prefix => self.report.prefix_asks += 1,
                 Want::Manifest => self.report.manifest_asks += 1,
                 Want::Summary(_) => self.report.summary_asks += 1,
                 Want::Page { .. } => self.report.page_asks += 1,
@@ -407,7 +431,7 @@ impl<'a> Reader<'a> {
             self.report.late += 1;
             return;
         };
-        let slot = self.slots.remove_swap(at);
+        let mut slot = self.slots.remove_swap(at);
         let object = slot.ask.object;
         let outcome = if now > slot.ask.deadline_ns {
             self.report.late += 1;
@@ -415,6 +439,13 @@ impl<'a> Reader<'a> {
         } else {
             match result {
                 Err(error) => Err(Unfetched::Origin { object, error }),
+                // The prefix is asked for up to `prefix_most` bytes, so fewer is its end: its
+                // decode then holds it to the length its head and rows say.
+                Ok(got) if slot.want == Want::Prefix && got <= slot.buf.len() => {
+                    slot.buf.truncate(got);
+                    self.report.bytes_fetched += got as u64;
+                    Ok(())
+                }
                 Ok(got) if got != slot.buf.len() => Err(Unfetched::Short { object, got: got as u64, wanted: slot.buf.len() as u64 }),
                 Ok(got) => {
                     self.report.bytes_fetched += got as u64;
@@ -446,6 +477,23 @@ impl<'a> Reader<'a> {
                     Ok(head) => Held::Yes(head),
                     Err(why) => Held::Failed(why),
                 };
+            }
+            Want::Prefix => {
+                let most = u64::from(self.limits.prefix_most);
+                match outcome.and_then(|()| form::decode_prefix(&bytes, most, self.namespace, self.check, self.alloc).map_err(Unfetched::Refused)) {
+                    Ok(prefixed) => {
+                        self.head = Held::Yes(prefixed.head);
+                        self.manifest = Held::Yes(());
+                        self.rows = prefixed.rows;
+                        self.summaries.clear();
+                        for summary in prefixed.summaries {
+                            self.summaries.push(Held::Yes(summary));
+                        }
+                    }
+                    // What the head would have been: the manifest and summaries come only
+                    // through it, so the batch fails as a failed head does.
+                    Err(why) => self.head = Held::Failed(why),
+                }
             }
             Want::Manifest => {
                 let Held::Yes(head) = &self.head else { return };
@@ -487,11 +535,16 @@ impl<'a> Reader<'a> {
                     Ok(()) => {
                         self.ranges[range].bytes = bytes;
                         let (first, end, at) = (self.ranges[range].first, self.ranges[range].end, self.ranges[range].at);
+                        // Ranges are laid in segment order, so a range after one of its own
+                        // segment is that segment's second or later.
+                        let later_of_its_segment = range > 0 && self.ranges[range - 1].row == self.ranges[range].row;
+                        let unverified = crate::planted(crate::Plant::SecondRangeUnverified) && later_of_its_segment;
                         for p in first..end {
                             let part = self.parts[p as usize];
                             let start = (part.entry.at - at) as usize;
                             let payload = &self.ranges[range].bytes[start..start + part.entry.len as usize];
                             let checked = crate::planted(crate::Plant::PayloadBeforeDigest)
+                                || unverified
                                 || crate::segment::value_digest(part.entry.tag, payload) == part.digest;
                             self.answers[part.key as usize] = if checked {
                                 Answer::Found { range: range as u32, at: start as u32, len: part.entry.len, tag: part.entry.tag }
@@ -564,6 +617,18 @@ impl<'a> Reader<'a> {
     fn advance(&mut self) {
         match self.phase {
             Phase::Idle if self.keys.is_empty() => self.finish(),
+            Phase::Idle if self.limits.prefix_most > 0 && matches!(self.head, Held::No) => {
+                self.phase = Phase::Prefix;
+                // A bound of this reader, not a length from the wire.
+                let most = u64::from(self.limits.prefix_most).min(form::PREFIX_MOST) as u32;
+                let _ = self.want(Want::Prefix, Object::Prefix, 0, most);
+            }
+            Phase::Prefix => match &self.head {
+                Held::Failed(why) => self.fail_all(*why),
+                Held::No => self.fail_all(Unfetched::Late { object: Object::Prefix, waited_ns: 0 }),
+                // The head, the manifest and every summary are held: the next turn probes.
+                Held::Yes(_) => self.phase = Phase::Summaries,
+            },
             Phase::Idle => {
                 self.phase = Phase::Head;
                 if matches!(self.head, Held::No) {

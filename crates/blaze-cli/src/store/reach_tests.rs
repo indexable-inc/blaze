@@ -27,7 +27,6 @@
 
 use blaze_ladder::code_records::CodeClass;
 
-use std::alloc::Global;
 use std::time::Duration;
 
 use blaze_cas::Key as CasKey;
@@ -38,7 +37,7 @@ use blaze_core::{Completion, Done, Driver, Effect, FileName, Tag as EffectTag};
 use blaze_ids::ContentId;
 use blaze_ladder::code_records::{CodeKey, CodeStore};
 
-use super::plain_place::{Facts, after_answer, config, open};
+use super::plain_place::{Facts, StoreAlloc, after_answer, config, open};
 use super::roots::{CleanupLine, keep_program, keep_toolchain};
 use crate::code_store::HomeCodeStore;
 use crate::start_list::{self, Certificate, HEAD, ListName, ROW, Today};
@@ -61,13 +60,13 @@ fn dir() -> FileName {
 }
 
 /// One process's store, as `open_for_command` opens it but with the reach sweep on.
-fn process(sim: Sim, n: u64) -> Lent<Sim, Global> {
+fn process(sim: Sim, n: u64) -> Lent<Sim, StoreAlloc> {
     let mut cfg = config(dir(), &StoreSettings::default(), Facts { boot: Some(1), nonce: 7300 + n });
     cfg.liveness = Liveness::Reached;
-    open(sim, cfg).expect("the store opens")
+    open(sim, cfg, blaze_own::testing::heap().alloc()).expect("the store opens")
 }
 
-fn back(lent: Lent<Sim, Global>) -> Sim {
+fn back(lent: Lent<Sim, StoreAlloc>) -> Sim {
     lent.into_store().into_driver()
 }
 

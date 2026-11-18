@@ -29,7 +29,11 @@ pub fn pack(files: &[(&str, &str)], alloc: Alloc<'_>) -> StdVec<u8> {
 /// It also has `rustc_coherence_is_core` and one inherent impl of a primitive, at the end: a
 /// probe of a primitive's method (`n.wrapping_add(1)`) has an answer, and asks the
 /// incoherent-impl fact the real core answers (blaze-cli engine_scope_reads_tests.rs).
-pub const CORE: &str = "#![no_core]\n#![feature(rustc_attrs)]\n#![rustc_coherence_is_core]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }\npub fn fixture_one() -> u8 {\n    1\n}\npub struct FixtureCell(pub u8);\nimpl FixtureCell {\n    pub fn get(&self) -> u8 {\n        self.0\n    }\n}\nimpl u32 {\n    pub const fn wrapping_add(self, rhs: u32) -> u32 {\n        self + rhs\n    }\n}\n";
+///
+/// And `fixture_len`, whose signature holds a constant (`[u8; FIXTURE_LEN]`): a toolchain
+/// head a body's seed freezes only with a constant evaluator (blaze-cli
+/// engine_refusal_causes_tests.rs).
+pub const CORE: &str = "#![no_core]\n#![feature(rustc_attrs)]\n#![rustc_coherence_is_core]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }\npub fn fixture_one() -> u8 {\n    1\n}\npub struct FixtureCell(pub u8);\nimpl FixtureCell {\n    pub fn get(&self) -> u8 {\n        self.0\n    }\n}\nimpl u32 {\n    pub const fn wrapping_add(self, rhs: u32) -> u32 {\n        self + rhs\n    }\n}\npub const FIXTURE_LEN: usize = 2;\npub fn fixture_len(_x: [u8; FIXTURE_LEN]) -> u8 {\n    1\n}\n";
 
 /// The text of the fixture's std when a test does not give its own.
 pub const STD: &str = "#![no_std]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }";

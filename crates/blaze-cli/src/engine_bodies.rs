@@ -52,7 +52,7 @@ use blaze_ladder::front2::source::NamesSource;
 use blaze_ladder::front2::tables::cost::{Cost, Gauge};
 use blaze_ladder::front2::item_shown::ItemShown;
 use blaze_ladder::front2::heads::Want;
-use blaze_ladder::front2::tables::head::{FreezeError, SeededHeads, SeededHeadsOpts, cell_id as head_cell_id};
+use blaze_ladder::front2::tables::head::{ConstValues, FreezeError, SeededHeads, SeededHeadsOpts, cell_id as head_cell_id};
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts};
 use blaze_ladder::front2::tables::seeds::{HeadSeed, RequestSeed, RequestSeedOpts, SeedError};
 use blaze_ladder::front2::tables::task::{BodyFrame, Make, MakeRefused, Said as Line, SaidWhat, TaskError, check_body};
@@ -72,6 +72,7 @@ use crate::CliError;
 use crate::body_types::Kept;
 use crate::engine_body_plan::{BodyClaim, BodyIs, FileClaim, FileIs};
 use crate::engine_check::EngineCheckError;
+use crate::engine_memory::InStretch;
 use crate::engine_names::NamesStage;
 use crate::engine_records::EngineRecords;
 use crate::engine_tasks::{CELLS, Outlined, WHOLE};
@@ -144,6 +145,9 @@ pub(crate) struct Ran<'f> {
     /// How many bytes its check grew its stretch's frame by (0 when it was not checked): what
     /// the profile's largest-frame line reads.
     pub(crate) bytes: u64,
+    /// Where its check stood in its stretch: under which part of the profile's stretch-frames
+    /// line its `bytes` are counted (engine_memory.rs `BodyFrames`).
+    pub(crate) stretch: crate::engine_memory::InStretch,
     /// What the engine core is told (`Done::findings`): the verdict's type, lint and borrow
     /// findings, or 1 for a body refused.
     pub(crate) findings: u32,
@@ -251,51 +255,202 @@ pub(crate) struct Scope<'r> {
     pub(crate) lang: Vec<usize, Global>,
     /// Each scope crate's `CrateScope` name, sorted.
     pub(crate) scope: Vec<Name, Global>,
-    /// The first scope crate without records, by its world index, when `crates` was cut there:
-    /// what a refusal names (rule 19, plan row A8), and, by its `CrateScope` name
-    /// ([`Scope::cut_name`]), what a refusal of the cut scope reads beside `scope`.
-    pub(crate) cut: Option<usize>,
+    /// The first scope crate without records, by its world index, when `crates` was cut there,
+    /// and why (one value, so a cut never lacks its cause): what a refusal names (rule 19, plan
+    /// row A8, [`Scope::cut_cause`]), and, by its `CrateScope` name ([`Scope::cut_name`]), what
+    /// a refusal of the cut scope reads beside `scope`.
+    pub(crate) cut: Option<(usize, CutWhy)>,
 }
 
 impl Scope<'_> {
     /// The `CrateScope` name of the crate the scope was cut at ([`Scope::cut`]), the cell a
     /// refusal of the cut scope reads (as ABSENT where that crate has no `Names` task).
     pub(crate) fn cut_name(&self, list: &blaze_world::crate_list::CrateList<'static>) -> Option<Name> {
-        self.cut.map(|one| blaze_drive::key::crate_scope_name(&list.key(one)))
+        self.cut.as_ref().map(|(one, _)| blaze_drive::key::crate_scope_name(&list.key(*one)))
+    }
+
+    /// The crate the scope was cut at and why, by its name: what a refusal of the cut scope
+    /// prints (`check scope holds `p`, which ...`).
+    pub(crate) fn cut_cause(&self, list: &blaze_world::crate_list::CrateList<'static>) -> Option<CutCause<'_>> {
+        self.cut.as_ref().map(|(one, why)| CutCause { krate: CrateGraph::name(list, *one), why })
+    }
+}
+
+/// Why a check scope was cut at one of its crates ([`Scope::cut`]).
+#[derive(Debug)]
+pub(crate) enum CutWhy {
+    /// The crate's `CrateScope` task defines no names record this command: it failed
+    /// (`failed`), or no `Names` task was planned for it.
+    NoNamesRecord { failed: bool },
+    /// Its names record is defined but could not be read in place (engine_records.rs).
+    Unreadable(crate::engine_records::ReadError),
+}
+
+/// A cut scope's crate and its [`CutWhy`], printed after "its crate's" or "its member's".
+pub(crate) struct CutCause<'s> {
+    pub(crate) krate: &'static str,
+    pub(crate) why: &'s CutWhy,
+}
+
+impl core::fmt::Display for CutCause<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let krate = self.krate;
+        match self.why {
+            CutWhy::NoNamesRecord { failed: true } => {
+                write!(f, "check scope holds `{krate}`, which has no names record this command (its `CrateScope` task failed: that failure is reported at it)")
+            }
+            CutWhy::NoNamesRecord { failed: false } => {
+                write!(f, "check scope holds `{krate}`, which has no names record this command (it has no `Names` task: engine_names.rs `plan`)")
+            }
+            CutWhy::Unreadable(error) => write!(f, "check scope holds `{krate}`, whose names record could not be read: {error} (engine_bodies.rs `scope_of`)"),
+        }
+    }
+}
+
+/// Why crate `at` has no check scope at all ([`scope_of`]): each drop the read could meet,
+/// typed, with the crate named (rule 19).
+#[derive(Debug)]
+pub(crate) enum ScopeRefusal {
+    /// The crate's own `CrateScope` task defines no names record this command: it failed
+    /// (`failed`, reported at it), or no `Names` task was planned for it.
+    NoNamesRecord { krate: &'static str, at: usize, failed: bool },
+    /// Its own names record is defined but could not be read in place.
+    Records { krate: &'static str, at: usize, error: crate::engine_records::ReadError },
+    /// Its check scope could not be made from the crate graph (blaze-world check_scope.rs).
+    CheckScope { error: blaze_world::check_scope::ScopeError<'static> },
+}
+
+impl core::fmt::Display for ScopeRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ScopeRefusal::NoNamesRecord { krate, failed: true, .. } => {
+                write!(f, "crate `{krate}` has no names record this command (its `CrateScope` task failed: that failure is reported at it)")
+            }
+            ScopeRefusal::NoNamesRecord { krate, failed: false, .. } => {
+                write!(f, "crate `{krate}` has no names record this command (it has no `Names` task: engine_names.rs `plan`)")
+            }
+            ScopeRefusal::Records { krate, error, .. } => write!(f, "the names record of crate `{krate}` could not be read: {error} (engine_bodies.rs `scope_of`)"),
+            ScopeRefusal::CheckScope { error } => write!(f, "its check scope could not be made: {error} (engine_bodies.rs `scope_of`)"),
+        }
     }
 }
 
 /// Crate `at`'s check scope (blaze-world check_scope.rs `check_scope_in`), each crate's
 /// records read in place through `read` (engine_records.rs), and whether every crate of it had
-/// records (`false`: a `Names` task failed, and the caller refuses by name). `None`: the crate's
-/// own names record or its scope could not be read.
+/// records (`false`: the scope was cut, [`Scope::cut`] says where and why, and the caller refuses by
+/// name). Refused: the crate's own names record or its scope could not be read, the cause typed
+/// ([`ScopeRefusal`]); nothing is dropped (rule 3).
 #[expect(clippy::too_many_arguments, reason = "a stage's handles, each named")]
-pub(crate) fn scope_of<'r>(read: &mut EngineRecords<'r>, cx: &Cx, store: &mut dyn crate::store::Store<'r>, names: &NamesStage<'_>, list: &blaze_world::crate_list::CrateList<'static>, at: usize, heap: &'static blaze_own::Heap) -> Option<(Scope<'r>, bool)> {
+pub(crate) fn scope_of<'r>(read: &mut EngineRecords<'r>, cx: &Cx, store: &mut dyn crate::store::Store<'r>, names: &NamesStage<'_>, list: &blaze_world::crate_list::CrateList<'static>, at: usize, heap: &'static blaze_own::Heap) -> Result<(Scope<'r>, bool), ScopeRefusal> {
     let g = heap.alloc();
-    let input_at = |at: usize| names.input_of(blaze_drive::key::crate_scope_name(&list.key(at)));
-    let own = input_at(at)?;
-    let own_records = read.records(cx, store, &own, list.key(at), g).ok()?;
+    let name_at = |at: usize| blaze_drive::key::crate_scope_name(&list.key(at));
+    let input_at = |at: usize| names.input_of(name_at(at));
+    let krate = CrateGraph::name(list, at);
+    let own = input_at(at).ok_or_else(|| ScopeRefusal::NoNamesRecord { krate, at, failed: names.failed(name_at(at)) })?;
+    let own_records = read.scope_records(cx, store, &own, list.key(at), krate, g).map_err(|error| ScopeRefusal::Records { krate, at, error })?;
     let no_core = blaze_scope::names_record::NamesRecord::open(own_records.names_proof).crate_root().head().no_core;
-    let checked = blaze_world::check_scope::check_scope_in(list, at, no_core, g).ok()?;
+    let checked = blaze_world::check_scope::check_scope_in(list, at, no_core, g).map_err(|error| ScopeRefusal::CheckScope { error })?;
     let mut scope = Scope { own_records, crates: Vec::new_in(Global), lang: Vec::new_in(Global), scope: Vec::new_in(Global), cut: None };
     scope.lang.extend(checked.lang_places());
     let mut whole = true;
     for one in checked.crates() {
         let Some(input) = input_at(one) else {
             whole = false;
-            scope.cut = Some(one);
+            scope.cut = Some((one, CutWhy::NoNamesRecord { failed: names.failed(name_at(one)) }));
             break;
         };
-        let Ok(records) = read.records(cx, store, &input, list.key(one), g) else {
-            whole = false;
-            scope.cut = Some(one);
-            break;
+        let records = match read.scope_records(cx, store, &input, list.key(one), CrateGraph::name(list, one), g) {
+            Ok(records) => records,
+            Err(error) => {
+                whole = false;
+                scope.cut = Some((one, CutWhy::Unreadable(error)));
+                break;
+            }
         };
         scope.crates.push(Crate { records, name: CrateGraph::name(list, one), package: list.shown_from(one), world_at: one });
         scope.scope.push(input.name);
     }
     scope.scope.sort_unstable();
-    Some((scope, whole))
+    Ok((scope, whole))
+}
+
+/// Each outlined file's bodies by name with their labels (or the words of why its text could
+/// not be read again), as [`planned_label`] makes them: in the request's frame.
+type Labels<'f> = Vec<(u32, Result<Vec<(Name, &'f str), &'f Frame>, &'f str>), &'f Frame>;
+
+/// The label body `name` of outline `file` prints when it was refused before any records named
+/// it (a member's scope not read, its file claimed by no unit): the label a checked body prints
+/// (`groups`: [`crate::item_name::shown_name`] of its outline item, or the macro call it is),
+/// made from the file's text outlined again under its part's edition, once a file (`labels`).
+/// Only printed, never keyed (rule 71). A file whose text no longer outlines to the body
+/// prints "" ([`crate::engine_body_plan::Named`] then names its place); one that cannot be read
+/// prints why, in braces as a label that is not a name.
+fn planned_label<'f>(labels: &mut Labels<'f>, cx: &Cx, root: &Dir<ReadWrite>, outlined: &[crate::engine_tasks::Outlined<'_>], file: u32, name: Name, frame: &'f Frame) -> &'f str {
+    let at = match labels.iter().position(|(one, _)| *one == file) {
+        Some(at) => at,
+        None => {
+            let made = file_labels(cx, root, outlined, file, frame).map_err(|lost| {
+                let words = bstd::mem::format_in!(frame, "{{a body of a file whose text could not be read again to name it: {lost}}}");
+                core::str::from_utf8(words.into_bytes().leak()).unwrap_or("{a body of a file whose text could not be read again}")
+            });
+            labels.push((file, made));
+            labels.len() - 1
+        }
+    };
+    match &labels[at].1 {
+        Ok(bodies) => bodies.iter().find(|(one, _)| *one == name).map_or("", |(_, label)| *label),
+        Err(words) => words,
+    }
+}
+
+/// Why a file's text could not be read again for its bodies' labels ([`planned_label`]).
+#[derive(Debug)]
+enum LabelLost {
+    /// No outline of that index ([`crate::engine_tasks::Outlined`]).
+    NoOutline { file: u32 },
+    Path(bstd::path::PathError),
+    Read(bstd::fs::FsError),
+    NotText,
+    NoEdition { byte: u8 },
+}
+
+impl core::fmt::Display for LabelLost {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            LabelLost::NoOutline { file } => write!(f, "outline {file} is not among the planner's"),
+            LabelLost::Path(error) => write!(f, "its path: {error}"),
+            LabelLost::Read(error) => write!(f, "{error}"),
+            LabelLost::NotText => f.write_str("its bytes are not UTF-8"),
+            LabelLost::NoEdition { byte } => write!(f, "its edition byte {byte} is no edition"),
+        }
+    }
+}
+
+/// Every body of outline `file` by its name ([`work::body_name`]), each labelled as `groups`
+/// labels a checked one.
+fn file_labels<'f>(cx: &Cx, root: &Dir<ReadWrite>, outlined: &[crate::engine_tasks::Outlined<'_>], file: u32, frame: &'f Frame) -> Result<Vec<(Name, &'f str), &'f Frame>, LabelLost> {
+    let one = outlined.get(file as usize).ok_or(LabelLost::NoOutline { file })?;
+    let path = core::str::from_utf8(&one.path).map_err(|_| LabelLost::NotText)?;
+    let mut bytes = bstd::mem::Bytes::new_in(frame, "a source file whose refused bodies are named");
+    root.read_all(cx, &bstd::path::Path::new(path).map_err(LabelLost::Path)?, &mut bytes).map_err(LabelLost::Read)?;
+    let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| LabelLost::NotText)?;
+    let edition = blaze_surface::Edition::from_byte(one.edition).ok_or(LabelLost::NoEdition { byte: one.edition })?;
+    let erased = blaze_own::Erased::new(frame);
+    let outline = blaze_file_items::outline(text, edition, erased.handle());
+    let mut found = Vec::new_in(frame);
+    for item in outline.items().iter() {
+        if work::checked_body(&outline, item).is_none() && !work::expansion_entry(&outline, item, text) {
+            continue;
+        }
+        let shown = crate::item_name::shown_name(item, text);
+        let label = match shown.is_empty() {
+            false => bstd::mem::format_in!(frame, "{shown}"),
+            true => bstd::mem::format_in!(frame, "{{a macro call}}"),
+        };
+        let label: &'f str = core::str::from_utf8(label.into_bytes().leak()).unwrap_or("");
+        found.push((work::body_name(one.name, &outline, item, text), label));
+    }
+    Ok(found)
 }
 
 /// One body a run checks.
@@ -454,6 +609,9 @@ impl<'f> BodiesStage<'f> {
         // function of; reused a task.
         let mut passed: Vec<u32, Global> = Vec::new_in(Global);
         let mut met: Vec<CellId, Global> = Vec::new_in(Global);
+        // Each file's bodies' labels, made once a file the first time a body of it is refused
+        // with none ([`planned_label`]); at most one entry an outlined file.
+        let mut labels: Labels<'f> = Vec::new_in(frame);
         for task in tasks.iter() {
             let name = task.planned.name;
             let file = handles.outlined.binary_search_by(|one| one.name.cmp(&task.planned.file)).map_or(u32::MAX, |at| u32::try_from(at).unwrap_or(u32::MAX));
@@ -507,7 +665,7 @@ impl<'f> BodiesStage<'f> {
                             // (engine_body_plan.rs `Outside::lines`), so the row keeps the certificate.
                             buffer.done.push(Done { name, key: task.key, out: crate::engine_body_plan::outside_out(name), defines: SVec::new_in(alloc), reads, findings: 0, failed: false });
                             self.outside.push(name, file, is);
-                            self.ran.push(Ran { name, label, file, ns: 0, bytes: 0, findings: 0, said: None, chain: 0, found: Vec::new_in(Global), items: 0 });
+                            self.ran.push(Ran { name, label, file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 0, said: None, chain: 0, found: Vec::new_in(Global), items: 0 });
                             continue;
                         }
                         // No member crate's records hold the body's file: checked by no crate. It
@@ -525,7 +683,7 @@ impl<'f> BodiesStage<'f> {
                             }
                             let out = ContentId::of(OWNERLESS_DOMAIN, &name.subject.0);
                             buffer.done.push(Done { name, key: task.key, out, defines: SVec::new_in(alloc), reads, findings: 0, failed: false });
-                            self.ran.push(Ran { name, label: "", file, ns: 0, bytes: 0, findings: 0, said: None, chain: 0, found: Vec::new_in(Global), items: 0 });
+                            self.ran.push(Ran { name, label: "", file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 0, said: None, chain: 0, found: Vec::new_in(Global), items: 0 });
                             continue;
                         }
                     }
@@ -536,7 +694,13 @@ impl<'f> BodiesStage<'f> {
                 reads.push((*id, view.cell(id)));
             }
             buffer.done.push(crate::engine_tasks::failed_with(task, reads, alloc));
-            self.ran.push(Ran { name, label, file, ns: 0, bytes: 0, findings: 1, said: Some(Said::Refused(refused)), chain: 0, found: Vec::new_in(Global), items: 0 });
+            // A body refused before any records named it is printed by the label a checked body
+            // prints (its outline item's name, `groups`), never an empty name (rule 19).
+            let label = match label.is_empty() {
+                true => planned_label(&mut labels, &cx, handles.root, handles.outlined, file, name, frame),
+                false => label,
+            };
+            self.ran.push(Ran { name, label, file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 1, said: Some(Said::Refused(refused)), chain: 0, found: Vec::new_in(Global), items: 0 });
         }
         self.outside.finish();
         // 3. Your code first is the next piece (engine.md 4); today: by member, file, name.
@@ -704,14 +868,18 @@ impl<'f> BodiesStage<'f> {
                 continue;
             };
             members.push(own.name);
-            let Some((scope, whole)) = scope_of(read, cx, store, names, &list, member, heap) else {
-                // `scope_of` reads the crate's own names record and the check scope the graph
-                // makes (blaze-world check_scope.rs): both cells.
-                refuse_all("its crate's records or its check scope could not be read (engine_bodies.rs `scope_of`)", own_cells);
-                continue;
+            let (scope, whole) = match scope_of(read, cx, store, names, &list, member, heap) {
+                Ok(made) => made,
+                Err(cause) => {
+                    // `scope_of` reads the crate's own names record and the check scope the
+                    // graph makes (blaze-world check_scope.rs): both cells. The cause printed,
+                    // typed, the crate named (rule 19).
+                    refuse_all(crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                    continue;
+                }
             };
             let own_records = scope.own_records;
-            let cut = scope.cut;
+            let cut_words = scope.cut_cause(&list).map(|cause| crate::engine_head_notes::leak(heap.alloc(), format_args!("its member's {cause}")));
             // The member's environment, its script run's record handed by the Scripts stage.
             let env = crate::body_types::owner_env_by(cx, store, &|script| names.input_of(script), &list, member, handles.env.home, frame)?;
             let (env, script, env_refused) = match env {
@@ -760,13 +928,8 @@ impl<'f> BodiesStage<'f> {
             let empty: &'f [CellId] = &[];
             let refused = match (whole, env_refused) {
                 (false, _) => Some((
-                    match cut {
-                        Some(one) => {
-                            let words = bstd::mem::format_in!(g, "its member's check scope holds `{}`, which has no names record this command (its `CrateScope` task failed: that failure is reported at it)", CrateGraph::name(&list, one));
-                            core::str::from_utf8(words.into_bytes().leak()).unwrap_or("")
-                        }
-                        None => "a crate of its member's check scope has no names record this command (its `CrateScope` task failed)",
-                    },
+                    // `scope_of` returns `false` exactly when it cuts the scope, the cause with it.
+                    cut_words.unwrap_or("its member's check scope was cut and `scope_of` kept no cut (engine_bodies.rs `scope_of`)"),
                     scope_cells,
                 )),
                 (true, Some(why)) => {
@@ -1056,6 +1219,8 @@ impl<'f> BodiesStage<'f> {
             let used_up = self.ran.iter().filter(|one| matches!(one.said, Some(Said::FrameUsedUp { .. }))).count();
             let _ = writeln!(into, "bodies: largest frame a body used: {} bytes, `{}` in {path} (of {BODIES_FRAME} reserved a stretch, a stretch ends past {STRETCH_FULL}); {used_up} body(ies) used one up", most.bytes, most.label);
         }
+        // What the bodies left in their stretches' frames, summed (the guard's line).
+        crate::engine_memory::BodyFrames::of(self.ran.iter().map(|one| (one.bytes, one.stretch, one.label))).line(into);
     }
 }
 
@@ -1141,9 +1306,9 @@ impl<'a> Make<'a> for ViewMake<'_, 'a> {
 }
 
 /// A stretch's frame past this many bytes takes no further body: the next body opens its
-/// records into a new frame. A body's lowerings and the records' copied segments live in the
-/// frame until the records go (`check_body` borrows them for the records' lifetime), so a frame
-/// is reset by ending its stretch, never per body; half the reserve leaves the next body the
+/// records into a new frame. A body's local items' rows live in the frame until the records go
+/// (`check_body` borrows them for the records' lifetime; no question copies into it any more:
+/// front2 source.rs `Records::walk`, `VariantRows`), so a frame is reset by ending its stretch, never per body; half the reserve leaves the next body the
 /// other half (tempo, g124650: three 32-body runs used up the whole 1 GiB in one frame).
 const STRETCH_FULL: usize = BODIES_FRAME / 2;
 
@@ -1168,7 +1333,7 @@ fn refuse<'a, 'f>(rest: &[One<'f>], why: &'static str, out: &mut Buffer<'a>, ran
         // A machine's refusal (a frame not reserved, records not opened in the run): a function
         // of no cell, so no read; owed (empty reads), entered again by the next request.
         out.done.push(crate::engine_tasks::failed(&one.task, alloc));
-        ran.push(Ran { name: one.task.planned.name, label: one.label, file: one.file, ns: 0, bytes: 0, findings: 1, said: Some(Said::Refused(why)), chain: one.place.chain, found: Vec::new_in(Global), items: 0 });
+        ran.push(Ran { name: one.task.planned.name, label: one.label, file: one.file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 1, said: Some(Said::Refused(why)), chain: one.place.chain, found: Vec::new_in(Global), items: 0 });
     }
     rest.len()
 }
@@ -1205,6 +1370,21 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
     // placed by this stretch's names the one way `widen` places a read (engine_seeds.rs
     // `StretchHeads`), on the stack so its `Owners` is dropped with the stretch.
     let stretch_heads = shared.seeds.map(|table| crate::engine_seeds::StretchHeads::new(table, opened.records, shared.heads, g));
+    // The seed freezer's constant evaluator: the head tasks' own (engine_head_consts.rs), its
+    // lang index built by the one function a head task builds it by, once a stretch, and what
+    // it reads kept as it grows (`EvalSink`), so each body's read list takes it ([`add_eval_reads`]).
+    // Two crates declaring one lang item refuse the stretch by name, as they fail a head task.
+    let evaluated: &crate::engine_head_consts::EvalSink<'_> = frame.alloc(crate::engine_head_consts::EvalSink::new(g));
+    let index: Option<&blaze_ladder::front2::index::Index<'_>> = match shared.seeds {
+        Some(_) => match crate::engine_head_consts::lang_index(tables, evaluated, &group.lang) {
+            Ok(index) => Some(&*frame.alloc(index)),
+            Err(twice) => return refuse(run, crate::engine_head_notes::leak(g, format_args!("its scope's constants have no lang index: {twice} (front2 index.rs `LangTwice`)")), out, ran, alloc),
+        },
+        None => None,
+    };
+    // The reads of building the index alone: a body takes the evaluator's reads only once it
+    // evaluated a constant (as a head task takes them when its evaluator was asked).
+    let index_reads = evaluated.len();
     let seed: Option<&dyn HeadSeed<'_>> = match &stretch_heads {
         Some(table) => {
             let mut sized = None;
@@ -1216,7 +1396,8 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
                 });
             }
             let fa = frame.alloc(blaze_own::Erased::new(frame)).handle();
-            let freezer = SeededHeads::new(SeededHeadsOpts { names: opened.records, sized, frame, scratch: g, alloc: fa, consts: None, known: Some(table) });
+            let consts = index.map(|index| frame.alloc(crate::engine_head_consts::HeadConsts::new(tables.reading_into(evaluated), index, g)) as &mut (dyn ConstValues<'_> + '_));
+            let freezer = SeededHeads::new(SeededHeadsOpts { names: opened.records, sized, frame, scratch: g, alloc: fa, consts, known: Some(table) });
             Some(frame.alloc(RequestSeed::new(RequestSeedOpts { names: opened.records, heads: table, freezer })))
         }
         None => None,
@@ -1226,12 +1407,20 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
     let cost: &Cost<'_> = frame.alloc(Cost::new(&NO_GAUGE));
     let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed, sources: Some(opened.sources), goals: None };
     let mut owners = crate::engine_heads::Owners::new(shared.heads);
+    // Each head whose first freeze in this stretch failed, with its own reason (key-free,
+    // engine_head_notes.rs `Reason`): what a body that asks it again quotes ([`own_reason`]).
+    // At most [`MOST_STRETCH_REASONS`]; past it a body says its reason was not kept.
+    let mut first_reasons: Vec<(Want, &'static str), blaze_own::Alloc<'static>> = Vec::new_in(g);
     let mut taken = 0usize;
     for one in run {
         if taken > 0 && frame.used() > STRETCH_FULL {
             break;
         }
         taken += 1;
+        // The guard (rule 54): the frame's use before and after each body, one load each; a
+        // later body's growth is what a question kept past its body (engine_memory.rs
+        // `BodyFrames`).
+        let stretch = if taken == 1 { InStretch::First } else { InStretch::Later };
         let at_start = frame.used();
         let _body = cx.span("engine: one body");
         let began = clock.now();
@@ -1337,20 +1526,39 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
             let said = match said {
                 Some(Said::Task(TaskError::Seed { body, error: SeedError::Freeze(error) })) => {
                     let words = match unmade_head(&error) {
-                        // A head that needs a constant's value: the freeze has no evaluator yet
-                        // (`consts: None`; the head tasks' evaluator is lane RH1's,
-                        // engine_heads.rs): the head and the constant by path, the evaluator's
-                        // reason, counted apart ("refused at a seed for a constant").
+                        // A head that needs a constant's value the evaluator could not give
+                        // (the head tasks' own, engine_head_consts.rs `HeadConsts`): the head and
+                        // the constant by path, the evaluator's reason, counted apart ("refused
+                        // at a seed for a constant").
                         Unmade::Head(want) => {
                             head = Some(want);
                             let shown = ItemShown::of_lib(opened.records, want.key());
-                            match &error {
-                                FreezeError::Const { c, error: reason, .. } => {
+                            // The head's OWN reason, once a body (rule 19): its head task's when
+                            // a member's head failed there, else its first freeze's in this
+                            // stretch (a second ask is `FreezeError::Again`, which says only
+                            // that it failed before).
+                            let own = own_reason(want, &first_reasons, shared.heads_failed, &mut owners, opened.records, g);
+                            // A first freeze's reason, kept for the bodies that ask again.
+                            if !matches!(error, FreezeError::Again { .. }) && !first_reasons.iter().any(|(one, _)| *one == want) && first_reasons.len() < MOST_STRETCH_REASONS {
+                                first_reasons.push((want, crate::engine_head_notes::leak(g, format_args!("{}", crate::engine_head_notes::Reason(&error)))));
+                            }
+                            match (own, &error) {
+                                (Some((head, why)), _) => {
+                                    if matches!(error, FreezeError::Const { .. }) {
+                                        tally.refused_const = tally.refused_const.saturating_add(1);
+                                    }
+                                    Some(bstd::mem::format_in!(g, "not checked because the head of `{head}` it reads could not be frozen: {why} (its head's own reason; engine_bodies.rs `own_reason`)"))
+                                }
+                                (None, FreezeError::Again { .. }) => Some(bstd::mem::format_in!(
+                                    g,
+                                    "not checked because a head it reads could not be made: the head of `{shown}` failed when first frozen, and its reason was not kept (this stretch keeps at most {MOST_STRETCH_REASONS}, and a head task's are kept by engine_head_notes.rs; engine_bodies.rs `own_reason`)"
+                                )),
+                                (None, FreezeError::Const { c, error: reason, .. }) => {
                                     tally.refused_const = tally.refused_const.saturating_add(1);
                                     let constant = ItemShown::of_lib(opened.records, *c);
                                     Some(bstd::mem::format_in!(g, "not checked: refused at a seed for a constant: the head of `{shown}` needs the value of constant `{constant}`: {reason} (engine_seeds.rs; front2 tables/head.rs `FreezeError::Const`)"))
                                 }
-                                _ => Some(bstd::mem::format_in!(g, "not checked because a head it reads could not be made: the head of `{shown}`: {error} (its head's own refusal says why; engine_bodies.rs `unmade_head`)")),
+                                (None, _) => Some(bstd::mem::format_in!(g, "not checked because a head it reads could not be made: the head of `{shown}`: {error} (its head's own refusal says why; engine_bodies.rs `unmade_head`)")),
                             }
                         }
                         Unmade::Unnamed => Some(bstd::mem::format_in!(g, "not checked because a head it reads could not be made: {error} (engine_bodies.rs `unmade_head`)")),
@@ -1376,12 +1584,37 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
             if let Some(want) = head {
                 reads.push((head_cell_id(want), ABSENT));
             }
+            // What the seed's constant evaluator read for it, as a checked body takes it; a read
+            // list it cannot place is no read list: the row is then owed (rule 21), its words
+            // after the body's own.
+            let placed = add_eval_reads(evaluated, index_reads, tables, opened.records, shared.heads, &group.crates, &mut reads, g);
+            let said = match (placed, said) {
+                (Ok(()), said) => said,
+                (Err(words), Some(Said::Unchecked(own))) => Some(Said::Unchecked(crate::engine_head_notes::leak(g, format_args!("{own}; and its read list is owed: {words}")))),
+                // The engine's own fault stays the body's words; the row is owed all the same.
+                (Err(_), Some(other)) => Some(other),
+                (Err(words), None) => Some(Said::Refused(words)),
+            };
+            let owed = !matches!(placed, Ok(()));
             let (mut reads, _) = widen_as(shared.scope_reads, &reads, group, &mut owners, opened.records, shared.view, shared.heads_failed, g, alloc);
             // And who checks it (engine_body_plan.rs), as a checked body's.
             crate::engine_body_plan::add_reads(&mut reads, one.held, shared.view);
-            out.done.push(crate::engine_tasks::failed_with(&one.task, reads, alloc));
-            ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, findings: 1, said, chain: one.place.chain, found: Vec::new_in(Global), items: 0 });
+            out.done.push(match owed {
+                false => crate::engine_tasks::failed_with(&one.task, reads, alloc),
+                true => crate::engine_tasks::failed(&one.task, alloc),
+            });
+            ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: 1, said, chain: one.place.chain, found: Vec::new_in(Global), items: 0 });
             continue;
+        }
+        // What the seed's constant evaluator read until now (module docs of
+        // engine_head_consts.rs), taken before the verdict is filed: a read list it cannot
+        // place is no read list, so the body is owed, named (rule 21), never filed on part of
+        // its reads.
+        let mut eval_reads: SVec<'a, (CellId, ContentId)> = SVec::new_in(alloc);
+        if said.is_none()
+            && let Err(words) = add_eval_reads(evaluated, index_reads, tables, opened.records, shared.heads, &group.crates, &mut eval_reads, g)
+        {
+            said = Some(Said::Refused(words));
         }
         if shared.seeds.is_some() && said.is_none() {
             tally.seeded = tally.seeded.saturating_add(1);
@@ -1391,7 +1624,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
             // A panic or a `TaskError` (check_body returns no reads with it): owed, never filed
             // on a partial read list (work.rs: panics and machine faults stay holes).
             out.done.push(crate::engine_tasks::failed(&one.task, alloc));
-            ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, findings: 1, said: Some(said), chain: one.place.chain, found: Vec::new_in(Global), items: 0 });
+            ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: 1, said: Some(said), chain: one.place.chain, found: Vec::new_in(Global), items: 0 });
             continue;
         }
         // Rule 25: the lines record's bytes a function of the findings alone.
@@ -1411,6 +1644,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
         if one.items.is_empty() {
             done.reads.push((CellId { of: group.own, cell: WHOLE }, ABSENT));
         }
+        done.reads.extend_from_slice(&eval_reads);
         let (wide, unfrozen) = widen_as(shared.scope_reads, &done.reads, group, &mut owners, opened.records, shared.view, shared.heads_failed, g, alloc);
         done.reads = wide;
         // Who checks it is a function of the units ranked before its checker (engine_body_plan.rs).
@@ -1434,7 +1668,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
         // as a finding): in the request's heap, as the labels are.
         let said = (done.failed || !why.is_empty()).then(|| Said::Unchecked(core::str::from_utf8(bstd::mem::format_in!(g, "{why}").into_bytes().leak()).unwrap_or("")));
         let items = u32::try_from(one.items.len()).unwrap_or(u32::MAX);
-        ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, findings: done.findings, said, chain: one.place.chain, found, items });
+        ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: done.findings, said, chain: one.place.chain, found, items });
         out.done.push(done);
     }
     taken
@@ -1508,6 +1742,68 @@ fn env_in<'l: 'n, 'n>(lent: Option<EnvLent<'_, 'l>>, frame: &'n Frame) -> Result
 /// [`widen`] by the command's strategy (engine_scope_reads.rs, rule 78): the one dispatch from
 /// the runtime choice to a [`crate::engine_scope_reads::ScopeReads`] instantiation.
 #[expect(clippy::too_many_arguments, reason = "the strategy, a body's reads and every table that names them")]
+/// The most first-freeze reasons one stretch keeps ([`own_reason`], rule 18).
+const MOST_STRETCH_REASONS: usize = 1 << 12;
+
+/// Head `want`'s own reason, the head named as its notes name it, for a body refused at a seed
+/// for it: its head task's (a member's head the Heads stage could not freeze, engine_head_notes.rs
+/// `Failed`), placed as `widen` places a head read; else the reason its first freeze in this
+/// stretch failed for (`first`). `None`: neither holds it.
+fn own_reason<'n>(
+    want: Want,
+    first: &[(Want, &'static str)],
+    heads_failed: &crate::engine_head_notes::Failed,
+    owners: &mut crate::engine_heads::Owners<'_>,
+    records: &'n blaze_ladder::front2::source::Records<'n>,
+    g: blaze_own::Alloc<'static>,
+) -> Option<(&'static str, &'static str)> {
+    if let Some(crate::engine_heads::HeadAt::Cell { cell, .. }) = owners.place(records, &head_cell_id(want), g)
+        && let Some(one) = heads_failed.find(cell.of, cell.cell)
+    {
+        return Some((one.head, one.why));
+    }
+    let why = first.iter().find(|(one, _)| *one == want)?.1;
+    Some((crate::engine_head_consts::head_label(records, want, g), why))
+}
+
+/// What a stretch's seed evaluator read until now ([`crate::engine_head_consts::EvalSink`]),
+/// into a body's `reads` as a head task takes its evaluator's (engine_heads.rs `heads_of`):
+/// each names cell as front2 names it (tables/task.rs `cell_id`) and, for each item whose text
+/// it read, the cell that moves with that text (engine_head_consts.rs `text_cell`); each read
+/// ABSENT, as [`widen_as`] reads every cell at the view's digest. Nothing when the evaluator
+/// evaluated no constant (`index_reads`: the reads of building its lang index alone). Refused,
+/// with the words a note prints, when a read cannot be placed or the reads were past their cap.
+#[expect(clippy::too_many_arguments, reason = "a body's reads and every table that names them")]
+fn add_eval_reads<'a, 'n>(
+    evaluated: &crate::engine_head_consts::EvalSink<'_>,
+    index_reads: usize,
+    tables: Tables<'_, 'n>,
+    records: &'n blaze_ladder::front2::source::Records<'n>,
+    subjects: &crate::engine_heads::Subjects,
+    crates: &[Crate<'_>],
+    reads: &mut SVec<'a, (CellId, ContentId)>,
+    g: blaze_own::Alloc<'static>,
+) -> Result<(), &'static str> {
+    if evaluated.len() <= index_reads {
+        return Ok(());
+    }
+    let mut table: Vec<blaze_ladder::front2::tables::recorder::TableRead, blaze_own::Alloc<'static>> = Vec::new_in(g);
+    evaluated
+        .reads(&mut |one| table.push(one))
+        .map_err(|full| crate::engine_head_notes::leak(g, format_args!("its constants' evaluation at the seed read too much: {full}")))?;
+    for one in table.iter() {
+        match blaze_ladder::front2::tables::task::cell_id(tables, *one) {
+            Ok(Some(id)) => reads.push((id, ABSENT)),
+            Ok(None) => {}
+            Err(error) => return Err(crate::engine_head_notes::leak(g, format_args!("a names read of its constants' evaluation at the seed names a crate its scope does not hold: {error} (front2 tables/task.rs `cell_id`)"))),
+        }
+    }
+    crate::engine_head_consts::eval_reads(records, subjects, &table, &mut |id| reads.push((id, ABSENT))).map_err(|unplaced| {
+        let shown = crate::engine_head_consts::UnplacedIn { unplaced: &unplaced, crates };
+        crate::engine_head_notes::leak(g, format_args!("its constants' evaluation at the seed read a text no crate of its scope holds: {shown}"))
+    })
+}
+
 fn widen_as<'a, 'n>(
     reads_as: crate::engine_scope_reads::ScopeReadsAs,
     reads: &[(CellId, ContentId)],

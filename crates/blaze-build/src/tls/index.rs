@@ -56,10 +56,10 @@ pub const ENDER_IMPORTS: [&str; 3] = ["pthread_setspecific", "free", "free"];
 
 /// The trap code of a `pthread_setspecific` that failed (it may allocate: glibc's second-level
 /// key arrays). Nothing is quietly ignored (rule 3).
-pub const SET_FAILED_TRAP: u32 = 0xfe02;
+pub const SET_FAILED_TRAP: u32 = blaze_code::trap::SET_FAILED;
 
 /// The trap code of a row whose `init_len` exceeds its `size` (a malformed descriptor).
-pub const BAD_ROW_TRAP: u32 = 0xfe03;
+pub const BAD_ROW_TRAP: u32 = blaze_code::trap::BAD_ROW;
 
 /// The least alignment a copy is asked at: both libcs' `aligned_alloc` accept it, and a smaller
 /// alignment a row asks for is met by a larger one.

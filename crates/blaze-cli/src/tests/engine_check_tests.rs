@@ -48,11 +48,12 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
         head_units: crate::engine_heads::HeadUnits::Each,
         frame,
         scope_reads: crate::engine_scope_reads::ScopeReadsAs::DEFAULT,
+        unreadable: None,
     }
 }
 
 /// `blaze why <target>` on the checkout `ws`: what it printed.
-fn why(io: &Io, target: &str) -> std::string::String {
+pub(super) fn why(io: &Io, target: &str) -> std::string::String {
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let out = io.need_out().expect("out");
@@ -1278,7 +1279,7 @@ fn a_body_through_a_broken_import_alone_fails() {
 /// A crate whose names cannot be made at all (a member proc macro: the test shelf has no
 /// `wasm32-wasip1` side, names/scope.rs `prepare`'s refused crate) and a member that depends on
 /// it and names nothing of it.
-fn failed_dep(io: &Io) {
+pub(super) fn failed_dep(io: &Io) {
     write(io, "Cargo.toml", "[workspace]\nmembers = [\"p\", \"b\", \"c\"]\nresolver = \"2\"\n");
     write(io, "p/Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\nproc-macro = true\n");
     write(io, "p/src/lib.rs", "pub fn nothing() {}\n");

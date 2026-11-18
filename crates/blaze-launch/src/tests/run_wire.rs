@@ -28,7 +28,7 @@ enum OwnedFailure {
     Overran(u64),
 }
 
-enum Message<'a> {
+pub(super) enum Message<'a> {
     Up(Up),
     Down(Down<'a>),
 }
@@ -108,7 +108,7 @@ fn owned(tape: &Tape) -> Owned {
     }
 }
 
-fn encoded(message: &Message<'_>, id: u64) -> Vec<u8> {
+pub(super) fn encoded(message: &Message<'_>, id: u64) -> Vec<u8> {
     let mut out = Vec::new();
     match message {
         Message::Up(up) => up.encode(id, &mut out),

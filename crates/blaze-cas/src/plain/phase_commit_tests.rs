@@ -21,13 +21,18 @@ use blaze_core::{
 };
 use blaze_ids::ContentId;
 use blaze_keyed::kind::{Namespace, Tag};
+use blaze_mem::Frame;
 
 use super::{
     core::{PlainConfig, Plant, TAGS},
     driven::{Cut, Driven},
     lent::{Lent, LentError, LentPlant},
+    test_root,
 };
 use crate::Key;
+
+/// A process's store, its arena in the run's frame.
+type Store<'f> = Lent<Sim, &'f Frame>;
 
 const TAG: Tag = Tag(1);
 /// Two phases of eight records each.
@@ -53,8 +58,8 @@ fn cfg(n: u64) -> PlainConfig {
     }
 }
 
-fn process(sim: Sim, n: u64) -> Lent<Sim, Global> {
-    Lent::planted(Driven::planted(sim, Path::new("/sim"), cfg(n), Plant::None).expect("the store opens"), Global, LentPlant::None)
+fn process(sim: Sim, n: u64, root: &Frame) -> Store<'_> {
+    Lent::planted(Driven::planted(sim, Path::new("/sim"), cfg(n), Plant::None).expect("the store opens"), root, LentPlant::None)
 }
 
 fn record(n: u32) -> Key {
@@ -81,7 +86,7 @@ fn answer() -> (Key, Vec<u8>) {
 
 /// The command: each phase's puts then a commit; then the answer's record, its pointer, and the
 /// last commit. `early`: the planted shape, the pointer written by the first phase's commit.
-fn command(lent: &Lent<Sim, Global>, early: bool) -> Result<(), LentError> {
+fn command(lent: &Store<'_>, early: bool) -> Result<(), LentError> {
     let (answer_key, answer_bytes) = answer();
     for (at, phase) in PHASES.iter().enumerate() {
         for n in phase.clone() {
@@ -105,7 +110,7 @@ fn command(lent: &Lent<Sim, Global>, early: bool) -> Result<(), LentError> {
 /// What a home reads: each record's bytes (or absent), the pointer, and the answer's bytes.
 type Read = (Vec<Option<Vec<u8>>>, Option<Key>, Option<Vec<u8>>);
 
-fn read(lent: &Lent<Sim, Global>) -> Result<Read, LentError> {
+fn read(lent: &Store<'_>) -> Result<Read, LentError> {
     let mut records = Vec::new();
     for n in PHASES.iter().flat_map(|phase| phase.clone()) {
         records.push(lent.get(&record(n))?.map(|got| got.bytes.to_vec()));
@@ -136,12 +141,15 @@ fn broken(read: &Read, reached: bool) -> Option<&'static str> {
 }
 
 /// Every cut of the command, each followed by process death alone and by a power cut, then the
-/// reopen's oracle and the next request: how many homes broke the claim, of how many cuts.
+/// reopen's oracle and the next request: how many homes broke the claim, of how many cuts. Each
+/// cut is a run of its own, its processes' arenas in a frame of that run, given back before the
+/// next.
 fn torn(early: bool, fresh: &Read) -> (u32, u32) {
     let (mut bad, mut cuts) = (0, 0);
     for at in 0..1024u32 {
         for power in [false, true] {
-            let first = process(Sim::new(53, Faults::default()), 1);
+            let root = test_root();
+            let first = process(Sim::new(53, Faults::default()), 1, &root);
             first.cut(Some(Cut::After(at)));
             let reached = command(&first, early).is_ok();
             let mut sim = first.into_store().into_driver();
@@ -151,7 +159,7 @@ fn torn(early: bool, fresh: &Read) -> (u32, u32) {
             } else {
                 sim.processes_died();
             }
-            let after = process(sim, 2);
+            let after = process(sim, 2, &root);
             let why = match read(&after) {
                 Ok(home) => broken(&home, reached),
                 Err(error) => {
@@ -189,9 +197,10 @@ fn torn(early: bool, fresh: &Read) -> (u32, u32) {
 #[test]
 fn a_commit_after_each_phase_leaves_a_home_the_next_request_finishes() {
     let fresh = {
-        let lent = process(Sim::new(53, Faults::default()), 1);
+        let root = test_root();
+        let lent = process(Sim::new(53, Faults::default()), 1, &root);
         command(&lent, false).expect("the command on a fresh home");
-        let after = process(lent.into_store().into_driver(), 2);
+        let after = process(lent.into_store().into_driver(), 2, &root);
         read(&after).expect("a fresh build's reads")
     };
     assert_eq!(broken(&fresh, true), None, "the fresh build itself breaks the oracle");

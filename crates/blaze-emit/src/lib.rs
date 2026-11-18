@@ -254,6 +254,10 @@ mod target_tests;
 #[cfg(test)]
 mod quad_tests;
 
+/// Every trap code a producer writes is blaze-code trap.rs's (its one home).
+#[cfg(test)]
+mod trap_codes_tests;
+
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tier_tests;
 
