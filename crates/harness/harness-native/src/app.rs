@@ -329,6 +329,8 @@ pub struct App {
     /// At home: nothing is selected on purpose, so the main card shows Learn and no session is selected in its place.
     /// True at launch and after the sidebar's Learn row; false once anything is selected.
     home: bool,
+    /// The scroll of a lesson's step (app/learn.rs learn_wheel): the text areas' physics and overlay scroller.
+    learn_scroll: std::cell::RefCell<view::field::FieldScroll>,
     /// The sidebar tree's rows across frames, for folding rows in and away (src/app/fold.rs).
     fold: fold::TreeFold,
     /// The tree has the keyboard (a tree row was pressed): arrows move in it until a pane is pressed or another key typed.
@@ -651,6 +653,7 @@ impl App {
             arch_scroll: archive::ListScroll::default(),
             learn: std::cell::RefCell::new(learn::Learn::default()),
             home: true,
+            learn_scroll: std::cell::RefCell::new(view::field::FieldScroll::default()),
             fold: fold::TreeFold::default(),
             tree_focus: false,
             press: (0, KeyMods::default()),
@@ -894,12 +897,29 @@ impl App {
         let rows = model::tree(w);
         // Learn's tutor is plumbing, never a row: a session by the name the app gives its tutor (app/learn.rs) is closed
         // out of the tree, running or ended.
-        for (e, _) in &rows {
-            let o = w.entity_from_id(*e);
-            if !o.has(model::Closed::id()) && o.try_cloned::<&model::Name>().is_some_and(|n| n.s.as_str() == learn::TUTOR_NAME) {
-                o.add(model::Closed::id());
+        // Closed as cmd+W closes (in `closed`, which the marks are kept from every frame): a tag alone would be taken off
+        // again by the next sync and the row would fold away and back for ever.
+        let tutors: Vec<u64> = rows
+            .iter()
+            .map(|(e, _)| *e)
+            .filter(|e| {
+                let o = w.entity_from_id(*e);
+                !o.has(model::Closed::id()) && o.try_cloned::<&model::Name>().is_some_and(|n| n.s.as_str() == learn::TUTOR_NAME)
+            })
+            .collect();
+        let mut closed_some = false;
+        for e in tutors {
+            if let Some(key) = self.key_of(e) {
+                if self.closed.insert(key) {
+                    self.world.entity_from_id(e).add(model::Closed::id());
+                    closed_some = true;
+                }
             }
         }
+        if closed_some {
+            self.save_marks();
+        }
+        let w = self.world.world_ref();
         // Once the daemon's first list is in: the object selected when the app last ran, if it is still there.
         if up && let Some(last) = self.restore.take() {
             // The app opens on Learn, its home: what was selected last is a press away in the sidebar.
@@ -2088,6 +2108,7 @@ impl App {
         }
         self.sync_side_status();
         self.step_archive_scroll();
+        self.step_learn_scroll();
         self.step_chat_scroll();
         let w = self.world.world_ref();
         if w.try_get::<&Viewport>(|v| (v.w, v.h)) != Some(view) {

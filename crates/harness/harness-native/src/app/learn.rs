@@ -72,6 +72,10 @@ pub struct Learn {
     inbox: Arc<Mutex<Vec<Arrived>>>,
     /// The tutor's session is being started (its id has not come yet): nothing starts another meanwhile.
     starting: bool,
+    /// The step's scroll area this frame (hn.LearnStep's `content`; 0 when no step shows), and whether the step is new
+    /// (it starts at its top).
+    area: std::cell::Cell<u64>,
+    fresh: std::cell::Cell<bool>,
     /// Where the arrow keys are in an order check: the item highlighted (its place in the list now).
     at: usize,
     /// The session this launch started, and how many it started: at most one, ever.
@@ -92,6 +96,8 @@ impl Default for Learn {
             want: None,
             ask: 0,
             inbox: Arc::new(Mutex::new(Vec::new())),
+            area: std::cell::Cell::new(0),
+            fresh: std::cell::Cell::new(true),
             at: 0,
             starting: false,
             started: None,
@@ -467,8 +473,9 @@ impl App {
                 let marked = run.view().is_some_and(|v| v.mark.is_some() || matches!(v.step, Step::Read { .. }));
                 run.step(Input::Next, &mut l.saved.progress, today());
                 if marked {
-                    // A new step: the arrows start from its first item.
+                    // A new step: the arrows start from its first item, and it shows from its top.
                     l.at = 0;
+                    l.fresh.set(true);
                 }
                 if run.view().is_none() {
                     l.finish();
@@ -651,6 +658,44 @@ not the transcript.\n\nThe conversation:\n{}",
         true
     }
 
+    /// A wheel over a lesson's step: its content scrolls (a window too short for a step). Whether Learn took it.
+    pub(super) fn learn_wheel(&mut self, ev: &sidebar::Wheel) -> bool {
+        if !self.learn_focused() {
+            return false;
+        }
+        let area = self.learn.borrow().area.get();
+        if area == 0 {
+            return false;
+        }
+        let e = self.world.entity_from_id(area);
+        if !e.is_alive() || !e.try_cloned::<&Laid>().is_some_and(|l| l.contains(self.pointer.x, self.pointer.y)) {
+            return false;
+        }
+        let z = self.zoom();
+        let k = if ev.precise { 1.0 / z } else { 1.0 };
+        if self.learn_scroll.borrow_mut().wheel(e, [ev.dx * k, ev.dy * k], ev.precise, ev.phase, ev.momentum) {
+            self.poke();
+        }
+        true
+    }
+
+    /// Step the lesson's scroll (its physics and its overlay scroller).
+    pub(super) fn step_learn_scroll(&mut self) {
+        let area = self.learn.borrow().area.get();
+        if area == 0 {
+            return;
+        }
+        let e = self.world.entity_from_id(area);
+        if !e.is_alive() {
+            self.learn.borrow().area.set(0);
+            return;
+        }
+        let points_per_pixel = 1.0 / f64::from(self.grid.scale.max(0.5));
+        if self.learn_scroll.borrow_mut().step(e, None, points_per_pixel) {
+            self.poke();
+        }
+    }
+
     /// Draw Learn into `pane` (hn.LearnPane): the one screen the state says.
     pub(super) fn fill_learn_pane(&self, pane: u64) {
         self.learn.borrow_mut().load();
@@ -659,6 +704,9 @@ not the transcript.\n\nThe conversation:\n{}",
         let Some(page) = View::of(w.entity_from_id(pane)).part("page") else { return };
         let l = self.learn.borrow();
         let l = &*l;
+        if !matches!((&l.screen, &l.run), (Screen::Step, Some(_))) {
+            l.area.set(0);
+        }
         let (key, prefab) = match (&l.screen, &l.run) {
             (Screen::Step, Some(_)) => ("step", "hn.LearnStep"),
             (Screen::Making { .. }, _) => ("making", "hn.LearnMaking"),
@@ -840,6 +888,13 @@ fn fill_step(v: View<'_>, l: &Learn, run: &Run) {
         (false, Some(x)) => x.title.clone(),
         (false, None) => "Review".to_owned(),
     };
+    let foot_of = v;
+    let Some(v) = v.part("content") else { return };
+    // The scroll area, for the wheel (App::learn_wheel); a new step starts at its top.
+    l.area.set(v.id());
+    if l.fresh.replace(false) {
+        v.set(harness_native_ui_layout_api::ScrollState { x: 0.0, y: 0.0 });
+    }
     set_text(v, "kicker", &kicker);
     let (title, body, code) = match s.step {
         Step::Read { title, body, code } => (title.as_str(), body.as_str(), code.as_str()),
@@ -913,14 +968,18 @@ fn fill_step(v: View<'_>, l: &Learn, run: &Run) {
             }
         }
     }
-    let (verdict, why) = match s.mark {
-        Some(Mark::Right) => ("Right.", s.step.why()),
-        Some(Mark::Wrong) => ("Not quite.", s.step.why()),
-        None => ("", ""),
-    };
-    set_text(v, "verdict", verdict);
-    set_text(v, "why", why);
-    if let Some(foot) = v.part("foot") {
+    if let Some(foot) = foot_of.part("foot") {
+        // What the marked check was and why, docked over the button; nothing before it is marked.
+        if let Some(said) = foot.part("said") {
+            let shown = s.mark.map(|m| match m {
+                Mark::Right => ("right", "hn.LearnSaidRight", "Right."),
+                Mark::Wrong => ("wrong", "hn.LearnSaidWrong", "Not quite."),
+            });
+            view::for_each_of(said, shown.map(|(key, prefab, verdict)| (key, prefab, verdict)), |card, verdict, _| {
+                set_text(card, "verdict", verdict);
+                set_text(card, "why", s.step.why());
+            });
+        }
         let read = matches!(s.step, Step::Read { .. });
         let (label, action) = match (read, s.mark, s.can_submit) {
             (true, _, _) | (false, Some(_), _) => ("Continue", "learn:next"),
@@ -932,9 +991,11 @@ fn fill_step(v: View<'_>, l: &Learn, run: &Run) {
             (Step::Order { .. }, None) => "\u{2191}\u{2193} to choose \u{b7} shift \u{2191}\u{2193} to move \u{b7} return to check",
             _ => "return",
         };
-        set_text(foot, "hint", hint);
-        if let Some(go) = foot.part("go") {
-            button(go, label, action);
+        if let Some(row) = foot.part("row") {
+            set_text(row, "hint", hint);
+            if let Some(go) = row.part("go") {
+                button(go, label, action);
+            }
         }
     }
 }
