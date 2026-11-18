@@ -236,17 +236,27 @@ fn discriminant_repr<'a, W: ConstWorld>(world: &W, adt: ItemKey) -> R<'a, (u32, 
     Ok(int_info(repr).ok_or(malformed("an enum repr that is not an integer"))?)
 }
 
-/// Variant `v`'s written discriminant `= n`, read from its record; `None`: none written.
+/// Variant `v`'s written discriminant `= n`; `None`: none written.
+///
+/// ONE home (rule 30): the value the layout writes and reads the variant's tag by
+/// (`LayoutFacts::discriminant`, blaze-build layout.rs `enum_`), so the machine's variant of a
+/// tag and the tag of a variant agree with every other reader of the enum. The class: the
+/// machine read its own answer (`ConstWorld::explicit_discriminant`'s record), front2's world
+/// answers that `None` for every variant (its discriminants are the head's, front2 heads.rs
+/// `discriminants`), so core's `AlignmentEnum` (`_Align1Shl0 = 1 << 0`, ..) was numbered 0, 1,
+/// 2, .. here while its layout's tags are 1, 2, 4, ..: a constant `Alignment` built by variant
+/// held 0, and the program's first copy of it found no variant (std hello, 2026-11-17: "the
+/// read of the enum's discriminant found no variant's discriminant" in
+/// `Layout::from_size_align_unchecked`). The record a world names for the discriminant, when it
+/// names one, joins `reads` (the record's key covers it, rule 21).
 fn explicit_discriminant<'a, W: ConstWorld>(world: &W, adt: ItemKey, v: u32, (bits, signed): (u32, bool), reads: &mut Vec<ContentId, Alloc<'a>>, alloc: Alloc<'a>) -> R<'a, Option<i128>> {
-    let Some(d) = world.explicit_discriminant(adt, v) else { return Ok(None) };
-    let key = RecordKey::of(instance_key(world.code_id(d), List::EMPTY, PTys::EMPTY, alloc).map_err(|_| malformed("an instance key"))?);
-    let rec = world.record(key).map_err(|_| Stop::Need(Need { kind: NeedKind::Value, item: d, args: List::EMPTY }))?;
-    reads.push(key.0);
-    let root = rec.data.allocs.first().ok_or(malformed("a record with no root"))?;
-    let mut x: u128 = 0;
-    for (k, &b) in root.bytes.iter().enumerate().take(16) {
-        x |= u128::from(b) << (8 * k);
+    let written = crate::layout::LayoutFacts::discriminant(world, adt, v).map_err(|m| Stop::Need(Need { kind: NeedKind::Value, item: m.item, args: List::EMPTY }))?;
+    let Some(d) = written else { return Ok(None) };
+    if let Some(item) = world.explicit_discriminant(adt, v) {
+        let key = RecordKey::of(instance_key(world.code_id(item), List::EMPTY, PTys::EMPTY, alloc).map_err(|_| malformed("an instance key"))?);
+        reads.push(key.0);
     }
+    let x = d as u128;
     Ok(Some(if signed { sext(x, bits) } else { mask(x, bits) as i128 }))
 }
 

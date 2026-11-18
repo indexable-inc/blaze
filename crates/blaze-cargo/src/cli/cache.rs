@@ -59,7 +59,11 @@ pub fn main(words: &[OsString], color: bool) -> i32 {
             let now_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |it| it.as_secs());
             crate::serve::state()
                 .map_err(|error| format!("{error:#}"))
-                .and_then(|state| blaze_remote::cmd::main(&state, &|name| std::env::var_os(name), all, now_s))
+                .and_then(|state| {
+                    // The store the command opens is kept in its own frame, let go when it answers.
+                    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Store).map_err(|error| error.to_string())?;
+                    blaze_remote::cmd::main(&state, &|name| std::env::var_os(name), all, now_s, &frame)
+                })
         }
         Some(["store", "verify"]) => verify(false),
         Some(["store", "verify", "--dry-run" | "-n"]) => verify(true),

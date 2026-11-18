@@ -4,7 +4,7 @@
 //! reallocation moves what it lent, and the address check catches the move. The planted run
 //! compares addresses only (a moved lend is never read).
 
-use std::{alloc::Global, path::Path};
+use std::path::Path;
 
 use blaze_core::{
     FileName,
@@ -22,10 +22,10 @@ use crate::Key;
 
 const TAG: Tag = Tag(1);
 
-fn cfg(n: u64) -> PlainConfig {
-    let mut writes = Vec::new_in(Global);
+fn cfg(n: u64, root: &blaze_mem::Frame) -> PlainConfig<&blaze_mem::Frame> {
+    let mut writes = Vec::new_in(root);
     writes.push(Namespace::LOCAL);
-    let mut reads = Vec::new_in(Global);
+    let mut reads = Vec::new_in(root);
     reads.push(Namespace::LOCAL);
     PlainConfig {
         dir: FileName::new("plain").expect("a name"),
@@ -34,7 +34,7 @@ fn cfg(n: u64) -> PlainConfig {
         boot: 1,
         nonce: 700 + n,
         durable: false,
-        machine: Vec::new_in(Global),
+        machine: Vec::new_in(root),
         writes,
         reads,
         liveness: super::super::Liveness::Everything,
@@ -56,14 +56,14 @@ fn big(n: u32) -> Vec<u8> {
 
 /// Three committed segments (keys 0..10, 10..30, 30..60) and a lazy store over them, in a Lent.
 fn lent(seed: u64, plant: LentPlant, root: &blaze_mem::Frame) -> Lent<Sim, &blaze_mem::Frame> {
-    let mut w = Driven::with(Sim::new(seed, Faults::default()), Path::new("/sim"), cfg(0)).expect("the writer opens");
+    let mut w = Driven::with(Sim::new(seed, Faults::default()), Path::new("/sim"), cfg(0, root), root).expect("the writer opens");
     for range in [0..10u32, 10..30, 30..60] {
         for n in range {
             w.put(key(n), Namespace::LOCAL, TAG, &value(n)).unwrap();
         }
         w.commit_with(&[]).unwrap();
     }
-    let r = Driven::with(w.into_driver(), Path::new("/sim"), cfg(1)).expect("the reader opens");
+    let r = Driven::with(w.into_driver(), Path::new("/sim"), cfg(1, root), root).expect("the reader opens");
     Lent::planted(r, root, plant)
 }
 

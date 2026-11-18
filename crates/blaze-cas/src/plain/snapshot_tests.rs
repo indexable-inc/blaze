@@ -23,7 +23,7 @@
 //!
 //! The model is `value(n)` under `key(n)`, never another store's answer.
 
-use std::{alloc::Global, collections::BTreeSet, path::Path};
+use std::{collections::BTreeSet, path::Path};
 
 use blaze_core::{
     FileName,
@@ -74,10 +74,10 @@ const REACH: &[&str] = &[
     "a cut commit was resolved",
 ];
 
-fn cfg(process: u64, boot: u64) -> PlainConfig {
-    let mut writes = Vec::new_in(Global);
+fn cfg(process: u64, boot: u64, root: &Frame) -> PlainConfig<&Frame> {
+    let mut writes = Vec::new_in(root);
     writes.push(Namespace::LOCAL);
-    let mut reads = Vec::new_in(Global);
+    let mut reads = Vec::new_in(root);
     reads.push(Namespace::LOCAL);
     PlainConfig {
         dir: FileName::new("plain").expect("a name"),
@@ -87,7 +87,7 @@ fn cfg(process: u64, boot: u64) -> PlainConfig {
         nonce: 1300 + process,
         // A power cut is part of the history, so a commit that returned is durable.
         durable: true,
-        machine: Vec::new_in(Global),
+        machine: Vec::new_in(root),
         writes,
         reads,
         liveness: Liveness::Everything,
@@ -112,7 +112,7 @@ fn value(n: u32) -> Vec<u8> {
 }
 
 fn open(sim: Sim, process: u64, boot: u64, root: &Frame) -> Result<Store<'_>, Broke> {
-    let store = Driven::with(sim, Path::new("/sim"), cfg(process, boot)).map_err(|why| Broke::Oracle(format!("the store did not open in process {process}: {why}")))?;
+    let store = Driven::with(sim, Path::new("/sim"), cfg(process, boot, root), root).map_err(|why| Broke::Oracle(format!("the store did not open in process {process}: {why}")))?;
     Ok(Lent::new(store, root))
 }
 
@@ -360,7 +360,9 @@ fn a_snapshot_is_read_from_eight_threads_at_once() {
         lent.commit().expect("a phase's commit");
     }
     // Shared by eight threads, the snapshot's list needs a `Sync` allocator, which a frame is
-    // not: blaze-mem's class pools, counted to the store's tag.
+    // not: blaze-mem's class pools, counted to the store's tag. The one test that names them:
+    // the tree has no owned `Sync` allocator yet (the missing piece: `Allocator` for
+    // `&blaze_mem::Arena`, or a `Headed + Sync` arena handing out `SharedAlloc`).
     let snapshot = lent.snapshot_in(blaze_mem::Kept(blaze_mem::Tag::Store)).expect("a snapshot after the commits");
     // After the take: put and committed, absent through the snapshot.
     for n in 40..KEYS {

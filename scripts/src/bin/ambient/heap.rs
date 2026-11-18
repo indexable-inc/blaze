@@ -14,11 +14,15 @@ use super::*;
 pub(super) const HEAP_DOC: &str = r#"
 The heap's ratchet (decision D102): the global allocator is a capability (`blaze_own::Heap`)
 the program's entry takes and hands down. Its own list tools/ratchets/alloc-global.txt, rows
-`<crate><TAB>` and four columns, each a count of calls outside test code:
+`<crate><TAB>` and five columns, each a count of calls outside test code (the last in it too):
   global         `Alloc::global()`: the heap from nowhere (it goes, D102 step 3)
   shared_global  `SharedAlloc::global()`: the same, the handle that crosses threads
   test_heap      `testing::heap()`: a test's root, named outside a test: a bug
   process        `Heap::process()`: the program's entry's; anywhere else, a bug
+  leak           `Root::leak(`: a root heap (blaze_mem::Root) made `'static` for good, for
+                 a caller that still demands `Alloc<'static>`; counted in test code too, so it
+                 falls to 0 as those callers take a lifetime
+A root made at a test's or an entry's top (`Root::new(`) is the design and is not counted.
 A call is read from the text as written (`Alloc::global(`, with or without a path before it),
 comments and strings skipped; a call inside a macro's arguments counts.
 
@@ -40,10 +44,11 @@ pub(super) const HEAP_LIST: &str = "tools/ratchets/alloc-global.txt";
 const HEAP_HEADER: &str = "# The calls that reach the process's heap with no caller handing it (decision D102, rule 75),\n\
                            # outside test code, by crate (its directory under crates/): `Alloc::global()`,\n\
                            # `SharedAlloc::global()`, `testing::heap()` (a test's root) and `Heap::process()` (the\n\
-                           # program's entry's). Only falls; a crate with no row is held to 0 in every column.\n\
+                           # program's entry's); and `Root::leak(` (a root heap made `'static`), in test code too.\n\
+                           # Only falls; a crate with no row is held to 0 in every column.\n\
                            # Written by scripts/src/bin/ambient.rs (`{\"command\": \"heap-write\"}`), checked by\n\
                            # `{\"command\": \"heap-check\"}`.\n\
-                           # crate\tglobal\tshared_global\ttest_heap\tprocess\n";
+                           # crate\tglobal\tshared_global\ttest_heap\tprocess\tleak\n";
 
 /// One call that reaches the heap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -52,6 +57,10 @@ pub(super) enum HeapUse {
     SharedGlobal,
     TestHeap,
     Process,
+    /// `Root::leak(..)`: a root heap made the process's for good. Counted in test code as
+    /// outside it ([`count_heap`]): the one named form for a caller that still demands
+    /// `'static` handles, driven to 0.
+    Leak,
     /// `Heap::process()` inside a top-level `fn main`: in an entry file (an example, a
     /// `src/bin/*.rs`, a `src/main.rs`) the program's entry, which is free; elsewhere it counts
     /// as [`HeapUse::Process`] ([`count_heap`] decides, by path). Never a column.
@@ -60,8 +69,11 @@ pub(super) enum HeapUse {
 
 const USES: [HeapUse; 4] = [HeapUse::Global, HeapUse::SharedGlobal, HeapUse::TestHeap, HeapUse::Process];
 
+/// Every column, in order: [`USES`], then the leaked root's.
+const COLUMNS: [HeapUse; 5] = [USES[0], USES[1], USES[2], USES[3], HeapUse::Leak];
+
 /// A crate's counts, by [`HeapUse`]'s column.
-type HeapRow = [usize; 4];
+type HeapRow = [usize; 5];
 
 impl HeapUse {
     const fn column(self) -> usize {
@@ -74,6 +86,7 @@ impl HeapUse {
             HeapUse::SharedGlobal => "shared_global",
             HeapUse::TestHeap => "test_heap",
             HeapUse::Process | HeapUse::MainProcess => "process",
+            HeapUse::Leak => "leak",
         }
     }
 
@@ -83,6 +96,7 @@ impl HeapUse {
             HeapUse::SharedGlobal => "calls of `SharedAlloc::global()`",
             HeapUse::TestHeap => "calls of `testing::heap()`",
             HeapUse::Process | HeapUse::MainProcess => "calls of `Heap::process()` outside an entry's `fn main`",
+            HeapUse::Leak => "calls of `Root::leak(..)` (test code included)",
         }
     }
 
@@ -95,6 +109,10 @@ impl HeapUse {
             HeapUse::TestHeap => "a test's root is for test code only: take the allocator from the caller",
             HeapUse::Process | HeapUse::MainProcess => {
                 "only the program's entry takes the heap, in its `fn main`: take `heap: &'static Heap` (or an `Alloc<'_>`) from the caller"
+            }
+            HeapUse::Leak => {
+                "make the root at the top (`let root = Root::new(..)?;`) and hand down `root.alloc()`; give the callee that \
+                 demands `Alloc<'static>` a lifetime instead"
             }
         }
     }
@@ -118,6 +136,7 @@ fn heap_use_of(text: &str, at: usize, end: usize) -> Option<HeapUse> {
         ("SharedAlloc", "global") => HeapUse::SharedGlobal,
         ("testing", "heap") => HeapUse::TestHeap,
         ("Heap", "process") => HeapUse::Process,
+        ("Root", "leak") => HeapUse::Leak,
         _ => return None,
     })
 }
@@ -201,14 +220,17 @@ fn count_heap(root: &Path) -> Result<HeapCounts, TreeError> {
             HeapUse::MainProcess => Some(HeapUse::Process),
             other => Some(other),
         };
+        // A leaked root counts wherever it is, test code too.
         for (line, what) in &found.heap {
             let Some(what) = kept(*what) else { continue };
             let site = HeapSite { path: path.clone(), line: *line, what };
-            if whole_test { inside.push(site) } else { outside.push(site) }
+            if whole_test && what != HeapUse::Leak { inside.push(site) } else { outside.push(site) }
         }
-        inside.extend(
-            found.test_heap.iter().filter_map(|(line, what)| Some(HeapSite { path: path.clone(), line: *line, what: kept(*what)? })),
-        );
+        for (line, what) in &found.test_heap {
+            let Some(what) = kept(*what) else { continue };
+            let site = HeapSite { path: path.clone(), line: *line, what };
+            if what == HeapUse::Leak { outside.push(site) } else { inside.push(site) }
+        }
     }
     for (outside, inside) in out.values_mut() {
         outside.sort();
@@ -218,7 +240,7 @@ fn count_heap(root: &Path) -> Result<HeapCounts, TreeError> {
 }
 
 fn tally_heap(sites: &[HeapSite]) -> HeapRow {
-    let mut row = [0; 4];
+    let mut row = [0; 5];
     for it in sites {
         row[it.what.column()] += 1;
     }
@@ -231,8 +253,8 @@ fn render_heap(counts: &HeapCounts) -> String {
     let mut out = HEAP_HEADER.to_owned();
     for (krate, (outside, _)) in counts {
         let row = tally_heap(outside);
-        if row != [0; 4] {
-            out.push_str(&format!("{krate}\t{}\t{}\t{}\t{}\n", row[0], row[1], row[2], row[3]));
+        if row != [0; 5] {
+            out.push_str(&render_row(krate, row));
         }
     }
     out
@@ -243,9 +265,9 @@ fn render_heap(counts: &HeapCounts) -> String {
 fn held_rows(counts: &HeapCounts, rows: &BTreeMap<String, HeapRow>) -> BTreeMap<String, HeapRow> {
     let mut out = BTreeMap::new();
     for (krate, held) in rows {
-        let now = counts.get(krate).map_or([0; 4], |(outside, _)| tally_heap(outside));
+        let now = counts.get(krate).map_or([0; 5], |(outside, _)| tally_heap(outside));
         let row: HeapRow = core::array::from_fn(|at| now[at].min(held[at]));
-        if row != [0; 4] {
+        if row != [0; 5] {
             out.insert(krate.clone(), row);
         }
     }
@@ -260,9 +282,14 @@ fn render_heap_rows(rows: &BTreeMap<String, HeapRow>, notes: &BTreeMap<String, s
             out.push_str(note);
             out.push('\n');
         }
-        out.push_str(&format!("{krate}\t{}\t{}\t{}\t{}\n", row[0], row[1], row[2], row[3]));
+        out.push_str(&render_row(krate, *row));
     }
     out
+}
+
+/// One row of the list: the crate and its five columns, tab-separated.
+fn render_row(krate: &str, row: HeapRow) -> String {
+    format!("{krate}\t{}\t{}\t{}\t{}\t{}\n", row[0], row[1], row[2], row[3], row[4])
 }
 
 /// A row of the list that is not one.
@@ -276,7 +303,7 @@ impl fmt::Display for HeapListError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HeapListError::NotARow { line, text } => {
-                write!(f, "{HEAP_LIST}:{line}: `{text}` is not `<crate><TAB><global><TAB><shared_global><TAB><test_heap><TAB><process>`")
+                write!(f, "{HEAP_LIST}:{line}: `{text}` is not `<crate><TAB><global><TAB><shared_global><TAB><test_heap><TAB><process><TAB><leak>`")
             }
             HeapListError::TwoRows { line, krate } => write!(f, "{HEAP_LIST}:{line}: a second row for `{krate}`"),
         }
@@ -292,10 +319,10 @@ fn parse_heap_rows(text: &str) -> Result<BTreeMap<String, HeapRow>, HeapListErro
         let bad = || HeapListError::NotARow { line: at + 1, text: line.to_owned() };
         let cells: Vec<&str> = line.split('\t').collect();
         let [krate, rest @ ..] = cells.as_slice() else { return Err(bad()) };
-        if krate.is_empty() || rest.len() != 4 {
+        if krate.is_empty() || rest.len() != 5 {
             return Err(bad());
         }
-        let mut row = [0; 4];
+        let mut row = [0; 5];
         for (cell, it) in row.iter_mut().zip(rest) {
             *cell = it.parse().map_err(|_| bad())?;
         }
@@ -326,8 +353,8 @@ fn heap_problems(
     for krate in crates {
         let sites = counts.get(krate).map_or(&[][..], |(outside, _)| outside.as_slice());
         let now_row = tally_heap(sites);
-        let held_row = rows.get(krate).copied().unwrap_or([0; 4]);
-        for what in USES {
+        let held_row = rows.get(krate).copied().unwrap_or([0; 5]);
+        for what in COLUMNS {
             let (now, held) = (now_row[what.column()], held_row[what.column()]);
             let column = what.name();
             if now > held {
@@ -345,13 +372,13 @@ fn heap_problems(
                     (None, _) => format!("first: {}", named.join(", ")),
                 };
                 over.push(format!(
-                    "`{krate}` has {now} {} outside tests, over its row's `{column}` {held} in {HEAP_LIST} ({new}): {} (D102)",
+                    "`{krate}` has {now} {} counted, over its row's `{column}` {held} in {HEAP_LIST} ({new}): {} (D102)",
                     what.what(),
                     what.instead()
                 ));
             } else if now < held {
                 under.push(format!(
-                    "`{krate}` has {now} {} outside tests, under its row's `{column}` {held} in {HEAP_LIST}: lower it (command `heap-write`)",
+                    "`{krate}` has {now} {} counted, under its row's `{column}` {held} in {HEAP_LIST}: lower it (command `heap-write`)",
                     what.what()
                 ));
             }
@@ -363,7 +390,7 @@ fn heap_problems(
 pub(super) fn main_with(command: &str, base: Option<&str>, root: &Path) {
     let counts = count_heap(root).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
     let totals = |pick: fn(&(Vec<HeapSite>, Vec<HeapSite>)) -> &Vec<HeapSite>| {
-        let mut row = [0; 4];
+        let mut row = [0; 5];
         for it in counts.values() {
             for (sum, n) in row.iter_mut().zip(tally_heap(pick(it))) {
                 *sum += n;
@@ -373,6 +400,7 @@ pub(super) fn main_with(command: &str, base: Option<&str>, root: &Path) {
     };
     let summary = |row: HeapRow| {
         format!("{} `Alloc::global()`, {} `SharedAlloc::global()`, {} `testing::heap()`, {} `Heap::process()`", row[0], row[1], row[2], row[3])
+            + &format!(", {} `Root::leak(..)`", row[4])
     };
     if command == "heap-sites" {
         for (krate, (outside, _)) in &counts {
@@ -388,9 +416,11 @@ pub(super) fn main_with(command: &str, base: Option<&str>, root: &Path) {
         by_total.sort_by_key(|(krate, outside, inside)| {
             (core::cmp::Reverse(outside[0] + outside[1] + inside[0] + inside[1]), (*krate).clone())
         });
-        println!("crate\tnon-test global\tnon-test shared_global\ttest global\ttest shared_global\tnon-test test_heap\tnon-test process");
+        println!(
+            "crate\tnon-test global\tnon-test shared_global\ttest global\ttest shared_global\tnon-test test_heap\tnon-test process\tleak"
+        );
         for (krate, outside, inside) in by_total {
-            println!("{krate}\t{}\t{}\t{}\t{}\t{}\t{}", outside[0], outside[1], inside[0], inside[1], outside[2], outside[3]);
+            println!("{krate}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", outside[0], outside[1], inside[0], inside[1], outside[2], outside[3], outside[4]);
         }
         println!("{SCRIPT}: outside tests {}; in tests {}", summary(totals(|it| &it.0)), summary(totals(|it| &it.1)));
         return;
@@ -484,20 +514,34 @@ pub(super) fn selftest() {
     // The list: a crate over its row is refused, naming the added line; under is a note.
     let site = |line| HeapSite { path: "crates/a/src/lib.rs".to_owned(), line, what: HeapUse::Global };
     let counts: HeapCounts = BTreeMap::from([("a".to_owned(), (vec![site(3), site(9)], Vec::new()))]);
-    let held = BTreeMap::from([("a".to_owned(), [1, 0, 0, 0])]);
+    let held = BTreeMap::from([("a".to_owned(), [1, 0, 0, 0, 0])]);
     let added = BTreeMap::from([("crates/a/src/lib.rs".to_owned(), BTreeSet::from([9]))]);
     let (over, under) = heap_problems(&counts, &held, Some(&added));
     expect(
         over.len() == 1 && over[0].contains("(new: crates/a/src/lib.rs:9)") && under.is_empty(),
         &format!("one over its row, named: {over:?}"),
     );
-    let (over, under) = heap_problems(&counts, &BTreeMap::from([("a".to_owned(), [3, 0, 0, 0])]), None);
+    let (over, under) = heap_problems(&counts, &BTreeMap::from([("a".to_owned(), [3, 0, 0, 0, 0])]), None);
     expect(over.is_empty() && under.len() == 1, &format!("under its row is a note: {over:?} {under:?}"));
     let rendered = render_heap(&counts);
-    expect(parse_heap_rows(&rendered) == Ok(BTreeMap::from([("a".to_owned(), [2, 0, 0, 0])])), "the list reads back");
+    expect(parse_heap_rows(&rendered) == Ok(BTreeMap::from([("a".to_owned(), [2, 0, 0, 0, 0])])), "the list reads back");
     // A write never raises a row: `a` at 2 over its 1 keeps 1; a crate with no row is held at 0.
     let kept = held_rows(&counts, &held);
-    expect(kept == BTreeMap::from([("a".to_owned(), [1, 0, 0, 0])]), &format!("a write keeps the lower: {kept:?}"));
+    expect(kept == BTreeMap::from([("a".to_owned(), [1, 0, 0, 0, 0])]), &format!("a write keeps the lower: {kept:?}"));
     expect(held_rows(&counts, &BTreeMap::new()).is_empty(), "a crate with no row stays without one");
-    expect(parse_heap_rows("a\t1\t0\n").is_err() && parse_heap_rows("a\t1\t0\t0\t0\na\t1\t0\t0\t0\n").is_err(), "a bad row is refused");
+    expect(
+        parse_heap_rows("a\t1\t0\t0\t0\n").is_err() && parse_heap_rows("a\t1\t0\t0\t0\t0\na\t1\t0\t0\t0\t0\n").is_err(),
+        "a bad row is refused (a four-column row too)",
+    );
+    // A root heap: `Root::leak(` is read, in test code as outside it; `Root::new(` is not counted.
+    let rooted = "let r = Root::new(RootOpts::TEST);\nlet s = blaze_mem::Root::leak(r);\n#[cfg(test)]\nmod tests {\n    fn t() { Root::leak(x); }\n}\n";
+    let split = scan_file(rooted);
+    expect(
+        split.heap == vec![(2, HeapUse::Leak)] && split.test_heap == vec![(5, HeapUse::Leak)],
+        &format!("a leaked root is read, a made one is not: {:?} {:?}", split.heap, split.test_heap),
+    );
+    let leak = |line| HeapSite { path: "crates/a/src/lib.rs".to_owned(), line, what: HeapUse::Leak };
+    let leaks: HeapCounts = BTreeMap::from([("a".to_owned(), (vec![leak(2), leak(5)], Vec::new()))]);
+    let (over, _) = heap_problems(&leaks, &BTreeMap::from([("a".to_owned(), [0, 0, 0, 0, 1])]), None);
+    expect(over.len() == 1 && over[0].contains("`leak` 1"), &format!("a leak over its row is refused: {over:?}"));
 }

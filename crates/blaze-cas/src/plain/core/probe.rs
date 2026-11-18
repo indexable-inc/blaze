@@ -38,6 +38,8 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
+use std::alloc::Allocator;
+
 use blaze_core::{Effect, Extent};
 use blaze_keyed::{
     kind::{Namespace, Tag},
@@ -107,7 +109,7 @@ pub struct Probes {
     pub most: u32,
 }
 
-impl Plain {
+impl<A: Allocator + Clone> Plain<A> {
     /// The open, for a process that reads through the lock-free handle from its start (the
     /// handle's own open, a push of whole segments, the eager DST): every segment the
     /// generation names mapped at the open, an earlier boot's unsealed segment checked there,
@@ -171,7 +173,8 @@ impl Plain {
     /// [`Plain::find`] in [`super::PlainConfig::reads`], in their order.
     pub fn find_read(&mut self, key: &Key, now_ns: u64, effects: &mut Vec<Effect>) -> Result<Probe, StoreError> {
         // Moved out and back (no allocation): `find` takes `&mut self` and the namespaces.
-        let reads = std::mem::take(&mut self.cfg.reads);
+        // An empty vector in the store's allocator holds no block (`new_in` does not allocate).
+        let reads = std::mem::replace(&mut self.cfg.reads, Vec::new_in(self.alloc.clone()));
         let out = self.find(&reads, key, now_ns, effects);
         self.cfg.reads = reads;
         out
@@ -270,7 +273,7 @@ impl Plain {
         if let Some((_, entry)) = self.held_in(space, key) {
             return Ok(Probe::Hit(Found { key: *key, tag: entry.tag, namespace: space, at: At::Held }));
         }
-        let mut rows: Vec<usize> = Vec::new_in(std::alloc::Global);
+        let mut rows: Vec<usize, A> = Vec::new_in(self.alloc.clone());
         rows.extend(self.newest_rows(space));
         for row in rows {
             if let Some(probe) = self.probe_row(row, key, now_ns, effects)? {
@@ -418,7 +421,7 @@ impl Plain {
 
     /// [`Then::All`]'s end: every parked row checked, whole from now on.
     pub(super) fn all_mapped(&mut self) {
-        let mut parked: Vec<u64> = Vec::new_in(std::alloc::Global);
+        let mut parked: Vec<u64, A> = Vec::new_in(self.alloc.clone());
         parked.extend(self.unchecked.keys().copied());
         for id in parked {
             self.check_parked(id);

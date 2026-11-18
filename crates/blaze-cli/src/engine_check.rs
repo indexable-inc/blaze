@@ -214,6 +214,7 @@ fn serve(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_
         frame,
         scope_reads: crate::engine_scope_reads::ScopeReadsAs::DEFAULT,
         unreadable: None,
+        body_locals: blaze_ladder::front2::tables::seeds::BodyLocals::Lowered,
     };
     let err = io.need_err()?;
     match why {
@@ -268,6 +269,10 @@ pub(crate) struct Opts<'f> {
     /// (engine_records.rs `EngineRecords::scope_records`): a test plants one (rule 23); the
     /// command's is `None`.
     pub(crate) unreadable: Option<&'static str>,
+    /// Where a body's need of an item declared in that body is made (front2 tables/seeds.rs
+    /// `BodyLocals`): the command's is `Lowered`, in the body's own store; a test plants
+    /// `AskTheRequest` (rule 23, engine_body_locals_tests.rs).
+    pub(crate) body_locals: blaze_ladder::front2::tables::seeds::BodyLocals,
 }
 
 /// The most one request's frame takes: its blocks are taken as it is used (blaze-mem
@@ -337,7 +342,7 @@ pub(crate) struct Checked {
 /// `err`.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
 pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, shown: &mut print::Shown<'f>, phases: &mut Phases, out: &Out, err: &Out) -> Result<Checked, CliError> {
-    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, frame, scope_reads, unreadable: planted_unreadable } = opts;
+    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, frame, scope_reads, unreadable: planted_unreadable, body_locals } = opts;
     let began = phases.now();
     let erased = blaze_own::Erased::new(frame);
     // The lint step and rules the root manifest names, as `check` reads them (lints.rs
@@ -659,7 +664,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
                 // the head tasks' cells and the dependency heads this machine froze before.
                 let seed_root = crate::engine_seeds::root_name(&tools, frame);
                 let seed_tool = crate::engine_seeds::tool_of(&tools);
-                let request_heads = match (heads_from, names.as_ref(), graph) {
+                let mut request_heads = match (heads_from, names.as_ref(), graph) {
                     (crate::engine_seeds::HeadsFrom::Frozen, Some(stage), Some(graph)) => match bodies.kept.list(cx, &mut store, &graph, frame)? {
                         Some(list) => {
                             let crates = crate::engine_seeds::crates_of(&list, stage);
@@ -670,6 +675,10 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
                     },
                     _ => None,
                 };
+                // The rule, or a test's plant (rule 23): where a body's own items are made.
+                if let Some(table) = request_heads.as_mut() {
+                    table.body_locals = body_locals;
+                }
                 bodies.run_phase(cx, &mut store, &mut read, &handles, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame, request_heads.as_ref())?;
                 // The dependency heads frozen now, put sorted by key and listed by the root.
                 if let Some(table) = &request_heads {

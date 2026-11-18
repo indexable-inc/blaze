@@ -158,7 +158,7 @@ struct TestStore {
 impl TestStore {
     fn open(shelf: ToolchainId, alloc: Alloc<'static>) -> Result<TestStore, TestStoreError> {
         let root = store_root(shelf);
-        let driven = Driven::open(&root, &Settings::default())
+        let driven = Driven::open(&root, &Settings::default(), alloc)
             .map_err(|why| TestStoreError::Store { root: root.clone(), why: LentError::Store { doing: "opening the test store", why } })?;
         let lent: &'static Lent<blaze_core::Native, Alloc<'static>> = Box::leak(Box::new(Lent::new(driven, alloc)));
         Ok(TestStore { lent, root })

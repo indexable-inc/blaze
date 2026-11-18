@@ -7,6 +7,7 @@
 //! Expected (`cargo test -p blaze-scope --lib -- tests::pkg_meta_env`): 2 passed.
 
 use blaze_expand::seen::SeenRoot;
+use blaze_mem::{Root, RootOpts};
 use blaze_unit_graph::PackageMetaVars;
 
 use crate::crate_env::{CrateEnv, EnvFacts, EnvUnknown};
@@ -22,10 +23,11 @@ const META: PackageMetaVars<'static> = PackageMetaVars {
     rust_version: "1.80",
 };
 
-/// The tests' allocator, as this crate's other test files make theirs (tests/refused.rs): on
-/// the sweep's list of ambient-heap lines (runner/global-debt.md), to come from the test's top.
-fn a() -> blaze_own::Alloc<'static> {
-    blaze_own::testing::heap().alloc()
+/// The test's root heap, made at its top; every handle the test passes is borrowed from it, and
+/// its drop checks nothing was leaked.
+fn root() -> Root {
+    // A crate's environment keeps what it makes for its arena's life (`TEST_ARENA`).
+    Root::new(RootOpts::TEST_ARENA).unwrap_or_else(|e| panic!("the test's root: {e}"))
 }
 
 fn facts(seen: SeenRoot<'static>, meta: Option<PackageMetaVars<'static>>) -> EnvFacts<'static> {
@@ -46,7 +48,8 @@ fn facts(seen: SeenRoot<'static>, meta: Option<PackageMetaVars<'static>>) -> Env
 /// `CARGO_PRIMARY_PACKAGE` is unset; without metadata the names stay refused by name.
 #[test]
 fn a_crate_s_env_holds_its_manifest_s_metadata_and_version_parts() {
-    let alloc = a();
+    let root = root();
+    let alloc = root.alloc();
     let member = SeenRoot::member("node").unwrap_or_else(|e| panic!("{e}"));
     let env = CrateEnv::of(facts(member, Some(META)), alloc).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(env.get("CARGO_PKG_VERSION_MAJOR"), Ok(Some("1")));
@@ -73,12 +76,13 @@ fn a_crate_s_env_holds_its_manifest_s_metadata_and_version_parts() {
 /// shadows one of its names; `clone_in` keeps it too.
 #[test]
 fn the_metadata_round_trips_through_facts_and_a_script_pair_shadows_it() {
-    let alloc = a();
+    let root = root();
+    let alloc = root.alloc();
     let printed = "cargo:rustc-env=CARGO_PKG_AUTHORS=from-script\n";
     let out = blaze_build_script::Outputs::read(printed.as_bytes(), "/out", blaze_build_script::instr::OutputLimits::DEFAULT, alloc).unwrap_or_else(|e| panic!("{e:?}"));
     let mut bytes = blaze_own::AVec::new_in(alloc);
     out.encode(&mut bytes);
-    let record = blaze_build_script::OutputsRef::open(bytes.leak()).unwrap_or_else(|e| panic!("{e:?}"));
+    let record = blaze_build_script::OutputsRef::open(&bytes).unwrap_or_else(|e| panic!("{e:?}"));
     let env = CrateEnv::of(EnvFacts { build_script: true, script: Some(record), ..facts(SeenRoot::Package, Some(META)) }, alloc).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(env.get("CARGO_PKG_AUTHORS"), Ok(Some("from-script")), "the script's pair is given after cargo's");
     assert_eq!(env.facts().meta, Some(META), "the facts keep the manifest's value, not the script's");

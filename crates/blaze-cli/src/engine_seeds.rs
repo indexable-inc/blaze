@@ -63,7 +63,7 @@ use blaze_ladder::front2::heads::Want;
 use blaze_ladder::front2::item_shown::ItemShown;
 use blaze_ladder::front2::source::{NamesSource, Records};
 use blaze_ladder::front2::tables::head::{FreezeError, FrozenHead, Known, KnownHeads, NotTheirs, VERSION, WANT_BYTES, cell_id as head_cell_id, want_bytes};
-use blaze_ladder::front2::tables::seeds::{MOST_CELLS, RequestHeads, SeedError};
+use blaze_ladder::front2::tables::seeds::{BodyLocals, MOST_CELLS, RequestHeads, SeedError};
 use blaze_own::{Alloc, SharedAlloc};
 use blaze_world::crate_list::{CrateGraph, CrateList};
 use bstd::cx::Cx;
@@ -204,6 +204,12 @@ pub(crate) struct SeedTally {
     pub(crate) refused_const: u32,
     /// The check rounds of the seeded bodies (front2 tables/cost.rs `Spent::rounds`).
     pub(crate) rounds: u64,
+    /// The reads the checked bodies' recorders were offered and kept, summed (front2
+    /// tables/recorder.rs `ReadTally`): the Bodies stage's reads line.
+    pub(crate) reads: blaze_ladder::front2::tables::recorder::ReadTally,
+    /// Expansions' origin columns the stretches' records opened (front2 source.rs
+    /// `Opened::origins`): once per expansion asked per stretch.
+    pub(crate) origins_opened: u64,
 }
 
 impl SeedTally {
@@ -212,6 +218,8 @@ impl SeedTally {
         self.refused = self.refused.saturating_add(other.refused);
         self.refused_const = self.refused_const.saturating_add(other.refused_const);
         self.rounds = self.rounds.saturating_add(other.rounds);
+        self.reads.add(other.reads);
+        self.origins_opened = self.origins_opened.saturating_add(other.origins_opened);
     }
 }
 
@@ -360,6 +368,10 @@ pub(crate) struct RequestTable {
     refused: blaze_core::SharedMap<CellId, NotTheirs, SharedAlloc<'static>>,
     twice: AtomicU32,
     heap: &'static blaze_own::Heap,
+    /// Where a body's need of an item declared in that body is made (front2 tables/seeds.rs
+    /// `BodyLocals`): the rule, `Lowered`, set by [`RequestTable::build`]; a test plants
+    /// `AskTheRequest` through engine_check.rs `Opts::body_locals` (rule 23).
+    pub(crate) body_locals: BodyLocals,
 }
 
 impl RequestTable {
@@ -433,6 +445,7 @@ impl RequestTable {
             refused: blaze_core::SharedMap::new_in("engine.member heads refused to a body, as said", heap.shared()),
             twice: AtomicU32::new(0),
             heap,
+            body_locals: BodyLocals::Lowered,
         })
     }
 
@@ -844,6 +857,12 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
         StretchHeads { table, failed, names, owners: RefCell::new(Owners::new(subjects)), g }
     }
 
+    /// Where this stretch's bodies make a need of an item declared in the body (the request's:
+    /// [`RequestTable::body_locals`]), for its `RequestSeed` (engine_bodies.rs).
+    pub(crate) fn body_locals(&self) -> BodyLocals {
+        self.table.body_locals
+    }
+
     /// Where `want`'s head is, by this stretch's names: the one placing (module docs).
     fn place(&self, want: Want) -> Placed {
         match self.owners.borrow_mut().place(self.names, &head_cell_id(want), self.g) {
@@ -977,6 +996,9 @@ impl KnownHeads for StretchHeads<'_, '_, '_> {
             // counted every time (`publish`: the profile's "frozen now and not put: N a
             // member's"), so the count is the work left, never a silent path (the coordinator's
             // decision, 2026-11-17: refusing every macro-written body would fail real projects).
+            // An item declared in the asking body never reaches here: its body's own store makes
+            // it (front2 tables/seeds.rs `of_the_body`, lane RU4), unless a test plants
+            // `BodyLocals::AskTheRequest`, which fails it here as the real projects did.
             Placed::Unplaced => match table.fresh_of(cell) {
                 Some(bytes) => Known::Bytes(bytes),
                 None => Known::Freeze,

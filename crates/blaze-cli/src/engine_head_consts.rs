@@ -228,7 +228,9 @@ fn text_cell_of<'n>(records: &'n Records<'n>, subjects: &Subjects, key: LibKey) 
 }
 
 /// The head `want` makes, as a finding shows its path (`krate::m::S`; an impl's fn
-/// `krate::m::<impl>::f`), kept for the request in `g`. A head of no path is named by its key.
+/// `krate::m::<impl>::f`), kept for the request in `g`. A head of no path is named by where it
+/// is written (front2 item_shown.rs `ItemShown`), or as an item declared in a body; never by a
+/// bare key (rule 19: the clap and serde projects printed `the item of key e459..`).
 pub(crate) fn head_label<'n>(records: &'n Records<'n>, want: Want, g: Alloc<'static>) -> &'static str {
     let key = want.key();
     let module = NamesSource::home_of(records, key).and_then(|m| NamesSource::module_path(records, m));
@@ -251,6 +253,11 @@ pub(crate) fn head_label<'n>(records: &'n Records<'n>, want: Want, g: Alloc<'sta
         (Some(module), Some(name), None) => leak(g, format_args!("{module}::{name}")),
         (Some(module), Some(owner), Some(Some(member))) => leak(g, format_args!("{module}::{owner}::{member}")),
         (Some(module), None, Some(Some(member))) => leak(g, format_args!("{module}::<impl>::{member}")),
-        _ => leak(g, format_args!("the item of key {key:x}")),
+        // An item declared in a body (its key's `INNER` bit: front2 locals.rs): the names records
+        // hold no row of it, so it has no path; said as what it is, never as a bare key (rule 19).
+        _ if key.is_inner() => leak(g, format_args!("an item declared in a body, which the names records hold no row of (its key is its body's lowering's, front2 locals.rs: {})", blaze_ladder::front2::item_shown::ItemShown::of_lib(records, key))),
+        // A path-less item the names do hold (an impl): where it is written, by front2
+        // item_shown.rs (its module, its file or the macro call that wrote it), then its key.
+        _ => leak(g, format_args!("{}", blaze_ladder::front2::item_shown::ItemShown::of_lib(records, key))),
     }
 }

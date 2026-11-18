@@ -29,7 +29,7 @@ use std::{
 };
 
 use blaze_cas::plain::{Form, PlainStore, Settings as StoreSettings};
-use blaze_core::{lock::Lock, temp::TempDir};
+use blaze_core::{Native, lock::Lock, temp::TempDir};
 use blaze_format::Aligned;
 use blaze_ids::ContentId;
 use blaze_keyed::{
@@ -657,14 +657,18 @@ impl Walker for HostWalk {
 
 // --- a store whose commit fails ---------------------------------------------------------------
 
+/// The real plain store these tests open, on the disk.
+type HostStore = PlainStore<Native, Global>;
+// ambient heap: this crate has no allocator crate to make a root from (the sweep's list)
+
 struct Failing<'s> {
-    inner: &'s PlainStore,
+    inner: &'s HostStore,
     fail: bool,
 }
 
 impl Store for Failing<'_> {
-    type Held<A: Allocator> = <PlainStore as Store>::Held<A>;
-    type Verified = <PlainStore as Store>::Verified;
+    type Held<A: Allocator> = <HostStore as Store>::Held<A>;
+    type Verified = <HostStore as Store>::Verified;
 
     fn read<K: Kind, A: Allocator>(&self, key: &Key<K>, frame: A) -> Result<Option<Read<Self::Verified, Self::Held<A>>>, StoreError> {
         self.inner.read(key, frame)
@@ -727,8 +731,9 @@ impl Bench {
         Bench { dir }
     }
 
-    fn store(&self) -> PlainStore {
-        PlainStore::open(&self.dir.path().join("store"), &StoreSettings { form: Form::Plain, ..StoreSettings::default() })
+    fn store(&self) -> HostStore {
+        PlainStore::open(&self.dir.path().join("store"), &StoreSettings { form: Form::Plain, ..StoreSettings::default() }, Global)
+            // ambient heap: this crate has no allocator crate to make a root from (the sweep's list)
             .expect("the plain store opens")
     }
 
@@ -802,7 +807,7 @@ fn ask<S: Store>(src: &Path, store: &S, front: &Scripted, base: u8, last: &[Opti
 }
 
 /// The bytes the store holds for a record proved, by its kind's layout.
-fn bytes_of(store: &PlainStore, tag: Tag, key: ContentId) -> Option<Vec<u8>> {
+fn bytes_of(store: &HostStore, tag: Tag, key: ContentId) -> Option<Vec<u8>> {
     if tag == Surface::TAG {
         return store.map::<Surface>(&Key::from_id(key)).expect("a surface is read").map(|read| read.bytes.to_vec());
     }

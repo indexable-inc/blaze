@@ -29,10 +29,12 @@ use super::head_record::{Head, HeadAt};
 use super::item_site::MarksLost;
 use super::keys::{KeyClash, Keys, MemberKind, checker_of};
 use super::preds::Preds;
-use super::rows::Rows;
 use super::source::NamesSource;
 use super::type_miss::TypeMiss;
 use super::types::{AliasGap, Bounds, Builder, Env, Heads, ParamBound, SelfTy, TraitAliasHead, Why, intern, intern_list};
+
+/// A heads store's table: in the allocator [`Store::new`] is handed (front2 rows.rs says whose).
+type Rows<K, V> = super::rows::Rows<K, V, Alloc<'static>>;
 use crate::resolve::Paths;
 
 mod member_fn;
@@ -137,7 +139,6 @@ pub struct TraitHead {
 }
 
 /// The heads [`Builder`] reads.
-#[derive(Default)]
 pub struct Maps {
     /// Each struct's, enum's and union's type parameter count and their defaults (over its
     /// own parameters, `None` where none is written).
@@ -215,6 +216,34 @@ pub struct Maps {
     /// both while one runs and for a caller that has no evaluator at all; this tells the two
     /// apart (check.rs `make`: only the second refuses a head by name).
     pub evaluating: core::cell::Cell<u32>,
+}
+
+impl Maps {
+    /// Empty maps; the tables in `alloc` ([`Store::new`]'s).
+    pub fn new_in(alloc: Alloc<'static>) -> Maps {
+        Maps {
+            generics: Rows::new_in(alloc),
+            traits: Rows::new_in(alloc),
+            assoc_generics: Rows::new_in(alloc),
+            assoc_where: Rows::new_in(alloc),
+            assoc_consts: Rows::new_in(alloc),
+            supers: Rows::new_in(alloc),
+            aliases: Rows::new_in(alloc),
+            alias_defaults: Rows::new_in(alloc),
+            alias_gaps: Rows::new_in(alloc),
+            trait_aliases: Rows::new_in(alloc),
+            const_lens: Default::default(),
+            const_bits: Default::default(),
+            anon_asked: Default::default(),
+            anon_failed: Default::default(),
+            qpaths: Default::default(),
+            inherents: Default::default(),
+            const_params: Rows::new_in(alloc),
+            fieldless_enums: Rows::new_in(alloc),
+            written_depth: Default::default(),
+            evaluating: Default::default(),
+        }
+    }
 }
 
 impl Heads for Maps {
@@ -965,20 +994,20 @@ impl<'n> Store<'n> {
                 // `new_stable` refuses only columns that already hold rows; these are new.
                 Err(error) => panic!("the heads store's type table over fresh columns was refused: {error:?}"),
             },
-            maps: Maps::default(),
-            adts: Rows::new_in(Global),
-            field_defaults: Rows::new_in(Global),
-            impls: Rows::new_in(Global),
-            fns: Rows::new_in(Global),
-            preds: Rows::new_in(Global),
+            maps: Maps::new_in(alloc),
+            adts: Rows::new_in(alloc),
+            field_defaults: Rows::new_in(alloc),
+            impls: Rows::new_in(alloc),
+            fns: Rows::new_in(alloc),
+            preds: Rows::new_in(alloc),
             sized,
             pointers: super::receiver::Pointers::NOT_LOOKED_UP,
-            trait_defs: Rows::new_in(Global),
-            fn_gaps: Rows::new_in(Global),
-            member_frames: Rows::new_in(Global),
-            ctors: Rows::new_in(Global),
-            statics: Rows::new_in(Global),
-            opaques: Rows::new_in(Global),
+            trait_defs: Rows::new_in(alloc),
+            fn_gaps: Rows::new_in(alloc),
+            member_frames: Rows::new_in(alloc),
+            ctors: Rows::new_in(alloc),
+            statics: Rows::new_in(alloc),
+            opaques: Rows::new_in(alloc),
             hidden: super::opaque_auto::HiddenTable::new_in(alloc),
             locals: super::locals::Locals::new(frame),
             lives: super::lifetimes::Lives::new_in(alloc),

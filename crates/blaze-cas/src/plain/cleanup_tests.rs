@@ -40,10 +40,12 @@ use blaze_keyed::{
     kind::{Namespace, Tag},
     store::{ENTRY, FOOTER, HEADER, StoreError},
 };
+use blaze_mem::Frame;
 
 use super::{
     core::{GRACE_NS, LEASE_NS, Liveness, Plain, PlainConfig, Plant, ROOT_LIFE_NS, TAGS},
     format::aligned,
+    test_root,
 };
 use crate::Key;
 
@@ -59,10 +61,10 @@ fn dir() -> FileName {
     FileName::new("plain").expect("a name")
 }
 
-fn cfg(n: u64, boot: u64) -> PlainConfig {
-    let mut writes = Vec::new_in(Global);
+fn cfg(n: u64, boot: u64, root: &Frame) -> PlainConfig<&Frame> {
+    let mut writes = Vec::new_in(root);
     writes.push(Namespace::LOCAL);
-    let mut reads = Vec::new_in(Global);
+    let mut reads = Vec::new_in(root);
     reads.push(Namespace::LOCAL);
     PlainConfig {
         dir: dir(),
@@ -72,7 +74,7 @@ fn cfg(n: u64, boot: u64) -> PlainConfig {
         nonce: 5000 + n,
         // A power cut is part of the claim, so a commit syncs (as root_commit_tests.rs).
         durable: true,
-        machine: Vec::new_in(Global),
+        machine: Vec::new_in(root),
         writes,
         reads,
         liveness: Liveness::Reached,
@@ -122,14 +124,19 @@ enum Step {
     Done,
 }
 
-struct Proc {
-    store: Plain,
+/// A process's store, its tables in the history's frame.
+type Store<'f> = Plain<&'f Frame>;
+
+struct Proc<'f> {
+    store: Store<'f>,
     effects: Vec<Effect>,
     job: Job,
     step: Step,
 }
 
-struct World {
+struct World<'f> {
+    /// The frame every process's store keeps its tables in, made by the test (or per cut).
+    root: &'f Frame,
     sim: Sim,
     boot: u64,
     next: u64,
@@ -154,9 +161,10 @@ struct World {
     dead: Option<u64>,
 }
 
-impl World {
-    fn new(seed: u64, plant: Plant) -> World {
+impl<'f> World<'f> {
+    fn new(seed: u64, plant: Plant, root: &'f Frame) -> World<'f> {
         World {
+            root,
             sim: Sim::new(seed, Faults::default()),
             boot: 1,
             next: 0,
@@ -172,17 +180,17 @@ impl World {
         }
     }
 
-    fn process(&mut self, plant: Plant) -> (Plain, Vec<Effect>, u64) {
+    fn process(&mut self, plant: Plant) -> (Store<'f>, Vec<Effect>, u64) {
         let n = self.next;
         self.next += 1;
-        let mut store = Plain::planted(cfg(n, self.boot), plant);
+        let mut store = Plain::planted(cfg(n, self.boot, self.root), self.root, plant);
         let mut effects = Vec::new_in(Global);
         store.open_whole(&mut effects);
         (store, effects, 5000 + n)
     }
 }
 
-fn commit(w: &mut World, p: &mut Proc) {
+fn commit(w: &mut World<'_>, p: &mut Proc<'_>) {
     let now = w.sim.wall_ns();
     match p.store.commit(&[], now, &mut p.effects) {
         Ok(()) => p.step = Step::Committing,
@@ -194,7 +202,7 @@ fn commit(w: &mut World, p: &mut Proc) {
 }
 
 /// `p`'s next step, its store ready.
-fn next_step(w: &mut World, p: &mut Proc) {
+fn next_step(w: &mut World<'_>, p: &mut Proc<'_>) {
     if let Some(why) = p.store.broken() {
         w.errors.push(format!("a command's store broke: {why}"));
         p.step = Step::Done;
@@ -207,7 +215,7 @@ fn next_step(w: &mut World, p: &mut Proc) {
                 Job::Answer { root, records, life_ns, fold } => (records.clone(), Some((root.clone(), *life_ns, *fold))),
                 Job::Dies { records } => (records.clone(), None),
             };
-            let mut named = Vec::new_in(Global);
+            let mut named = Vec::new_in(w.root);
             for n in records {
                 let k = key(n);
                 w.model.insert(k, n);
@@ -265,8 +273,8 @@ fn next_step(w: &mut World, p: &mut Proc) {
 
 /// `jobs` run at once, each a process of its own, until each is done; or, at completion `cut`
 /// (counted over the whole history), every process dies there. Whether the cut came.
-fn wave(w: &mut World, jobs: Vec<Job>, cut: Option<u64>) -> bool {
-    let mut procs: Vec<Proc> = Vec::new_in(Global);
+fn wave(w: &mut World<'_>, jobs: Vec<Job>, cut: Option<u64>) -> bool {
+    let mut procs: Vec<Proc<'_>, &Frame> = Vec::new_in(w.root);
     for job in jobs {
         let (store, effects, nonce) = w.process(w.plant);
         if matches!(job, Job::Dies { .. }) {
@@ -323,7 +331,7 @@ fn drain(sim: &mut Sim) {
 }
 
 /// A reader opened on the head as it is now (no plant: the reader is the oracle's).
-fn reader(w: &mut World) -> Result<Plain, String> {
+fn reader<'f>(w: &mut World<'f>) -> Result<Store<'f>, String> {
     let (mut store, mut effects, _) = w.process(Plant::None);
     let mut done: Vec<Completion> = Vec::new_in(Global);
     for _ in 0..1_000_000u32 {
@@ -345,7 +353,7 @@ fn reader(w: &mut World) -> Result<Plain, String> {
 }
 
 /// Every key an unexpired root names, the roots' own records too, each once.
-fn rooted(w: &World, r: &Plain) -> Result<BTreeSet<Key>, String> {
+fn rooted(w: &World<'_>, r: &Store<'_>) ->Result<BTreeSet<Key>, String> {
     let now = w.sim.wall_ns();
     let mut out = BTreeSet::new();
     for (name, root, expires_ns) in r.roots_expiring() {
@@ -362,7 +370,7 @@ fn rooted(w: &World, r: &Plain) -> Result<BTreeSet<Key>, String> {
 }
 
 /// The oracle's first claim: what does not read back of what an unexpired root names.
-fn unreadable(w: &mut World) -> Vec<String> {
+fn unreadable(w: &mut World<'_>) -> Vec<String> {
     let r = match reader(w) {
         Ok(r) => r,
         Err(why) => return vec![why],
@@ -384,7 +392,7 @@ fn unreadable(w: &mut World) -> Vec<String> {
 /// The live bytes (each rooted record's aligned payload and index entry) and the segments'
 /// bytes on disk, with their count. A root whose record, or a record it names, does not read
 /// is the oracle's finding (a planted run's), returned, not a panic.
-fn bytes(w: &mut World) -> Result<(u64, u64, u64), String> {
+fn bytes(w: &mut World<'_>) ->Result<(u64, u64, u64), String> {
     let r = reader(w)?;
     let mut live = 0u64;
     for k in rooted(w, &r)? {
@@ -432,8 +440,8 @@ fn dead_records() -> Vec<u32> {
 }
 
 /// `commands` commands of checkouts, `per_wave` at a time, every one folding a slice.
-fn history(seed: u64, plant: Plant, commands: u32, per_wave: u32) -> Outcome {
-    let mut w = World::new(seed, plant);
+fn history(seed: u64, plant: Plant, commands: u32, per_wave: u32, root: &Frame) -> Outcome {
+    let mut w = World::new(seed, plant, root);
     let mut rng = Rng(seed);
     let mut versions = [[0u32; SLOTS as usize]; CHECKOUTS as usize];
     let mut problems = Vec::new_in(Global);
@@ -502,7 +510,8 @@ fn history(seed: u64, plant: Plant, commands: u32, per_wave: u32) -> Outcome {
 /// rooted record read back; the dead holder's lease and records gone; the short root gone`.
 #[test]
 fn a_thousand_commands_keep_what_roots_reach_wait_on_no_cleanup_and_hold_twice_the_live_bytes() {
-    let out = history(1, Plant::None, 1000, 3);
+    let root = test_root();
+    let out = history(1, Plant::None, 1000, 3, &root);
     assert!(out.errors.is_empty(), "{:?}", out.errors);
     assert!(out.problems.is_empty(), "{:?}", out.problems);
     assert_eq!(out.waits_on_cleanup, 0, "a command waited on cleanup for the flip lock");
@@ -530,13 +539,14 @@ fn a_thousand_commands_keep_what_roots_reach_wait_on_no_cleanup_and_hold_twice_t
 /// line each.
 #[test]
 fn the_oracle_catches_a_skipped_root_a_lease_that_never_expires_and_cleanup_under_the_lock() {
-    let out = history(2, Plant::ReachSkipsRoot, 240, 3);
+    let root = test_root();
+    let out = history(2, Plant::ReachSkipsRoot, 240, 3, &root);
     assert!(out.caught(), "the planted reach that skips a root went unseen");
     println!("cleanup, planted ReachSkipsRoot: caught ({} unreadable, {} errors)", out.problems.len(), out.errors.len());
-    let out = history(3, Plant::LeaseNeverExpires, 240, 3);
+    let out = history(3, Plant::LeaseNeverExpires, 240, 3, &root);
     assert!(out.dead_lease_left || out.dead_kept.1 > 0, "the planted lease that never expires went unseen");
     println!("cleanup, planted LeaseNeverExpires: caught (the dead holder's lease left: {}, its records left: {})", out.dead_lease_left, out.dead_kept.1);
-    let out = history(4, Plant::SliceFlipsAlone, 240, 4);
+    let out = history(4, Plant::SliceFlipsAlone, 240, 4, &root);
     assert!(out.waits_on_cleanup > 0, "the planted cleanup flip under the lock went unseen");
     println!("cleanup, planted SliceFlipsAlone: caught ({} waits on cleanup)", out.waits_on_cleanup);
 }
@@ -547,21 +557,22 @@ fn the_oracle_catches_a_skipped_root_a_lease_that_never_expires_and_cleanup_unde
 /// `cleanup, planted CarrySkipped: caught (U unreadable)`.
 #[test]
 fn a_commit_a_slice_lands_under_carries_its_records_forward_and_a_skipped_carry_is_caught() {
-    let out = history(5, Plant::None, 600, 4);
+    let root = test_root();
+    let out = history(5, Plant::None, 600, 4, &root);
     assert!(out.errors.is_empty(), "{:?}", out.errors);
     assert!(out.problems.is_empty(), "{:?}", out.problems);
     assert_eq!(out.swept_under, 0, "a commit was refused as swept under with three other slices at most");
     assert!(out.carried > 0, "no commit carried a record forward: the race was not reached");
     println!("cleanup: {} records carried over 600 commands, 4 at a time, every rooted record read back", out.carried);
-    let out = history(5, Plant::CarrySkipped, 600, 4);
+    let out = history(5, Plant::CarrySkipped, 600, 4, &root);
     assert!(out.caught(), "the planted commit that skips its carry went unseen");
     println!("cleanup, planted CarrySkipped: caught ({} unreadable, {} errors)", out.problems.len(), out.errors.len());
 }
 
 /// Twelve commands of two checkouts that each change half their records, then a wave of two
 /// folding commands cut at completion `at` (`None`: not cut).
-fn cut_history(plant: Plant, at: Option<u64>, power: bool) -> (Vec<String>, bool) {
-    let mut w = World::new(17, plant);
+fn cut_history(plant: Plant, at: Option<u64>, power: bool, root: &Frame) -> (Vec<String>, bool) {
+    let mut w = World::new(17, plant, root);
     let mut rng = Rng(17);
     let mut versions = [[0u32; SLOTS as usize]; 2];
     let jobs_of = |rng: &mut Rng, versions: &mut [[u32; SLOTS as usize]; 2], fold: bool| -> Vec<Job> {
@@ -598,12 +609,14 @@ fn cut_history(plant: Plant, at: Option<u64>, power: bool) -> (Vec<String>, bool
 }
 
 /// Every cut of a wave whose commands fold slices: the processes dying alone, and a power cut.
-/// How many recoveries broke the oracle, of how many cuts.
+/// How many recoveries broke the oracle, of how many cuts. Each cut is a run of its own, its
+/// processes' stores in a frame of that run, given back before the next.
 fn torn(plant: Plant) -> (u32, u32) {
     let (mut bad, mut cuts) = (0, 0);
     for power in [false, true] {
         for at in 0..2_000u64 {
-            let (problems, cut) = cut_history(plant, Some(at), power);
+            let root = test_root();
+            let (problems, cut) = cut_history(plant, Some(at), power, &root);
             if !problems.is_empty() {
                 bad += 1;
             }
@@ -620,7 +633,8 @@ fn torn(plant: Plant) -> (u32, u32) {
 /// read back`, then `cleanup, planted UnlinkEarly: caught (N recoveries ...)`.
 #[test]
 fn every_cut_of_a_folded_slice_keeps_what_roots_reach_and_an_early_unlink_is_caught() {
-    let (problems, _) = cut_history(Plant::None, None, false);
+    let root = test_root();
+    let (problems, _) = cut_history(Plant::None, None, false, &root);
     assert!(problems.is_empty(), "the uncut history: {problems:?}");
     let (bad, cuts) = torn(Plant::None);
     assert_eq!(bad, 0, "a recovery after a cut lost a record an unexpired root names");

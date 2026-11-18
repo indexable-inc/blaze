@@ -165,6 +165,9 @@ pub struct BodyOut<'a> {
     /// own reads are in `reads` too (share.rs, "A HIT IS ONE READ"); the engine names a goal
     /// as a cell of its own once goals are records.
     pub goal_hits: AVec<'a, blaze_solve::share::GoalHit>,
+    /// The reads the body's recorder was offered and kept (recorder.rs [`ReadTally`](super::recorder::ReadTally)):
+    /// the Bodies stage's reads line.
+    pub read_tally: super::recorder::ReadTally,
 }
 
 /// One line of a body's verdict ([`BodyOut::said`]): `start..end` is item-relative (rule 71).
@@ -258,7 +261,7 @@ pub fn check_body<'n, 'a>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     let mut goal_hits: AVec<'a, blaze_solve::share::GoalHit> = AVec::with_capacity_in(world.goal_hits().len(), alloc);
     goal_hits.extend_from_slice(world.goal_hits());
     drop(world);
-    let reads = recorder.finish().map_err(TaskError::Full)?;
+    let (reads, read_tally) = recorder.finish_tallied().map_err(TaskError::Full)?;
     let bytes = verdict_bytes(&verdict, &borrows, Facts::Digest, alloc)?;
     let out = ContentId::of(OUT_DOMAIN, &bytes);
 
@@ -279,7 +282,7 @@ pub fn check_body<'n, 'a>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     }
     let done = Done { name, key: task.key, out, defines, reads: cells, findings: u32::try_from(findings).unwrap_or(u32::MAX), failed };
     drop(reading);
-    Ok(BodyOut { done, made, bytes, reads, held, said, goal_hits })
+    Ok(BodyOut { done, made, bytes, reads, held, said, goal_hits, read_tally })
 }
 
 /// The lines `check` prints for a verdict (blaze-cli body_types.rs, today's path), in `alloc`.

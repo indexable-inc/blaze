@@ -30,10 +30,12 @@ use blaze_keyed::{
     kind::{Namespace, Tag},
     store::{ENTRY, FOOTER, HEADER},
 };
+use blaze_mem::Frame;
 
 use super::{
     core::{GRACE_NS, INDEX_TAG, INDEXED_ROOT_TAG, LEASE_NS, Liveness, Plain, PlainConfig, Plant, ROOT_LIFE_NS, TAGS},
     format::aligned,
+    test_root,
 };
 use crate::Key;
 
@@ -55,10 +57,10 @@ fn dir() -> FileName {
     FileName::new("plain").expect("a name")
 }
 
-fn cfg(n: u64) -> PlainConfig {
-    let mut writes = Vec::new_in(Global);
+fn cfg(n: u64, root: &Frame) -> PlainConfig<&Frame> {
+    let mut writes = Vec::new_in(root);
     writes.push(Namespace::LOCAL);
-    let mut reads = Vec::new_in(Global);
+    let mut reads = Vec::new_in(root);
     reads.push(Namespace::LOCAL);
     PlainConfig {
         dir: dir(),
@@ -67,7 +69,7 @@ fn cfg(n: u64) -> PlainConfig {
         boot: 1,
         nonce: 9000 + n,
         durable: false,
-        machine: Vec::new_in(Global),
+        machine: Vec::new_in(root),
         writes,
         reads,
         liveness: Liveness::Reached,
@@ -100,18 +102,24 @@ fn dead() -> impl Iterator<Item = u32> {
     DEAD_FROM..DEAD_FROM + DEAD
 }
 
-pub(super) struct World {
+/// The history's world: the simulation, the next process's number, the plant, and the test's
+/// frame every process's store keeps its tables in (made at the top of the test).
+pub(super) struct World<'f> {
     pub(super) sim: Sim,
     pub(super) next: u64,
     pub(super) plant: Plant,
+    pub(super) root: &'f Frame,
 }
 
-impl World {
+/// A process's store, its tables in the test's frame.
+pub(super) type Store<'f> = Plain<&'f Frame>;
+
+impl<'f> World<'f> {
     /// A process's store, opened whole on the head as it is now.
-    pub(super) fn open(&mut self, plant: Plant) -> Result<Plain, String> {
+    pub(super) fn open(&mut self, plant: Plant) -> Result<Store<'f>, String> {
         let n = self.next;
         self.next += 1;
-        let mut store = Plain::planted(cfg(n), plant);
+        let mut store = Plain::planted(cfg(n, self.root), self.root, plant);
         let mut effects = Vec::new_in(Global);
         store.open_whole(&mut effects);
         self.settle(&mut store, &mut effects)?;
@@ -120,7 +128,7 @@ impl World {
     }
 
     /// Every effect `store` asks, done, until it asks nothing more.
-    fn settle(&mut self, store: &mut Plain, effects: &mut Vec<Effect>) -> Result<(), String> {
+    fn settle(&mut self, store: &mut Store<'f>, effects: &mut Vec<Effect>) -> Result<(), String> {
         let mut done: Vec<Completion> = Vec::new_in(Global);
         for _ in 0..1_000_000u32 {
             self.sim.submit(effects);
@@ -141,7 +149,7 @@ impl World {
 
     /// One command: `puts` then `roots` (each given the store), one slice folded when `fold`,
     /// the lease let go of, one commit.
-    pub(super) fn command(&mut self, puts: &[u32], roots: impl FnOnce(&mut Plain) -> Result<(), String>, fold: bool) -> Result<(), String> {
+    pub(super) fn command(&mut self, puts: &[u32], roots: impl FnOnce(&mut Store<'f>) -> Result<(), String>, fold: bool) -> Result<(), String> {
         let mut store = self.open(self.plant)?;
         let mut effects = Vec::new_in(Global);
         for &n in puts {
@@ -178,20 +186,20 @@ impl World {
 }
 
 /// Which of `records` do not read back with their own bytes in a fresh reader.
-fn unreadable(w: &mut World, records: impl Iterator<Item = u32>) -> Result<Vec<u32>, String> {
+fn unreadable(w: &mut World<'_>, records: impl Iterator<Item = u32>) -> Result<Vec<u32>, String> {
     let r = w.open(Plant::None)?;
     Ok(records.filter(|&n| r.get(&key(n)).map(|it| it.bytes.to_vec()) != Some(value(n))).collect())
 }
 
 /// Which of `records` still read in a fresh reader.
-pub(super) fn readable(w: &mut World, records: impl Iterator<Item = u32>) -> Result<Vec<u32>, String> {
+pub(super) fn readable(w: &mut World<'_>, records: impl Iterator<Item = u32>) -> Result<Vec<u32>, String> {
     let r = w.open(Plant::None)?;
     Ok(records.filter(|&n| r.get(&key(n)).is_some()).collect())
 }
 
 /// The live bytes: each record reached (its aligned payload and index entry), the roots' and
 /// the index's records too, read in a fresh reader.
-fn live_bytes(w: &mut World, records: impl Iterator<Item = u32>, extra: &[Key]) -> Result<u64, String> {
+fn live_bytes(w: &mut World<'_>, records: impl Iterator<Item = u32>, extra: &[Key]) -> Result<u64, String> {
     let r = w.open(Plant::None)?;
     let mut live = 0u64;
     for k in records.map(key).chain(extra.iter().copied()) {
@@ -206,8 +214,8 @@ fn live_bytes(w: &mut World, records: impl Iterator<Item = u32>, extra: &[Key]) 
 }
 
 /// What the history showed: each claim broken, in words. Empty: every claim held.
-fn history(plant: Plant) -> Result<Vec<String>, String> {
-    let mut w = World { sim: Sim::new(41, Faults::default()), next: 0, plant };
+fn history(plant: Plant, root: &Frame) -> Result<Vec<String>, String> {
+    let mut w = World { sim: Sim::new(41, Faults::default()), next: 0, plant, root };
     let mut problems = Vec::new_in(Global);
     // 1. The program's records, their index named by two roots of two lives; a plain root's
     // few; and dead records, all in one segment.
@@ -300,7 +308,8 @@ fn history(plant: Plant) -> Result<Vec<String>, String> {
 /// Prints "indexed roots: 64 records through one index kept by 2 roots; 64 dead swept; expiry lets go".
 #[test]
 fn an_indexed_root_keeps_what_its_indexes_hold() {
-    let problems = history(Plant::None).expect("the history runs");
+    let root = test_root();
+    let problems = history(Plant::None, &root).expect("the history runs");
     assert!(problems.is_empty(), "{problems:?}");
     std::println!("indexed roots: {PROGRAM} records through one index kept by 2 roots; {DEAD} dead swept; expiry lets go");
 }
@@ -310,7 +319,8 @@ fn an_indexed_root_keeps_what_its_indexes_hold() {
 /// Prints "indexed roots control: the index not followed: <the oracle's finding>".
 #[test]
 fn reach_that_does_not_follow_an_index_is_caught() {
-    let problems = history(Plant::IndexNotFollowed).expect("the history runs");
+    let root = test_root();
+    let problems = history(Plant::IndexNotFollowed, &root).expect("the history runs");
     assert!(problems.iter().any(|it| it.contains("a live root reaches do not read back")), "the planted reach was not caught: {problems:?}");
     std::println!("indexed roots control: the index not followed: {}", problems[0]);
 }

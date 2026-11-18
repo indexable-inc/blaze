@@ -37,10 +37,10 @@ type Store<'f> = Lent<Sim, &'f Frame>;
 
 const TAG: Tag = Tag(1);
 
-fn cfg(n: u64) -> PlainConfig {
-    let mut writes = Vec::new_in(Global);
+fn cfg(n: u64, root: &Frame) -> PlainConfig<&Frame> {
+    let mut writes = Vec::new_in(root);
     writes.push(Namespace::LOCAL);
-    let mut reads = Vec::new_in(Global);
+    let mut reads = Vec::new_in(root);
     reads.push(Namespace::LOCAL);
     PlainConfig {
         dir: FileName::new("plain").expect("a name"),
@@ -50,7 +50,7 @@ fn cfg(n: u64) -> PlainConfig {
         nonce: 700 + n,
         // A power cut is part of the claim, so the commit syncs (as root_commit_tests.rs).
         durable: true,
-        machine: Vec::new_in(Global),
+        machine: Vec::new_in(root),
         writes,
         reads,
         liveness: super::Liveness::Everything,
@@ -70,7 +70,7 @@ fn value(n: u32) -> Vec<u8> {
 }
 
 fn process(sim: Sim, n: u64, lent: LentPlant, core: Plant, root: &Frame) -> Store<'_> {
-    Lent::planted(Driven::planted(sim, Path::new("/sim"), cfg(n), core).expect("the store opens"), root, lent)
+    Lent::planted(Driven::planted(sim, Path::new("/sim"), cfg(n, root), root, core).expect("the store opens"), root, lent)
 }
 
 /// The targets `ns` put and committed by a process of their own.
@@ -161,14 +161,14 @@ fn a_pointer_and_its_target_ride_one_flip_through_every_cut() {
 }
 
 /// A process at the core: the store's state machine and the effects it asks.
-struct Proc {
-    store: Plain,
+struct Proc<'r> {
+    store: Plain<&'r Frame>,
     effects: Vec<Effect>,
 }
 
-impl Proc {
-    fn open(sim: &mut Sim, n: u64) -> Proc {
-        let mut it = [Proc { store: Plain::new(cfg(n)), effects: Vec::new_in(Global) }];
+impl<'r> Proc<'r> {
+    fn open(sim: &mut Sim, n: u64, root: &'r Frame) -> Proc<'r> {
+        let mut it = [Proc { store: Plain::new(cfg(n, root), root), effects: Vec::new_in(Global) }];
         it[0].store.open_whole(&mut it[0].effects);
         settle(sim, &mut it);
         let [mut it] = it;
@@ -188,7 +188,7 @@ impl Proc {
 }
 
 /// Runs until nothing is in flight; bounded.
-fn settle(sim: &mut Sim, procs: &mut [Proc]) {
+fn settle(sim: &mut Sim, procs: &mut [Proc<'_>]) {
     let mut done: Vec<Completion> = Vec::new_in(Global);
     for _ in 0..1_000_000 {
         for p in procs.iter_mut() {
@@ -222,8 +222,8 @@ fn pointed_now(sim: Sim, n: u64, root: &Frame) -> (Sim, Option<Key>) {
 fn of_two_processes_the_later_commit_wins() {
     let root = test_root();
     let mut sim = targets(Sim::new(43, Faults::default()), 1, &[0, 1, 2, 3], &root);
-    let mut a = Proc::open(&mut sim, 2);
-    let mut b = Proc::open(&mut sim, 3);
+    let mut a = Proc::open(&mut sim, 2, &root);
+    let mut b = Proc::open(&mut sim, 3, &root);
     let mut won = 0;
     for (n, (writer, t)) in [(0u8, 0u32), (1, 1), (0, 0), (1, 2)].into_iter().enumerate() {
         let p = if writer == 0 { &mut a } else { &mut b };

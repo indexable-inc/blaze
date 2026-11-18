@@ -454,6 +454,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-cert"
+version = "0.0.0"
+dependencies = [
+ "blaze-int",
+ "blaze-own",
+ "blaze-solve",
+]
+
+[[package]]
 name = "blaze-check"
 version = "0.0.0"
 dependencies = [
@@ -467,6 +476,7 @@ dependencies = [
 name = "blaze-cli"
 version = "0.0.0"
 dependencies = [
+ "blaze-answer",
  "blaze-apple-sdk",
  "blaze-blake3",
  "blaze-build-script",
@@ -657,6 +667,7 @@ dependencies = [
 name = "blaze-engine"
 version = "0.0.0"
 dependencies = [
+ "blaze-answer",
  "blaze-drive",
  "blaze-id",
  "blaze-own",
@@ -1299,6 +1310,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-json",
+ "blaze-mem",
  "blaze-own",
  "blaze-resolve",
  "blaze-semver",
@@ -1694,6 +1706,7 @@ dependencies = [
  "blaze-id",
  "blaze-ids",
  "blaze-manifest",
+ "blaze-mem",
  "blaze-own",
  "blaze-sim",
  "blaze-surface",
@@ -1969,6 +1982,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-test-reach"
+version = "0.0.0"
+dependencies = [
+ "blaze-blake3",
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-text"
 version = "0.0.0"
 dependencies = [
@@ -2158,6 +2180,19 @@ dependencies = [
  "blaze-unit-graph",
  "blaze-world",
  "edition",
+]
+
+[[package]]
+name = "blaze-world-api"
+version = "0.0.0"
+dependencies = [
+ "blaze-cbor",
+ "blaze-data",
+ "blaze-id",
+ "blaze-json",
+ "blaze-mem",
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]

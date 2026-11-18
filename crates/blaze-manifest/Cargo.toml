@@ -61,6 +61,8 @@ url = { workspace = true, optional = true }
 [dev-dependencies]
 # `Alloc::global()` in tests (the `std` feature), and `expected.json` read for the layout's test.
 blaze-own = { workspace = true, features = ["std", "testing"] }
+# `Root`: the root heap a test makes at its top (src/layout/meta_tests.rs), its handles borrowed.
+blaze-mem.workspace = true
 blaze-data.workspace = true
 blaze-json.workspace = true
 blaze-sim.workspace = true

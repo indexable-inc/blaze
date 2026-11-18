@@ -1215,6 +1215,11 @@ impl<'f> BodiesStage<'f> {
         let tasks = self.ran.iter().filter(|one| one.items > 0).count();
         let _ = writeln!(into, "bodies: {items} item bodies checked in {tasks} task(s); {} body(ies) a macro wrote that no entry covers", self.uncovered);
         let _ = writeln!(into, "bodies: us a body: sum {}, median {}; {} bodies a CPU second; phase wall {} us against {} us of body CPU ({parallel:.1}x)", sum / 1000, median / 1000, per_cpu_s, self.wall_ns / 1000, sum / 1000);
+        // What the bodies' recorders were offered and kept (front2 tables/recorder.rs
+        // `ReadTally`): a repeat is never pushed, so only `kept` reads are sorted.
+        let reads = self.seeds.reads;
+        let _ = writeln!(into, "bodies: reads offered {}, kept {}, compares sorting them {} (front2 tables/recorder.rs)", reads.offered, reads.kept, reads.sort_compares);
+        let _ = writeln!(into, "bodies: expansion origin columns opened {} (once per expansion asked per stretch: front2 source.rs `Records::text_marks`)", self.seeds.origins_opened);
         for (ns, _, file) in checked.iter().take(10) {
             let path = outlined.get(*file as usize).map_or("?", |one| core::str::from_utf8(&one.path).unwrap_or("?"));
             let _ = writeln!(into, "bodies: slow  {:>9} us  {path}", ns / 1000);
@@ -1408,7 +1413,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
             let fa = frame.alloc(blaze_own::Erased::new(frame)).handle();
             let consts = index.map(|index| frame.alloc(crate::engine_head_consts::HeadConsts::new(tables.reading_into(evaluated), index, g)) as &mut (dyn ConstValues<'_> + '_));
             let freezer = SeededHeads::new(SeededHeadsOpts { names: opened.records, sized, frame, scratch: g, alloc: fa, consts, known: Some(table) });
-            Some(frame.alloc(RequestSeed::new(RequestSeedOpts { names: opened.records, heads: table, freezer })))
+            Some(frame.alloc(RequestSeed::new(RequestSeedOpts { names: opened.records, heads: table, freezer, body_locals: table.body_locals() })))
         }
         None => None,
     };
@@ -1447,6 +1452,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
             asked.planned.name = Name::new(Kind::BodyCheck, item.0);
             match work::unwinding(|| check_body(tables, &asked, &body_frame, &make, alloc)) {
                 Ok(Ok(body)) => {
+                    tally.reads.add(body.read_tally);
                     whole.update(&body.done.out.0);
                     reads.extend_from_slice(&body.done.reads);
                     findings = findings.saturating_add(body.done.findings);
@@ -1684,6 +1690,9 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
         ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: done.findings, said, head_failed: None, chain: one.place.chain, found, items });
         out.done.push(done);
     }
+    // The stretch's records opened each expansion's origin column once (front2 source.rs
+    // `Records::text_marks`): how many, for the stage's line.
+    tally.origins_opened = tally.origins_opened.saturating_add(opened.records.opened().origins);
     taken
 }
 

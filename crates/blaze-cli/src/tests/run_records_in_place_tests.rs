@@ -118,8 +118,9 @@ fn stored() -> std::vec::Vec<Stored> {
 
 /// Process `n` of one boot over `sim`: the command's store as `open_for_command` opens it.
 fn process(sim: Sim, n: u64) -> Lent<Sim, StoreAlloc> {
-    let cfg = config(FileName::new("store").expect("a name"), &StoreSettings::default(), Facts { boot: Some(1), nonce: 9100 + n });
-    open(sim, cfg, blaze_own::testing::heap().alloc()).expect("the store opens")
+    let alloc = blaze_own::testing::heap().alloc();
+    let cfg = config(FileName::new("store").expect("a name"), &StoreSettings::default(), Facts { boot: Some(1), nonce: 9100 + n }, alloc);
+    open(sim, cfg, alloc).expect("the store opens")
 }
 
 /// The command's store over the simulation, counting its gets.

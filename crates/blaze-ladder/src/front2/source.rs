@@ -501,9 +501,11 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
     }
 
     fn text_marks(self, krate: usize, call: ItemKey) -> Result<Option<blaze_scope::crate_roots::TextMarks<'n>>, super::item_site::MarksLost> {
-        use super::item_site::{MarksLost, marks_of};
+        use super::item_site::{MarksLost, marks_of_column};
         let made = self.crates().get(krate).and_then(|c| c.expansions.get(&call)).and_then(|e| e.made).ok_or(MarksLost::NoExpansion { call })?;
-        marks_of(call, made.text, &made.origins)
+        // The column the solve opened once when it made the text (blaze-scope resolve.rs
+        // `ExpansionText::column`): O(1).
+        marks_of_column(call, made.text, made.column)
     }
 
     fn extern_abi(self, key: ItemKey) -> Option<Option<&'n str>> {
@@ -796,6 +798,10 @@ impl<'n> LoadItems<'n> for Loader<'n> {
 pub struct Opened {
     pub names: Decoded,
     pub items: ItemsDecoded,
+    /// Expansions' origin columns opened (each verified whole, blaze-expand origin_column.rs
+    /// `OriginsRef::open`): once per expansion asked of these records, however often its
+    /// marks are asked ([`NamesSource::text_marks`]).
+    pub origins: u64,
 }
 
 /// An enum's variants as a [`NamesSource`] holds them, in declaration order: the solve's list
@@ -900,10 +906,22 @@ pub struct Records<'n> {
     /// Each changed file's outline as it is now, by (crate, file), made the first time a
     /// member of it is read at item grain (source/item_grain.rs): at most [`MOST_OUTLINES`].
     outlines: RefCell<HashMap<(usize, u32), blaze_file_items::Outline<'n>, Alloc<'n>>>,
+    /// What [`NamesSource::text_marks`] answered, by (crate, call): the expansion's origin
+    /// column opened and verified ONCE (rule 74), its view handed out after in O(1). Before
+    /// (tempo `engine-check`, 2026-11-17): every head and body site of an expansion re-opened
+    /// the column, each open reading every mark and row. At most [`MOST_MARKED_TEXTS`].
+    marks: RefCell<HashMap<(usize, ItemKey), Result<Option<blaze_scope::crate_roots::TextMarks<'n>>, super::item_site::MarksLost>, Alloc<'n>>>,
+    /// Origin columns opened so far ([`Opened::origins`]).
+    origins_opened: Cell<u64>,
     /// The allocator the records were opened with, the caller's: a walk's and a digest's
     /// scratch too.
     alloc: Alloc<'n>,
 }
+
+/// The most expansions whose marks one [`Records`] keeps (rule 18): past it a text's marks are
+/// refused by name (`MarksLost::TooManyTexts`), never re-opened per ask. tempo's whole
+/// workspace writes on the order of 10^5 expansions.
+pub const MOST_MARKED_TEXTS: usize = 1 << 20;
 
 impl<'n> Records<'n> {
     /// `keys`: each crate's key by index (index 0 the program's own), as `load` and `log` know
@@ -923,6 +941,8 @@ impl<'n> Records<'n> {
             incoherent: Cell::new(None),
             no_item: Cell::new(None),
             outlines: RefCell::new(HashMap::new_in(alloc)),
+            marks: RefCell::new(HashMap::new_in(alloc)),
+            origins_opened: Cell::new(0),
             alloc,
         }
     }
@@ -999,7 +1019,7 @@ impl<'n> Records<'n> {
 
     /// What was opened and decoded so far.
     pub fn opened(&self) -> Opened {
-        Opened { names: self.paths.decoded(), items: self.items.decoded() }
+        Opened { names: self.paths.decoded(), items: self.items.decoded(), origins: self.origins_opened.get() }
     }
 
     /// PLANTED BUG, for tests/front2_records.rs only: crate `krate`'s impl rows are withheld
@@ -1429,15 +1449,29 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
 
     fn text_marks(self, krate: usize, call: ItemKey) -> Result<Option<blaze_scope::crate_roots::TextMarks<'n>>, super::item_site::MarksLost> {
         use super::item_site::{MarksLost, marks_of};
-        let text = self.load.expansion(krate, call).ok_or(MarksLost::NoExpansion { call })?;
-        // `Load::expansion_origins`: `None` is a loader that holds no origins for the call and
-        // empty bytes a text that keeps none; both are a text with no column, as
-        // `item_site::marks_of`'s `Ok(None)` (OPEN: the records loaders of tests/ serve none, so a
-        // def-site head over records resolves at its module until they do).
-        match self.load.expansion_origins(krate, call) {
-            None | Some([]) => Ok(None),
-            Some(bytes) => marks_of(call, text, &Ok(bytes)),
+        // Asked before: the opened view, O(1) (the field's docs).
+        if let Some(answer) = self.marks.borrow().get(&(krate, call)) {
+            return *answer;
         }
+        if self.marks.borrow().len() >= MOST_MARKED_TEXTS {
+            return Err(MarksLost::TooManyTexts { call, most: MOST_MARKED_TEXTS });
+        }
+        let answer = (|| -> Result<Option<blaze_scope::crate_roots::TextMarks<'n>>, MarksLost> {
+            let text = self.load.expansion(krate, call).ok_or(MarksLost::NoExpansion { call })?;
+            // `Load::expansion_origins`: `None` is a loader that holds no origins for the call
+            // and empty bytes a text that keeps none; both are a text with no column, as
+            // `item_site::marks_of`'s `Ok(None)` (OPEN: the records loaders of tests/ serve none,
+            // so a def-site head over records resolves at its module until they do).
+            match self.load.expansion_origins(krate, call) {
+                None | Some([]) => Ok(None),
+                Some(bytes) => {
+                    self.origins_opened.set(self.origins_opened.get() + 1);
+                    marks_of(call, text, &Ok(bytes))
+                }
+            }
+        })();
+        self.marks.borrow_mut().insert((krate, call), answer);
+        answer
     }
 
     fn extern_abi(self, key: ItemKey) -> Option<Option<&'n str>> {

@@ -22,13 +22,13 @@
 //! The brand: a [`Verified`] holds for the [`Boot`] it was made in, and a process lives in one
 //! boot, so the proof cannot outlive what it proves; a new boot is a new process, whose
 //! segments of the boot before are [`Unverified`] until their one check. There is no function
-//! that checks a [`Verified`]: only [`Verified::scrub`], the caller's explicit ask, evaluates
+//! that checks a [`Verified`]: only [`Verified::scrub_into`], the caller's explicit ask, evaluates
 //! the per-record CRCs, to name a record whose bytes changed on the disk since.
 
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::alloc::Global;
+use std::alloc::Allocator;
 
 use blaze_core::{FileName, Mapping};
 use blaze_keyed::store::{ENTRY, Generation, SegmentId, SegmentProof, StoreError};
@@ -221,16 +221,15 @@ impl Verified {
 
     /// The caller's explicit ask, never a read's: every record's CRC-32C evaluated against its
     /// bytes as they lie now, naming each that changed on the disk after its proof was made.
-    pub(crate) fn scrub(&self) -> Vec<Corrupt> {
-        let mut out = Vec::new_in(Global);
-        self.scrub_from(0, u64::MAX, &mut out);
-        out
+    /// Findings go to `out`, the caller's list in its allocator.
+    pub(crate) fn scrub_into<B: Allocator>(&self, out: &mut Vec<Corrupt, B>) {
+        self.scrub_from(0, u64::MAX, out);
     }
 
-    /// [`Verified::scrub`] from entry `from`, stopping after the entry that takes the payload
+    /// [`Verified::scrub_into`] from entry `from`, stopping after the entry that takes the payload
     /// bytes walked to `budget` or more (at least one entry): the background pass's slice
     /// (store-next.md). Findings go to `out`; returns the next entry and the bytes walked.
-    pub(crate) fn scrub_from(&self, from: usize, budget: u64, out: &mut Vec<Corrupt>) -> (usize, u64) {
+    pub(crate) fn scrub_from<B: Allocator>(&self, from: usize, budget: u64, out: &mut Vec<Corrupt, B>) -> (usize, u64) {
         let run = self.run();
         let mut walked = 0u64;
         let mut i = from;
@@ -244,7 +243,7 @@ impl Verified {
 
     /// One entry of the index checked against its payload's CRC-32C, a finding to `out` when
     /// it fails.
-    fn scrub_entry(&self, run: &[u8], i: usize, out: &mut Vec<Corrupt>) {
+    fn scrub_entry<B: Allocator>(&self, run: &[u8], i: usize, out: &mut Vec<Corrupt, B>) {
         let entry = match Entry::decode(&run[i * ENTRY..(i + 1) * ENTRY]) {
             Ok(entry) => entry,
             Err(what) => {

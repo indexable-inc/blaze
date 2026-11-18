@@ -6,12 +6,12 @@
 //! to make a head it meets on the spot instead of ending the round (a round re-runs the body's
 //! whole inference), a row filed during the check must not move a row an earlier answer still
 //! points into. A `HashMap<K, V>` moves its values when it grows; these tables keep each value
-//! in an [`AppendVec`] (address space reserved up front, pages committed as it grows, never
-//! moved) and the map holds only the row's index.
+//! in a [`SharedSegs`] (doubling segments, a new one allocated as it grows, none ever moved)
+//! and the map holds only the row's index.
 //!
-//! What makes it sound, with no `unsafe` here: every value is a published element of the
-//! `AppendVec`, which is written once, never written again through `&self`, and dropped only
-//! when the table is (blaze-mem append.rs states and checks that). A reader's `&V` is to that
+//! What makes the rows sound, with no `unsafe` for them here: every value is a published
+//! element of the `SharedSegs`, which is written once, never written again through `&self`, and
+//! dropped only when the table is (blaze-own segs.rs states that). A reader's `&V` is to that
 //! element, never to the index map's buckets, so neither a later insert (which may grow the
 //! map), a replacement (a new row; the index moves to it) nor a removal (the key leaves the
 //! index; the row stays) can move or free what an answer holds. The index map is behind a
@@ -19,39 +19,46 @@
 //!
 //! Iteration is in the order the live rows were filed: every caller sorts (rule 25), as it
 //! did over the map's order.
+//!
+//! Whose memory (lane RP3, 2026-11-17): the caller's allocator, handed in (`new_in`), for the
+//! rows and the index alike, freed when the table drops. Before, each table and each type
+//! column reserved its own `blaze_mem` region (an `mmap` at the first row, an `munmap` at the
+//! drop), and a heads store (`Store`, `Lives`, `PortableTys`) is made per head and per body:
+//! tempo's `engine-check` paid two kernel calls per table per body. Now a store's tables are
+//! in the allocator its maker hands `Store::new` (blaze-cli engine_bodies.rs: the request's
+//! heap), which maps nothing per table; the rows stay where they were filed because
+//! [`SharedSegs`] grows by new segments, never by moving one.
 
-use core::cell::{OnceCell, RefCell};
+use core::alloc::{Allocator, Layout};
+use core::cell::{Cell, RefCell};
 use core::hash::Hash;
+use core::ptr::NonNull;
 use std::alloc::Global;
 
 use blaze_hash::HashMap;
-use blaze_mem::{AppendVec, Tag};
+use blaze_own::SharedSegs;
 
-/// The most rows one table holds: address space only (pages are committed as rows are filed).
-/// A table past it stops naming its tag, as memory that cannot be had does.
+/// The most rows one table holds (rule 18): a table past it stops naming it.
 const MOST_ROWS: usize = 1 << 22;
 
-/// Keyed rows, filed through `&self`, each at an address that holds until the table drops.
-pub struct Rows<K, V> {
-    /// Every row ever filed, with its key; reserved at the first insert (a store whose table
-    /// stays empty maps nothing).
-    rows: OnceCell<AppendVec<(K, V)>>,
+/// Keyed rows, filed through `&self`, each at an address that holds until the table drops; in
+/// the allocator `A` the table was made with (the module docs say whose).
+pub struct Rows<K, V, A: Allocator + Clone = Global> {
+    /// Every row ever filed, with its key, in segments that never move.
+    rows: SharedSegs<(K, V), A>,
     /// Each live key's row.
-    at: RefCell<HashMap<K, u32, Global>>,
+    at: RefCell<HashMap<K, u32, A>>,
 }
 
-impl<K: Copy + Eq + Hash, V> Rows<K, V> {
-    /// An empty table; its index in `alloc` (the rows are in their own reserved range).
-    pub fn new_in(alloc: Global) -> Rows<K, V> {
-        Rows { rows: OnceCell::new(), at: RefCell::new(HashMap::new_in(alloc)) }
-    }
-
-    fn filed(&self) -> &[(K, V)] {
-        self.rows.get().map_or(&[], AppendVec::as_slice)
+impl<K: Copy + Eq + Hash, V, A: Allocator + Clone> Rows<K, V, A> {
+    /// An empty table in `alloc` (its rows and its index): nothing is allocated until a row is
+    /// filed.
+    pub fn new_in(alloc: A) -> Rows<K, V, A> {
+        Rows { rows: SharedSegs::new_in(alloc.clone()), at: RefCell::new(HashMap::new_in(alloc)) }
     }
 
     fn row(&self, i: u32) -> Option<&(K, V)> {
-        self.filed().get(i as usize)
+        self.rows.get(i as usize)
     }
 
     /// The live row of `k`.
@@ -67,11 +74,19 @@ impl<K: Copy + Eq + Hash, V> Rows<K, V> {
     /// Files `v` as `k`'s row: a new row, so every reference to the row it replaces (returned)
     /// still reads what it read.
     pub fn insert(&self, k: K, v: V) -> Option<&V> {
-        let rows = self.rows.get_or_init(|| match AppendVec::new(MOST_ROWS, Tag::Infer) {
-            Ok(rows) => rows,
-            Err(error) => panic!("the heads store's rows could not be reserved: {error}"),
-        });
-        let i = rows.append((k, v));
+        let filed = self.rows.len();
+        if filed >= MOST_ROWS {
+            panic!("a heads store's table is past its {MOST_ROWS} rows (front2 rows.rs `MOST_ROWS`)");
+        }
+        // The one appender: every insert takes it and drops it before returning, and the table
+        // is not `Sync`, so another is never out here.
+        let Some(mut appender) = self.rows.appender() else {
+            panic!("a heads store's table was filed while another insert into it was filing (front2 rows.rs)");
+        };
+        let i = appender.push((k, v));
+        drop(appender);
+        // `i` is `filed`, below `MOST_ROWS` (2^22), so it fits.
+        let i = i as u32;
         let old = self.at.borrow_mut().insert(k, i)?;
         self.row(old).map(|(_, v)| v)
     }
@@ -102,7 +117,8 @@ impl<K: Copy + Eq + Hash, V> Rows<K, V> {
 
     /// The live rows, in the order filed; rows filed while iterating are not seen.
     pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> + '_ {
-        self.filed().iter().enumerate().filter(move |(i, (k, _))| self.at.borrow().get(k) == Some(&(*i as u32))).map(|(_, (k, v))| (k, v))
+        let filed = self.rows.len();
+        (0..filed).filter_map(move |i| self.rows.get(i).map(|row| (i, row))).filter(move |(i, (k, _))| self.at.borrow().get(k) == Some(&(*i as u32))).map(|(_, (k, v))| (k, v))
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &K> + '_ {
@@ -115,7 +131,7 @@ impl<K: Copy + Eq + Hash, V> Rows<K, V> {
 }
 
 /// `rows[&k]`, as a map's: the caller has checked `k` is filed; a key that is not stops naming it.
-impl<K: Copy + Eq + Hash + core::fmt::Debug, V> core::ops::Index<&K> for Rows<K, V> {
+impl<K: Copy + Eq + Hash + core::fmt::Debug, V, A: Allocator + Clone> core::ops::Index<&K> for Rows<K, V, A> {
     type Output = V;
 
     #[track_caller]
@@ -127,63 +143,123 @@ impl<K: Copy + Eq + Hash + core::fmt::Debug, V> core::ops::Index<&K> for Rows<K,
     }
 }
 
-impl<K: Copy + Eq + Hash + core::fmt::Debug, V: core::fmt::Debug> core::fmt::Debug for Rows<K, V> {
+impl<K: Copy + Eq + Hash + core::fmt::Debug, V: core::fmt::Debug, A: Allocator + Clone> core::fmt::Debug for Rows<K, V, A> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }
 }
 
-impl<K: Copy + Eq + Hash, V> Default for Rows<K, V> {
-    fn default() -> Rows<K, V> {
-        Rows::new_in(Global)
-    }
-}
-
-/// The most entries one [`StableColumn`] holds: address space only.
+/// The most entries one [`StableColumn`] holds (rule 18): past it an extend is `Full`.
 const MOST_ENTRIES: usize = 1 << 26;
 
-/// A type table's column (blaze-typeck `Stable`, the `&self` form of `PortableTys`): an
-/// [`AppendVec`] reserved at its first entry (a body's table that interns nothing maps
-/// nothing), so nothing it holds moves while a view of it is held. Past [`MOST_ENTRIES`], or
+/// The room of a column's first buffer, in entries.
+const FIRST_ROOM: usize = 64;
+
+/// The most buffers one column is ever grown through: each growth at least doubles the room
+/// from [`FIRST_ROOM`] (2^6) to at most [`MOST_ENTRIES`] (2^26), so 21 are ever used.
+const BUFFERS: usize = 32;
+
+/// A type table's column (blaze-typeck `Stable`, the `&self` form of `PortableTys`), in the
+/// allocator it was made with: contiguous (the type table reads it as one slice), and nothing it
+/// holds moves while a view of it is held.
+///
+/// How, through `&self`: a growth copies the entries into a buffer twice as large and KEEPS
+/// the old one until the column drops, so a slice handed out before (`as_slice`, a view's
+/// snapshot) still reads what it read, in memory that is never written again. The cost: the
+/// old buffers, under the live one's room in all (a geometric sum), and one copy of each entry
+/// per doubling; a column that interns nothing allocates nothing. Past [`MOST_ENTRIES`], or
 /// memory that cannot be had, is `Full`.
-pub struct StableColumn<T> {
-    cells: OnceCell<AppendVec<T>>,
+pub struct StableColumn<T: Copy, A: Allocator> {
+    /// Each buffer ever grown to, oldest first, with its room: the last holds every entry,
+    /// each older one a prefix of them. `count` of them are set.
+    bufs: RefCell<[(*mut T, usize); BUFFERS]>,
+    count: Cell<usize>,
+    /// Entries written: the first `len` of the last buffer.
+    len: Cell<usize>,
+    alloc: A,
 }
 
-impl<T> StableColumn<T> {
-    pub const fn new() -> StableColumn<T> {
-        StableColumn { cells: OnceCell::new() }
+impl<T: Copy, A: Allocator> StableColumn<T, A> {
+    /// An empty column in `alloc`: nothing is allocated until an entry is.
+    pub fn new_in(alloc: A) -> StableColumn<T, A> {
+        StableColumn { bufs: RefCell::new([(core::ptr::null_mut(), 0); BUFFERS]), count: Cell::new(0), len: Cell::new(0), alloc }
+    }
+
+    /// The live buffer and its room; `(null, 0)` before the first entry.
+    fn live(&self) -> (*mut T, usize) {
+        match self.count.get() {
+            0 => (core::ptr::null_mut(), 0),
+            n => self.bufs.borrow()[n - 1],
+        }
     }
 }
 
-impl<T> Default for StableColumn<T> {
-    fn default() -> StableColumn<T> {
-        StableColumn::new()
-    }
-}
-
-impl<T: Copy> blaze_typeck::Stable<T> for StableColumn<T> {
+impl<T: Copy, A: Allocator> blaze_typeck::Stable<T> for StableColumn<T, A> {
     fn extend(&self, values: &[T]) -> Result<u32, blaze_typeck::Full> {
-        let cells = match self.cells.get() {
-            Some(c) => c,
-            None => {
-                let made = AppendVec::new(MOST_ENTRIES, Tag::Infer).map_err(|_| blaze_typeck::Full)?;
-                self.cells.get_or_init(|| made)
+        let len = self.len.get();
+        let first = u32::try_from(len).map_err(|_| blaze_typeck::Full)?;
+        let end = len.checked_add(values.len()).filter(|&end| end <= MOST_ENTRIES).ok_or(blaze_typeck::Full)?;
+        if values.is_empty() {
+            return Ok(first);
+        }
+        let (mut at, room) = self.live();
+        if end > room {
+            let count = self.count.get();
+            if count == BUFFERS {
+                return Err(blaze_typeck::Full);
             }
-        };
-        cells.try_extend_from_slice(values).map_err(|_| blaze_typeck::Full)
+            let grown = room.saturating_mul(2).max(end).max(FIRST_ROOM).min(MOST_ENTRIES);
+            let layout = Layout::array::<T>(grown).map_err(|_| blaze_typeck::Full)?;
+            let made = self.alloc.allocate(layout).map_err(|_| blaze_typeck::Full)?.cast::<T>().as_ptr();
+            if len > 0 {
+                // SAFETY: `at` is the live buffer, whose first `len` entries are written
+                // (below, on earlier extends); `made` is a fresh allocation of `grown >= end >
+                // len` entries, so the two do not overlap and both are aligned for `T`.
+                unsafe { core::ptr::copy_nonoverlapping(at, made, len) };
+            }
+            self.bufs.borrow_mut()[count] = (made, grown);
+            self.count.set(count + 1);
+            at = made;
+        }
+        // SAFETY: the live buffer `at` has room for `end` entries; slots `len..end` are past
+        // every slice handed out of it (each ends at the `len` of its time, at most this one)
+        // and past every buffer kept, so no reader sees them until `len` is set below; `values`
+        // is a live borrow, so it is no unwritten slot of this buffer and does not overlap them.
+        unsafe { core::ptr::copy_nonoverlapping(values.as_ptr(), at.add(len), values.len()) };
+        self.len.set(end);
+        Ok(first)
     }
 
     fn as_slice(&self) -> &[T] {
-        self.cells.get().map_or(&[], AppendVec::as_slice)
+        let (at, _) = self.live();
+        if at.is_null() {
+            return &[];
+        }
+        // SAFETY: the first `len` entries of the live buffer are written and never written
+        // again (a growth copies them into a new buffer and leaves these as they are), and a
+        // buffer is freed only when the column drops (`&mut self`), so they outlive `&self`.
+        unsafe { core::slice::from_raw_parts(at, self.len.get()) }
+    }
+}
+
+impl<T: Copy, A: Allocator> Drop for StableColumn<T, A> {
+    fn drop(&mut self) {
+        let count = self.count.get();
+        for &(at, room) in &self.bufs.get_mut()[..count] {
+            let (Some(at), Ok(layout)) = (NonNull::new(at), Layout::array::<T>(room)) else { continue };
+            // SAFETY: allocated by `self.alloc` in `extend` with exactly this layout (`room`
+            // entries of `T`), freed once here; `&mut self`: no slice of it is left. The
+            // entries are `Copy`, so nothing is dropped.
+            unsafe { self.alloc.deallocate(at.cast::<u8>(), layout) };
+        }
     }
 }
 
 /// A type table over [`StableColumn`]s in `alloc` (blaze-typeck `PortableTys::new_stable`):
-/// interned through `&self` too.
+/// interned through `&self` too, its columns in `alloc` (the module docs say whose).
 pub fn stable_tys(alloc: blaze_own::Alloc<'_>) -> Result<blaze_typeck::PortableTys<'_>, blaze_typeck::CheckError> {
-    let nodes: blaze_own::Box<dyn blaze_typeck::Stable<blaze_typeck::PNode>, blaze_own::Alloc<'_>> = blaze_own::Box::new_in(StableColumn::new(), alloc);
-    let lists: blaze_own::Box<dyn blaze_typeck::Stable<blaze_typeck::PTy>, blaze_own::Alloc<'_>> = blaze_own::Box::new_in(StableColumn::new(), alloc);
+    let nodes: blaze_own::Box<dyn blaze_typeck::Stable<blaze_typeck::PNode>, blaze_own::Alloc<'_>> = blaze_own::Box::new_in(StableColumn::new_in(alloc), alloc);
+    let lists: blaze_own::Box<dyn blaze_typeck::Stable<blaze_typeck::PTy>, blaze_own::Alloc<'_>> = blaze_own::Box::new_in(StableColumn::new_in(alloc), alloc);
     blaze_typeck::PortableTys::new_stable(alloc, nodes, lists)
 }
 

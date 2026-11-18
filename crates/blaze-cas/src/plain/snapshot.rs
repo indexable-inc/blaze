@@ -161,7 +161,7 @@ impl<A: Allocator> Snapshot<A> {
     /// The snapshot of `plain`'s generation as it stands: every mapped, proved local segment of
     /// each namespace it reads, in probe order, each mapping cloned (no byte copied). `plain`
     /// must be whole ([`Plain::whole`]); the plant [`SnapshotPlant::SkipsMapAll`] takes it anyway.
-    pub(crate) fn of(plain: &Plain, alloc: A, plant: SnapshotPlant) -> Result<Snapshot<A>, SnapshotError> {
+    pub(crate) fn of<P: Allocator + Clone>(plain: &Plain<P>, alloc: A, plant: SnapshotPlant) -> Result<Snapshot<A>, SnapshotError> {
         let generation = plain.generation();
         if !plain.whole() && plant != SnapshotPlant::SkipsMapAll {
             return Err(SnapshotError::NotWhole { generation });
@@ -229,7 +229,7 @@ impl<A: Allocator> Snapshot<A> {
 
 /// The indexes (in `plain`'s maps) of the generation's mapped, proved local segments of `space`,
 /// in its probe order: the rows `Plain::find_in` probes for that namespace, in its order.
-fn in_space(plain: &Plain, space: Namespace) -> impl Iterator<Item = usize> + '_ {
+fn in_space<P: Allocator + Clone>(plain: &Plain<P>, space: Namespace) -> impl Iterator<Item = usize> + '_ {
     plain.view.iter().filter_map(move |&row| plain.mapped_row(row)).filter(move |&at| plain.mapped_at(at).seg().namespace == space)
 }
 

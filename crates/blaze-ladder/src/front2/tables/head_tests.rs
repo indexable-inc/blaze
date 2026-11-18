@@ -155,7 +155,7 @@ impl SourceTexts<'static> for Texts {
     }
 }
 
-fn a() -> Alloc<'static> {
+pub(super) fn a() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
 }
 

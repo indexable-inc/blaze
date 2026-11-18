@@ -93,7 +93,7 @@ impl<'n, A: Allocator + Clone> Names<'n, A> {
 }
 
 /// The expression a task is about, when it has one.
-fn task_expr(t: &Task) -> Option<ExprId> {
+pub(super) fn task_expr(t: &Task) -> Option<ExprId> {
     match *t {
         Task::Eval(e)
         | Task::Raw(e)

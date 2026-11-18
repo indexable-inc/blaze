@@ -21,6 +21,7 @@
 //!   `{"namespace": "public", "serial": N, "issued": unix_s, "keys": [{"key": "<64 hex>",
 //!   "roles": ["build", "root"], "from": unix_s, "until": unix_s}], "out": "<path>"}`.
 
+use std::alloc::Allocator;
 use std::{alloc::Global, path::Path};
 
 use blaze_cas::plain::{Driven, Namespace, Settings as StoreSettings};
@@ -47,24 +48,24 @@ pub const USAGE: &str = "blaze cache status | blaze cache pull <toolchain> <targ
 /// Makes the bucket a command talks to: the HTTP driver, or a test's fake.
 pub type Connect<'c> = &'c mut dyn FnMut(&Settings) -> Result<Box<dyn Bucket>, Failure>;
 
-/// `blaze cache <words>` over HTTPS.
+/// `blaze cache <words>` over HTTPS, the store opened in `alloc` (the command's).
 #[cfg(feature = "bucket")]
-pub fn main(root: &Path, env: Env<'_>, words: &[&str], now_s: u64) -> Result<String, String> {
-    run(root, env, words, now_s, &mut |settings| Ok(Box::new(crate::http::HttpBucket::new(settings)?) as Box<dyn Bucket>))
+pub fn main<A: Allocator + Clone>(root: &Path, env: Env<'_>, words: &[&str], now_s: u64, alloc: A) -> Result<String, String> {
+    run(root, env, words, now_s, &mut |settings| Ok(Box::new(crate::http::HttpBucket::new(settings)?) as Box<dyn Bucket>), alloc)
 }
 
 /// `blaze cache <words>`, the bucket made by `connect` (called only when the cache contacts
-/// a bucket and the command needs one).
-pub fn run(root: &Path, env: Env<'_>, words: &[&str], now_s: u64, connect: Connect<'_>) -> Result<String, String> {
+/// a bucket and the command needs one), the store opened in `alloc`.
+pub fn run<A: Allocator + Clone>(root: &Path, env: Env<'_>, words: &[&str], now_s: u64, connect: Connect<'_>, alloc: A) -> Result<String, String> {
     match words {
         ["status"] => {
             let settings = Settings::read(root, env)?;
             let store = StoreSettings::read(root)?;
-            Ok(format!("{}{}", store_status(&store), status(&settings)))
+            Ok(format!("{}{}", store_status(&store, alloc), status(&settings)))
         }
-        ["pull", toolchain, target, cfg] => pull(root, env, toolchain, target, cfg, "public", connect),
-        ["pull", toolchain, target, cfg, namespace] => pull(root, env, toolchain, target, cfg, namespace, connect),
-        ["push", json] => push(root, env, json, now_s, connect),
+        ["pull", toolchain, target, cfg] => pull(root, env, toolchain, target, cfg, "public", connect, alloc),
+        ["pull", toolchain, target, cfg, namespace] => pull(root, env, toolchain, target, cfg, namespace, connect, alloc),
+        ["push", json] => push(root, env, json, now_s, connect, alloc),
         ["keys", "public"] => keys_public(root, env),
         ["keys", "sign", json] => keys_sign(env, json),
         _ => Err(USAGE.to_owned()),
@@ -82,9 +83,10 @@ fn space_said(namespace: Namespace) -> String {
 /// What `status` says of the store's namespaces, from its settings alone (`<root>/store.json`):
 /// which it reads and which it writes, and, when no organisation is set and `trusted_writer` is
 /// off, that nothing it writes leaves this machine. Contacts nothing.
-pub fn store_status(store: &StoreSettings) -> String {
-    let list = |it: Vec<Namespace>| it.into_iter().map(space_said).collect::<Vec<_>>().join(", ");
-    let mut out = format!("the store reads namespaces {}; it writes {}\n", list(store.reads()), list(store.writes()));
+pub fn store_status<A: Allocator + Clone>(store: &StoreSettings, alloc: A) -> String {
+    // The two namespace lists are made in the caller's allocator (blaze-cas plain/settings.rs).
+    let list = |it: Vec<Namespace, A>| it.into_iter().map(space_said).collect::<Vec<_>>().join(", ");
+    let mut out = format!("the store reads namespaces {}; it writes {}\n", list(store.reads(alloc.clone())), list(store.writes(alloc)));
     if let Some(org) = &store.org {
         out.push_str(&format!("organisation {org:?}: namespace {}\n", space_said(Namespace::named(org))));
     }
@@ -146,7 +148,7 @@ fn contacts_nothing(settings: &Settings) -> String {
     format!("{}nothing was contacted", status(settings))
 }
 
-fn pull(root: &Path, env: Env<'_>, toolchain: &str, target: &str, cfg: &str, namespace: &str, connect: Connect<'_>) -> Result<String, String> {
+fn pull<A: Allocator + Clone>(root: &Path, env: Env<'_>, toolchain: &str, target: &str, cfg: &str, namespace: &str, connect: Connect<'_>, alloc: A) -> Result<String, String> {
     let settings = Settings::read(root, env)?;
     if settings.contacts().is_none() {
         return Err(contacts_nothing(&settings));
@@ -155,13 +157,13 @@ fn pull(root: &Path, env: Env<'_>, toolchain: &str, target: &str, cfg: &str, nam
     let ns = name::namespace_named(namespace).map_err(|it| it.to_string())?;
     let trusted = trusted(&settings, id.toolchain.clone(), ns)?;
     let store_settings = StoreSettings::read(root)?;
-    if !store_settings.reads().contains(&ns) {
+    if !store_settings.reads(alloc.clone()).contains(&ns) {
         return Err(format!(
             "namespace {namespace} is not one this store reads ({}); nothing was contacted. An organisation's namespace is read once `org` names it in the store's settings",
-            store_settings.reads().into_iter().map(space_said).collect::<Vec<_>>().join(", ")
+            store_settings.reads(alloc.clone()).into_iter().map(space_said).collect::<Vec<_>>().join(", ")
         ));
     }
-    let mut driven = Driven::open(root, &store_settings).map_err(|it| it.to_string())?;
+    let mut driven = Driven::open(root, &store_settings, alloc).map_err(|it| it.to_string())?;
     let mut bucket = connect(&settings).map_err(|it| it.to_string())?;
     let mut remote = Remote::new(&mut *bucket, &settings.root, trusted);
     let (bundle, segments) = remote.bundle_ahead(ns, &id).map_err(|it| it.to_string())?;
@@ -215,7 +217,7 @@ impl FromValue<Global> for BundleInput {
     }
 }
 
-fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>) -> Result<String, String> {
+fn push<A: Allocator + Clone>(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>, alloc: A) -> Result<String, String> {
     let input: PushInput = read_json(json.as_bytes()).map_err(|e| format!("blaze cache push: {e}: {USAGE}"))?;
     let settings = Settings::read(root, env)?;
     if settings.contacts().is_none() {
@@ -246,7 +248,7 @@ fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>)
     let ns = name::namespace_named(&input.namespace).map_err(|it| it.to_string())?;
     let store_settings = StoreSettings::read(root)?;
     let store_file = root.join(blaze_cas::plain::settings::FILE);
-    let mut driven = Driven::open(root, &store_settings).map_err(|it| it.to_string())?;
+    let mut driven = Driven::open(root, &store_settings, alloc.clone()).map_err(|it| it.to_string())?;
     if !store_settings.trusted_writer {
         // By construction: a machine that is not a trusted writer files everything in
         // namespace local, so its store holds nothing of a namespace that can be pushed.
@@ -257,12 +259,12 @@ fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>)
             store_file.display()
         ));
     }
-    let pushable: Vec<Namespace> = store_settings.writes().into_iter().filter(|it| *it != Namespace::LOCAL).collect();
+    let pushable: Vec<Namespace> = store_settings.writes(alloc.clone()).into_iter().filter(|it| *it != Namespace::LOCAL).collect();
     if !pushable.contains(&ns) {
         return Err(format!(
             "namespace {} is not one this store writes ({}, set in {}); nothing pushed",
             input.namespace,
-            store_settings.writes().into_iter().map(space_said).collect::<Vec<_>>().join(", "),
+            store_settings.writes(alloc.clone()).into_iter().map(space_said).collect::<Vec<_>>().join(", "),
             store_file.display()
         ));
     }
@@ -270,7 +272,7 @@ fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>)
     let key_list_path = settings.key_list.as_ref().expect("checked");
     let key_list = std::fs::read(key_list_path).map_err(|e| format!("{}: {e}", key_list_path.display()))?;
 
-    let mut ids = Vec::new();
+    let mut ids = Vec::new_in(alloc);
     let mut other = 0usize;
     // The store opens lazily (a segment mapped at its first probe): a push reads every
     // segment's bytes, so every one is mapped first.

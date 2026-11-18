@@ -8,7 +8,7 @@
 //! planted control (`LentPlant::RootFirst`) flips the root in a commit of its own before the
 //! records'.
 
-use std::{alloc::Global, path::Path};
+use std::path::Path;
 
 use blaze_core::{
     FileName,
@@ -32,10 +32,10 @@ type Store<'f> = Lent<Sim, &'f Frame>;
 const TAG: Tag = Tag(1);
 const ROOT: &str = "last";
 
-fn cfg(n: u64) -> PlainConfig {
-    let mut writes = Vec::new_in(Global);
+fn cfg(n: u64, root: &Frame) -> PlainConfig<&Frame> {
+    let mut writes = Vec::new_in(root);
     writes.push(Namespace::LOCAL);
-    let mut reads = Vec::new_in(Global);
+    let mut reads = Vec::new_in(root);
     reads.push(Namespace::LOCAL);
     PlainConfig {
         dir: FileName::new("plain").expect("a name"),
@@ -47,7 +47,7 @@ fn cfg(n: u64) -> PlainConfig {
         // path's cache setting) a power cut may tear a segment the manifest names, which the
         // read path reports as `Changed`; that is the cache's promise, not this one's.
         durable: true,
-        machine: Vec::new_in(Global),
+        machine: Vec::new_in(root),
         writes,
         reads,
         liveness: super::Liveness::Everything,
@@ -68,7 +68,7 @@ fn model(k: &Key) -> Option<Vec<u8>> {
 }
 
 fn process(sim: Sim, n: u64, plant: LentPlant, root: &Frame) -> Store<'_> {
-    Lent::planted(Driven::with(sim, Path::new("/sim"), cfg(n)).expect("the store opens"), root, plant)
+    Lent::planted(Driven::with(sim, Path::new("/sim"), cfg(n, root), root).expect("the store opens"), root, plant)
 }
 
 /// One command: the records of `range` put, the root `last` set to name them, one commit.

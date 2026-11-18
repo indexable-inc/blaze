@@ -353,6 +353,18 @@ pub struct ExpansionText<'a> {
     pub text: &'a str,
     pub outline: Outline<'a>,
     pub origins: Result<&'a [u8], crate::expansion_origins::OriginsError>,
+    /// `origins`' column, opened and verified ONCE when the text is made
+    /// ([`crate::crate_roots::column_in`], rule 74): what the marks of every head and body of
+    /// this text are read by (front2 item_site.rs `marks_of_column`), never re-opened per ask.
+    pub column: Result<blaze_expand::origin_column::OriginsRef<'a>, crate::crate_roots::RootsLost>,
+}
+
+impl<'a> ExpansionText<'a> {
+    /// The text with its column opened once (the field's docs).
+    pub fn new(text: &'a str, outline: Outline<'a>, origins: Result<&'a [u8], crate::expansion_origins::OriginsError>) -> ExpansionText<'a> {
+        let column = crate::crate_roots::column_in(&origins);
+        ExpansionText { text, outline, origins, column }
+    }
 }
 
 /// A macro call's expansion: what it adds to its module.
@@ -3048,10 +3060,11 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         crate::nested_input::ExpansionTokens { stream: sealed, text, places: placed, words }
     };
     part(ExpandPart::Outline, mac.name, text.len());
-    let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText { text, outline: outline(text, edition, alloc), origins }, alloc));
+    let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText::new(text, outline(text, edition, alloc), origins), alloc));
     part(ExpandPart::Lower, mac.name, text.len());
-    // The marks a lowered path's first segment resolves by (token-mark-2): the text's column.
-    let column = match crate::crate_roots::column_in(&made.origins) {
+    // The marks a lowered path's first segment resolves by (token-mark-2): the text's column,
+    // opened once in `ExpansionText::new`.
+    let column = match made.column {
         Ok(column) => Some(column),
         Err(lost) if roots_written > 0 => {
             note(ExpandNote::RootsLost { macro_name: mac.name, lost });
@@ -3101,11 +3114,11 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
                             Err(_) => None,
                         };
                         let again: &'a ExpansionText<'a> = Box::leak(Box::new_in(
-                            ExpansionText {
-                                text: items,
-                                outline: outline(items, edition, alloc),
-                                origins: Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
-                            },
+                            ExpansionText::new(
+                                items,
+                                outline(items, edition, alloc),
+                                Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
+                            ),
                             alloc,
                         ));
                         if let Some(error) = again.outline.errors().first() {
@@ -3214,7 +3227,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
     // Its origins: the identity column and the entry the call is at, the item itself
     // (expansion_origins.rs `kept`), so a head it declares is covered by that entry's check.
     let origins = crate::expansion_origins::kept(call, src.place, text, src.name, base.edition, alloc);
-    let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText { text, outline: outline(text, base.edition, alloc), origins }, alloc));
+    let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText::new(text, outline(text, base.edition, alloc), origins), alloc));
     if let Some(error) = made.outline.errors().first() {
         note(ExpandNote::NotItems { macro_name: KEPT_ITEM_NAME, message: made.outline.message(error) });
         return None;
@@ -3287,11 +3300,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bo
         let rendered = crate::blocks::module_text(body.text, &nested, &mut |c| copies.push(c), alloc);
         let text: &'a str = Box::leak(rendered.into_boxed_str());
         let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(
-            ExpansionText {
-                text,
-                outline: outline(text, base.edition, alloc),
-                origins: Err(crate::expansion_origins::OriginsError::Rewritten { what: "a block's module text" }),
-            },
+            ExpansionText::new(text, outline(text, base.edition, alloc), Err(crate::expansion_origins::OriginsError::Rewritten { what: "a block's module text" })),
             alloc,
         ));
         let call = crate::task::key_of(base.key, body.key, "blocks", "", 0);

@@ -47,6 +47,9 @@ pub enum MarksLost {
     /// No member of the trait or impl `owner` is the member a head was made from (by its name
     /// and kind, and by its text where several share them): which text wrote it is unknown.
     NotAMember { owner: LibKey },
+    /// The records keep the opened marks of `most` expansions already (front2 source.rs
+    /// `MOST_MARKED_TEXTS`, rule 18), and `call` would be one more.
+    TooManyTexts { call: LibKey, most: usize },
 }
 
 impl core::fmt::Display for MarksLost {
@@ -58,6 +61,7 @@ impl core::fmt::Display for MarksLost {
             MarksLost::Roots { call, error } => write!(f, "the expansion of macro call {call:?}: {error} {rule}"),
             MarksLost::NotInText { key, call } => write!(f, "item {key:?}'s text is not a slice of the expansion of macro call {call:?} {rule}"),
             MarksLost::NotAMember { owner } => write!(f, "no member of {owner:?} is the one its head was made from, so which text wrote it is unknown {rule}"),
+            MarksLost::TooManyTexts { call, most } => write!(f, "the expansion of macro call {call:?} is one past the {most} whose marks one command keeps (front2 source.rs `MOST_MARKED_TEXTS`) {rule}"),
         }
     }
 }
@@ -77,8 +81,19 @@ impl MarksLost {
 /// text's heads resolve at their module, as before this piece, which is right for every token
 /// the text copies from the call as written; a token of such a text that a def-site macro wrote
 /// is the open case (token-mark-2 carries the column into rewritten texts).
+///
+/// This OPENS the column (every mark and row read once: blaze-expand origin_column.rs
+/// `OriginsRef::open`), so it is called once per expansion asked: the records' source keeps
+/// what it answered (front2 source.rs `Records::text_marks`), the solved names keep the column
+/// opened when the text was made (blaze-scope resolve.rs `ExpansionText::column`), and both
+/// hand out the opened view ([`marks_of_column`]) afterwards.
 pub fn marks_of<'t>(call: LibKey, text: &'t str, origins: &Result<&'t [u8], OriginsError>) -> Result<Option<TextMarks<'t>>, MarksLost> {
-    match column_in(origins) {
+    marks_of_column(call, text, column_in(origins))
+}
+
+/// [`marks_of`] over a column already opened (`column_in`'s answer, kept): O(1).
+pub fn marks_of_column<'t>(call: LibKey, text: &'t str, column: Result<blaze_expand::origin_column::OriginsRef<'t>, RootsLost>) -> Result<Option<TextMarks<'t>>, MarksLost> {
+    match column {
         Ok(column) => Ok(Some(TextMarks { text, column })),
         Err(RootsLost::NoOrigins { error: OriginsError::Rewritten { .. } | OriginsError::Unplaced { .. } }) => Ok(None),
         Err(error) => Err(MarksLost::Roots { call, error }),

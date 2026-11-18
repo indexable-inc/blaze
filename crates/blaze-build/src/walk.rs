@@ -466,6 +466,10 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     vtables: Vec<crate::vtable::VtableRef, A>,
     /// Each `unreachable` written to end a construct ([`Walk::unreachable_of`]), in order.
     trap_marks: Vec<TrapMark, A>,
+    /// The expression of the task being stepped (`walk_root`), the body's root after the last:
+    /// the site of an `unreachable` a step writes with no expression of its own (an enum
+    /// copy's no-variant arm, `copy`), so a trap row names where in the text the copy is.
+    task_at: Option<ExprId>,
     /// The one layout of every type (rule 30): the walk's rows read their sizes, alignments,
     /// offsets, strides, tags and niches from it.
     ls: Layouts<A>,
@@ -785,6 +789,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         thread_locals: Vec::new_in(alloc.clone()),
         vtables: Vec::new_in(alloc.clone()),
         trap_marks: Vec::new_in(alloc.clone()),
+        task_at: None,
         ls: Layouts::new_in(alloc.clone()),
         layouts: Vec::new_in(alloc.clone()),
         layout_fields: Vec::new_in(alloc.clone()),
@@ -1753,7 +1758,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                             self.switch(d, none, &cases);
                             // No variant has another discriminant: holding one is UB.
                             self.begin(none);
-                            self.unreachable_of(TrapKind::Discriminant, None);
+                            self.unreachable_of(TrapKind::Discriminant, self.task_at);
                         }
                     }
                 }
@@ -2918,8 +2923,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         self.work.push(Task::Eval(self.body.root));
         while let Some(task) = self.work.pop() {
             self.note_task(&task);
+            if let Some(e) = state_names::task_expr(&task) {
+                self.task_at = Some(e);
+            }
             self.step(task)?;
         }
+        // The result's copy out is the root's.
+        self.task_at = Some(self.body.root);
         let v = self.pop()?;
         if !self.vals.is_empty() {
             return Err(malformed("values left on the stack at the end (a build bug)"));

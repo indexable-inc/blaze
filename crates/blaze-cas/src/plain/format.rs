@@ -1035,8 +1035,9 @@ pub fn find_many<'a>(n: usize, keys: &[ContentId], mut key_of: impl FnMut(usize)
 
 /// `entries` as one sorted run, each key once. Two entries of one key that are not one record
 /// (two values under one key, rule 21) stop it with [`StoreError::TwoValues`], naming the key
-/// and the later record's tag.
-pub(crate) fn sorted_run(mut entries: Vec<Entry>) -> Result<Vec<u8>, StoreError> {
+/// and the later record's tag. The run is the process heap: it is moved whole into the
+/// segment's write (blaze-core's effect owns it); `entries` may be in any allocator.
+pub(crate) fn sorted_run<B: core::alloc::Allocator>(mut entries: Vec<Entry, B>) -> Result<Vec<u8>, StoreError> {
     entries.sort_unstable_by(|a, b| a.key.cmp(&b.key));
     let mut out = Vec::with_capacity_in(entries.len() * ENTRY, Global);
     let mut last: Option<Entry> = None;

@@ -17,6 +17,18 @@
 //!   A freeze is a function of its cell and the names (head.rs `freeze_seeded`), so a body's
 //!   result never depends on which worker froze a head first: two workers that freeze one cell
 //!   at once make equal bytes, one is kept, and other bytes are a typed refusal.
+//!
+//! AN ITEM DECLARED IN A BODY is never any seed's ([`of_the_body`], lane RU4): its key is its
+//! enclosing body's lowering's (front2 locals.rs: `ItemKey::INNER` set, derived from that body's
+//! key), its head's text is a range of that body's text or a copy of an expansion inside it, and
+//! only the store that lowered the body holds it (`Store::locals`). No head task, dependency
+//! record or other worker's freeze holds it, and a freeze in another store cannot read it: the
+//! names records hold no row for it, so `Store::step` met `resolver.detail(key)` as `None` and
+//! raised `HeadError::NoText` (heads.rs, the "names library holds no text of an item it needs"
+//! of every clap and serde body whose derive writes items inside a fn: serde's `fn deserialize`
+//! declares `struct __Visitor` and `impl Visitor for __Visitor`). Each seed answers
+//! [`Seeded::Lower`] for it, so the body's own store lowers it from its own rows, as a store with
+//! no seed always did.
 
 use core::cell::{Cell, RefCell};
 
@@ -84,6 +96,29 @@ impl core::fmt::Display for SeedError {
             SeedError::NotInItsUnit { said, .. } | SeedError::NoMemberCell { said, .. } => write!(f, "{said}"),
         }
     }
+}
+
+/// Whether `need` is of an item declared in a body that `store` lowered (module docs, "AN ITEM
+/// DECLARED IN A BODY"): its key says it is inside a body ([`blaze_id::ItemKey::is_inner`]) and
+/// the store's locals hold its head's row (front2 locals.rs `Locals::head_of`, an unsupported
+/// kind's refusal included: the store's own step raises it, naming the item). The one test every
+/// seed takes, before it turns the need into a cell (`cell_of` reads the names records, which
+/// hold no row for it).
+pub fn of_the_body(store: &Store<'_>, need: Want) -> bool {
+    let key = need.key();
+    key.is_inner() && store.locals.head_of(key).is_some()
+}
+
+/// Where a [`RequestSeed`] makes a body's need of an item declared in that body (rule 23: the
+/// plant removes the cause and a test watches the effect come back).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BodyLocals {
+    /// In the body's own store ([`of_the_body`]): the rule.
+    Lowered,
+    /// THE PLANT: asked of the request like any head (the form before lane RU4), which a body's
+    /// item has no cell of, so its stretch's freezer freezes it in a store without the body's
+    /// rows and fails `HeadError::NoText`.
+    AskTheRequest,
 }
 
 /// How many cells one table holds at most.
@@ -219,6 +254,9 @@ impl HeadSource for OneCell<'_> {
 
 impl<'n, N: NamesSource<'n>> HeadSeed<'n> for TableView<'_, '_, N> {
     fn seed(&self, store: &Store<'n>, keys: &Keys, need: Want, scratch: Alloc<'static>) -> Result<Seeded, SeedError> {
+        if of_the_body(store, need) {
+            return Ok(Seeded::Lower);
+        }
         let cell = cell_of(self.names, need).map_err(SeedError::Freeze)?;
         let bytes = self.table.bytes_of(cell).ok_or(SeedError::NotFrozen { need, cell })?;
         seed(self.names, None, need, &mut OneCell { cell, bytes }, store, keys, scratch).map_err(SeedError::Freeze)
@@ -239,6 +277,9 @@ impl<'n, 'a, N: NamesSource<'n>> Freezing<'n, 'a, N> {
 
 impl<'n, N: NamesSource<'n>> HeadSeed<'n> for Freezing<'n, '_, N> {
     fn seed(&self, store: &Store<'n>, keys: &Keys, need: Want, scratch: Alloc<'static>) -> Result<Seeded, SeedError> {
+        if of_the_body(store, need) {
+            return Ok(Seeded::Lower);
+        }
         let mut heads = self.heads.borrow_mut();
         seed(self.names, None, need, &mut *heads, store, keys, scratch).map_err(SeedError::Freeze)
     }
@@ -276,6 +317,9 @@ pub struct RequestSeed<'k, 'n, 'a, N, H> {
     pub known: Cell<u32>,
     /// Asks whose cell this stretch froze (with what that freeze needed and froze first).
     pub froze: Cell<u32>,
+    /// Asks of an item declared in the asking body, lowered in its own store ([`of_the_body`]).
+    pub own: Cell<u32>,
+    body_locals: BodyLocals,
 }
 
 /// What a [`RequestSeed`] is made over. `freezer` is made with `known: Some(heads)`, so a
@@ -284,11 +328,14 @@ pub struct RequestSeedOpts<'k, 'n, 'a, N, H> {
     pub names: N,
     pub heads: &'k H,
     pub freezer: SeededHeads<'n, 'a, N>,
+    /// Where a need of an item declared in the asking body is made: [`BodyLocals::Lowered`],
+    /// or a test's plant.
+    pub body_locals: BodyLocals,
 }
 
 impl<'k, 'n, 'a, N: NamesSource<'n>, H: RequestHeads> RequestSeed<'k, 'n, 'a, N, H> {
     pub fn new(o: RequestSeedOpts<'k, 'n, 'a, N, H>) -> RequestSeed<'k, 'n, 'a, N, H> {
-        RequestSeed { names: o.names, heads: o.heads, freezer: RefCell::new(o.freezer), known: Cell::new(0), froze: Cell::new(0) }
+        RequestSeed { names: o.names, heads: o.heads, freezer: RefCell::new(o.freezer), known: Cell::new(0), froze: Cell::new(0), own: Cell::new(0), body_locals: o.body_locals }
     }
 
     /// The wants this stretch's freezes lowered, and the freeze attempts they took.
@@ -300,6 +347,12 @@ impl<'k, 'n, 'a, N: NamesSource<'n>, H: RequestHeads> RequestSeed<'k, 'n, 'a, N,
 
 impl<'n, N: NamesSource<'n>, H: RequestHeads> HeadSeed<'n> for RequestSeed<'_, 'n, '_, N, H> {
     fn seed(&self, store: &Store<'n>, keys: &Keys, need: Want, scratch: Alloc<'static>) -> Result<Seeded, SeedError> {
+        // An item declared in the asking body: the body's own store lowers it (module docs),
+        // before the need is made a cell or asked of the request (which holds none of it).
+        if self.body_locals == BodyLocals::Lowered && of_the_body(store, need) {
+            self.own.set(self.own.get().saturating_add(1));
+            return Ok(Seeded::Lower);
+        }
         let cell = cell_of(self.names, need).map_err(SeedError::Freeze)?;
         match self.heads.known(cell) {
             Known::Bytes(bytes) => {

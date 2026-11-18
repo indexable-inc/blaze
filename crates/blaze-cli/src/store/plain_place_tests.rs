@@ -37,9 +37,10 @@ fn process(sim: Sim, n: u64, cap_bytes: u64) -> Lent<Sim, StoreAlloc> {
 /// the store takes its own segments as proved by their rows (no byte read) and a torn one is
 /// `StoreError::Changed` (something outside blaze changed it), not a loss.
 fn process_in_boot(sim: Sim, n: u64, cap_bytes: u64, boot: u64) -> Lent<Sim, StoreAlloc> {
-    let mut cfg = config(FileName::new("store").expect("a name"), &Settings::default(), Facts { boot: Some(boot), nonce: 9000 + n });
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut cfg = config(FileName::new("store").expect("a name"), &Settings::default(), Facts { boot: Some(boot), nonce: 9000 + n }, alloc);
     cfg.cap_bytes = cap_bytes;
-    open(sim, cfg, blaze_own::testing::heap().alloc()).expect("the store opens")
+    open(sim, cfg, alloc).expect("the store opens")
 }
 
 fn back(lent: Lent<Sim, StoreAlloc>) -> Sim {

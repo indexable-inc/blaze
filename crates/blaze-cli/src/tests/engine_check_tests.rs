@@ -49,6 +49,7 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
         frame,
         scope_reads: crate::engine_scope_reads::ScopeReadsAs::DEFAULT,
         unreadable: None,
+        body_locals: blaze_ladder::front2::tables::seeds::BodyLocals::Lowered,
     }
 }
 

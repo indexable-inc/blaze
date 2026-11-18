@@ -10,6 +10,10 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
+// The process heap only where bytes cross into blaze-core's effects, which own process-heap
+// vectors (`Effect::Append { bytes: Vec<u8> }`): a batch's payloads, a segment's pieces, a
+// manifest's encoding. Everything else the store keeps is in the caller's `A` (rule 75).
+use std::alloc::Allocator;
 use std::{
     alloc::Global,
     collections::{BTreeMap, BTreeSet},
@@ -167,9 +171,8 @@ const MAPPING: &str = "mapping a segment its generation names";
 /// what `blaze clean --store` requires before it removes a directory.
 pub const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by blaze: its plain store.\n# For information about cache directory tags see https://bford.info/cachedir/\n";
 
-/// What a store is opened on.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct PlainConfig {
+/// What a store is opened on, its lists in the caller's allocator `A` (the store's own).
+pub struct PlainConfig<A: Allocator + Clone> {
     /// Its directory, under the driver's root.
     pub dir: FileName,
     /// Its tags are `tags .. tags + TAGS`.
@@ -190,17 +193,69 @@ pub struct PlainConfig {
     /// the store's paths, in each spelling the caller gives): a put into any namespace but
     /// [`Namespace::LOCAL`] whose bytes hold one is refused, naming the key and the offset
     /// (rule 25, sealed sharing: nothing of the machine leaves it). Empty: nothing is scanned.
-    pub machine: Vec<Vec<u8>>,
+    pub machine: Vec<Vec<u8, A>, A>,
     /// The namespaces a put may name, [`Namespace::LOCAL`] always among them (the store's roots
     /// live there): only `LOCAL` on a machine that is not a trusted writer (every developer's);
     /// a trusted builder (CI) adds [`Namespace::PUBLIC`] and its organisation's. A commit writes
     /// one segment for each that has records.
-    pub writes: Vec<Namespace>,
+    pub writes: Vec<Namespace, A>,
     /// The namespaces [`Plain::get`] answers from, in the order it asks them; no other is
     /// searched.
-    pub reads: Vec<Namespace>,
+    pub reads: Vec<Namespace, A>,
     /// What a compaction slice keeps.
     pub liveness: Liveness,
+}
+
+// By hand: a derive would ask the allocator for `PartialEq` and `Debug`, which a handle lacks.
+impl<A: Allocator + Clone> Clone for PlainConfig<A> {
+    fn clone(&self) -> PlainConfig<A> {
+        PlainConfig {
+            dir: self.dir.clone(),
+            tags: self.tags,
+            cap_bytes: self.cap_bytes,
+            boot: self.boot,
+            nonce: self.nonce,
+            durable: self.durable,
+            machine: self.machine.clone(),
+            writes: self.writes.clone(),
+            reads: self.reads.clone(),
+            liveness: self.liveness,
+        }
+    }
+}
+
+impl<A: Allocator + Clone> PartialEq for PlainConfig<A> {
+    fn eq(&self, other: &PlainConfig<A>) -> bool {
+        self.dir == other.dir
+            && self.tags == other.tags
+            && self.cap_bytes == other.cap_bytes
+            && self.boot == other.boot
+            && self.nonce == other.nonce
+            && self.durable == other.durable
+            && self.machine == other.machine
+            && self.writes == other.writes
+            && self.reads == other.reads
+            && self.liveness == other.liveness
+    }
+}
+
+impl<A: Allocator + Clone> Eq for PlainConfig<A> {}
+
+impl<A: Allocator + Clone> std::fmt::Debug for PlainConfig<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlainConfig")
+            .field("dir", &self.dir)
+            .field("tags", &self.tags)
+            .field("cap_bytes", &self.cap_bytes)
+            .field("boot", &self.boot)
+            .field("nonce", &self.nonce)
+            .field("durable", &self.durable)
+            .field("machine", &self.machine)
+            .field("writes", &self.writes)
+            .field("reads", &self.reads)
+            .field("liveness", &self.liveness)
+            .finish()
+    }
 }
 
 /// What a compaction slice counts as live.
@@ -262,7 +317,7 @@ pub enum PutError {
 /// Where the first of `needles` occurs in `bytes`, and which one: the scan of a record before
 /// it may go to a shared namespace (rule 25). Each needle is looked for from each place its
 /// first byte occurs; none empty is ever found.
-pub(crate) fn machine_in(needles: &[Vec<u8>], bytes: &[u8]) -> Option<(u64, u32)> {
+pub(crate) fn machine_in<B: Allocator>(needles: &[Vec<u8, B>], bytes: &[u8]) -> Option<(u64, u32)> {
     let mut first: Option<(u64, u32)> = None;
     for (i, needle) in needles.iter().enumerate() {
         let Some(&lead) = needle.first() else { continue };
@@ -334,13 +389,33 @@ pub struct Report {
     pub whole: Option<u64>,
 }
 
-/// A completed commit.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Committed {
+/// A completed commit, its list in the store's allocator.
+pub struct Committed<A: Allocator + Clone> {
     pub generation: u64,
     /// The segments it wrote, one for each namespace that held a record, in the order of
     /// [`PlainConfig::writes`]; none when it held no record.
-    pub segments: Vec<u64>,
+    pub segments: Vec<u64, A>,
+}
+
+// By hand, as [`PlainConfig`]'s: no bound on the allocator but `Clone`.
+impl<A: Allocator + Clone> Clone for Committed<A> {
+    fn clone(&self) -> Committed<A> {
+        Committed { generation: self.generation, segments: self.segments.clone() }
+    }
+}
+
+impl<A: Allocator + Clone> PartialEq for Committed<A> {
+    fn eq(&self, other: &Committed<A>) -> bool {
+        self.generation == other.generation && self.segments == other.segments
+    }
+}
+
+impl<A: Allocator + Clone> Eq for Committed<A> {}
+
+impl<A: Allocator + Clone> std::fmt::Debug for Committed<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Committed").field("generation", &self.generation).field("segments", &self.segments).finish()
+    }
 }
 
 /// What one compaction slice did.
@@ -558,10 +633,10 @@ enum RootEdit {
 /// A compaction slice written with no lock and flipped by the command's next commit
 /// ([`Plain::fold_slice`]): its copy (none when the slice only drops), the segments it
 /// replaces, the orphans it retires.
-struct Folded {
+struct Folded<A: Allocator + Clone> {
     seg: Option<(Segment, FileName)>,
-    candidates: Vec<u64>,
-    orphans: Vec<(u64, bool)>,
+    candidates: Vec<u64, A>,
+    orphans: Vec<(u64, bool), A>,
     stats: Sliced,
 }
 
@@ -573,46 +648,47 @@ enum Ctx {
 }
 
 /// What a write of a segment is for.
-enum Why {
+enum Why<A: Allocator + Clone> {
     /// A commit's segments are written one after another, one for each namespace with
     /// records, then flipped at once: `rest` still to write, `done` written.
-    Commit { started_ns: u64, roots: Vec<RootEdit>, rest: Vec<Laid>, done: Vec<(Segment, FileName)> },
-    Compact { candidates: Vec<u64>, stats: Sliced },
+    Commit { started_ns: u64, roots: Vec<RootEdit, A>, rest: Vec<Laid<A>, A>, done: Vec<(Segment, FileName), A> },
+    Compact { candidates: Vec<u64, A>, stats: Sliced },
 }
 
 /// One segment laid out and not yet written: the payloads at their offsets, from [`HEADER`]
-/// to `index_at`, and the sorted run.
-struct Laid {
-    pieces: Vec<(u64, Vec<u8>)>,
+/// to `index_at`, and the sorted run. The list is the store's; each piece's bytes and the run
+/// are the process heap, moved whole into their writes (blaze-core's effects own them).
+struct Laid<A: Allocator + Clone> {
+    pieces: Vec<(u64, Vec<u8>), A>,
     index_at: u64,
     run: Vec<u8>,
     namespace: Namespace,
 }
 
 /// A segment being written, before its flip.
-struct Writing {
+struct Writing<A: Allocator + Clone> {
     seg: Segment,
     file: FileName,
     /// The writes at offsets, laid out by [`Plain::commit`], each moved into its effect.
-    pieces: Vec<(u64, Vec<u8>)>,
+    pieces: Vec<(u64, Vec<u8>), A>,
     left: u32,
 }
 
 /// What a flip adds to the generation it builds on.
-enum Change {
-    Commit { segs: Vec<(Segment, FileName)>, started_ns: u64, roots: Vec<RootEdit> },
+enum Change<A: Allocator + Clone> {
+    Commit { segs: Vec<(Segment, FileName), A>, started_ns: u64, roots: Vec<RootEdit, A> },
     /// Only what an open found (segments checked or lost): [`Plain::pending_stamps`].
     Stamp,
-    Compact { seg: Option<(Segment, FileName)>, candidates: Vec<u64>, orphans: Vec<(u64, bool)>, stats: Sliced },
+    Compact { seg: Option<(Segment, FileName)>, candidates: Vec<u64, A>, orphans: Vec<(u64, bool), A>, stats: Sliced },
     /// Segments fetched from a source, written here: named here and published.
-    Adopt { segs: Vec<Segment> },
+    Adopt { segs: Vec<Segment, A> },
     /// Segments pushed to a shared bucket.
-    Publish { ids: Vec<u64> },
+    Publish { ids: Vec<u64, A> },
     /// The exit tail sealed (store-next.md): each `(id, generation added)` had a barrier
     /// complete on its file before this flip was asked. A row is sealed only while it is still
     /// that one (named here, with that generation): a file removed and written again since
     /// is another's bytes, and stays for the next seal.
-    Seal { ids: Vec<(u64, u64)> },
+    Seal { ids: Vec<(u64, u64), A> },
 }
 
 /// The generation a flip builds on, read under the lock.
@@ -623,16 +699,17 @@ struct Base {
     manifest: Manifest,
 }
 
-struct Flip {
-    change: Change,
+struct Flip<A: Allocator + Clone> {
+    change: Change<A>,
     waits: u32,
     next: Option<(Slot, Manifest)>,
     /// The head file did not exist: the first flip writes it whole.
     fresh: bool,
     new_log: bool,
     log: FileName,
+    /// The process heap: moved whole into the log's append (blaze-core's effect owns it).
     manifest_bytes: Vec<u8>,
-    removals: Vec<FileName>,
+    removals: Vec<FileName, A>,
     /// The commit was refused under the lock, or the compaction aborted: unlock and stop.
     refused: Option<StoreError>,
     aborted: bool,
@@ -644,7 +721,7 @@ struct Flip {
     deferred: Option<Effect>,
 }
 
-enum Phase {
+enum Phase<A: Allocator + Clone> {
     New,
     /// A head read, at the open or for a flip.
     ReadHead(Ctx),
@@ -666,13 +743,13 @@ enum Phase {
     /// file a power cut took from one that failed to map.
     CheckMaps { then: Then },
     Ready,
-    Writing(Box<Writing>, Box<Why>),
+    Writing(Box<Writing<A>>, Box<Why<A>>),
     /// The segment's sync, before the flip.
-    SyncingSegment(Box<Writing>, Box<Why>),
-    Flipping(Box<Flip>),
+    SyncingSegment(Box<Writing<A>>, Box<Why<A>>),
+    Flipping(Box<Flip<A>>),
     Removing { left: u32, then: Then },
     /// [`Plain::seal`]'s barriers, `left` of them in flight; the flip follows the last.
-    Sealing { left: u32, ids: Vec<(u64, u64)> },
+    Sealing { left: u32, ids: Vec<(u64, u64), A> },
     Broken,
 }
 
@@ -690,36 +767,38 @@ enum Then {
     All,
 }
 
-/// The plain store's state machine: one per process (or per test actor).
-pub struct Plain {
-    cfg: PlainConfig,
+/// The plain store's state machine: one per process (or per test actor). What it keeps is in
+/// `alloc`, its caller's, handed to [`Plain::new`] (rule 75).
+pub struct Plain<A: Allocator + Clone> {
+    alloc: A,
+    cfg: PlainConfig<A>,
     #[cfg(test)]
     plant: Plant,
     head: FileName,
     flip: FileName,
-    phase: Phase,
+    phase: Phase<A>,
     /// The newest generation this process saw, and its manifest.
     slot: Option<Slot>,
     manifest: Manifest,
     /// Every segment this process mapped, each through its proof: kept mapped for the life of
     /// the process, never unmapped during a run (an unmap is a TLB shootdown on every core).
-    maps: Vec<Verified>,
+    maps: Vec<Verified, A>,
     /// The boot every proof here holds for.
     boot: Boot,
     /// Full checks made by this process, and reads (the per-read count stays zero).
     checks: std::cell::Cell<Checks>,
     /// Each segment this process checked in full, in order: for the oracle, which fails on a
     /// segment checked twice in one boot.
-    checked_ids: Vec<u64>,
+    checked_ids: Vec<u64, A>,
     /// Each segment of another boot this process proved by its sealed row, in order.
-    sealed_ids: Vec<u64>,
+    sealed_ids: Vec<u64, A>,
     /// The background pass's place ([`Plain::scrub_next`]); lost with the process, so a
     /// crash re-walks only the segment it was in.
     scrubbing: Option<ScrubAt>,
     by_id: BTreeMap<u64, usize>,
     /// This generation's local rows not lost, as indices into `manifest.segments`, in probe
     /// order (largest first, ties newest first: [`Plain::order_view`]). A row may be unmapped.
-    pub(super) view: Vec<usize>,
+    pub(super) view: Vec<usize, A>,
     /// Earlier-boot unsealed segments a probe mapped, length checked, not yet proved: each is
     /// checked whole at its first hit, or by [`Plain::map_all`] (probe.rs).
     unchecked: BTreeMap<u64, Unverified>,
@@ -734,46 +813,46 @@ pub struct Plain {
     /// The store's own batches, one for each namespace of [`PlainConfig::writes`] in its order,
     /// behind [`Plain::put`]: read back by [`Plain::get`] until the commit that writes them
     /// completes.
-    held: Vec<Held>,
+    held: Vec<Held, A>,
     /// Held batches being committed, still read by [`Plain::get`].
-    sealed: Vec<Held>,
+    sealed: Vec<Held, A>,
     /// The segments the commit in flight wrote, for its [`Committed`].
-    committing: Vec<u64>,
-    roots_pending: Vec<RootEdit>,
+    committing: Vec<u64, A>,
+    roots_pending: Vec<RootEdit, A>,
     /// Found at the open, written at the next flip: segments of another boot checked whole,
     /// segments lost, files named by no generation.
     checked: BTreeSet<u64>,
     dropped: BTreeSet<u64>,
-    orphans: Vec<(u64, bool)>,
+    orphans: Vec<(u64, bool), A>,
     /// The segments this open found lost, with why: the next flip marks the rows that retire
     /// them "lost, not yet reported" in the same manifest ([`Retired::lost`]).
-    marks: Vec<(u64, LostMark)>,
+    marks: Vec<(u64, LostMark), A>,
     /// Marked rows this process's report names, its report not yet handed to its caller.
-    unreported: Vec<u64>,
+    unreported: Vec<u64, A>,
     /// Marked rows whose report was handed to the caller ([`Plain::handed`]): the next flip
     /// this process makes clears them.
-    clearable: Vec<u64>,
+    clearable: Vec<u64, A>,
     report: Report,
-    committed: Option<Result<Committed, StoreError>>,
+    committed: Option<Result<Committed<A>, StoreError>>,
     sliced: Option<Sliced>,
     /// The first stop, typed: each reason is a [`StoreError`] variant naming the file, the
     /// step and what was found, never text.
     broken: Option<StoreError>,
     /// The files a flip retired past their grace, being unlinked: by the index of their
     /// effects, so a failed unlink names its file.
-    removing: Vec<FileName>,
+    removing: Vec<FileName, A>,
     seq: u64,
     /// Lists and footers of the open's fallback, by tag index.
-    listed: Vec<(FileName, u64)>,
+    listed: Vec<(FileName, u64), A>,
     /// A flip's state while its head is read under the lock.
-    flip_parked: Option<Box<Flip>>,
+    flip_parked: Option<Box<Flip<A>>>,
     /// What a compaction's directory look found, for its flip.
-    orphans_for_compact: Vec<(u64, bool)>,
+    orphans_for_compact: Vec<(u64, bool), A>,
     /// The planted [`Plant::FlipBeforeSync`]'s segments, synced after the flip.
-    late_sync: Vec<FileName>,
+    late_sync: Vec<FileName, A>,
     /// Segments of an earlier boot whose map failed, with why: lost only if the directory no
     /// longer holds them (a power cut took the file); a failed map of one it holds is an error.
-    unopened: Vec<(Segment, FileName, StoreError)>,
+    unopened: Vec<(Segment, FileName, StoreError), A>,
     /// This open made the head at its length already (it is made once, never twice).
     head_made: bool,
     /// The log the current slot names gave no generation's manifest back (a power cut tore it,
@@ -800,21 +879,21 @@ pub struct Plain {
     /// [`Plain::release_lease`] was asked: no later commit sets the lease again.
     released: bool,
     /// The slice [`Plain::fold_slice`] wrote, for the next commit's flip; then, being flipped.
-    folding: Option<Folded>,
+    folding: Option<Folded<A>>,
     /// The slice in flight is [`Plain::fold_slice`]'s: it parks in `folding`, not flipped.
     fold_asked: bool,
     /// The commit in flight's reused records, by segment ([`Plain::reused`]).
-    touches: Vec<(u64, ContentId)>,
+    touches: Vec<(u64, ContentId), A>,
     /// The commit in flight's reused records whose segment the flip found replaced: what its
     /// next round carries forward ([`Plain::carry`]).
-    carrying: Vec<(u64, ContentId)>,
+    carrying: Vec<(u64, ContentId), A>,
     /// The rounds the commit in flight carried records forward: at most [`CARRY_ROUNDS`].
     carry_rounds: u32,
     /// Records carried forward by this process's commits, ever ([`Plain::carried`]).
     carried: u64,
     /// The indexes this process made, with how many keys each holds: what an indexed root
     /// that names one counts ([`Plain::named`]).
-    indexes_made: Vec<(Key, u64)>,
+    indexes_made: Vec<(Key, u64), A>,
     /// The roots this process set and the keys they name ([`Plain::named`]).
     named: Named,
 }
@@ -926,10 +1005,10 @@ fn parse_leaf(leaf: &str) -> Option<(u64, bool)> {
     (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok()).flatten().map(|id| (id, log))
 }
 
-impl Plain {
+impl<A: Allocator + Clone> Plain<A> {
     #[cfg(test)]
-    pub(crate) fn planted(cfg: PlainConfig, plant: Plant) -> Plain {
-        let mut it = Plain::new(cfg);
+    pub(crate) fn planted(cfg: PlainConfig<A>, alloc: A, plant: Plant) -> Plain<A> {
+        let mut it = Plain::new(cfg, alloc);
         it.plant = plant;
         it
     }
@@ -945,53 +1024,54 @@ impl Plain {
         Plant::None
     }
 
-    pub fn new(cfg: PlainConfig) -> Plain {
+    /// The store `cfg` names, what it keeps in `alloc` (the caller's: rule 75).
+    pub fn new(cfg: PlainConfig<A>, alloc: A) -> Plain<A> {
         assert!(cfg.writes.contains(&Namespace::LOCAL), "a plain store writes the local namespace: its roots live there");
         let name = |leaf: &str| FileName::new(&format!("{}/{leaf}", cfg.dir.as_str())).expect("a store's directory names files under it");
-        let mut held = Vec::with_capacity_in(cfg.writes.len(), Global);
+        let mut held = Vec::with_capacity_in(cfg.writes.len(), alloc.clone());
         held.extend(cfg.writes.iter().map(|it| Held::new(*it)));
         Plain {
             head: name(HEAD),
             flip: name(FLIP),
             boot: Boot(cfg.boot),
             checks: std::cell::Cell::new(Checks::default()),
-            checked_ids: Vec::new_in(Global),
-            sealed_ids: Vec::new_in(Global),
+            checked_ids: Vec::new_in(alloc.clone()),
+            sealed_ids: Vec::new_in(alloc.clone()),
             scrubbing: None,
             held,
-            sealed: Vec::new_in(Global),
-            committing: Vec::new_in(Global),
+            sealed: Vec::new_in(alloc.clone()),
+            committing: Vec::new_in(alloc.clone()),
             cfg,
             #[cfg(test)]
             plant: Plant::None,
             phase: Phase::New,
             slot: None,
             manifest: Manifest::default(),
-            maps: Vec::new_in(Global),
+            maps: Vec::new_in(alloc.clone()),
             by_id: BTreeMap::new(),
-            view: Vec::new_in(Global),
+            view: Vec::new_in(alloc.clone()),
             unchecked: BTreeMap::new(),
             eager: false,
             opened_ns: 0,
             probes: Probes::default(),
-            roots_pending: Vec::new_in(Global),
+            roots_pending: Vec::new_in(alloc.clone()),
             checked: BTreeSet::new(),
             dropped: BTreeSet::new(),
-            orphans: Vec::new_in(Global),
-            marks: Vec::new_in(Global),
-            unreported: Vec::new_in(Global),
-            clearable: Vec::new_in(Global),
+            orphans: Vec::new_in(alloc.clone()),
+            marks: Vec::new_in(alloc.clone()),
+            unreported: Vec::new_in(alloc.clone()),
+            clearable: Vec::new_in(alloc.clone()),
             report: Report::default(),
             committed: None,
             sliced: None,
             broken: None,
-            removing: Vec::new_in(Global),
+            removing: Vec::new_in(alloc.clone()),
             seq: 0,
-            listed: Vec::new_in(Global),
+            listed: Vec::new_in(alloc.clone()),
             flip_parked: None,
-            orphans_for_compact: Vec::new_in(Global),
-            late_sync: Vec::new_in(Global),
-            unopened: Vec::new_in(Global),
+            orphans_for_compact: Vec::new_in(alloc.clone()),
+            late_sync: Vec::new_in(alloc.clone()),
+            unopened: Vec::new_in(alloc.clone()),
             head_made: false,
             log_lost: false,
             holds_lock: false,
@@ -1003,13 +1083,20 @@ impl Plain {
             released: false,
             folding: None,
             fold_asked: false,
-            touches: Vec::new_in(Global),
-            carrying: Vec::new_in(Global),
+            touches: Vec::new_in(alloc.clone()),
+            carrying: Vec::new_in(alloc.clone()),
             carry_rounds: 0,
             carried: 0,
-            indexes_made: Vec::new_in(Global),
+            indexes_made: Vec::new_in(alloc.clone()),
             named: Named::default(),
+            alloc,
         }
+    }
+
+    /// The allocator the caller handed this store: what it keeps, and what its lists are
+    /// answered in.
+    pub fn alloc(&self) -> &A {
+        &self.alloc
     }
 
     fn name(&self, leaf: &str) -> FileName {
@@ -1056,7 +1143,7 @@ impl Plain {
     }
 
     /// The last commit's outcome, once.
-    pub fn take_committed(&mut self) -> Option<Result<Committed, StoreError>> {
+    pub fn take_committed(&mut self) -> Option<Result<Committed<A>, StoreError>> {
         self.committed.take()
     }
 
@@ -1086,15 +1173,15 @@ impl Plain {
     }
 
     /// The segments this generation names, oldest first: `(id, records)`.
-    pub fn segments(&self) -> Vec<(u64, u32)> {
-        let mut out = Vec::with_capacity_in(self.manifest.segments.len(), Global);
+    pub fn segments(&self) -> Vec<(u64, u32), A> {
+        let mut out = Vec::with_capacity_in(self.manifest.segments.len(), self.alloc.clone());
         out.extend(self.manifest.segments.iter().map(|it| (it.id, it.count)));
         out
     }
 
     /// The roots this generation names: `(name, record key)`.
-    pub fn roots(&self) -> Vec<(String, Key)> {
-        let mut out = Vec::with_capacity_in(self.manifest.roots.len(), Global);
+    pub fn roots(&self) -> Vec<(String, Key), A> {
+        let mut out = Vec::with_capacity_in(self.manifest.roots.len(), self.alloc.clone());
         out.extend(self.manifest.roots.iter().map(|it| (it.name.clone(), Key(it.key))));
         out
     }
@@ -1108,15 +1195,15 @@ impl Plain {
 
     /// The roots this generation names with their expiry: `(name, record key, expires ns)`
     /// ([`format::NEVER`]: none).
-    pub fn roots_expiring(&self) -> Vec<(String, Key, u64)> {
-        let mut out = Vec::with_capacity_in(self.manifest.roots.len(), Global);
+    pub fn roots_expiring(&self) -> Vec<(String, Key, u64), A> {
+        let mut out = Vec::with_capacity_in(self.manifest.roots.len(), self.alloc.clone());
         out.extend(self.manifest.roots.iter().map(|it| (it.name.clone(), Key(it.key), it.expires_ns)));
         out
     }
 
     /// The leases this generation names: `(holder's nonce, expires ns)`.
-    pub fn leases(&self) -> Vec<(u64, u64)> {
-        let mut out = Vec::with_capacity_in(self.manifest.leases.len(), Global);
+    pub fn leases(&self) -> Vec<(u64, u64), A> {
+        let mut out = Vec::with_capacity_in(self.manifest.leases.len(), self.alloc.clone());
         out.extend(self.manifest.leases.iter().map(|it| (it.holder, it.expires_ns)));
         out
     }
@@ -1226,8 +1313,8 @@ impl Plain {
     }
 
     /// The ids of the segments the generation this process holds names sealed.
-    pub fn sealed_segments(&self) -> Vec<u64> {
-        let mut out = Vec::new_in(Global);
+    pub fn sealed_segments(&self) -> Vec<u64, A> {
+        let mut out = Vec::new_in(self.alloc.clone());
         out.extend(self.manifest.segments.iter().filter(|it| it.sealed).map(|it| it.id));
         out
     }
@@ -1236,17 +1323,19 @@ impl Plain {
     /// segment mapped here checked against its CRC-32C as its bytes lie now. A byte that changed
     /// on the disk after its segment was proved is found here, or by the consumer that fails on
     /// it; a read never looks.
-    pub fn scrub(&self) -> Vec<Corrupt> {
+    pub fn scrub(&self) -> Vec<Corrupt, A> {
         assert!(self.eager, "Plain::scrub walks a whole store: Plain::map_all first");
-        let mut out = Vec::new_in(Global);
-        out.extend(self.maps.iter().flat_map(Verified::scrub));
+        let mut out = Vec::new_in(self.alloc.clone());
+        for map in self.maps.iter() {
+            map.scrub_into(&mut out);
+        }
         out
     }
 
     /// The segments of `spaces` this generation names that are not here: what a source is
     /// asked to fetch from on a miss.
-    pub fn remote(&self, spaces: &[Namespace]) -> Vec<Segment> {
-        let mut out = Vec::new_in(Global);
+    pub fn remote(&self, spaces: &[Namespace]) -> Vec<Segment, A> {
+        let mut out = Vec::new_in(self.alloc.clone());
         out.extend(self.manifest.segments.iter().filter(|it| !it.local && spaces.contains(&it.namespace)).copied());
         out
     }
@@ -1364,7 +1453,7 @@ impl Plain {
     /// more than its life less [`TOUCH_NS`] left is not set again, so a build that changed
     /// nothing flips nothing for it.
     pub fn root_for(&mut self, name: &str, keys: &[Key], life_ns: u64) -> Result<Key, StoreError> {
-        let bytes = sorted_keys(keys);
+        let bytes = sorted_keys(keys, self.alloc.clone());
         let key = self.set_root(name, &bytes, life_ns, ROOT_TAG, ROOT_DOMAIN)?;
         self.named.roots += 1;
         self.named.keys += (bytes.len() / 32) as u64;
@@ -1383,7 +1472,7 @@ impl Plain {
     /// [`Plain::root_through`] keeps it and every key it holds (reach follows one level).
     /// Over [`INDEX_KEYS_MOST`] keys is refused by name ([`StoreError::IndexOver`]).
     pub fn index(&mut self, keys: &[Key]) -> Result<Key, StoreError> {
-        let bytes = sorted_keys(keys);
+        let bytes = sorted_keys(keys, self.alloc.clone());
         let count = (bytes.len() / 32) as u64;
         if count > INDEX_KEYS_MOST as u64 {
             return Err(StoreError::IndexOver { keys: count, most: INDEX_KEYS_MOST as u64 });
@@ -1402,7 +1491,7 @@ impl Plain {
     /// records). The owner's key must cover what `keys` are (its record is a function of them):
     /// other keys under one owner are the store's two-values refusal (rule 21).
     pub fn index_beside(&mut self, owner: Key, keys: &[Key]) -> Result<Key, StoreError> {
-        let bytes = sorted_keys(keys);
+        let bytes = sorted_keys(keys, self.alloc.clone());
         let count = (bytes.len() / 32) as u64;
         if count > INDEX_KEYS_MOST as u64 {
             return Err(StoreError::IndexOver { keys: count, most: INDEX_KEYS_MOST as u64 });
@@ -1422,7 +1511,7 @@ impl Plain {
     /// reads, with no probe of the keys it names. Over [`ROOT_INDEXES_MOST`] indexes is refused
     /// by name.
     pub fn root_through(&mut self, name: &str, indexes: &[Key], life_ns: u64) -> Result<Key, StoreError> {
-        let bytes = sorted_keys(indexes);
+        let bytes = sorted_keys(indexes, self.alloc.clone());
         let count = (bytes.len() / 32) as u64;
         if count > ROOT_INDEXES_MOST as u64 {
             return Err(StoreError::IndexOver { keys: count, most: ROOT_INDEXES_MOST as u64 });
@@ -1500,7 +1589,7 @@ impl Plain {
             }
         }
         // The held batches stay readable while they are written: sealed until the commit ends.
-        let mut fresh = Vec::with_capacity_in(self.cfg.writes.len(), Global);
+        let mut fresh = Vec::with_capacity_in(self.cfg.writes.len(), self.alloc.clone());
         fresh.extend(self.cfg.writes.iter().map(|it| Held::new(*it)));
         self.sealed = std::mem::replace(&mut self.held, fresh);
         let laid = self.lay_out(batches);
@@ -1523,11 +1612,11 @@ impl Plain {
         self.carrying.clear();
         self.carry_rounds = 0;
         // The roots this commit's records were put with: one set after it started is the next's.
-        let mut roots = std::mem::take(&mut self.roots_pending);
+        let mut roots = std::mem::replace(&mut self.roots_pending, Vec::new_in(self.alloc.clone()));
         // The segments of records this commit's roots name but did not write, dead in this
         // view: computed here, before the lock; the flip marks them touched.
         self.touches = match self.cfg.liveness {
-            Liveness::Everything => Vec::new_in(Global),
+            Liveness::Everything => Vec::new_in(self.alloc.clone()),
             Liveness::Reached => match self.reused(&roots, now_ns) {
                 Ok(it) => it,
                 Err(why) => {
@@ -1545,14 +1634,14 @@ impl Plain {
         let mut rest = laid.into_iter();
         match rest.next() {
             None if roots.is_empty() && !self.pending_stamps() && self.folding.is_none() => {
-                self.committed = Some(Ok(Committed { generation: self.manifest.generation, segments: Vec::new_in(Global) }));
+                self.committed = Some(Ok(Committed { generation: self.manifest.generation, segments: Vec::new_in(self.alloc.clone()) }));
                 self.sealed.clear();
             }
-            None => self.start_flip(Change::Commit { segs: Vec::new_in(Global), started_ns: now_ns, roots }, effects),
+            None => self.start_flip(Change::Commit { segs: Vec::new_in(self.alloc.clone()), started_ns: now_ns, roots }, effects),
             Some(first) => {
-                let mut left = Vec::with_capacity_in(rest.len(), Global);
+                let mut left = Vec::with_capacity_in(rest.len(), self.alloc.clone());
                 left.extend(rest);
-                self.write_segment(first, Why::Commit { started_ns: now_ns, roots, rest: left, done: Vec::new_in(Global) }, effects);
+                self.write_segment(first, Why::Commit { started_ns: now_ns, roots, rest: left, done: Vec::new_in(self.alloc.clone()) }, effects);
             }
         }
         Ok(())
@@ -1566,19 +1655,20 @@ impl Plain {
     /// their threads interleaved. A key in two batches with equal records is laid once (the
     /// workers converge on one record); with other bytes it is [`StoreError::TwoValues`]. The
     /// payloads are copied into one piece, so no batch is kept by the commit.
-    fn lay_out(&self, batches: &[&Batch]) -> Result<Vec<Laid>, StoreError> {
-        let mut out = Vec::with_capacity_in(self.cfg.writes.len(), Global);
-        for &namespace in &self.cfg.writes {
+    fn lay_out(&self, batches: &[&Batch]) -> Result<Vec<Laid<A>, A>, StoreError> {
+        let mut out = Vec::with_capacity_in(self.cfg.writes.len(), self.alloc.clone());
+        for &namespace in self.cfg.writes.iter() {
             let own = self.sealed.iter().find(|it| it.batch.namespace == namespace).map(|it| &it.batch);
-            // Every record of the namespace, the store's own batch's and each worker's: the
-            // global heap, freed when the commit's layout is made.
-            let mut all: Vec<(Entry, &[u8])> = Vec::new_in(Global);
+            // Every record of the namespace, the store's own batch's and each worker's: in the
+            // store's allocator, freed when the commit's layout is made.
+            let mut all: Vec<(Entry, &[u8]), A> = Vec::new_in(self.alloc.clone());
             for batch in own.into_iter().chain(batches.iter().copied().filter(|it| it.namespace == namespace)) {
                 all.extend(batch.entries.iter().map(|it| (*it, batch.payload(it))));
             }
             all.sort_unstable_by(|a, b| a.0.key.cmp(&b.0.key));
-            let mut entries: Vec<Entry> = Vec::with_capacity_in(all.len(), Global);
-            // The payloads from [`HEADER`] on, each at a multiple of [`ALIGN`] of the segment.
+            let mut entries: Vec<Entry, A> = Vec::with_capacity_in(all.len(), self.alloc.clone());
+            // The payloads from [`HEADER`] on, each at a multiple of [`ALIGN`] of the segment:
+            // the process heap, as the segment's write takes it whole (blaze-core's effect).
             let mut bytes: Vec<u8> = Vec::new_in(Global);
             let mut last: Option<(Entry, &[u8])> = None;
             for (entry, payload) in all {
@@ -1632,7 +1722,7 @@ impl Plain {
                 continue;
             }
             let index_at = HEADER as u64 + bytes.len() as u64;
-            let mut pieces: Vec<(u64, Vec<u8>)> = Vec::with_capacity_in(1, Global);
+            let mut pieces: Vec<(u64, Vec<u8>), A> = Vec::with_capacity_in(1, self.alloc.clone());
             if !bytes.is_empty() {
                 pieces.push((HEADER as u64, bytes));
             }
@@ -1666,7 +1756,7 @@ impl Plain {
     /// the digest of all before it), names it by its digest, and starts its write: the file
     /// made at its length, then each piece written at its offset, in parallel. A segment of the
     /// same bytes already here is not written again (a published file is never rewritten).
-    fn write_segment(&mut self, laid: Laid, why: Why, effects: &mut Vec<Effect>) {
+    fn write_segment(&mut self, laid: Laid<A>, why: Why<A>, effects: &mut Vec<Effect>) {
         let Laid { mut pieces, index_at, run, namespace } = laid;
         debug_assert!(pieces.iter().scan(HEADER as u64, |at, (piece_at, bytes)| {
             let ok = *piece_at == *at;
@@ -1689,7 +1779,7 @@ impl Plain {
         }
         if self.by_id.contains_key(&seg.id) {
             // These bytes are here already, under this name: flip without writing them.
-            self.segment_written(Writing { seg, file, pieces: Vec::new_in(Global), left: 0 }, why, effects);
+            self.segment_written(Writing { seg, file, pieces: Vec::new_in(self.alloc.clone()), left: 0 }, why, effects);
             return;
         }
         let mut header = Vec::with_capacity_in(HEADER, Global);
@@ -1706,7 +1796,7 @@ impl Plain {
     /// Names segments fetched from a source (their files already written here, unchanged,
     /// each checked by [`super::format::check_segment`] and its statement verified by the
     /// driver) in a new generation: here, published.
-    pub fn adopt(&mut self, fetched: Vec<Segment>, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
+    pub fn adopt(&mut self, fetched: Vec<Segment, A>, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
         if !self.ready() {
             return Err(StoreError::Busy { phase: self.what() });
         }
@@ -1715,7 +1805,7 @@ impl Plain {
     }
 
     /// Marks segments as published (pushed to a shared bucket): compaction never rewrites them.
-    pub fn publish(&mut self, ids: Vec<u64>, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
+    pub fn publish(&mut self, ids: Vec<u64, A>, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
         if !self.ready() {
             return Err(StoreError::Busy { phase: self.what() });
         }
@@ -1775,7 +1865,7 @@ impl Plain {
     }
 
     /// Which segments a slice replaces, and whether it prunes.
-    fn plan(&self) -> (Vec<Segment>, bool) {
+    fn plan(&self) -> (Vec<Segment, A>, bool) {
         let current = self.manifest.generation;
         let over = self.manifest.bytes() > self.cfg.cap_bytes;
         let local = self.manifest.segments.iter().filter(|it| it.local).count();
@@ -1784,15 +1874,15 @@ impl Plain {
         } else if local > SEGMENTS_MOST {
             2
         } else {
-            return (Vec::new_in(Global), false);
+            return (Vec::new_in(self.alloc.clone()), false);
         };
         // Pruning reads published segments too (it lets go of this machine's copy, rewriting
         // nothing); merging never does. One namespace a slice: no segment mixes two.
         let eligible = |it: &&Segment| it.local && (if over { it.generation + WINDOW <= current } else { !it.published });
         let Some(namespace) = self.manifest.segments.iter().find(eligible).map(|it| it.namespace) else {
-            return (Vec::new_in(Global), false);
+            return (Vec::new_in(self.alloc.clone()), false);
         };
-        let mut out = Vec::new_in(Global);
+        let mut out = Vec::new_in(self.alloc.clone());
         let mut bytes = 0u64;
         // A CONTIGUOUS run of the namespace's rows held here: the copy takes the first one's
         // place, so a row the slice skipped would move from before a pointer's newest value
@@ -1822,7 +1912,7 @@ impl Plain {
     /// generation, up to [`SLICE_BYTES`]; else, while more than [`SEGMENTS_MOST`] are named, a
     /// merge of two or more from the oldest. A row a live lease keeps, a published row and one
     /// not here are never in a run (a run stops at one).
-    fn plan_reached(&self, now_ns: u64) -> Result<Vec<Segment>, StoreError> {
+    fn plan_reached(&self, now_ns: u64) -> Result<Vec<Segment, A>, StoreError> {
         let roots = self.live_roots(now_ns)?;
         let over = self.manifest.bytes() > self.cfg.cap_bytes;
         let segs = &self.manifest.segments;
@@ -1851,12 +1941,12 @@ impl Plain {
             Some(i) => i,
             None if segs.iter().filter(|it| it.local).count() > SEGMENTS_MOST => match segs.iter().position(|it| eligible(it)) {
                 Some(i) => i,
-                None => return Ok(Vec::new_in(Global)),
+                None => return Ok(Vec::new_in(self.alloc.clone())),
             },
-            None => return Ok(Vec::new_in(Global)),
+            None => return Ok(Vec::new_in(self.alloc.clone())),
         };
         let namespace = segs[from].namespace;
-        let mut out = Vec::new_in(Global);
+        let mut out = Vec::new_in(self.alloc.clone());
         let mut bytes = 0u64;
         // Contiguous, as [`Plain::plan`]'s: the copy takes the first one's place.
         for seg in segs[from..].iter().filter(|it| it.local && it.namespace == namespace) {
@@ -1879,8 +1969,8 @@ impl Plain {
 
     /// Each unexpired root's key and its record's sorted keys, read in place: what
     /// [`reached`] searches. A root whose record no segment holds stops the slice by name.
-    fn live_roots(&self, now_ns: u64) -> Result<Vec<(ContentId, &[u8])>, StoreError> {
-        let mut out = Vec::with_capacity_in(self.manifest.roots.len(), Global);
+    fn live_roots(&self, now_ns: u64) -> Result<Vec<(ContentId, &[u8]), A>, StoreError> {
+        let mut out = Vec::with_capacity_in(self.manifest.roots.len(), self.alloc.clone());
         for (i, root) in self.manifest.roots.iter().enumerate() {
             if root.expires_ns <= now_ns || (i == 0 && self.plant() == Plant::ReachSkipsRoot) {
                 continue;
@@ -1902,7 +1992,7 @@ impl Plain {
     /// index's own record and every key it holds are live. One level: what an index names is
     /// not looked into. An index no segment holds, or a record there of another tag, stops the
     /// slice by name, as a root's missing record does.
-    fn follow<'s>(&'s self, root: ContentId, named: &[u8], out: &mut Vec<(ContentId, &'s [u8])>) -> Result<(), StoreError> {
+    fn follow<'s>(&'s self, root: ContentId, named: &[u8], out: &mut Vec<(ContentId, &'s [u8]), A>) -> Result<(), StoreError> {
         for index in named.chunks_exact(32) {
             let index = ContentId(index.try_into().expect("32 bytes"));
             let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(index)) else {
@@ -1922,10 +2012,10 @@ impl Plain {
     /// too) that this view holds and no unexpired root of this view reaches: a slice planned
     /// from a view like this one may have judged it dead, so the flip marks the segment
     /// touched ([`Segment::touched`]) and a slice that replaces it aborts. Sorted, each once.
-    fn reused(&self, edits: &[RootEdit], now_ns: u64) -> Result<Vec<(u64, ContentId)>, StoreError> {
-        let mut out = Vec::new_in(Global);
-        let sets: Vec<Key> = {
-            let mut it = Vec::new_in(Global);
+    fn reused(&self, edits: &[RootEdit], now_ns: u64) -> Result<Vec<(u64, ContentId), A>, StoreError> {
+        let mut out = Vec::new_in(self.alloc.clone());
+        let sets: Vec<Key, A> = {
+            let mut it = Vec::new_in(self.alloc.clone());
             it.extend(edits.iter().filter_map(|it| match it {
                 RootEdit::Set { key, .. } => Some(*key),
                 _ => None,
@@ -1936,7 +2026,7 @@ impl Plain {
             return Ok(out);
         }
         let live = self.live_roots(now_ns)?;
-        let look = |key: &ContentId, out: &mut Vec<(u64, ContentId)>| {
+        let look = |key: &ContentId, out: &mut Vec<(u64, ContentId), A>| {
             if reached(&live, key) {
                 return;
             }
@@ -2011,7 +2101,7 @@ impl Plain {
 
     fn listed_compact(&mut self, listed: Vec<(FileName, blaze_core::Meta)>, now_ns: u64, effects: &mut Vec<Effect>) {
         let current_log = self.slot.map(|it| it.log);
-        let mut orphans = Vec::new_in(Global);
+        let mut orphans = Vec::new_in(self.alloc.clone());
         for (name, _) in &listed {
             let leaf = name.as_str().rsplit('/').next().unwrap_or(name.as_str());
             let Some((id, log)) = parse_leaf(leaf) else { continue };
@@ -2038,7 +2128,7 @@ impl Plain {
                 self.phase = Phase::Ready;
                 return;
             }
-            self.slice_ready(None, Vec::new_in(Global), orphans, stats, effects);
+            self.slice_ready(None, Vec::new_in(self.alloc.clone()), orphans, stats, effects);
             return;
         }
         let copied = self.copy_live(candidates, prune, now_ns, &mut stats);
@@ -2050,7 +2140,7 @@ impl Plain {
             self.slice_ready(None, ids, orphans, stats, effects);
             return;
         }
-        let laid = match laid_of(out) {
+        let laid = match laid_of(out, self.alloc.clone()) {
             Ok(laid) => laid,
             Err(why) => return self.stop(why),
         };
@@ -2061,7 +2151,7 @@ impl Plain {
 
     /// A slice's change is ready: parked for the next commit's flip when
     /// [`Plain::fold_slice`] asked it, else flipped on its own ([`Plain::compact`]).
-    fn slice_ready(&mut self, seg: Option<(Segment, FileName)>, candidates: Vec<u64>, orphans: Vec<(u64, bool)>, stats: Sliced, effects: &mut Vec<Effect>) {
+    fn slice_ready(&mut self, seg: Option<(Segment, FileName)>, candidates: Vec<u64, A>, orphans: Vec<(u64, bool), A>, stats: Sliced, effects: &mut Vec<Effect>) {
         if std::mem::take(&mut self.fold_asked) {
             self.folding = Some(Folded { seg, candidates, orphans, stats });
             self.phase = Phase::Ready;
@@ -2073,7 +2163,7 @@ impl Plain {
     /// What of `candidates` a slice keeps, copied into one batch, and the candidates it
     /// replaces (a published one only when it holds nothing live: it is let go of whole, or
     /// kept whole, never rewritten).
-    fn copy_live(&self, candidates: Vec<Segment>, prune: bool, now_ns: u64, stats: &mut Sliced) -> Result<(Batch, Vec<u64>), StoreError> {
+    fn copy_live(&self, candidates: Vec<Segment, A>, prune: bool, now_ns: u64, stats: &mut Sliced) -> Result<(Batch, Vec<u64, A>), StoreError> {
         let live = match (prune, self.cfg.liveness) {
             (false, _) => Live::All,
             (true, Liveness::Everything) => Live::Rooted(self.rooted(now_ns)?),
@@ -2088,7 +2178,7 @@ impl Plain {
             let run = self.maps[at].run();
             (0..seg.count as usize).any(|i| live.keeps(&format::key_at(run, i), false))
         };
-        let mut kept_candidates = Vec::with_capacity_in(candidates.len(), Global);
+        let mut kept_candidates = Vec::with_capacity_in(candidates.len(), self.alloc.clone());
         kept_candidates.extend(candidates.into_iter().filter(|seg| !seg.published || !holds_live(seg)));
         let candidates = kept_candidates;
         let namespace = candidates.first().map_or(Namespace::LOCAL, |it| it.namespace);
@@ -2124,14 +2214,14 @@ impl Plain {
             }
         }
         stats.segments = candidates.len() as u32;
-        let mut ids: Vec<u64> = Vec::with_capacity_in(candidates.len(), Global);
+        let mut ids: Vec<u64, A> = Vec::with_capacity_in(candidates.len(), self.alloc.clone());
         ids.extend(candidates.iter().map(|it| it.id));
         Ok((out, ids))
     }
 
     // ---- the flip: the one lock, held for it alone ----
 
-    fn start_flip(&mut self, change: Change, effects: &mut Vec<Effect>) {
+    fn start_flip(&mut self, change: Change<A>, effects: &mut Vec<Effect>) {
         self.phase = Phase::Flipping(Box::new(Flip {
             change,
             waits: 0,
@@ -2140,7 +2230,7 @@ impl Plain {
             new_log: false,
             log: self.head.clone(),
             manifest_bytes: Vec::new_in(Global),
-            removals: Vec::new_in(Global),
+            removals: Vec::new_in(self.alloc.clone()),
             refused: None,
             aborted: false,
             carry: false,
@@ -2176,7 +2266,7 @@ impl Plain {
             retire(&mut m, *id, false);
         }
         let current_log = base.slot.map(|it| it.log);
-        let orphans: Vec<(u64, bool)> = std::mem::take(&mut self.orphans);
+        let orphans: Vec<(u64, bool), A> = std::mem::replace(&mut self.orphans, Vec::new_in(self.alloc.clone()));
         let adopt_orphans = |m: &mut Manifest, list: &[(u64, bool)]| {
             for &(id, log) in list {
                 let named = if log { Some(id) == current_log } else { m.segments.iter().any(|it| it.id == id) };
@@ -2237,7 +2327,7 @@ impl Plain {
         // The slice [`Plain::fold_slice`] parked rides this commit's flip.
         let mut folded = if matches!(flip.change, Change::Commit { .. }) { self.folding.take() } else { None };
         // Unlinked before the slot lands ([`Plant::UnlinkEarly`]).
-        let mut early = Vec::new_in(Global);
+        let mut early = Vec::new_in(self.alloc.clone());
         match &mut flip.change {
             Change::Commit { segs, started_ns, roots } => {
                 if now_ns.saturating_sub(*started_ns) > GRACE_NS / 2 {
@@ -2380,7 +2470,7 @@ impl Plain {
         // Marks of losses whose report this process handed to its caller are cleared (rows
         // another process cleared already, or that a commit named again, need nothing); a
         // mark not yet written stays clearable for the flip after the one that writes it.
-        let clearable = std::mem::replace(&mut self.clearable, Vec::new_in(Global));
+        let clearable = std::mem::replace(&mut self.clearable, Vec::new_in(self.alloc.clone()));
         for id in clearable {
             if self.marks.iter().any(|(it, _)| *it == id) {
                 self.clearable.push(id);
@@ -2393,7 +2483,7 @@ impl Plain {
         // The losses this open found are marked in the rows this same manifest retires them
         // with: on disk with the retirement, so a failure or a crash anywhere after the slot
         // lands leaves them for the next open to report.
-        for (id, mark) in std::mem::replace(&mut self.marks, Vec::new_in(Global)) {
+        for (id, mark) in std::mem::replace(&mut self.marks, Vec::new_in(self.alloc.clone())) {
             if let Some(row) = m.retired.iter_mut().find(|it| it.id == id && !it.log) {
                 row.lost = if self.plant() == Plant::ClearMarkAtOnce { None } else { Some(mark) };
             }
@@ -2408,8 +2498,8 @@ impl Plain {
         // unlink stays readable through its mapping until it is unmapped (POSIX `munmap`; the
         // kernel drops the pages only with the last reference), so a reader that mapped a
         // segment is never hurt by the unlink, and one that has not is held off by the rule.
-        let mut removals = Vec::new_in(Global);
-        let mut holders = Vec::with_capacity_in(m.leases.len(), Global);
+        let mut removals = Vec::new_in(self.alloc.clone());
+        let mut holders = Vec::with_capacity_in(m.leases.len(), self.alloc.clone());
         holders.extend(m.leases.iter().map(|it| it.opened_ns));
         if let Some(slice) = folded.as_ref()
             && slice.stats.aborted
@@ -2523,7 +2613,7 @@ impl Plain {
         if let Some(why) = flip.refused {
             let roots = match flip.change {
                 Change::Commit { roots, .. } => roots,
-                _ => Vec::new_in(Global),
+                _ => Vec::new_in(self.alloc.clone()),
             };
             self.commit_refused(why, roots);
             return;
@@ -2574,7 +2664,7 @@ impl Plain {
         // The slot names the log this flip wrote its manifest to.
         self.log_lost = false;
         if self.cfg.durable && self.plant() == Plant::FlipBeforeSync {
-            for (i, file) in std::mem::take(&mut self.late_sync).into_iter().enumerate() {
+            for (i, file) in std::mem::replace(&mut self.late_sync, Vec::new_in(self.alloc.clone())).into_iter().enumerate() {
                 effects.push(Effect::Sync { file, tag: self.tag(LATE_SYNC, i as u32) });
             }
         }
@@ -2591,7 +2681,7 @@ impl Plain {
     }
 
     /// A refused commit's outcome: `why`, its roots and held records kept for the next.
-    fn commit_refused(&mut self, why: StoreError, roots: Vec<RootEdit>) {
+    fn commit_refused(&mut self, why: StoreError, roots: Vec<RootEdit, A>) {
         self.committed = Some(Err(why));
         let later = std::mem::replace(&mut self.roots_pending, roots);
         self.roots_pending.extend(later);
@@ -2608,9 +2698,9 @@ impl Plain {
     /// then asked again, naming the commit's segments and it. The records are the commit's
     /// own from then on: no longer reused, so nothing more is checked of them. Counted in
     /// [`Plain::carried`].
-    fn carry(&mut self, segs: Vec<(Segment, FileName)>, started_ns: u64, roots: Vec<RootEdit>, effects: &mut Vec<Effect>) {
+    fn carry(&mut self, segs: Vec<(Segment, FileName), A>, started_ns: u64, roots: Vec<RootEdit, A>, effects: &mut Vec<Effect>) {
         self.carry_rounds += 1;
-        let carrying = std::mem::replace(&mut self.carrying, Vec::new_in(Global));
+        let carrying = std::mem::replace(&mut self.carrying, Vec::new_in(self.alloc.clone()));
         let mut out = Batch::new(Namespace::LOCAL);
         for &(segment, key) in carrying.iter() {
             // Each key once: `reused` lists it with the one segment its lookup found.
@@ -2628,8 +2718,8 @@ impl Plain {
         }
         self.touches.retain(|it| !carrying.contains(it));
         self.carried += out.entries.len() as u64;
-        match laid_of(out) {
-            Ok(laid) => self.write_segment(laid, Why::Commit { started_ns, roots, rest: Vec::new_in(Global), done: segs }, effects),
+        match laid_of(out, self.alloc.clone()) {
+            Ok(laid) => self.write_segment(laid, Why::Commit { started_ns, roots, rest: Vec::new_in(self.alloc.clone()), done: segs }, effects),
             Err(why) => self.commit_refused(why, roots),
         }
     }
@@ -2642,7 +2732,7 @@ impl Plain {
 
     /// A refused commit's held records are held again, for the next.
     fn sealed_back(&mut self) {
-        let sealed = std::mem::take(&mut self.sealed);
+        let sealed = std::mem::replace(&mut self.sealed, Vec::new_in(self.alloc.clone()));
         for old in &sealed {
             let held = self.held.iter_mut().find(|it| it.batch.namespace == old.batch.namespace).expect("one held batch for each namespace written");
             for entry in &old.batch.entries {
@@ -2797,7 +2887,7 @@ impl Plain {
     /// times, and more than once only across a crash or a failure between its report and the
     /// flip that clears it.
     pub fn handed(&mut self) {
-        let reported = std::mem::take(&mut self.unreported);
+        let reported = std::mem::replace(&mut self.unreported, Vec::new_in(self.alloc.clone()));
         for id in reported {
             if !self.clearable.contains(&id) {
                 self.clearable.push(id);
@@ -2816,10 +2906,12 @@ impl Plain {
     }
 
     /// Adds `needle` to what names this machine ([`PlainConfig::machine`]); an empty one is
-    /// not added (it would be found everywhere).
-    pub fn machine(&mut self, needle: Vec<u8>) {
-        if !needle.is_empty() && !self.cfg.machine.contains(&needle) {
-            self.cfg.machine.push(needle);
+    /// not added (it would be found everywhere). Copied into the store's allocator.
+    pub fn machine(&mut self, needle: &[u8]) {
+        if !needle.is_empty() && !self.cfg.machine.iter().any(|it| it.as_slice() == needle) {
+            let mut kept = Vec::with_capacity_in(needle.len(), self.alloc.clone());
+            kept.extend_from_slice(needle);
+            self.cfg.machine.push(kept);
         }
     }
 
@@ -2829,7 +2921,7 @@ impl Plain {
     }
 
     /// What names this machine ([`PlainConfig::machine`] and [`Plain::machine`]'s).
-    pub(crate) fn needles(&self) -> &[Vec<u8>] {
+    pub(crate) fn needles(&self) -> &[Vec<u8, A>] {
         &self.cfg.machine
     }
 
@@ -2844,7 +2936,7 @@ impl Plain {
         if !self.ready() {
             return false;
         }
-        let mut ids = Vec::new_in(Global);
+        let mut ids = Vec::new_in(self.alloc.clone());
         ids.extend(self.manifest.segments.iter().filter(|it| it.local && !it.sealed && it.boot == self.cfg.boot).map(|it| (it.id, it.generation)));
         if ids.is_empty() {
             // Nothing to seal, but rows this process checked at a first hit (or lost) after
@@ -2874,13 +2966,13 @@ impl Plain {
 
     /// The sealed segments of an earlier boot this boot has not walked yet: what the
     /// background pass has left ([`Plain::scrub_next`]), oldest generation first.
-    pub fn unscrubbed(&self) -> Vec<u64> {
-        let mut left: Vec<&Segment> = Vec::new_in(Global);
+    pub fn unscrubbed(&self) -> Vec<u64, A> {
+        let mut left: Vec<&Segment, A> = Vec::new_in(self.alloc.clone());
         // Walked whole or lost by this process, its flip not landed yet: not walked again.
         let pending = |id: u64| self.checked.contains(&id) || self.dropped.contains(&id);
         left.extend(self.manifest.segments.iter().filter(|it| it.local && it.sealed && it.boot != self.cfg.boot && self.by_id.contains_key(&it.id) && !pending(it.id)));
         left.sort_unstable_by_key(|it| (it.generation, it.id));
-        let mut out = Vec::with_capacity_in(left.len(), Global);
+        let mut out = Vec::with_capacity_in(left.len(), self.alloc.clone());
         out.extend(left.iter().map(|it| it.id));
         out
     }
@@ -2910,7 +3002,7 @@ impl Plain {
             }
         };
         let map = *self.by_id.get(&at.id)?;
-        let mut corrupt = Vec::new_in(Global);
+        let mut corrupt = Vec::new_in(self.alloc.clone());
         let (next, bytes) = self.maps[map].scrub_from(at.next, budget, &mut corrupt);
         let count = self.maps[map].seg().count as usize;
         let seg = *self.maps[map].seg();
@@ -2943,7 +3035,7 @@ impl Plain {
         self.order_view();
         match then {
             Then::Commit => {
-                let segments = std::mem::replace(&mut self.committing, Vec::new_in(Global));
+                let segments = std::mem::replace(&mut self.committing, Vec::new_in(self.alloc.clone()));
                 self.committed = Some(Ok(Committed { generation: self.manifest.generation, segments }));
                 self.sealed.clear();
             }
@@ -3217,7 +3309,7 @@ impl Plain {
                     return Err(fail("listing", &self.cfg.dir, &done).unwrap_or_else(|| unexpected("listing")));
                 };
                 let generation = self.manifest.generation;
-                for (seg, file, why) in std::mem::take(&mut self.unopened) {
+                for (seg, file, why) in std::mem::replace(&mut self.unopened, Vec::new_in(self.alloc.clone())) {
                     let leaf = file.as_str().rsplit('/').next().unwrap_or(file.as_str());
                     if listed.iter().any(|(name, _)| name.as_str().rsplit('/').next() == Some(leaf)) {
                         // Here, and its map failed: the failure, by name, never a loss.
@@ -3273,7 +3365,7 @@ impl Plain {
                 if let Some(why) = fail("making a segment", &writing.file, &done) {
                     return Err(why);
                 }
-                let pieces = std::mem::take(&mut writing.pieces);
+                let pieces = std::mem::replace(&mut writing.pieces, Vec::new_in(self.alloc.clone()));
                 writing.left = pieces.len() as u32;
                 let file = writing.file.clone();
                 for (i, (at, bytes)) in pieces.into_iter().enumerate() {
@@ -3498,7 +3590,7 @@ impl Plain {
 
     /// A segment is written (and synced, when durable): a commit's next is written, or, with
     /// none left, the flip names them all.
-    fn segment_written(&mut self, writing: Writing, why: Why, effects: &mut Vec<Effect>) {
+    fn segment_written(&mut self, writing: Writing<A>, why: Why<A>, effects: &mut Vec<Effect>) {
         let seg = (writing.seg, writing.file);
         match why {
             Why::Commit { started_ns, roots, mut rest, mut done } => {
@@ -3511,7 +3603,7 @@ impl Plain {
                 self.start_flip(Change::Commit { segs: done, started_ns, roots }, effects);
             }
             Why::Compact { candidates, stats } => {
-                let orphans = std::mem::take(&mut self.orphans_for_compact);
+                let orphans = std::mem::replace(&mut self.orphans_for_compact, Vec::new_in(self.alloc.clone()));
                 self.slice_ready(Some(seg), candidates, orphans, stats, effects);
             }
         }
@@ -3520,7 +3612,8 @@ impl Plain {
 
 /// A batch of copied records (a slice's, a carry's: each payload at a multiple of [`ALIGN`]
 /// of its bytes) as a segment's layout: its entries placed after the [`HEADER`] and sorted.
-fn laid_of(mut out: Batch) -> Result<Laid, StoreError> {
+/// The list of pieces in `alloc`, the store's.
+fn laid_of<A: Allocator + Clone>(mut out: Batch, alloc: A) -> Result<Laid<A>, StoreError> {
     let namespace = out.namespace;
     let mut entries = std::mem::take(&mut out.entries);
     for entry in entries.iter_mut() {
@@ -3528,18 +3621,19 @@ fn laid_of(mut out: Batch) -> Result<Laid, StoreError> {
     }
     let run = format::sorted_run(entries)?;
     let index_at = HEADER as u64 + out.bytes.len() as u64;
-    let mut pieces = Vec::with_capacity_in(1, Global);
+    let mut pieces = Vec::with_capacity_in(1, alloc);
     pieces.push((HEADER as u64, out.bytes));
     Ok(Laid { pieces, index_at, run, namespace })
 }
 
-/// `keys` sorted and each once, as the 32-byte array a root's or an index's record holds.
-fn sorted_keys(keys: &[Key]) -> Vec<u8> {
-    let mut sorted = Vec::with_capacity_in(keys.len(), Global);
+/// `keys` sorted and each once, as the 32-byte array a root's or an index's record holds: in
+/// `alloc`, scratch of the one put that copies it into its batch.
+fn sorted_keys<A: Allocator + Clone>(keys: &[Key], alloc: A) -> Vec<u8, A> {
+    let mut sorted = Vec::with_capacity_in(keys.len(), alloc.clone());
     sorted.extend_from_slice(keys);
     sorted.sort_unstable();
     sorted.dedup();
-    let mut bytes = Vec::with_capacity_in(sorted.len() * 32, Global);
+    let mut bytes = Vec::with_capacity_in(sorted.len() * 32, alloc);
     for key in &sorted {
         bytes.extend_from_slice(&key.0.0);
     }
@@ -3566,16 +3660,16 @@ fn sorted_holds(keys: &[u8], key: &ContentId) -> bool {
 }
 
 /// What a slice's copy keeps.
-enum Live<'a> {
+enum Live<'a, A: Allocator + Clone> {
     /// Everything (a merge of a [`Liveness::Everything`] store).
     All,
     /// What roots name, or younger than [`WINDOW`] (its pruning over the cap).
     Rooted(BTreeSet<ContentId>),
     /// What reaches from an unexpired root ([`Liveness::Reached`]).
-    Reached(Vec<(ContentId, &'a [u8])>),
+    Reached(Vec<(ContentId, &'a [u8]), A>),
 }
 
-impl Live<'_> {
+impl<A: Allocator + Clone> Live<'_, A> {
     fn keeps(&self, key: &ContentId, young: bool) -> bool {
         match self {
             Live::All => true,

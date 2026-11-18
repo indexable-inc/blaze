@@ -279,10 +279,11 @@ impl From<TextAt> for LifeRefusal {
 /// The lifetime records made so far, by key; a refusal is kept too (asked again, it is the same).
 pub struct Lives {
     // `Rows`, filed through `&self`: a head imported during a body's check files its part here.
-    fns: super::rows::Rows<ItemKey, Result<FnLife, LifeRefusal>>,
-    adts: super::rows::Rows<LibKey, Result<AdtLife, LifeRefusal>>,
+    // In the store's allocator, `alloc` (front2 rows.rs says whose).
+    fns: super::rows::Rows<ItemKey, Result<FnLife, LifeRefusal>, Mem>,
+    adts: super::rows::Rows<LibKey, Result<AdtLife, LifeRefusal>, Mem>,
     /// By the container's checker key (`checker_of`), as its impl's head is filed.
-    containers: super::rows::Rows<ItemKey, Result<ContainerLife, LifeRefusal>>,
+    containers: super::rows::Rows<ItemKey, Result<ContainerLife, LifeRefusal>, Mem>,
     /// How many lifetime parameters an ADT's or a trait's generics declare.
     counts: Map<LibKey, u32>,
     alloc: Mem,
@@ -290,7 +291,7 @@ pub struct Lives {
 
 impl Lives {
     pub fn new_in(alloc: Mem) -> Lives {
-        Lives { fns: super::rows::Rows::default(), adts: super::rows::Rows::default(), containers: super::rows::Rows::default(), counts: HashMap::new_in(alloc), alloc }
+        Lives { fns: super::rows::Rows::new_in(alloc), adts: super::rows::Rows::new_in(alloc), containers: super::rows::Rows::new_in(alloc), counts: HashMap::new_in(alloc), alloc }
     }
 }
 

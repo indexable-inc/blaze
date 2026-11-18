@@ -14,9 +14,11 @@
 use std::{alloc::Global, time::Duration};
 
 use blaze_core::sim::{Faults, Sim};
+use blaze_mem::Frame;
 
 use super::core::{GRACE_NS, INDEX_TAG, LEASE_NS, Plant, ROOT_LIFE_NS, beside_key};
 use super::index_tests::{World, key, readable};
+use super::test_root;
 use crate::Key;
 
 const MINUTE: Duration = Duration::from_secs(60);
@@ -28,8 +30,8 @@ const BESIDE: core::ops::Range<u32> = 1..17;
 const DEAD: core::ops::Range<u32> = 20_000..20_064;
 
 /// What the history showed: each claim broken. `beside` false is the control.
-fn history(beside: bool) -> Result<Vec<String>, String> {
-    let mut w = World { sim: Sim::new(53, Faults::default()), next: 0, plant: Plant::None };
+fn history(beside: bool, root: &Frame) -> Result<Vec<String>, String> {
+    let mut w = World { sim: Sim::new(53, Faults::default()), next: 0, plant: Plant::None, root };
     let mut problems = Vec::new_in(Global);
     let mut puts: Vec<u32> = core::iter::once(OWNER).chain(BESIDE).chain(DEAD).collect();
     puts.sort_unstable();
@@ -83,7 +85,8 @@ fn history(beside: bool) -> Result<Vec<String>, String> {
 /// Prints "beside: the owner and its 16 records kept through the sweep".
 #[test]
 fn an_index_beside_its_owner_keeps_what_was_put_with_it() {
-    let problems = history(true).expect("the history runs");
+    let root = test_root();
+    let problems = history(true, &root).expect("the history runs");
     assert!(problems.is_empty(), "{problems:?}");
     std::println!("beside: the owner and its {} records kept through the sweep", BESIDE.len());
 }
@@ -93,7 +96,8 @@ fn an_index_beside_its_owner_keeps_what_was_put_with_it() {
 /// Prints "beside control: no index beside named: <the oracle's finding>".
 #[test]
 fn a_root_without_the_index_beside_loses_what_was_put_with_it() {
-    let problems = history(false).expect("the history runs");
+    let root = test_root();
+    let problems = history(false, &root).expect("the history runs");
     assert!(problems.iter().any(|it| it.contains("read back after the sweep")), "the missing index beside was not caught: {problems:?}");
     std::println!("beside control: no index beside named: {}", problems[0]);
 }

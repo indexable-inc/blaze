@@ -1941,6 +1941,7 @@ mod tests {
     mod engine_unit_heads_tests;
     mod engine_unit_files_tests;
     mod engine_member_heads_tests;
+    mod engine_body_locals_tests;
     mod engine_head_cells_tests;
     mod engine_scope_reads_tests;
     mod engine_scope_reads_tables_tests;

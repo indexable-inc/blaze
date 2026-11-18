@@ -59,6 +59,8 @@ blaze-sim.workspace = true
 target-features.workspace = true
 # `Alloc::global()`: the tests' allocator handle.
 blaze-own = { workspace = true, features = ["std", "testing"] }
+# `Root`: the root heap a test makes at its top (tests/pkg_meta_env.rs, tests/attr_path_from_expansion.rs).
+blaze-mem.workspace = true
 # `testing::MemSurface`: the records the fixtures write, read back through `RecordFacts`.
 blaze-surface = { workspace = true, features = ["testing"] }
 # examples/crates.rs: the workspaces' manifests read through `layout::Layout` (sans-IO).

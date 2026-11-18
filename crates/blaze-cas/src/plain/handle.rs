@@ -92,8 +92,8 @@ impl Lane {
 
 /// The plain store, as one process holds it: lock-free reads, a lane per worker for puts, one
 /// writer for the commit and compaction.
-pub struct PlainStore<D: Driver = Native> {
-    writer: Lock<Driven<D>>,
+pub struct PlainStore<D: Driver, A: Allocator + Clone> {
+    writer: Lock<Driven<D, A>>,
     /// Index `i` is the `i`th segment mapped; written under the writer's lock, read without it.
     table: SharedMap<usize, Mapped, Global>,
     /// How many of `table`'s indexes are in: published with `Release` after their inserts.
@@ -105,7 +105,7 @@ pub struct PlainStore<D: Driver = Native> {
     /// What names this machine, as the store was opened with it: a put to a shared namespace
     /// holding one is refused at the put. The commit scans again with the writer's own list,
     /// which [`Driven::machine`] may have grown since.
-    needles: Vec<Vec<u8>>,
+    needles: Vec<Vec<u8, A>, A>,
     /// The lanes, by index; insert-only, each a lock its worker and the commit take.
     lanes: SharedMap<usize, Lock<Lane>, Global>,
     /// The next lane's index.
@@ -119,23 +119,25 @@ pub struct PlainStore<D: Driver = Native> {
     released: AtomicU64,
 }
 
-impl PlainStore<Native> {
-    /// The plain store in `root/plain`, with the namespaces `settings` name.
-    pub fn open(root: &std::path::Path, settings: &Settings) -> Result<PlainStore<Native>, StoreError> {
-        Driven::open(root, settings).and_then(PlainStore::new)
+impl<A: Allocator + Clone> PlainStore<Native, A> {
+    /// The plain store in `root/plain`, with the namespaces `settings` name, the writer's
+    /// store in `alloc`.
+    pub fn open(root: &std::path::Path, settings: &Settings, alloc: A) -> Result<PlainStore<Native, A>, StoreError> {
+        Driven::open(root, settings, alloc).and_then(PlainStore::new)
     }
 }
 
-impl<D: Driver> PlainStore<D> {
+// `S`, the store's allocator: `A` names a read's frame in the methods below.
+impl<D: Driver, S: Allocator + Clone> PlainStore<D, S> {
     /// The handle over an opened store, made whole first ([`Driven::map_all`]): a reader of the
     /// handle cannot map, so every row is mapped (and every parked row checked) here.
-    pub fn new(mut driven: Driven<D>) -> Result<PlainStore<D>, StoreError> {
+    pub fn new(mut driven: Driven<D, S>) -> Result<PlainStore<D, S>, StoreError> {
         driven.map_all()?;
         let mut reads = Vec::with_capacity_in(driven.core().reads().len(), Global);
         reads.extend_from_slice(driven.core().reads());
         let mut writes = Vec::with_capacity_in(driven.core().writes().len(), Global);
         writes.extend_from_slice(driven.core().writes());
-        let mut needles = Vec::with_capacity_in(driven.core().needles().len(), Global);
+        let mut needles = Vec::with_capacity_in(driven.core().needles().len(), driven.core().alloc().clone());
         needles.extend(driven.core().needles().iter().cloned());
         let it = PlainStore {
             writer: Lock::new("store.plain.writer", driven),
@@ -156,13 +158,13 @@ impl<D: Driver> PlainStore<D> {
 
     /// The writer back, the handle let go of (a test's simulation, crashed and opened again).
     /// Puts not committed are dropped with their lanes.
-    pub fn into_writer(self) -> Driven<D> {
+    pub fn into_writer(self) -> Driven<D, S> {
         self.writer.into_inner()
     }
 
     /// What the writer mapped since the last refresh, into the table; called under the
     /// writer's lock, so one refresher at a time.
-    fn refresh(&self, writer: &Driven<D>) {
+    fn refresh(&self, writer: &Driven<D, S>) {
         let core = writer.core();
         let generation = Generation(core.generation());
         let from = self.len.load(Ordering::Relaxed);
@@ -357,7 +359,7 @@ impl<D: Driver> PlainStore<D> {
     }
 
     /// The writer, for what the trait does not cover (pull, publish, scrub).
-    pub fn writer(&self) -> blaze_core::lock::LockGuard<'_, Driven<D>> {
+    pub fn writer(&self) -> blaze_core::lock::LockGuard<'_, Driven<D, S>> {
         self.writer.lock()
     }
 }
@@ -382,7 +384,8 @@ fn copied<A: Allocator>(mapped: &Mapped, entry: &Entry, frame: A) -> (Tag, Vec<u
     (entry.tag, bytes, mapped.proof)
 }
 
-impl<D: Driver> Store for PlainStore<D> {
+// `S`, the store's allocator: `A` is the trait's, a read's frame.
+impl<D: Driver, S: Allocator + Clone> Store for PlainStore<D, S> {
     type Held<A: Allocator> = Vec<u8, A>;
     type Verified = Proof;
 

@@ -18,9 +18,36 @@
 //! through four `#[inline(never)]` matchers: by value, by reference, inside a struct by value,
 //! inside a struct by reference (the struct's other fields are checked too, so a tag written
 //! over a neighbour shows). Each matcher returns `v + 1` for variant `v`, and a payload checked
-//! by a literal pattern returns 98 when it is wrong. `main` returns 250 when every variant gave
-//! its status on every path, else `4 * v + p + 1` for the first variant `v` whose path `p` (0 by
-//! value, 1 by reference, 2 in a struct, 3 in a struct by reference) was wrong.
+//! by a literal pattern returns 98 when it is wrong. A row whose variants are built from
+//! constants alone also passes a CONSTANT ITEM of each variant (`const K<v>: T = ..;`, made by
+//! the constant evaluator, whose tag must be the layout's) through the by-value matcher; a row
+//! with a cast also checks `as_int(make(v))` (an `as` cast, or a field read and a cast) against
+//! the variant's integer. `main` returns 250 when every check passed, else, for the first
+//! variant `v` that failed: `1 + v` (one of the four matchers), `70 + v` (its constant), `140 +
+//! v` (its cast).
+//!
+//! THE ALIGNMENT ROWS (std hello, 2026-11-17, after the trap table: "it struck at +0x3fc in fn
+//! `core::alloc::layout::<impl Layout>::from_size_align_unchecked` .. `brk #0xff02`: an
+//! `unreachable` reached ..: the read of the enum's discriminant found no variant's
+//! discriminant"): core's `ptr::Alignment(AlignmentEnum)`, `#[repr(usize)] enum AlignmentEnum {
+//! _Align1Shl0 = 1 << 0, .., _Align1Shl63 = 1 << 63 }`, made by `mem::transmute(align)` and
+//! copied into `Layout { size, align }`. Each row isolates one candidate: (a) discriminants
+//! that are constant EXPRESSIONS (with a constant item of each variant: the cause, below), (b)
+//! the sign bit `1 << 63` under `repr(usize)` and `repr(u64)`, (c) all 64 sparse variants,
+//! (d) `transmute` in (at run time and in a constant), (e) through the `repr(transparent)`
+//! newtype inside a `Layout`-shaped struct, (f) `Option` of the newtype (the niche is the
+//! invalid discriminants: `None` is 0).
+//!
+//! THE CAUSE (read, 2026-11-17): the constant evaluator numbered an enum's variants by its own
+//! answer, `ConstWorld::explicit_discriminant` (blaze-consteval machine.rs
+//! `explicit_discriminant`, the record of the variant's `= expr`), which both front ends'
+//! worlds answer `None` for EVERY variant (front2/consts.rs `ConstsWorld::explicit_discriminant`
+//! and run.rs `FrontConsts::explicit_discriminant`), so every enum was 0, 1, 2, .. there, while
+//! the layout writes and reads tags by `LayoutFacts::discriminant` (front2 heads.rs
+//! `discriminants`: 1, 2, 4, ..). A constant built by variant (`Alignment::MIN`'s
+//! `AlignmentEnum::_Align1Shl0`) held tag 0, and a constant made by `transmute` was decoded as
+//! the variant whose INDEX the bits are, then written back by that variant's real discriminant
+//! (8 became 256). The machine now reads `LayoutFacts::discriminant`, the one home.
 //!
 //! The helpers are tests/const_fn_pointers.rs's (fixture, reader, builder, the every-item
 //! stand-in), copied: a test file is its own crate.
@@ -55,7 +82,7 @@ const PASSED: u8 = 250;
 
 /// The lang items a `match` over these layouts needs (core's marker.rs), and the `Option` and
 /// `Result` core declares.
-const HEAD: &str = "#![feature(no_core, lang_items, rustc_attrs)]
+const HEAD: &str = "#![feature(no_core, lang_items, rustc_attrs, intrinsics, decl_macro, pattern_types, pattern_type_macro)]
 #![no_core]
 #![no_main]
 #![allow(internal_features, dead_code, unreachable_patterns)]
@@ -87,6 +114,11 @@ enum Result<T, E> {
     Ok(T),
     Err(E),
 }
+
+/// As the pinned core declares it (library/core/src/intrinsics/mod.rs).
+#[rustc_nounwind]
+#[rustc_intrinsic]
+pub const unsafe fn transmute<Src, Dst>(src: Src) -> Dst;
 ";
 
 /// One layout kind: its items, the matched type (it may name `'a`, the lifetime of `make`'s
@@ -98,6 +130,18 @@ struct Layout {
     ty: &'static str,
     variants: Vec<(String, String)>,
     extra: &'static str,
+    /// Each variant's build is a constant expression (it names no `r`): a constant item of each
+    /// is matched too.
+    consts: bool,
+    /// `as_int(e: T) -> int { expr }` and each variant's integer.
+    cast: Option<Cast>,
+}
+
+/// A cast check: the integer type, the body over `e`, each variant's value.
+struct Cast {
+    int: &'static str,
+    expr: &'static str,
+    values: Vec<u128>,
 }
 
 /// The arms of every matcher: variant `v`'s pattern gives `v + 1`, then `extra`.
@@ -179,20 +223,36 @@ pub extern \"C-unwind\" fn main() -> i32 {{
     let seven: u8 = 7;
 "
     ));
+    let check = |s: &mut String, call: &str, want: &str, code: usize| {
+        writeln!(s, "    match {call} {{\n        {want} => {{}}\n        _ => return {code},\n    }}").expect("a String takes the text");
+    };
     for v in 0..l.variants.len() {
-        let want = v + 1;
+        let want = format!("{}", v + 1);
         let calls = [
             format!("by_value(make({v}, &seven))"),
             format!("by_ref(&make({v}, &seven))"),
             format!("in_struct(Holder {{ pad: 1, e: make({v}, &seven), r: &seven }})"),
             format!("in_struct_ref(&Holder {{ pad: 1, e: make({v}, &seven), r: &seven }})"),
         ];
-        for (p, call) in calls.iter().enumerate() {
-            let code = 4 * v + p + 1;
-            writeln!(s, "    match {call} {{\n        {want} => {{}}\n        _ => return {code},\n    }}").expect("a String takes the text");
+        for call in &calls {
+            check(&mut s, call, &want, 1 + v);
+        }
+        if l.consts {
+            check(&mut s, &format!("by_value(K{v})"), &want, 70 + v);
+        }
+        if let Some(cast) = &l.cast {
+            check(&mut s, &format!("as_int(make({v}, &seven))"), &format!("{}", cast.values[v]), 140 + v);
         }
     }
     writeln!(s, "    {PASSED}\n}}").expect("a String takes the text");
+    if l.consts {
+        for (v, (build, _)) in l.variants.iter().enumerate() {
+            writeln!(s, "\nconst K{v}: {ty} = {build};").expect("a String takes the text");
+        }
+    }
+    if let Some(cast) = &l.cast {
+        writeln!(s, "\n#[inline(never)]\nfn as_int<'a>(e: {ty}) -> {} {{\n    {}\n}}", cast.int, cast.expr).expect("a String takes the text");
+    }
     s
 }
 
@@ -385,7 +445,7 @@ fn row(l: Layout) {
     let name = l.name;
     walked.unwrap_or_else(|e| panic!("{name}: the lazy path: {e}"));
     let status = ran.unwrap_or_else(|e| panic!("{name}: the whole run refused: {e}"));
-    assert_eq!(status, PASSED, "{name}: 250 is every variant matched on every path; else 4 * variant + path + 1 (path 0 by value, 1 by reference, 2 in a struct, 3 in a struct by reference)\n{text}");
+    assert_eq!(status, PASSED, "{name}: 250 is every check passed; else for variant v: 1 + v a matcher, 70 + v its constant, 140 + v its cast\n{text}");
 }
 
 /// `fmt::rt::ArgumentType`'s shape: `Placeholder` holds a reference and a fn pointer (both
@@ -413,6 +473,8 @@ enum ArgumentType<'a> {
             ("ArgumentType::Count(3)", "ArgumentType::Count(3)"),
         ]),
         extra: "        ArgumentType::Count(_) => 98,\n",
+        consts: false,
+        cast: None,
     });
 }
 
@@ -425,6 +487,8 @@ fn option_of_a_reference() {
         ty: "Option<&'a u8>",
         variants: pairs(&[("Option::None", "Option::None"), ("Option::Some(r)", "Option::Some(_)")]),
         extra: "",
+        consts: false,
+        cast: None,
     });
 }
 
@@ -437,6 +501,8 @@ fn alignment() {
         ty: "Alignment",
         variants: units(&["Alignment::Left", "Alignment::Right", "Alignment::Center"]),
         extra: "",
+        consts: true,
+        cast: None,
     });
 }
 
@@ -449,6 +515,8 @@ fn option_of_alignment() {
         ty: "Option<Alignment>",
         variants: units(&["Option::None", "Option::Some(Alignment::Left)", "Option::Some(Alignment::Right)", "Option::Some(Alignment::Center)"]),
         extra: "",
+        consts: true,
+        cast: None,
     });
 }
 
@@ -471,6 +539,8 @@ fn ordering() {
         ty: "Ordering",
         variants: units(&["Ordering::Less", "Ordering::Equal", "Ordering::Greater"]),
         extra: "",
+        consts: true,
+        cast: None,
     });
 }
 
@@ -484,6 +554,8 @@ fn option_of_ordering() {
         ty: "Option<Ordering>",
         variants: units(&["Option::None", "Option::Some(Ordering::Less)", "Option::Some(Ordering::Equal)", "Option::Some(Ordering::Greater)"]),
         extra: "",
+        consts: true,
+        cast: None,
     });
 }
 
@@ -502,6 +574,8 @@ fn error_kind() {
         ty: "ErrorKind",
         variants: names.iter().map(|n| (n.clone(), n.clone())).collect(),
         extra: "",
+        consts: true,
+        cast: None,
     });
 }
 
@@ -515,45 +589,172 @@ fn repr_u8_explicit() {
         ty: "Tag",
         variants: units(&["Tag::A", "Tag::B", "Tag::C", "Tag::D"]),
         extra: "",
+        consts: true,
+        cast: None,
     });
 }
 
-/// `Option<NonZero<u32>>`: `None` is 0, the value the narrowed range leaves out. Statuses 1
-/// (None), 2 (Some(5)).
+/// core's `pattern_type!` as the pinned core declares it (library/core/src/pat.rs): the pinned
+/// core's `NonZero` and `NonNull` are PATTERN TYPES (`NonZeroU32Inner(u32 is 1..=u32::MAX)` in
+/// num/niche_types.rs, `NonNull { pointer: *const T is !null }`), laid out by blaze-build
+/// layout.rs `PNode::Pat`. The `rustc_layout_scalar_valid_range_*` attribute these rows used
+/// before is what front2 refuses (heads.rs `narrowed`, lazy/fill.rs `adt_rows`), and real core
+/// no longer uses it on these types: why std hello was not refused.
+const PATTERN_TYPE: &str = "
+#[rustc_builtin_macro(pattern_type)]
+pub macro pattern_type($($arg:tt)*) {
+    /* compiler built-in */
+}
+";
+
+/// `Option<NonZero<u32>>`'s inner shape: `None` is 0, the value the pattern type leaves out.
+/// Statuses 1 (None), 2 (Some(5)).
 #[test]
-#[ignore = "another piece: the lazy path refuses an ADT whose valid range is narrowed (front2/program/lazy/fill.rs `adt_rows`: `Front2Refusal::Layout`, and front2/consts.rs 'its valid range is narrowed (`rustc_layout_scalar_valid_range_*`), which the constant evaluator's layout does not read yet')"]
 fn option_of_non_zero() {
     row(Layout {
-        name: "Option<NonZeroU32>",
-        decls: String::from("\n#[rustc_layout_scalar_valid_range_start(1)]\n#[repr(transparent)]\nstruct NonZeroU32(u32);\n"),
-        ty: "Option<NonZeroU32>",
-        variants: pairs(&[("Option::None", "Option::None"), ("Option::Some(unsafe { NonZeroU32(5) })", "Option::Some(_)")]),
+        name: "Option<NonZeroU32Inner> (pattern type)",
+        decls: format!("{PATTERN_TYPE}\n#[repr(transparent)]\nstruct NonZeroU32Inner(pattern_type!(u32 is 1..=4294967295));\n"),
+        ty: "Option<NonZeroU32Inner>",
+        variants: pairs(&[("Option::None", "Option::None"), ("Option::Some(unsafe { transmute::<u32, NonZeroU32Inner>(5) })", "Option::Some(_)")]),
         extra: "",
+        consts: true,
+        cast: None,
     });
 }
 
 /// A niche in a `NonNull` FIELD of a struct with another field before it: `None` is the null
-/// pointer at the field's offset (8), not the struct's first word. Statuses 1 (None), 2 (Some).
+/// pointer at the field's offset (8), not the struct's first word. Statuses 1 (None), 2 (Some);
+/// a `Some` whose `len` is not 4 gives 98.
 #[test]
-#[ignore = "another piece: the lazy path refuses an ADT whose valid range is narrowed (front2/program/lazy/fill.rs `adt_rows`: `Front2Refusal::Layout`)"]
 fn option_of_a_non_null_field() {
     row(Layout {
-        name: "Option<Raw> (NonNull field)",
-        decls: String::from(
-            "
-#[rustc_layout_scalar_valid_range_start(1)]
+        name: "Option<Raw> (NonNull field, pattern type)",
+        decls: format!(
+            "{PATTERN_TYPE}
 #[repr(transparent)]
-struct NonNull<T: PointeeSized>(*const T);
+struct NonNull<T: PointeeSized> {{
+    pointer: pattern_type!(*const T is !null),
+}}
 
-struct Raw {
+struct Raw {{
     len: u32,
     ptr: NonNull<u8>,
-}
-",
+}}
+"
         ),
         ty: "Option<Raw>",
-        variants: pairs(&[("Option::None", "Option::None"), ("Option::Some(Raw { len: 4, ptr: unsafe { NonNull(r as *const u8) } })", "Option::Some(Raw { len: 4, .. })")]),
+        variants: pairs(&[("Option::None", "Option::None"), ("Option::Some(Raw { len: 4, ptr: unsafe { transmute::<*const u8, NonNull<u8>>(r as *const u8) } })", "Option::Some(Raw { len: 4, .. })")]),
         extra: "        Option::Some(_) => 98,\n",
+        consts: false,
+        cast: None,
+    });
+}
+
+/// `1 << n` for each `n`: core's `AlignmentEnum` variants up to `last` (64 is all of them), as
+/// declarations and as `(build, pattern)` pairs, and each one's integer.
+fn shifts(name: &str, repr: &str, ns: &[u32]) -> (String, Vec<(String, String)>, Vec<u128>) {
+    let mut decls = format!("\n#[repr({repr})]\nenum {name} {{\n");
+    for n in ns {
+        writeln!(decls, "    S{n} = 1 << {n},").expect("a String takes the text");
+    }
+    decls.push_str("}\n");
+    let variants = ns.iter().map(|n| (format!("{name}::S{n}"), format!("{name}::S{n}"))).collect();
+    (decls, variants, ns.iter().map(|&n| 1u128 << n).collect())
+}
+
+/// (a) Discriminants given by CONSTANT EXPRESSIONS (`1 << n`, not literals), `repr(usize)`:
+/// `as usize` gives 1, 2, 8, 4096; the matchers 1..=4; each variant's CONSTANT item (the
+/// constant evaluator's tag) too. Isolates the cause: before the fix the constants held tags
+/// 0..=3 (the evaluator's own numbering), and the run stopped on `brk #0xff02` in `by_value`
+/// (the first constant matched no arm) or returned 70 + v.
+#[test]
+fn a_discriminants_by_constant_expressions() {
+    let (decls, variants, values) = shifts("A", "usize", &[0, 1, 3, 12]);
+    row(Layout { name: "(a) 1 << n discriminants", decls, ty: "A", variants, extra: "", consts: true, cast: Some(Cast { int: "usize", expr: "e as usize", values }) });
+}
+
+/// (b) The SIGN BIT under `repr(usize)`: `1 << 63` beside `1 << 0` and `1 << 62`. A tag's
+/// range check or compare done signed (`1 << 63` as `i64::MIN`) refuses it or everything.
+/// Statuses 1..=3; casts 1, 2^62, 2^63.
+#[test]
+fn b_the_sign_bit_repr_usize() {
+    let (decls, variants, values) = shifts("B", "usize", &[0, 62, 63]);
+    row(Layout { name: "(b) 1 << 63, repr(usize)", decls, ty: "B", variants, extra: "", consts: true, cast: Some(Cast { int: "usize", expr: "e as usize", values }) });
+}
+
+/// (b) The SIGN BIT under `repr(u64)`, as (b) under `repr(usize)`.
+#[test]
+fn b_the_sign_bit_repr_u64() {
+    let (decls, variants, values) = shifts("B", "u64", &[0, 62, 63]);
+    row(Layout { name: "(b) 1 << 63, repr(u64)", decls, ty: "B", variants, extra: "", consts: true, cast: Some(Cast { int: "u64", expr: "e as u64", values }) });
+}
+
+/// (c) ALL 64 sparse variants, `1 << 0 ..= 1 << 63`, `repr(usize)`: a switch lowered as a
+/// dense table over the VALUE (1..2^63) instead of a compare chain or a table over the variant
+/// index fails here. Statuses 1..=64; casts 2^n.
+#[test]
+#[ignore = "ANOTHER LIMIT (2026-11-17): the row's `main` (64 variants, each built, matched four ways and cast) is refused before it runs: `main`: a branch or PC-relative reference past its reach is past what the baseline tier encodes: a function this large needs the tier's far-branch form (its own piece); the sparse-discriminant mechanism itself passes in rows (a), (b), (d), (e), (f)"]
+fn c_all_sixty_four_sparse_variants() {
+    let ns: Vec<u32> = (0..64).collect();
+    let (decls, variants, values) = shifts("AlignmentEnum", "usize", &ns);
+    row(Layout { name: "(c) all 64 of AlignmentEnum", decls, ty: "AlignmentEnum", variants, extra: "", consts: true, cast: Some(Cast { int: "usize", expr: "e as usize", values }) });
+}
+
+/// (d) TRANSMUTE in: each variant made by `transmute::<usize, A>(1 << n)` (at run time in
+/// `make`, and in a constant item: the constant evaluator decodes the bits by its
+/// discriminants), then matched and cast back. Before the fix a constant `transmute(8)` was
+/// decoded as variant 8 (the index) and written back as 1 << 8.
+#[test]
+fn d_transmute_in() {
+    let (decls, _, values) = shifts("A", "usize", &[0, 1, 3, 12]);
+    let variants = [0u32, 1, 3, 12].iter().map(|n| (format!("unsafe {{ transmute::<usize, A>({}) }}", 1u128 << n), format!("A::S{n}"))).collect();
+    row(Layout { name: "(d) transmute::<usize, A>", decls, ty: "A", variants, extra: "", consts: true, cast: Some(Cast { int: "usize", expr: "e as usize", values }) });
+}
+
+/// The newtype and the `Layout`-shaped struct (core's `ptr::Alignment(AlignmentEnum)` and
+/// `alloc::Layout { size, align }`), over (a)'s enum.
+fn newtype_decls() -> String {
+    let (decls, _, _) = shifts("A", "usize", &[0, 1, 3, 12]);
+    format!("{decls}\n#[repr(transparent)]\nstruct W(A);\n\nstruct L {{\n    size: usize,\n    align: W,\n}}\n")
+}
+
+/// (e) Through the newtype: `L { size: 16, align: transmute::<usize, W>(1 << n) }` built as
+/// `Layout::from_size_align_unchecked` builds it, matched by its field and read back as
+/// `l.align.0 as usize`. Statuses 1..=4 (a wrong `size` gives 98); casts 1, 2, 8, 4096.
+#[test]
+fn e_through_the_newtype_in_a_layout() {
+    let variants = [0u32, 1, 3, 12]
+        .iter()
+        .map(|n| (format!("L {{ size: 16, align: unsafe {{ transmute::<usize, W>({}) }} }}", 1u128 << n), format!("L {{ size: 16, align: W(A::S{n}) }}")))
+        .collect();
+    row(Layout {
+        name: "(e) Layout { size, align: W(A) }",
+        decls: newtype_decls(),
+        ty: "L",
+        variants,
+        extra: "        _ => 98,\n",
+        consts: true,
+        cast: Some(Cast { int: "usize", expr: "e.align.0 as usize", values: [0u32, 1, 3, 12].iter().map(|&n| 1u128 << n).collect() }),
+    });
+}
+
+/// (f) `Option<W>`: the niche is the discriminants no variant has, so `None` is 0. `None`,
+/// `Some(W(A::S3))` by variant, `Some(transmute(4096))`. Statuses 1..=3 (a `Some` of another
+/// variant gives 98).
+#[test]
+fn f_option_of_the_newtype() {
+    row(Layout {
+        name: "(f) Option<W>",
+        decls: newtype_decls(),
+        ty: "Option<W>",
+        variants: pairs(&[
+            ("Option::None", "Option::None"),
+            ("Option::Some(W(A::S3))", "Option::Some(W(A::S3))"),
+            ("Option::Some(unsafe { transmute::<usize, W>(4096) })", "Option::Some(W(A::S12))"),
+        ]),
+        extra: "        Option::Some(_) => 98,\n",
+        consts: true,
+        cast: None,
     });
 }
 
@@ -567,6 +768,8 @@ fn a_variant_of_a_zero_variant_enum() {
         ty: "Result<u8, Void>",
         variants: pairs(&[("Result::Ok(3)", "Result::Ok(3)")]),
         extra: "        Result::Ok(_) => 98,\n        Result::Err(_) => 0,\n",
+        consts: true,
+        cast: None,
     });
 }
 
@@ -580,5 +783,7 @@ fn result_of_unit_and_fmt_error() {
         ty: "Result<(), Error>",
         variants: pairs(&[("Result::Ok(())", "Result::Ok(_)"), ("Result::Err(Error)", "Result::Err(_)")]),
         extra: "",
+        consts: true,
+        cast: None,
     });
 }

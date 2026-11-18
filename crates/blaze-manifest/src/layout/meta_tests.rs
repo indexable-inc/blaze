@@ -10,11 +10,18 @@
 //! Expected (`cargo test -p blaze-manifest --lib -- layout::meta_tests`): 3 passed, printing
 //! "a: authors `A <a@x>:B`, description ``; b inherits `W <w@x>`, readme `../../README.md`".
 
+use blaze_mem::{Root, RootOpts};
+
 use super::{Entry, Layout, LayoutError, Need, Pass, PackageMetaVars, Units};
 
+/// The test's root heap, made at its top; every table read borrows it.
+fn root() -> Root {
+    Root::new(RootOpts::TEST).unwrap_or_else(|e| panic!("the test's root: {e}"))
+}
+
 /// Files with their texts; a directory is implied by a file under it.
-fn read(files: &[(&'static str, &'static str)], start: &str) -> Result<Units<'static>, LayoutError<'static>> {
-    let alloc = blaze_own::testing::heap().alloc();
+fn read<'r>(root: &'r Root, files: &[(&'static str, &'static str)], start: &str) -> Result<Units<'r>, LayoutError<'r>> {
+    let alloc = root.alloc();
     let mut layout = Layout::new(start, alloc)?;
     for _ in 0..64 {
         match layout.pass()? {
@@ -79,8 +86,9 @@ fn vars_of<'u>(units: &'u Units<'_>, name: &str) -> PackageMetaVars<'u> {
 /// An inherited key is the root's; an inherited path is made relative to the member.
 #[test]
 fn metadata_is_the_manifest_s_joined_empty_or_inherited() {
+    let root = root();
     let files = workspace();
-    let units = read(&files, "crates/a").unwrap_or_else(|e| panic!("{e}"));
+    let units = read(&root, &files, "crates/a").unwrap_or_else(|e| panic!("{e}"));
     let a = vars_of(&units, "a");
     assert_eq!(a.authors, "A <a@x>:B", "CARGO_PKG_AUTHORS is the authors joined with `:`");
     assert_eq!(a.description, "", "an unstated description is the empty string");
@@ -106,9 +114,10 @@ fn metadata_is_the_manifest_s_joined_empty_or_inherited() {
 /// A key inherited from a root that does not offer it is refused by name, never `""`.
 #[test]
 fn an_inherited_key_the_root_lacks_is_refused_by_name() {
+    let root = root();
     let mut files = workspace();
     files[4] = ("crates/b/Cargo.toml", "[package]\nname = \"b\"\nhomepage.workspace = true\n");
-    match read(&files, "crates/b") {
+    match read(&root, &files, "crates/b") {
         Err(LayoutError::NotInherited { key, .. }) => assert_eq!(key, "homepage"),
         Err(other) => panic!("another refusal: {other}"),
         Ok(_) => panic!("an inherited homepage the root lacks was answered"),
@@ -119,17 +128,18 @@ fn an_inherited_key_the_root_lacks_is_refused_by_name() {
 /// removed, its effect goes; an unrelated key edited, the authors' value stays).
 #[test]
 fn an_authors_edit_moves_only_the_authors_value() {
+    let root = root();
     let files = workspace();
-    let before = read(&files, "crates/a").unwrap_or_else(|e| panic!("{e}"));
+    let before = read(&root, &files, "crates/a").unwrap_or_else(|e| panic!("{e}"));
     let mut edited = workspace();
     edited[2] = ("crates/a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"1.2.3-rc.1\"\nauthors = [\"A <a@x>\"]\nreadme = false\n");
-    let after = read(&edited, "crates/a").unwrap_or_else(|e| panic!("{e}"));
+    let after = read(&root, &edited, "crates/a").unwrap_or_else(|e| panic!("{e}"));
     let (was, now) = (vars_of(&before, "a"), vars_of(&after, "a"));
     assert_ne!(was.authors, now.authors);
     assert_eq!(now.authors, "A <a@x>");
     assert_eq!((was.description, was.homepage, was.readme), (now.description, now.homepage, now.readme));
     let mut other = workspace();
     other[2] = ("crates/a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"1.2.3-rc.1\"\nauthors = [\"A <a@x>\", \"B\"]\nreadme = false\ndescription = \"new\"\n");
-    let described = read(&other, "crates/a").unwrap_or_else(|e| panic!("{e}"));
+    let described = read(&root, &other, "crates/a").unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(vars_of(&described, "a").authors, was.authors, "a description edit leaves the authors' value");
 }

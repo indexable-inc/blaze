@@ -32,8 +32,9 @@ fn rows(count: u32) -> std::vec::Vec<Row> {
 }
 
 fn process(sim: Sim, n: u64) -> Lent<Sim, StoreAlloc> {
-    let cfg = config(FileName::new("store").expect("a name"), &StoreSettings::default(), Facts { boot: Some(1), nonce: 9000 + n });
-    open(sim, cfg, blaze_own::testing::heap().alloc()).expect("the store opens")
+    let alloc = blaze_own::testing::heap().alloc();
+    let cfg = config(FileName::new("store").expect("a name"), &StoreSettings::default(), Facts { boot: Some(1), nonce: 9000 + n }, alloc);
+    open(sim, cfg, alloc).expect("the store opens")
 }
 
 fn back(lent: Lent<Sim, StoreAlloc>) -> Sim {

@@ -3,6 +3,7 @@
 //! seam (blaze-keyed's [`Source`] and [`Verifier`]: one home, rule 30), and the store a root's
 //! settings choose ([`Opened`]).
 
+use std::alloc::Allocator;
 use std::{
     alloc::Global,
     collections::BTreeMap,
@@ -161,11 +162,12 @@ impl Source for LocalDir {
     }
 }
 
-/// The plain store driven on the calling thread.
-pub struct Driven<D: Driver = Native> {
+/// The plain store driven on the calling thread, what it keeps in the caller's `A`. The
+/// effect queues stay blaze-core's process-heap vectors (`Driver::submit`, `Driver::poll`).
+pub struct Driven<D: Driver, A: Allocator + Clone> {
     driver: D,
     root: PathBuf,
-    core: Plain,
+    core: Plain<A>,
     effects: Vec<Effect>,
     done: Vec<Completion>,
     /// Completions of the driver's own effects, by tag.
@@ -189,17 +191,23 @@ pub(crate) enum Cut {
     AtFlip,
 }
 
-impl Driven<Native> {
+impl<A: Allocator + Clone> Driven<Native, A> {
     /// The plain store in `root/plain`, made if missing, on the native driver over `root`. It
     /// reads and writes the namespaces `settings` name ([`Settings::reads`],
-    /// [`Settings::writes`]): everything [`Namespace::LOCAL`] by default.
-    pub fn open(root: &Path, settings: &Settings) -> Result<Driven<Native>, StoreError> {
+    /// [`Settings::writes`]): everything [`Namespace::LOCAL`] by default. What it keeps is in
+    /// `alloc`, the caller's.
+    pub fn open(root: &Path, settings: &Settings, alloc: A) -> Result<Driven<Native, A>, StoreError> {
         let dir = FileName::new("plain").expect("a relative name");
         let at = root.join(dir.as_str());
         std::fs::create_dir_all(&at).map_err(|e| os("mkdir", "the plain store's directory", &e))?;
         exclude_from_backup(&at)?;
         let driver = blaze_core::native(root, 2).map_err(|e| os("making the native driver", "the store's root", &e))?;
         let nonce = nonce();
+        let spelled = root.as_os_str().as_encoded_bytes();
+        let mut own_root = Vec::with_capacity_in(spelled.len(), alloc.clone());
+        own_root.extend_from_slice(spelled);
+        let mut machine = Vec::with_capacity_in(1, alloc.clone());
+        machine.push(own_root);
         let cfg = PlainConfig {
             dir,
             tags: STORE_TAGS,
@@ -210,13 +218,13 @@ impl Driven<Native> {
             durable: settings.durable,
             // The store's own root, in the spelling it was opened by; the caller adds the
             // checkout's and the home's ([`Driven::machine`]).
-            machine: vec![root.as_os_str().as_encoded_bytes().to_vec()],
-            writes: settings.writes(),
-            reads: settings.reads(),
+            machine,
+            writes: settings.writes(alloc.clone()),
+            reads: settings.reads(alloc.clone()),
             // The keyed handle's callers root nothing of their own.
             liveness: Liveness::Everything,
         };
-        let mut it = Driven::with(driver, root, cfg)?;
+        let mut it = Driven::with(driver, root, cfg, alloc)?;
         it.open_files()?;
         Ok(it)
     }
@@ -254,23 +262,24 @@ impl Driven<Native> {
     }
 
     /// [`Driven::commit_with`], then the new segments opened for `pread`.
-    pub fn commit(&mut self, batches: &[&Batch]) -> Result<Committed, StoreError> {
+    pub fn commit(&mut self, batches: &[&Batch]) -> Result<Committed<A>, StoreError> {
         let committed = self.commit_with(batches)?;
         self.open_files()?;
         Ok(committed)
     }
 }
 
-impl<D: Driver> Driven<D> {
-    /// The store `cfg` names, opened on `driver` (whose root is `root`).
-    pub fn with(driver: D, root: &Path, cfg: PlainConfig) -> Result<Driven<D>, StoreError> {
-        Driven::with_core(driver, root, Plain::new(cfg))
+impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
+    /// The store `cfg` names, opened on `driver` (whose root is `root`), what it keeps in
+    /// `alloc`.
+    pub fn with(driver: D, root: &Path, cfg: PlainConfig<A>, alloc: A) -> Result<Driven<D, A>, StoreError> {
+        Driven::with_core(driver, root, Plain::new(cfg, alloc))
     }
 
     /// [`Driven::with`], its store opened with `plant`.
     #[cfg(test)]
-    pub(crate) fn planted(driver: D, root: &Path, cfg: PlainConfig, plant: super::core::Plant) -> Result<Driven<D>, StoreError> {
-        let mut it = Driven::bare(driver, root, Plain::planted(cfg, plant));
+    pub(crate) fn planted(driver: D, root: &Path, cfg: PlainConfig<A>, alloc: A, plant: super::core::Plant) -> Result<Driven<D, A>, StoreError> {
+        let mut it = Driven::bare(driver, root, Plain::planted(cfg, alloc, plant));
         it.core.open(&mut it.effects);
         it.opened()
     }
@@ -281,7 +290,7 @@ impl<D: Driver> Driven<D> {
         self.cut = at;
     }
 
-    fn bare(driver: D, root: &Path, core: Plain) -> Driven<D> {
+    fn bare(driver: D, root: &Path, core: Plain<A>) -> Driven<D, A> {
         Driven {
             driver,
             root: root.to_owned(),
@@ -295,14 +304,14 @@ impl<D: Driver> Driven<D> {
         }
     }
 
-    fn with_core(driver: D, root: &Path, core: Plain) -> Result<Driven<D>, StoreError> {
+    fn with_core(driver: D, root: &Path, core: Plain<A>) -> Result<Driven<D, A>, StoreError> {
         let mut it = Driven::bare(driver, root, core);
         it.core.open(&mut it.effects);
         it.opened()
     }
 
     /// The open (asked already) run to its end and its report handed.
-    fn opened(mut self) -> Result<Driven<D>, StoreError> {
+    fn opened(mut self) -> Result<Driven<D, A>, StoreError> {
         let it = &mut self;
         it.run("opening the plain store")?;
         if !it.core.ready() {
@@ -381,11 +390,11 @@ impl<D: Driver> Driven<D> {
         }
     }
 
-    pub fn core(&self) -> &Plain {
+    pub fn core(&self) -> &Plain<A> {
         &self.core
     }
 
-    pub(crate) fn core_mut(&mut self) -> &mut Plain {
+    pub(crate) fn core_mut(&mut self) -> &mut Plain<A> {
         &mut self.core
     }
 
@@ -494,7 +503,7 @@ impl<D: Driver> Driven<D> {
 
     /// The explicit scrub ([`Plain::scrub`]): every record's CRC-32C against its bytes now,
     /// over a whole store.
-    pub fn scrub(&mut self) -> Result<Vec<Corrupt>, StoreError> {
+    pub fn scrub(&mut self) -> Result<Vec<Corrupt, A>, StoreError> {
         self.map_all()?;
         Ok(self.core.scrub())
     }
@@ -513,7 +522,7 @@ impl<D: Driver> Driven<D> {
 
     /// Writes the store's puts and `batches` as one segment for each namespace that holds
     /// records, and flips to a generation naming them, driven until done.
-    pub fn commit_with(&mut self, batches: &[&Batch]) -> Result<Committed, StoreError> {
+    pub fn commit_with(&mut self, batches: &[&Batch]) -> Result<Committed<A>, StoreError> {
         // After the answer: what is left unmapped is mapped, so the layout refuses two values
         // under one key against every row. A commit with nothing to lay out maps nothing.
         if self.core.holds_uncommitted() || batches.iter().any(|it| !it.is_empty()) {
@@ -531,16 +540,16 @@ impl<D: Driver> Driven<D> {
     /// Up to `slices` compaction slices, each bounded by [`super::SLICE_BYTES`], until one says
     /// there is no more. Lowers the calling thread first ([`lower_this_thread`]): call it after
     /// the command has answered, or from its own invocation, never before a build's first read.
-    pub fn compact(&mut self, slices: u32) -> Result<Vec<Sliced>, StoreError> {
+    pub fn compact(&mut self, slices: u32) -> Result<Vec<Sliced, A>, StoreError> {
         lower_this_thread()?;
         self.slices(slices)
     }
 
     /// [`Driven::compact`] on the calling thread as it is: for a caller that runs it beside
     /// builds on a thread it lowered itself.
-    pub(crate) fn slices(&mut self, slices: u32) -> Result<Vec<Sliced>, StoreError> {
+    pub(crate) fn slices(&mut self, slices: u32) -> Result<Vec<Sliced, A>, StoreError> {
         self.map_all()?;
-        let mut out = Vec::new_in(Global);
+        let mut out = Vec::new_in(self.core.alloc().clone());
         for _ in 0..slices {
             if !self.core.compact(&mut self.effects) {
                 return Err(StoreError::Busy { phase: self.core.what() });
@@ -632,7 +641,7 @@ impl<D: Driver> Driven<D> {
     /// put into a shared namespace is scanned for ([`super::PlainConfig::machine`]).
     pub fn machine(&mut self, paths: &[&Path]) {
         for path in paths {
-            self.core.machine(path.as_os_str().as_encoded_bytes().to_vec());
+            self.core.machine(path.as_os_str().as_encoded_bytes());
         }
     }
 
@@ -645,38 +654,39 @@ impl<D: Driver> Driven<D> {
     /// The fetch buffer is the global heap, not the caller's frame: the bytes are handed to the
     /// segment's write ([`Effect::WriteUnsynced`] owns a `Vec<u8>` of the global heap), so a
     /// frame's buffer would be copied once more.
-    pub fn fetch_missing(&mut self, source: &mut dyn Source, verifier: &dyn Verifier, namespace: Namespace, keys: &[RecordRef]) -> Result<Vec<u64>, StoreError> {
+    pub fn fetch_missing(&mut self, source: &mut dyn Source, verifier: &dyn Verifier, namespace: Namespace, keys: &[RecordRef]) -> Result<Vec<u64, A>, StoreError> {
         if !self.core.reads().contains(&namespace) {
             return Err(StoreError::Other { what: "a fetch from a namespace this store does not read: a key is never answered from a namespace the caller did not ask for" });
         }
         // What is held is asked of every row, not of the mapped ones alone.
         self.map_all()?;
-        let mut missing: Vec<RecordRef> = Vec::with_capacity_in(keys.len(), Global);
+        let alloc = self.core.alloc().clone();
+        let mut missing: Vec<RecordRef, A> = Vec::with_capacity_in(keys.len(), alloc.clone());
         missing.extend(keys.iter().filter(|it| self.core.get_in(&[namespace], &Key(it.key)).is_none()).copied());
         missing.sort_unstable_by(|a, b| a.key.cmp(&b.key));
         missing.dedup_by(|a, b| a.key == b.key);
         if missing.is_empty() {
-            return Ok(Vec::new_in(Global));
+            return Ok(Vec::new_in(alloc));
         }
-        let mut found: Vec<Option<Located>> = Vec::with_capacity_in(missing.len(), Global);
+        let mut found: Vec<Option<Located>, A> = Vec::with_capacity_in(missing.len(), alloc.clone());
         found.resize(missing.len(), None);
         source.find(namespace, &missing, &mut found)?;
         let mut segments: BTreeMap<SegmentId, SegmentRef> = BTreeMap::new();
         for it in found.into_iter().flatten() {
             segments.insert(it.segment.digest(), it.segment);
         }
-        let mut wanted = Vec::with_capacity_in(segments.len(), Global);
+        let mut wanted = Vec::with_capacity_in(segments.len(), alloc);
         wanted.extend(segments.into_values());
         self.pull(source, verifier, namespace, &wanted)
     }
 
     /// Fetches whole segments a source names (a bundle: std for a toolchain, target and cfg
     /// set), each verified and checked as [`Driven::fetch_missing`] says, and names them here.
-    pub fn pull(&mut self, source: &mut dyn Source, verifier: &dyn Verifier, namespace: Namespace, wanted: &[SegmentRef]) -> Result<Vec<u64>, StoreError> {
+    pub fn pull(&mut self, source: &mut dyn Source, verifier: &dyn Verifier, namespace: Namespace, wanted: &[SegmentRef]) -> Result<Vec<u64, A>, StoreError> {
         // The adopted segments are mapped as their flip lands: a whole store.
         self.map_all()?;
-        let mut adopted = Vec::with_capacity_in(wanted.len(), Global);
-        let mut ids = Vec::with_capacity_in(wanted.len(), Global);
+        let mut adopted = Vec::with_capacity_in(wanted.len(), self.core.alloc().clone());
+        let mut ids = Vec::with_capacity_in(wanted.len(), self.core.alloc().clone());
         for (i, want) in wanted.iter().enumerate() {
             let segment = want.digest();
             let statement = source.statement(want)?;
@@ -716,8 +726,9 @@ impl<D: Driver> Driven<D> {
         Ok(ids)
     }
 
-    /// Marks segments as pushed to a shared bucket: compaction never rewrites them.
-    pub fn publish(&mut self, ids: Vec<u64>) -> Result<(), StoreError> {
+    /// Marks segments as pushed to a shared bucket: compaction never rewrites them. `ids` in
+    /// the store's allocator ([`Plain::alloc`]).
+    pub fn publish(&mut self, ids: Vec<u64, A>) -> Result<(), StoreError> {
         self.core.publish(ids, &mut self.effects)?;
         self.run("marking segments published")
     }
@@ -804,19 +815,20 @@ fn nonce() -> u64 {
 
 /// The store a root's settings (`<root>/store.json`) choose: the packs, as before, or the plain
 /// store.
-pub enum Opened {
+pub enum Opened<A: Allocator + Clone> {
     Packs(crate::Driven),
-    Plain(Driven<Native>),
+    Plain(Driven<Native, A>),
 }
 
-impl Opened {
-    pub fn open(root: &Path) -> Result<Opened, String> {
+impl<A: Allocator + Clone> Opened<A> {
+    /// The plain store's in `alloc`, the caller's.
+    pub fn open(root: &Path, alloc: A) -> Result<Opened<A>, String> {
         let settings = Settings::read(root)?;
         match settings.form {
             Form::Packs => crate::Driven::open(root).map(Opened::Packs),
             // The packs' open says its failure as text; the plain store's typed error is
             // printed beside it.
-            Form::Plain => Driven::open(root, &settings).map(Opened::Plain).map_err(|it| it.to_string()),
+            Form::Plain => Driven::open(root, &settings, alloc).map(Opened::Plain).map_err(|it| it.to_string()),
         }
     }
 }

@@ -1,6 +1,7 @@
 //! Which store a root opens: `<root>/store.json`, one typed value. No file is the
 //! content-addressed store of packs, as before; `{"form": "plain"}` is the plain store.
 
+use std::alloc::Allocator;
 use std::{alloc::Global, path::Path};
 
 use blaze_data::{Cursor, FromValue, Shape, ShapeError};
@@ -94,8 +95,9 @@ impl Settings {
 
     /// The namespaces a lookup asks, in order: this machine's own, the organisation's, the
     /// public one. No other is ever searched.
-    pub fn reads(&self) -> Vec<Namespace> {
-        let mut out = Vec::with_capacity_in(3, Global);
+    /// In `alloc`, the caller's.
+    pub fn reads<A: Allocator>(&self, alloc: A) -> Vec<Namespace, A> {
+        let mut out = Vec::with_capacity_in(3, alloc);
         out.push(Namespace::LOCAL);
         out.extend(self.org_namespace());
         out.push(Namespace::PUBLIC);
@@ -105,8 +107,9 @@ impl Settings {
     /// The namespaces a put may name: [`Namespace::LOCAL`] alone unless this machine is a
     /// trusted writer, which adds the organisation's and the public one (both absent: the
     /// default, everything local).
-    pub fn writes(&self) -> Vec<Namespace> {
-        let mut out = Vec::with_capacity_in(3, Global);
+    /// In `alloc`, the caller's.
+    pub fn writes<A: Allocator>(&self, alloc: A) -> Vec<Namespace, A> {
+        let mut out = Vec::with_capacity_in(3, alloc);
         out.push(Namespace::LOCAL);
         if self.trusted_writer {
             out.extend(self.org_namespace());

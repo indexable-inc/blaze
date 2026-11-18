@@ -5,7 +5,7 @@
 //! `Plant::TrustsUnchecked` (a first hit served unchecked). Rule 8: the oracle is the model of
 //! what was put (`value(n)` under `key(n)`), never another store's answer.
 
-use std::{alloc::Global, path::Path};
+use std::path::Path;
 
 use blaze_core::{
     FileName,
@@ -16,19 +16,24 @@ use blaze_keyed::{
     kind::{Namespace, Tag},
     store::{HEADER, StoreError},
 };
+use blaze_mem::Frame;
 
 use super::{
     core::{GRACE_NS, PlainConfig, Plant, TAGS},
     driven::Driven,
+    test_root,
 };
 use crate::Key;
 
 const TAG: Tag = Tag(1);
 
-fn cfg(n: u64, boot: u64) -> PlainConfig {
-    let mut writes = Vec::new_in(Global);
+/// A process's store, its tables in the test's frame.
+type Store<'f> = Driven<Sim, &'f Frame>;
+
+fn cfg(n: u64, boot: u64, root: &Frame) -> PlainConfig<&Frame> {
+    let mut writes = Vec::new_in(root);
     writes.push(Namespace::LOCAL);
-    let mut reads = Vec::new_in(Global);
+    let mut reads = Vec::new_in(root);
     reads.push(Namespace::LOCAL);
     PlainConfig {
         dir: FileName::new("plain").expect("a name"),
@@ -37,7 +42,7 @@ fn cfg(n: u64, boot: u64) -> PlainConfig {
         boot,
         nonce: 500 + n,
         durable: false,
-        machine: Vec::new_in(Global),
+        machine: Vec::new_in(root),
         writes,
         reads,
         liveness: super::Liveness::Everything,
@@ -56,8 +61,8 @@ fn value(n: u32) -> Vec<u8> {
 
 /// A writer of boot 1 on a fresh simulation, committing each range of `commits` as one segment
 /// of `LOCAL` (no seal: an unsealed tail): the simulation back, and each commit's segment id.
-fn written(seed: u64, commits: &[std::ops::Range<u32>]) -> (Sim, Vec<u64>) {
-    let mut w = Driven::with(Sim::new(seed, Faults::default()), Path::new("/sim"), cfg(0, 1)).expect("the writer opens");
+fn written(seed: u64, commits: &[std::ops::Range<u32>], root: &Frame) -> (Sim, Vec<u64>) {
+    let mut w = Driven::with(Sim::new(seed, Faults::default()), Path::new("/sim"), cfg(0, 1, root), root).expect("the writer opens");
     let mut ids = Vec::new();
     for range in commits {
         for n in range.clone() {
@@ -71,12 +76,12 @@ fn written(seed: u64, commits: &[std::ops::Range<u32>]) -> (Sim, Vec<u64>) {
 }
 
 /// A reader process (`n`) of `boot` over `sim`, opened lazily, with `plant`.
-fn reader(sim: Sim, n: u64, boot: u64, plant: Plant) -> Driven<Sim> {
-    Driven::planted(sim, Path::new("/sim"), cfg(n, boot), plant).expect("the reader opens")
+fn reader(sim: Sim, n: u64, boot: u64, plant: Plant, root: &Frame) -> Store<'_> {
+    Driven::planted(sim, Path::new("/sim"), cfg(n, boot, root), root, plant).expect("the reader opens")
 }
 
 /// The bytes under `k` through get and got.
-fn read(d: &mut Driven<Sim>, k: &Key) -> Option<Vec<u8>> {
+fn read(d: &mut Store<'_>, k: &Key) -> Option<Vec<u8>> {
     let found = d.get(k).expect("a get with no failure")?;
     Some(d.got(found).bytes.to_vec())
 }
@@ -85,9 +90,10 @@ fn read(d: &mut Driven<Sim>, k: &Key) -> Option<Vec<u8>> {
 /// planted open that maps every row is caught by the "mapped of named" oracle.
 #[test]
 fn the_open_maps_nothing_and_a_get_maps_one_segment() {
+    let root = test_root();
     let mapped = |plant: Plant| {
-        let (sim, _) = written(11, &[0..2, 10..20, 30..35]);
-        let mut r = reader(sim, 1, 1, plant);
+        let (sim, _) = written(11, &[0..2, 10..20, 30..35], &root);
+        let mut r = reader(sim, 1, 1, plant, &root);
         let open = r.mapped_of_named();
         assert_eq!(read(&mut r, &key(15)), Some(value(15)), "record 15");
         (open, r.mapped_of_named())
@@ -107,8 +113,9 @@ fn the_open_maps_nothing_and_a_get_maps_one_segment() {
 /// unchecked returns bytes that are not the record.
 #[test]
 fn a_first_hit_checks_the_crash_tail_and_the_plant_serves_it_torn() {
+    let root = test_root();
     let outcome = |plant: Plant| {
-        let (mut sim, ids) = written(12, &[1..11]);
+        let (mut sim, ids) = written(12, &[1..11], &root);
         let file = FileName::new(&format!("plain/seg-{:016x}", ids[0])).unwrap();
         // The first payload's bytes; the index (past the payloads) is left whole. Through
         // `change`, not `rot`: the writer never synced, and `rot` changes only the durable
@@ -118,7 +125,7 @@ fn a_first_hit_checks_the_crash_tail_and_the_plant_serves_it_torn() {
             torn[HEADER + 3 + at] ^= byte | 0x5a;
         }
         sim.change(&file, &torn);
-        let mut r = reader(sim, 1, 2, plant);
+        let mut r = reader(sim, 1, 2, plant, &root);
         let reads: Vec<Option<Vec<u8>>> = (1..11).map(|n| read(&mut r, &key(n))).collect();
         (reads, r.report().clone(), r.core().checks().full, file)
     };
@@ -138,7 +145,8 @@ fn a_first_hit_checks_the_crash_tail_and_the_plant_serves_it_torn() {
 /// fixed key with a moving value): set twice, it answers the second key whatever the order.
 #[test]
 fn the_largest_segment_is_probed_first_and_a_root_answers_by_name() {
-    let mut w = Driven::with(Sim::new(13, Faults::default()), Path::new("/sim"), cfg(0, 1)).expect("the writer opens");
+    let root = test_root();
+    let mut w = Driven::with(Sim::new(13, Faults::default()), Path::new("/sim"), cfg(0, 1, &root), &root).expect("the writer opens");
     for n in 100..103 {
         w.put(key(n), Namespace::LOCAL, TAG, &value(n)).unwrap();
     }
@@ -150,7 +158,7 @@ fn the_largest_segment_is_probed_first_and_a_root_answers_by_name() {
     let second = w.root("shape", &[key(200)]).unwrap();
     w.commit_with(&[]).unwrap();
     assert_ne!(first, second);
-    let mut r = reader(w.into_driver(), 1, 1, Plant::None);
+    let mut r = reader(w.into_driver(), 1, 1, Plant::None, &root);
     assert_eq!(read(&mut r, &key(201)), Some(value(201)));
     assert_eq!(r.probes().most, 1, "a get in the largest segment probed another first");
     let named: Vec<Key> = r.core().roots().into_iter().filter(|(name, _)| name == "shape").map(|(_, k)| k).collect();
@@ -164,8 +172,9 @@ fn the_largest_segment_is_probed_first_and_a_root_answers_by_name() {
 /// and the store is whole.
 #[test]
 fn a_miss_parks_and_map_all_checks_each_once() {
-    let (sim, _) = written(14, &[1..3, 10..20, 30..35]);
-    let mut r = reader(sim, 1, 2, Plant::None);
+    let root = test_root();
+    let (sim, _) = written(14, &[1..3, 10..20, 30..35], &root);
+    let mut r = reader(sim, 1, 2, Plant::None, &root);
     assert_eq!(read(&mut r, &key(9999)), None);
     let after_miss = (r.mapped_of_named(), r.core().checks().full);
     assert_eq!(after_miss, ((3, 3), 0), "a miss checked a segment");
@@ -189,9 +198,10 @@ fn a_miss_parks_and_map_all_checks_each_once() {
 /// miss as if a power cut took it.
 #[test]
 fn a_holder_that_maps_all_in_the_grace_outlives_the_unlink_and_a_lazy_one_is_refused() {
+    let root = test_root();
     let held = |map_first: bool| {
-        let (sim, ids) = written(16, &[1..4, 10..20, 30..36]);
-        let mut r = reader(sim, 1, 1, Plant::None);
+        let (sim, ids) = written(16, &[1..4, 10..20, 30..36], &root);
+        let mut r = reader(sim, 1, 1, Plant::None, &root);
         if map_first {
             r.driver().advance(std::time::Duration::from_secs(60));
             r.map_all().expect("map_all inside the grace");
@@ -228,12 +238,13 @@ fn a_holder_that_maps_all_in_the_grace_outlives_the_unlink_and_a_lazy_one_is_ref
 /// what it checked even with nothing to seal), the next process of the same boot checks nothing.
 #[test]
 fn a_first_hit_check_is_recorded_for_the_boot() {
-    let (sim, _) = written(15, &[1..6]);
-    let mut r = reader(sim, 1, 2, Plant::None);
+    let root = test_root();
+    let (sim, _) = written(15, &[1..6], &root);
+    let mut r = reader(sim, 1, 2, Plant::None, &root);
     assert_eq!(read(&mut r, &key(3)), Some(value(3)));
     assert_eq!(r.core().checks().full, 1);
     assert!(r.seal().unwrap(), "the check's stamp did not flip");
-    let mut next = reader(r.into_driver(), 2, 2, Plant::None);
+    let mut next = reader(r.into_driver(), 2, 2, Plant::None, &root);
     assert_eq!(read(&mut next, &key(4)), Some(value(4)));
     assert_eq!(next.core().checks().full, 0, "a segment checked once this boot was checked again");
     println!("first-hit check recorded: the next process of the boot checked 0");

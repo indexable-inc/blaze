@@ -20,7 +20,7 @@
 
 use core::fmt;
 use core::marker::PhantomData;
-use std::alloc::{Allocator, Global};
+use std::alloc::Allocator;
 
 use blaze_cas::Key as CasKey;
 use blaze_own::Alloc;
@@ -99,8 +99,9 @@ pub struct Facts {
     pub nonce: u64,
 }
 
-/// The plain store's configuration for the folder `dir` (as the driver names it).
-pub(crate) fn config(dir: FileName, settings: &Settings, facts: Facts) -> PlainConfig {
+/// The plain store's configuration for the folder `dir` (as the driver names it), its lists in
+/// `alloc`, the store's.
+pub(crate) fn config(dir: FileName, settings: &Settings, facts: Facts, alloc: StoreAlloc) -> PlainConfig<StoreAlloc> {
     PlainConfig {
         dir,
         tags: STORE_TAGS,
@@ -110,9 +111,9 @@ pub(crate) fn config(dir: FileName, settings: &Settings, facts: Facts) -> PlainC
         nonce: facts.nonce,
         durable: settings.durable,
         // The caller adds the checkout's and the home's spellings ([`PlainPlace::machine`]).
-        machine: Vec::new_in(Global),
-        writes: settings.writes(),
-        reads: settings.reads(),
+        machine: Vec::new_in(alloc),
+        writes: settings.writes(alloc),
+        reads: settings.reads(alloc),
         // Everything, until the switch to the engine path (plan row D5) turns the sweep on:
         // `Reached`, which keeps what the roots reach and what a running command's lease keeps.
         // On the engine path every record a later command reads by key is reached now
@@ -131,9 +132,9 @@ pub(crate) fn config(dir: FileName, settings: &Settings, facts: Facts) -> PlainC
 
 /// The store opened lazily over `driver` (nothing mapped: a segment is mapped at its first
 /// probe), owned by a [`Lent`] whose arena is in `alloc`, the caller's (rule 75).
-pub fn open<D: Driver>(driver: D, cfg: PlainConfig, alloc: StoreAlloc) -> Result<Lent<D, StoreAlloc>, PlaceError> {
+pub fn open<D: Driver>(driver: D, cfg: PlainConfig<StoreAlloc>, alloc: StoreAlloc) -> Result<Lent<D, StoreAlloc>, PlaceError> {
     // The root path is read only by the native pread path, which this module never takes.
-    let store = Driven::with(driver, std::path::Path::new("/"), cfg).map_err(|why| PlaceError::Open { why })?;
+    let store = Driven::with(driver, std::path::Path::new("/"), cfg, alloc).map_err(|why| PlaceError::Open { why })?;
     Ok(Lent::new(store, alloc))
 }
 

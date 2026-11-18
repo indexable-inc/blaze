@@ -118,9 +118,43 @@ pub struct RecorderOpts<'a> {
     pub alloc: Alloc<'a>,
 }
 
+/// What a recorder was offered and what it kept (the Bodies stage's reads line, blaze-cli
+/// engine_bodies.rs): `offered` every read put, repeats too; `kept` the distinct ones, the
+/// list [`Recorder::finish`] sorts; `sort_compares` the compares that sort made. A body that
+/// resolves hundreds of paths in a handful of scopes offers thousands and keeps tens.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct ReadTally {
+    pub offered: u64,
+    pub kept: u64,
+    pub sort_compares: u64,
+}
+
+impl ReadTally {
+    /// Both summed, saturating (the stage sums its bodies').
+    pub fn add(&mut self, other: ReadTally) {
+        self.offered = self.offered.saturating_add(other.offered);
+        self.kept = self.kept.saturating_add(other.kept);
+        self.sort_compares = self.sort_compares.saturating_add(other.sort_compares);
+    }
+}
+
 /// One task's reads (module docs).
+///
+/// A read is kept once, when first offered: the common case is the SAME cell read again and
+/// again (every path of a body resolved through a handful of scopes, each lookup logging the
+/// cell it read: blaze-scope names_cells.rs `Logged`), so a repeat costs one compare against
+/// the last read, or one probe of `seen`, and is never pushed. Before (tempo, 2026-11-17, a
+/// stack sample of `engine-check`): every offer was pushed and the whole tape, repeats and all,
+/// sorted at the end: 538 samples in `read`, 265 in the sort's compares.
 pub struct Recorder<'a> {
+    /// The distinct reads, in the order first offered; sorted once at [`Recorder::finish`].
     reads: RefCell<AVec<'a, TableRead>>,
+    /// Every read in `reads`, for the repeat's O(1) answer; in the recorder's allocator.
+    seen: RefCell<blaze_hash::HashSet<TableRead, Alloc<'a>>>,
+    /// The read offered last: a run of one cell is answered by this compare alone.
+    last: Cell<Option<TableRead>>,
+    /// Reads offered (repeats too), past a planted drop.
+    offered: Cell<u64>,
     full: Cell<bool>,
     /// A test's planted bug: reads of this cell are dropped ([`Recorder::plant_drop`]).
     dropped: Cell<Option<NameCell>>,
@@ -128,7 +162,19 @@ pub struct Recorder<'a> {
 
 impl<'a> Recorder<'a> {
     pub fn new(opts: RecorderOpts<'a>) -> Recorder<'a> {
-        Recorder { reads: RefCell::new(AVec::new_in(opts.alloc)), full: Cell::new(false), dropped: Cell::new(None) }
+        Recorder {
+            reads: RefCell::new(AVec::new_in(opts.alloc)),
+            seen: RefCell::new(blaze_hash::HashSet::new_in(opts.alloc)),
+            last: Cell::new(None),
+            offered: Cell::new(0),
+            full: Cell::new(false),
+            dropped: Cell::new(None),
+        }
+    }
+
+    /// What was offered and kept so far ([`ReadTally`]; `sort_compares` is 0 before the sort).
+    pub fn tally(&self) -> ReadTally {
+        ReadTally { offered: self.offered.get(), kept: self.reads.borrow().len() as u64, sort_compares: 0 }
     }
 
     /// PLANTED BUG, for tests only: every read of `cell` is dropped from now on, as a view
@@ -165,13 +211,26 @@ impl<'a> Recorder<'a> {
 
     /// The task's reads, sorted and each once: the one sort of the task (rule 25).
     pub fn finish(self) -> Result<AVec<'a, TableRead>, ReadsFull> {
+        self.finish_tallied().map(|(reads, _)| reads)
+    }
+
+    /// [`Recorder::finish`] with what was offered, kept and compared ([`ReadTally`]). The list
+    /// holds each read once already (`seen`), so the sort is of the distinct reads alone.
+    pub fn finish_tallied(self) -> Result<(AVec<'a, TableRead>, ReadTally), ReadsFull> {
         if self.full.get() {
             return Err(ReadsFull { most: MOST_READS });
         }
+        let offered = self.offered.get();
         let mut reads = self.reads.into_inner();
-        reads.sort_unstable();
+        let compares = Cell::new(0u64);
+        reads.sort_unstable_by(|a, b| {
+            compares.set(compares.get() + 1);
+            a.cmp(b)
+        });
+        // Each once by `seen`; kept as the guard of the list's form (rule 25), a no-op.
         reads.dedup();
-        Ok(reads)
+        let tally = ReadTally { offered, kept: reads.len() as u64, sort_compares: compares.get() };
+        Ok((reads, tally))
     }
 }
 
@@ -182,11 +241,22 @@ impl ReadSink for Recorder<'_> {
         {
             return;
         }
+        self.offered.set(self.offered.get().saturating_add(1));
+        // The run of one cell: answered by one compare.
+        if self.last.get() == Some(read) {
+            return;
+        }
+        self.last.set(Some(read));
+        let mut seen = self.seen.borrow_mut();
+        if seen.contains(&read) {
+            return;
+        }
         let mut reads = self.reads.borrow_mut();
         if reads.len() >= MOST_READS {
             self.full.set(true);
             return;
         }
+        seen.insert(read);
         reads.push(read);
     }
 }

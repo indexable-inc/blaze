@@ -313,7 +313,7 @@ struct PutAt {
 }
 
 struct Inner<D: Driver, A: Allocator + Clone> {
-    store: Driven<D>,
+    store: Driven<D, A>,
     /// Each chunk made at its capacity and never pushed past it: its buffer never moves.
     chunks: Vec<Vec<Block, A>, A>,
     /// Each chunk's: whether a get lent bytes of it. A chunk that lent is kept to the `Lent`'s
@@ -366,11 +366,11 @@ fn block_bytes(blocks: &[Block], len: usize) -> &[u8] {
 
 impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// The owner over an opened store (lazy: [`Driven::with`]); the arena in `alloc`.
-    pub fn new(store: Driven<D>, alloc: A) -> Lent<D, A> {
+    pub fn new(store: Driven<D, A>, alloc: A) -> Lent<D, A> {
         Lent::planted(store, alloc, LentPlant::None)
     }
 
-    pub(crate) fn planted(store: Driven<D>, alloc: A, plant: LentPlant) -> Lent<D, A> {
+    pub(crate) fn planted(store: Driven<D, A>, alloc: A, plant: LentPlant) -> Lent<D, A> {
         let inner = Inner {
             store,
             chunks: Vec::new_in(alloc.clone()),
@@ -656,14 +656,14 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     }
 
     /// The roots the generation this store holds names: `(name, record key)`.
-    pub fn roots(&self) -> Vec<(String, Key)> {
+    pub fn roots(&self) -> Vec<(String, Key), A> {
         self.inner.borrow().store.core().roots()
     }
 
     /// What is not yet committed, one segment per namespace, one flip (a whole store: the
     /// commit maps what is left first). Then every arena chunk no get lent from is freed and
     /// its puts are read from the segment; what it lent stays lent (`lend`'s contract).
-    pub fn commit(&self) -> Result<Committed, LentError> {
+    pub fn commit(&self) -> Result<Committed<A>, LentError> {
         let mut inner = self.inner.borrow_mut();
         let inner = &mut *inner;
         if self.plant == LentPlant::RootFirst {
@@ -730,7 +730,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     }
 
     /// After the answer: at most `slices` compaction slices (`Driven::compact`).
-    pub fn compact(&self, slices: u32) -> Result<Vec<Sliced>, LentError> {
+    pub fn compact(&self, slices: u32) -> Result<Vec<Sliced, A>, LentError> {
         self.inner.borrow_mut().store.compact(slices).map_err(stopped("compacting"))
     }
 
@@ -769,13 +769,13 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
 
     /// Every root the generation this store holds names, with its expiry (wall ns): the
     /// command's cleanup line counts the unexpired ones (`Plain::roots_expiring`).
-    pub fn roots_expiring(&self) -> Vec<(String, Key, u64)> {
+    pub fn roots_expiring(&self) -> Vec<(String, Key, u64), A> {
         self.inner.borrow().store.core().roots_expiring()
     }
 
     /// The leases the generation this store holds names, `(holder, expires wall ns)`
     /// (`Plain::leases`).
-    pub fn leases(&self) -> Vec<(u64, u64)> {
+    pub fn leases(&self) -> Vec<(u64, u64), A> {
         self.inner.borrow().store.core().leases()
     }
 
@@ -828,7 +828,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// The store lent to `read` by shared reference for the call alone: what a snapshot
     /// (snapshot.rs, `Lent::snapshot_in`) is taken from. Never `&mut`: `read` cannot replace the
     /// store or drop a mapping (the module's docs), and nothing it gets outlives the call.
-    pub(crate) fn store_with<T>(&self, read: impl FnOnce(&Driven<D>) -> T) -> T {
+    pub(crate) fn store_with<T>(&self, read: impl FnOnce(&Driven<D, A>) -> T) -> T {
         read(&self.inner.borrow().store)
     }
 
@@ -839,7 +839,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     }
 
     /// The store back, every lend ended (by value: no borrow of `self` is alive).
-    pub fn into_store(self) -> Driven<D> {
+    pub fn into_store(self) -> Driven<D, A> {
         self.inner.into_inner().store
     }
 }

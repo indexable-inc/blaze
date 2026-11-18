@@ -13,7 +13,7 @@
 //! pointer not last). A cut before the second phase's commit leaves an answer standing whose
 //! second phase's records are gone, which the oracle sees.
 
-use std::{alloc::Global, path::Path};
+use std::path::Path;
 
 use blaze_core::{
     FileName,
@@ -38,10 +38,10 @@ const TAG: Tag = Tag(1);
 /// Two phases of eight records each.
 const PHASES: [core::ops::Range<u32>; 2] = [0..8, 8..16];
 
-fn cfg(n: u64) -> PlainConfig {
-    let mut writes = Vec::new_in(Global);
+fn cfg(n: u64, root: &Frame) -> PlainConfig<&Frame> {
+    let mut writes = Vec::new_in(root);
     writes.push(Namespace::LOCAL);
-    let mut reads = Vec::new_in(Global);
+    let mut reads = Vec::new_in(root);
     reads.push(Namespace::LOCAL);
     PlainConfig {
         dir: FileName::new("plain").expect("a name"),
@@ -51,7 +51,7 @@ fn cfg(n: u64) -> PlainConfig {
         nonce: 900 + n,
         // A power cut is part of the claim, so the commit syncs (as pointer_tests.rs).
         durable: true,
-        machine: Vec::new_in(Global),
+        machine: Vec::new_in(root),
         writes,
         reads,
         liveness: super::Liveness::Everything,
@@ -59,7 +59,7 @@ fn cfg(n: u64) -> PlainConfig {
 }
 
 fn process(sim: Sim, n: u64, root: &Frame) -> Store<'_> {
-    Lent::planted(Driven::planted(sim, Path::new("/sim"), cfg(n), Plant::None).expect("the store opens"), root, LentPlant::None)
+    Lent::planted(Driven::planted(sim, Path::new("/sim"), cfg(n, root), root, Plant::None).expect("the store opens"), root, LentPlant::None)
 }
 
 fn record(n: u32) -> Key {

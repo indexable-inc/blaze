@@ -20,6 +20,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use blaze_expand::{HostAsk, HostError, HostWhy, MacroDefinition, ProcCall, ProcKind, Produced, Reads, TokenKind, TokenOrigin, Transparency, lex};
 use blaze_id::{ContentId, CrateItemKey};
+use blaze_mem::{Root, RootOpts};
 use blaze_own::{AVec, Alloc};
 use blaze_surface::{Edition, Namespace, PathKind};
 use blaze_unit_graph::{Implicit, Prelude, StdIs};
@@ -30,8 +31,11 @@ use crate::names::Written;
 use crate::resolve::{AttrPlant, CrateInput, ExpandNote, Names, NamesNote, SourceTexts, resolve_crates};
 use crate::task::Serial;
 
-fn heap() -> Alloc<'static> {
-    blaze_own::testing::heap().alloc()
+/// The test's root heap, made at its top; the names resolved borrow it, and its drop checks
+/// nothing was leaked.
+fn root() -> Root {
+    // The names resolution keeps what it makes for its arena's life (`TEST_ARENA`).
+    Root::new(RootOpts::TEST_ARENA).unwrap_or_else(|e| panic!("the test's root: {e}"))
 }
 
 /// The proc-macro crate: one attribute macro, `mark`.
@@ -97,8 +101,8 @@ struct World {
 
 const FILES: [&[(&str, &str)]; 3] = [&[("/user/lib.rs", USER)], &[("/sdk/lib.rs", SDK)], &[("/macros/lib.rs", MACROS)]];
 
-impl SourceTexts<'static> for World {
-    fn read(&self, krate: usize, path: &str) -> Option<&'static str> {
+impl<'r> SourceTexts<'r> for World {
+    fn read(&self, krate: usize, path: &str) -> Option<&'r str> {
         FILES.get(krate)?.iter().find(|(p, _)| *p == path).map(|(_, t)| *t)
     }
 
@@ -136,23 +140,24 @@ impl SourceTexts<'static> for World {
     }
 }
 
-/// The three crates resolved under `plant`, and the world that ran `mark`.
-fn solve(plant: AttrPlant) -> (Names<'static>, World) {
+/// The three crates resolved under `plant` into `root`, and the world that ran `mark`.
+fn solve(root: &Root, plant: AttrPlant) -> (Names<'_>, World) {
     let world = World { plant, ran: AtomicU32::new(0), clean: AtomicU32::new(0) };
     let macros = input("macros", "/macros/lib.rs", &[]);
     let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false };
     let crates = [input("user", "/user/lib.rs", &[("sdk", SDK_CRATE)]), input("sdk", "/sdk/lib.rs", &[("macros", MACROS_CRATE)]), CrateInput { implicit, ..macros }];
-    let names = resolve_crates(&crates, Sysroot::default(), &world, &Serial, heap()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &world, &Serial, root.alloc()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     (names, world)
 }
 
-/// Whether `name` is declared in the value namespace of `krate`'s root.
-fn declared(names: &Names<'static>, krate: usize, name: &str) -> bool {
-    names.item_at(names.root(krate), Namespace::Values, Written { kind: PathKind::Plain, segments: &[name] }, heap()).is_ok()
+/// Whether `name` is declared in the value namespace of `krate`'s root, the lookup's scratch in
+/// `alloc`.
+fn declared(names: &Names<'_>, krate: usize, name: &str, alloc: Alloc<'_>) -> bool {
+    names.item_at(names.root(krate), Namespace::Values, Written { kind: PathKind::Plain, segments: &[name] }, alloc).is_ok()
 }
 
 /// The names of the attribute calls of `krate` refused as not among their item's attributes.
-fn not_found<'n>(names: &'n Names<'static>, krate: usize) -> impl Iterator<Item = &'static str> + 'n {
+fn not_found<'n, 'r>(names: &'n Names<'r>, krate: usize) -> impl Iterator<Item = &'r str> + 'n {
     names.notes(krate).iter().filter_map(|note| match note {
         NamesNote::Expand { note: ExpandNote::AttrNotFound { name }, .. } => Some(*name),
         _ => None,
@@ -174,12 +179,13 @@ fn bit(name: &str) -> u32 {
 /// [`the_planted_spelling_match_refuses_the_macro_written_attribute`]).
 #[test]
 fn a_dollar_crate_attribute_a_macro_writes_in_its_own_crate_is_found_and_run() {
-    let (names, world) = solve(AttrPlant::None);
+    let root = root();
+    let (names, world) = solve(&root, AttrPlant::None);
     assert_eq!(not_found(&names, SDK_CRATE).count(), 0, "no attribute call of the sdk is refused: notes {:?}", names.notes(SDK_CRATE));
     assert_ne!(world.ran.load(Ordering::Relaxed) & bit("A"), 0, "`mark` ran on `A`: notes {:?}", names.notes(SDK_CRATE));
     assert_ne!(world.clean.load(Ordering::Relaxed) & bit("A"), 0, "`mark`'s input is `A` without its attribute");
-    assert!(declared(&names, SDK_CRATE, "A_MARKED"), "the output is declared: notes {:?}", names.notes(SDK_CRATE));
-    assert!(!declared(&names, SDK_CRATE, "A"), "the output replaces the item");
+    assert!(declared(&names, SDK_CRATE, "A_MARKED", root.alloc()), "the output is declared: notes {:?}", names.notes(SDK_CRATE));
+    assert!(!declared(&names, SDK_CRATE, "A", root.alloc()), "the output replaces the item");
 }
 
 /// Rule (b): the same macro called from another crate: `$crate` names the sdk (the defining
@@ -187,11 +193,12 @@ fn a_dollar_crate_attribute_a_macro_writes_in_its_own_crate_is_found_and_run() {
 /// run, and `B_MARKED` is declared in the calling crate's root in place of `B`.
 #[test]
 fn a_dollar_crate_attribute_written_for_another_crate_is_found_and_run() {
-    let (names, world) = solve(AttrPlant::None);
+    let root = root();
+    let (names, world) = solve(&root, AttrPlant::None);
     assert_eq!(not_found(&names, USER_CRATE).count(), 0, "no attribute call of the user is refused: notes {:?}", names.notes(USER_CRATE));
     assert_ne!(world.ran.load(Ordering::Relaxed) & bit("B"), 0, "`mark` ran on `B`: notes {:?}", names.notes(USER_CRATE));
-    assert!(declared(&names, USER_CRATE, "B_MARKED"), "the output is declared where the call stands: notes {:?}", names.notes(USER_CRATE));
-    assert!(!declared(&names, USER_CRATE, "B"), "the output replaces the item");
+    assert!(declared(&names, USER_CRATE, "B_MARKED", root.alloc()), "the output is declared where the call stands: notes {:?}", names.notes(USER_CRATE));
+    assert!(!declared(&names, USER_CRATE, "B", root.alloc()), "the output replaces the item");
 }
 
 /// Rule (c): with a `#[doc = ..]` written before the macro-written `#[$crate::attrs::mark]`, and
@@ -199,14 +206,15 @@ fn a_dollar_crate_attribute_written_for_another_crate_is_found_and_run() {
 /// `#[doc]` and no `mark`, and both outputs are declared.
 #[test]
 fn the_macro_written_attribute_is_found_among_two_in_either_order() {
-    let (names, world) = solve(AttrPlant::None);
+    let root = root();
+    let (names, world) = solve(&root, AttrPlant::None);
     let (ran, clean) = (world.ran.load(Ordering::Relaxed), world.clean.load(Ordering::Relaxed));
     for name in ["C", "D"] {
         assert_ne!(ran & bit(name), 0, "`mark` ran on `{name}`: notes {:?}", names.notes(USER_CRATE));
         assert_ne!(clean & bit(name), 0, "`{name}`'s input keeps the `#[doc]` and loses `mark`");
     }
-    assert!(declared(&names, USER_CRATE, "C_MARKED"), "`C`'s output is declared (doc first)");
-    assert!(declared(&names, USER_CRATE, "D_MARKED"), "`D`'s output is declared (mark first)");
+    assert!(declared(&names, USER_CRATE, "C_MARKED", root.alloc()), "`C`'s output is declared (doc first)");
+    assert!(declared(&names, USER_CRATE, "D_MARKED", root.alloc()), "`D`'s output is declared (mark first)");
 }
 
 /// Rule (d): the macro writes the static inside `const _: () = { .. };`: the attribute call on
@@ -218,7 +226,8 @@ fn the_macro_written_attribute_is_found_among_two_in_either_order() {
 #[test]
 #[ignore = "OPEN (2026-11-17): no attribute call is refused, but `mark` never ran on `E`: a static a macro writes inside `const _: () = { .. };` is the body layer's item (blaze-lower driver.rs resolves an attribute there by text plus a mark), not this resolve's: the next piece"]
 fn the_macro_written_attribute_in_a_const_block_is_found_and_run() {
-    let (names, world) = solve(AttrPlant::None);
+    let root = root();
+    let (names, world) = solve(&root, AttrPlant::None);
     assert_eq!(not_found(&names, USER_CRATE).count(), 0, "no attribute call of the user is refused: notes {:?}", names.notes(USER_CRATE));
     assert_ne!(world.ran.load(Ordering::Relaxed) & bit("E"), 0, "`mark` ran on `E` in the const block: notes {:?}", names.notes(USER_CRATE));
     assert_ne!(world.clean.load(Ordering::Relaxed) & bit("E"), 0, "`E`'s input lost its attribute");
@@ -228,13 +237,14 @@ fn the_macro_written_attribute_in_a_const_block_is_found_and_run() {
 /// sdk's file, are found and run as before.
 #[test]
 fn the_source_forms_are_found_and_run() {
-    let (names, world) = solve(AttrPlant::None);
+    let root = root();
+    let (names, world) = solve(&root, AttrPlant::None);
     let ran = world.ran.load(Ordering::Relaxed);
     for name in ["P", "Q"] {
         assert_ne!(ran & bit(name), 0, "`mark` ran on `{name}`: notes {:?}", names.notes(SDK_CRATE));
     }
-    assert!(declared(&names, SDK_CRATE, "P_MARKED"), "`P`'s output is declared");
-    assert!(declared(&names, SDK_CRATE, "Q_MARKED"), "`Q`'s output is declared");
+    assert!(declared(&names, SDK_CRATE, "P_MARKED", root.alloc()), "`P`'s output is declared");
+    assert!(declared(&names, SDK_CRATE, "Q_MARKED", root.alloc()), "`Q`'s output is declared");
 }
 
 /// Rule 23 (f): the planted switch restores the old match (the path's text, spaces taken out):
@@ -244,11 +254,12 @@ fn the_source_forms_are_found_and_run() {
 /// the cause is the `$crate` the expansion wrote, not the walk.
 #[test]
 fn the_planted_spelling_match_refuses_the_macro_written_attribute() {
-    let (names, world) = solve(AttrPlant::Spelling);
+    let root = root();
+    let (names, world) = solve(&root, AttrPlant::Spelling);
     let refused = not_found(&names, SDK_CRATE).find(|name| name.chars().filter(|c| !c.is_whitespace()).eq("crate::attrs::mark".chars()));
     assert!(refused.is_some(), "the plant refuses `crate::attrs::mark` as not among the item's attributes: notes {:?}", names.notes(SDK_CRATE));
     let ran = world.ran.load(Ordering::Relaxed);
     assert_eq!(ran & bit("A"), 0, "under the plant `mark` never runs on `A`");
-    assert!(!declared(&names, SDK_CRATE, "A_MARKED"), "under the plant `A`'s output is not declared");
+    assert!(!declared(&names, SDK_CRATE, "A_MARKED", root.alloc()), "under the plant `A`'s output is not declared");
     assert_ne!(ran & bit("P"), 0, "control: the source form `#[attrs::mark]` is still found under the plant");
 }

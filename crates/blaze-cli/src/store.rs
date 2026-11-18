@@ -520,7 +520,7 @@ impl Home {
     pub fn open_store(&self, settings: &Settings, facts: Facts, alloc: StoreAlloc) -> Result<Lent<bstd::io::LentDriver, StoreAlloc>, CliError> {
         let driver = self.dir.lend(&Path::new(plain_place::STORE_DIR)?);
         let dir = driver.dir().clone();
-        Ok(plain_place::open(driver, plain_place::config(dir, settings, facts), alloc)?)
+        Ok(plain_place::open(driver, plain_place::config(dir, settings, facts, alloc), alloc)?)
     }
 }
 

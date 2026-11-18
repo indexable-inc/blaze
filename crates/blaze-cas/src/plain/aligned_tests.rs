@@ -7,7 +7,7 @@
 //! planted control (`Plant::Unpadded`) lays a commit's payloads end to end: a recovery reads a
 //! record misaligned or refused.
 
-use std::{alloc::Global, path::Path};
+use std::path::Path;
 
 use blaze_core::{
     FileName,
@@ -30,10 +30,10 @@ type Store<'f> = Lent<Sim, &'f Frame>;
 
 const TAG: Tag = Tag(1);
 
-fn cfg(n: u64) -> PlainConfig {
-    let mut writes = Vec::new_in(Global);
+fn cfg(n: u64, root: &Frame) -> PlainConfig<&Frame> {
+    let mut writes = Vec::new_in(root);
     writes.push(Namespace::LOCAL);
-    let mut reads = Vec::new_in(Global);
+    let mut reads = Vec::new_in(root);
     reads.push(Namespace::LOCAL);
     PlainConfig {
         dir: FileName::new("plain").expect("a name"),
@@ -43,7 +43,7 @@ fn cfg(n: u64) -> PlainConfig {
         nonce: 1100 + n,
         // A power cut is part of the claim, so the commit syncs (as root_commit_tests.rs).
         durable: true,
-        machine: Vec::new_in(Global),
+        machine: Vec::new_in(root),
         writes,
         reads,
         liveness: Liveness::Everything,
@@ -61,7 +61,7 @@ fn value(n: u32) -> Vec<u8> {
 }
 
 fn process(sim: Sim, n: u64, core: Plant, root: &Frame) -> Store<'_> {
-    Lent::planted(Driven::planted(sim, Path::new("/sim"), cfg(n), core).expect("the store opens"), root, LentPlant::None)
+    Lent::planted(Driven::planted(sim, Path::new("/sim"), cfg(n, root), root, core).expect("the store opens"), root, LentPlant::None)
 }
 
 fn command(lent: &Store<'_>, range: std::ops::Range<u32>) -> Result<(), super::lent::LentError> {

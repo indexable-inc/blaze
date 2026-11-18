@@ -61,9 +61,10 @@ fn dir() -> FileName {
 
 /// One process's store, as `open_for_command` opens it but with the reach sweep on.
 fn process(sim: Sim, n: u64) -> Lent<Sim, StoreAlloc> {
-    let mut cfg = config(dir(), &StoreSettings::default(), Facts { boot: Some(1), nonce: 7300 + n });
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut cfg = config(dir(), &StoreSettings::default(), Facts { boot: Some(1), nonce: 7300 + n }, alloc);
     cfg.liveness = Liveness::Reached;
-    open(sim, cfg, blaze_own::testing::heap().alloc()).expect("the store opens")
+    open(sim, cfg, alloc).expect("the store opens")
 }
 
 fn back(lent: Lent<Sim, StoreAlloc>) -> Sim {

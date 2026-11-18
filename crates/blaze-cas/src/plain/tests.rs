@@ -26,7 +26,7 @@
 //! The controls (`the_oracle_catches_*`) plant one bug each and show the oracle fails.
 
 use std::{
-    alloc::Global,
+    alloc::{Allocator, Global},
     collections::{BTreeMap, BTreeSet},
     path::Path,
     time::Duration,
@@ -43,6 +43,7 @@ use blaze_keyed::{
     kind::{Namespace, Tag, Tier},
     store::{ENTRY, FOOTER, HEADER, Located, Put, Refused, SegmentId, SegmentLen, SegmentRef, Source, Statement, StoreError, Verifier},
 };
+use blaze_mem::Frame;
 use blaze_sim::{Config as SimConfig, Tape};
 
 use super::{
@@ -50,6 +51,7 @@ use super::{
     driven::{Cut, Driven, LocalDir},
     format::{self, Entry, FORMAT, SEGMENT_FORMAT, Slot, check_segment, seal_segment},
     handle::{LaneId, PlainStore},
+    test_root,
 };
 use crate::Key;
 
@@ -83,8 +85,30 @@ fn space(n: u32) -> Namespace {
     writes()[n as usize % 3]
 }
 
-fn cfg(n: u64, boot: u64, durable: bool) -> PlainConfig {
-    PlainConfig { dir: dir(), tags: n * TAGS, cap_bytes: u64::MAX, boot, nonce: 100 + n, durable, machine: vec![MACHINE.to_vec()], writes: writes(), reads: reads(), liveness: super::Liveness::Everything }
+/// `list`, its tables in `root`.
+fn spaces_in(list: Vec<Namespace>, root: &Frame) -> Vec<Namespace, &Frame> {
+    let mut out = Vec::with_capacity_in(list.len(), root);
+    out.extend(list);
+    out
+}
+
+fn cfg(n: u64, boot: u64, durable: bool, root: &Frame) -> PlainConfig<&Frame> {
+    let mut path = Vec::with_capacity_in(MACHINE.len(), root);
+    path.extend_from_slice(MACHINE);
+    let mut machine = Vec::with_capacity_in(1, root);
+    machine.push(path);
+    PlainConfig {
+        dir: dir(),
+        tags: n * TAGS,
+        cap_bytes: u64::MAX,
+        boot,
+        nonce: 100 + n,
+        durable,
+        machine,
+        writes: spaces_in(writes(), root),
+        reads: spaces_in(reads(), root),
+        liveness: super::Liveness::Everything,
+    }
 }
 
 fn key(n: u32) -> Key {
@@ -96,8 +120,9 @@ fn value(n: u32) -> Vec<u8> {
     (0..len).map(|i| (n as usize).wrapping_mul(31).wrapping_add(i) as u8).collect()
 }
 
-struct Actor {
-    store: Plain,
+struct Actor<'f> {
+    /// The process's store, its tables in the run's frame.
+    store: Plain<&'f Frame>,
     effects: Vec<Effect>,
     /// The test's own failure: one effect of this kind fails, once, after this actor's flip
     /// wrote its slot (the commit point), so the generation that retires the losses its open
@@ -144,13 +169,13 @@ fn kind_of(effect: &Effect) -> Kind {
     }
 }
 
-impl Actor {
-    fn new(cfg: PlainConfig, plant: Plant) -> Actor {
-        Actor::injecting(cfg, plant, None)
+impl<'f> Actor<'f> {
+    fn new(cfg: PlainConfig<&'f Frame>, root: &'f Frame, plant: Plant) -> Actor<'f> {
+        Actor::injecting(cfg, root, plant, None)
     }
 
-    fn injecting(cfg: PlainConfig, plant: Plant, inject: Option<Place>) -> Actor {
-        let mut store = Plain::planted(cfg, plant);
+    fn injecting(cfg: PlainConfig<&'f Frame>, root: &'f Frame, plant: Plant, inject: Option<Place>) -> Actor<'f> {
+        let mut store = Plain::planted(cfg, root, plant);
         let mut effects = Vec::new_in(Global);
         store.open_whole(&mut effects);
         Actor { store, effects, inject, armed: false, fired: false, kinds: BTreeMap::new() }
@@ -186,14 +211,14 @@ fn injected(why: &StoreError) -> bool {
 
 /// Runs until nothing is in flight, or `budget` completions have been taken (then `false`: the
 /// caller cuts the power). Bounded: a run that does not settle in a million polls fails.
-fn run(sim: &mut Sim, actors: &mut [Actor], budget: &mut Option<u32>) -> bool {
+fn run(sim: &mut Sim, actors: &mut [Actor<'_>], budget: &mut Option<u32>) -> bool {
     run_traced(sim, actors, budget, &mut 0, &mut None)
 }
 
 /// [`run`], each effect asked and each completion taken written to `trace` when there is one.
 /// The trace only observes: every statement of the untraced run is the same, in the same
 /// order, and the trace reads (never takes) what the run holds.
-fn run_traced(sim: &mut Sim, actors: &mut [Actor], budget: &mut Option<u32>, taken: &mut u32, trace: &mut Option<Trace>) -> bool {
+fn run_traced(sim: &mut Sim, actors: &mut [Actor<'_>], budget: &mut Option<u32>, taken: &mut u32, trace: &mut Option<Trace>) -> bool {
     let mut done: Vec<Completion> = Vec::new_in(Global);
     for _ in 0..1_000_000 {
         for (i, actor) in actors.iter_mut().enumerate() {
@@ -244,7 +269,7 @@ fn run_traced(sim: &mut Sim, actors: &mut [Actor], budget: &mut Option<u32>, tak
     panic!("the simulation did not settle in a million polls");
 }
 
-fn settle(sim: &mut Sim, actors: &mut [Actor]) {
+fn settle(sim: &mut Sim, actors: &mut [Actor<'_>]) {
     assert!(run(sim, actors, &mut None));
 }
 
@@ -270,20 +295,20 @@ fn wait(sim: &mut Sim, after: Duration) {
 /// A reader of `boot` with `plant`, opened again while an injected failure breaks its open (a
 /// new process each time: the store never retries itself). Its open returned, so its report
 /// was handed ([`Plain::handed`]): what `Driven::with` does as it returns.
-fn reader_with(sim: &mut Sim, n: u64, boot: u64, plant: Plant) -> Actor {
-    reader_traced(sim, n, boot, plant, None, &mut 0, &mut None)
+fn reader_with<'f>(sim: &mut Sim, n: u64, boot: u64, plant: Plant, root: &'f Frame) -> Actor<'f> {
+    reader_traced(sim, n, boot, plant, None, &mut 0, &mut None, root)
 }
 
 /// [`reader_with`], each attempt's effects and what its open found written to `trace`; the
 /// first attempt fails one effect at `inject` after its flip's slot lands (durable when that is
 /// the head's sync).
-fn reader_traced(sim: &mut Sim, n: u64, boot: u64, plant: Plant, inject: Option<Place>, taken: &mut u32, trace: &mut Option<Trace>) -> Actor {
+fn reader_traced<'f>(sim: &mut Sim, n: u64, boot: u64, plant: Plant, inject: Option<Place>, taken: &mut u32, trace: &mut Option<Trace>, root: &'f Frame) -> Actor<'f> {
     let durable = inject == Some(Place::HeadSync);
     for attempt in 0..50 {
         if let Some(trace) = trace {
             trace.cast = vec![format!("reader {n} attempt {attempt}")];
         }
-        let mut it = [Actor::injecting(cfg(n, boot, durable), plant, if attempt == 0 { inject } else { None })];
+        let mut it = [Actor::injecting(cfg(n, boot, durable, root), root, plant, if attempt == 0 { inject } else { None })];
         assert!(run_traced(sim, &mut it, &mut None, taken, trace));
         let [mut it] = it;
         if let Some(trace) = trace {
@@ -303,7 +328,7 @@ fn reader_traced(sim: &mut Sim, n: u64, boot: u64, plant: Plant, inject: Option<
 /// The flip that clears the marks of the losses `actor`'s handed report named, run (none when
 /// it named none): whether the marks are cleared (`false`: an injected failure stopped it, and
 /// the marks stay for the next open to report again).
-fn acknowledged(sim: &mut Sim, actor: &mut Actor, taken: &mut u32, trace: &mut Option<Trace>) -> bool {
+fn acknowledged(sim: &mut Sim, actor: &mut Actor<'_>, taken: &mut u32, trace: &mut Option<Trace>) -> bool {
     if !actor.store.acknowledge(&mut actor.effects) {
         return true;
     }
@@ -319,14 +344,14 @@ fn acknowledged(sim: &mut Sim, actor: &mut Actor, taken: &mut u32, trace: &mut O
 
 /// A reader that opened, handed its report and cleared the marks it named: a process that
 /// read the store and made no flip of its own ([`Driven::acknowledge`]).
-fn reader(sim: &mut Sim, n: u64, boot: u64) -> Actor {
-    let mut it = reader_with(sim, n, boot, Plant::None);
+fn reader<'f>(sim: &mut Sim, n: u64, boot: u64, root: &'f Frame) -> Actor<'f> {
+    let mut it = reader_with(sim, n, boot, Plant::None, root);
     assert!(acknowledged(sim, &mut it, &mut 0, &mut None), "no failure is injected here");
     it
 }
 
 /// The segments a report names lost.
-fn named_lost(store: &Plain) -> BTreeSet<u64> {
+fn named_lost<A: Allocator + Clone>(store: &Plain<A>) ->BTreeSet<u64> {
     store.report().lost.iter().filter_map(|it| it.segment).collect()
 }
 
@@ -536,7 +561,7 @@ impl Trace {
         }
     }
 
-    fn opened(&mut self, i: usize, store: &Plain) {
+    fn opened<A: Allocator + Clone>(&mut self, i: usize, store: &Plain<A>) {
         let report = store.report();
         let mut lost = String::new();
         for it in &report.lost {
@@ -737,7 +762,7 @@ struct Ledger {
 impl Ledger {
     /// The commit of `keys` (each in `maybe`) completed as `committed`: one segment for each
     /// namespace that held one of them, in the order of [`writes`].
-    fn land(&mut self, keys: &[u32], committed: &Committed) -> Result<(), String> {
+    fn land<A: Allocator + Clone>(&mut self, keys: &[u32], committed: &Committed<A>) ->Result<(), String> {
         let mut spaces: Vec<Namespace> = Vec::new_in(Global);
         spaces.extend(writes().into_iter().filter(|it| keys.iter().any(|n| self.maybe.get(n) == Some(it))));
         if spaces.len() != committed.segments.len() {
@@ -755,7 +780,7 @@ impl Ledger {
 /// The oracle. `cut`: a power cut happened; `durable`: the writers synced every commit, so a
 /// cut may take only what no commit completed (an interrupted flip's traces, reported, are
 /// right to report) and every committed record must read back.
-fn oracle(store: &Plain, ledger: &Ledger, cut: bool, durable: bool) -> Result<(), String> {
+fn oracle<A: Allocator + Clone>(store: &Plain<A>, ledger: &Ledger, cut: bool, durable: bool) -> Result<(), String> {
     oracle_with(store, ledger, cut, durable, &BTreeSet::new())
 }
 
@@ -763,7 +788,7 @@ fn oracle(store: &Plain, ledger: &Ledger, cut: bool, durable: bool) -> Result<()
 /// the segments named by the reports earlier opens since the cut handed to their callers (a
 /// loss is reported at least once, by some open whose open returned; one whose report dies
 /// with its process does not count).
-fn oracle_with(store: &Plain, ledger: &Ledger, cut: bool, durable: bool, handed: &BTreeSet<u64>) -> Result<(), String> {
+fn oracle_with<A: Allocator + Clone>(store: &Plain<A>, ledger: &Ledger, cut: bool, durable: bool, handed: &BTreeSet<u64>) -> Result<(), String> {
     oracle_since(store, ledger, cut, durable, handed, store.report().whole.unwrap_or(0))
 }
 
@@ -773,7 +798,7 @@ fn oracle_with(store: &Plain, ledger: &Ledger, cut: bool, durable: bool, handed:
 /// the openers' own flips number on from what survived (from 1 again when no slot did), so a
 /// later open's newest whole generation is not one a writer committed, and only the first
 /// open's says what survived the cut.
-fn oracle_since(store: &Plain, ledger: &Ledger, cut: bool, durable: bool, handed: &BTreeSet<u64>, survived: u64) -> Result<(), String> {
+fn oracle_since<A: Allocator + Clone>(store: &Plain<A>, ledger: &Ledger, cut: bool, durable: bool, handed: &BTreeSet<u64>, survived: u64) -> Result<(), String> {
     let mut lost = named_lost(store);
     lost.extend(handed.iter().copied());
     // Verify once: no segment checked twice by this process, and no read checked anything.
@@ -867,12 +892,14 @@ fn scenario_traced(
     taken: &mut u32,
     trace: &mut Option<Trace>,
 ) -> Result<(), String> {
+    // A run of its own: every process's store in a frame of this run, given back at its end.
+    let root = test_root();
     let mut sim = Sim::new(seed, Faults { fail_one_in, ..Faults::default() });
     if let Some(trace) = trace {
         trace.cast = vec!["writer 0".into(), "writer 1".into()];
     }
     // Their opens' effects are asked, and traced, at the first run's submit.
-    let mut actors = vec![Actor::new(cfg(0, 1, durable), plants[0]), Actor::new(cfg(1, 1, durable), plants[1])];
+    let mut actors = vec![Actor::new(cfg(0, 1, durable, &root), &root, plants[0]), Actor::new(cfg(1, 1, durable, &root), &root, plants[1])];
     let mut budget = crash_after;
     let mut ledger = Ledger { never: vec![500_000, 1_500_000], ..Ledger::default() };
     let mut next = [0u32, 1_000_000];
@@ -947,7 +974,7 @@ fn scenario_traced(
     // The first open whose report is handed: an attempt an injected failure stopped (after its
     // flip's slot landed, at `inject`, or anywhere) handed nothing, and the marks its flip
     // wrote make the next attempt report what it found.
-    let mut r = reader_traced(&mut sim, 2, boot, plants[2], inject, taken, trace);
+    let mut r = reader_traced(&mut sim, 2, boot, plants[2], inject, taken, trace, &root);
     if let Some(trace) = trace {
         let mut ledger_says = String::from("the ledger's committed records (key: segment, generation): ");
         for (n, it) in &ledger.committed {
@@ -965,7 +992,7 @@ fn scenario_traced(
     // Reopened again in the same boot: what the first reader read, byte for byte; no loss
     // reported a second time once the marks were cleared, and with them not cleared, only what
     // the first reader reported (at least once, never a loss it did not name).
-    let again = reader_traced(&mut sim, 3, boot, Plant::None, None, taken, trace);
+    let again = reader_traced(&mut sim, 3, boot, Plant::None, None, taken, trace, &root);
     for &n in ledger.committed.keys().chain(ledger.maybe.keys()) {
         let (a, b) = (r.store.get(&key(n)), again.store.get(&key(n)));
         if a.map(|it| it.bytes) != b.map(|it| it.bytes) {
@@ -1008,9 +1035,10 @@ fn two_writers_and_power_cuts_keep_every_committed_record_or_say_so() {
 /// completion for completion, and the test asserts only that the cut lands.
 #[test]
 fn a_head_torn_by_a_power_cut_is_read_through_not_refused() {
+    let root = test_root();
     let mut sim = Sim::new(0, Faults::default());
     // Two writers of boot 1 open the empty store: the first to read the head makes it.
-    let mut actors = vec![Actor::new(cfg(0, 1, false), Plant::None), Actor::new(cfg(1, 1, false), Plant::None)];
+    let mut actors = vec![Actor::new(cfg(0, 1, false, &root), &root, Plant::None), Actor::new(cfg(1, 1, false, &root), &root, Plant::None)];
     let mut ledger = Ledger { never: vec![500_000, 1_500_000], ..Ledger::default() };
     let mut budget = Some(21);
     let mut pending: [Option<u32>; 2] = [None, None];
@@ -1048,7 +1076,7 @@ fn a_head_torn_by_a_power_cut_is_read_through_not_refused() {
     sim.crash();
     // Whatever the cut left of the head (short, torn, or whole), a reader of the next boot
     // opens: the head is never taken for another store's file, and the invariant holds.
-    let r = reader(&mut sim, 2, 2);
+    let r = reader(&mut sim, 2, 2, &root);
     assert_eq!(r.store.broken(), None);
     let head = sim.contents(&FileName::new("plain/head").unwrap());
     assert!(head.len() <= format::HEAD_LEN, "a head of {} bytes", head.len());
@@ -1235,8 +1263,10 @@ fn the_oracle_catches_a_lookup_that_ignores_the_namespace() {
 #[test]
 fn the_oracle_catches_a_flip_before_the_sync() {
     let cut_as_the_commit_is_told = |seed: u64, plant: Plant| -> Result<(), String> {
+        // A run of its own, its stores in a frame of this run.
+        let root = test_root();
         let mut sim = Sim::new(seed, Faults::default());
-        let mut w = [Actor::new(cfg(0, 1, true), plant)];
+        let mut w = [Actor::new(cfg(0, 1, true, &root), &root, plant)];
         settle(&mut sim, &mut w);
         let mut ledger = Ledger::default();
         let keys: Vec<u32> = (0..6).collect();
@@ -1267,7 +1297,7 @@ fn the_oracle_catches_a_flip_before_the_sync() {
         assert!(told, "the commit was never told");
         drop(w);
         sim.crash();
-        let r = reader(&mut sim, 1, 2);
+        let r = reader(&mut sim, 1, 2, &root);
         oracle(&r.store, &ledger, true, true)
     };
     let mut caught = None;
@@ -1296,8 +1326,9 @@ fn the_oracle_catches_a_flip_on_a_stale_base() {
 /// contended (the second waits on its timer, bounded).
 #[test]
 fn two_writers_commit_at_once() {
+    let root = test_root();
     let mut sim = Sim::new(7, Faults::default());
-    let mut actors = vec![Actor::new(cfg(0, 1, false), Plant::None), Actor::new(cfg(1, 1, false), Plant::None)];
+    let mut actors = vec![Actor::new(cfg(0, 1, false, &root), &root, Plant::None), Actor::new(cfg(1, 1, false, &root), &root, Plant::None)];
     settle(&mut sim, &mut actors);
     for round in 0..8u32 {
         for (i, actor) in actors.iter_mut().enumerate() {
@@ -1310,7 +1341,7 @@ fn two_writers_commit_at_once() {
             assert!(matches!(actor.store.take_committed(), Some(Ok(_))));
         }
     }
-    let r = reader(&mut sim, 2, 1);
+    let r = reader(&mut sim, 2, 1, &root);
     // Generation 0 is the empty store (no slot written); each commit's flip makes the next.
     assert_eq!(r.store.generation(), 16, "16 commits by two writers, each flipped once on the one before");
     for n in 0..16 {
@@ -1320,8 +1351,8 @@ fn two_writers_commit_at_once() {
 
 /// A store of one writer that has committed `keys` under `LOCAL` in one commit, durably; the
 /// commit's one segment and its ledger.
-fn one_local_commit(sim: &mut Sim, keys: std::ops::Range<u32>) -> (u64, Ledger) {
-    let mut w = [Actor::new(cfg(0, 1, true), Plant::None)];
+fn one_local_commit(sim: &mut Sim, keys: std::ops::Range<u32>, root: &Frame) -> (u64, Ledger) {
+    let mut w = [Actor::new(cfg(0, 1, true, root), root, Plant::None)];
     settle(sim, &mut w);
     let mut ledger = Ledger::default();
     let segment = commit_local(sim, &mut w, keys, &mut ledger);
@@ -1329,7 +1360,7 @@ fn one_local_commit(sim: &mut Sim, keys: std::ops::Range<u32>) -> (u64, Ledger) 
 }
 
 /// `w`'s commit of `keys` under `LOCAL`, run to its end and entered in `ledger`: its one segment.
-fn commit_local(sim: &mut Sim, w: &mut [Actor], keys: std::ops::Range<u32>, ledger: &mut Ledger) -> u64 {
+fn commit_local(sim: &mut Sim, w: &mut [Actor<'_>], keys: std::ops::Range<u32>, ledger: &mut Ledger) -> u64 {
     let keys: Vec<u32> = keys.collect();
     for &n in &keys {
         w[0].store.put(key(n), Namespace::LOCAL, TAG, &value(n)).unwrap();
@@ -1353,7 +1384,7 @@ fn rot_segment(sim: &mut Sim, segment: u64) {
 
 /// Runs `actor` alone until it asks the flip lock and nothing of its own is in flight; the ask
 /// is kept, not submitted, so another process can commit before this one's flip.
-fn run_until_it_asks_the_lock(sim: &mut Sim, actor: &mut Actor) {
+fn run_until_it_asks_the_lock(sim: &mut Sim, actor: &mut Actor<'_>) {
     let mut done = Vec::new_in(Global);
     for _ in 0..100_000 {
         let asks = actor.effects.iter().any(|it| matches!(it, Effect::Lock { .. }));
@@ -1392,9 +1423,11 @@ fn run_until_it_asks_the_lock(sim: &mut Sim, actor: &mut Actor) {
 /// - [`Place::HeadSync`]: the open of boot 2, durable, loses the one segment, and the head's
 ///   sync after its slot fails.
 fn lost_after_the_slot(place: Place, plant: Plant) -> (Result<(), String>, bool) {
+    // A run of its own, its stores in a frame of this run.
+    let root = test_root();
     let mut sim = Sim::new(31, Faults::default());
     let mut ledger = Ledger::default();
-    let mut w = [Actor::new(cfg(0, 1, true), Plant::None)];
+    let mut w = [Actor::new(cfg(0, 1, true, &root), &root, Plant::None)];
     settle(&mut sim, &mut w);
     let first = commit_local(&mut sim, &mut w, 0..6, &mut ledger);
     let mut handed = BTreeSet::new();
@@ -1404,39 +1437,39 @@ fn lost_after_the_slot(place: Place, plant: Plant) -> (Result<(), String>, bool)
             drop(w);
             sim.crash();
             rot_segment(&mut sim, first);
-            let earlier = reader(&mut sim, 1, 2);
+            let earlier = reader(&mut sim, 1, 2, &root);
             assert_eq!(named_lost(&earlier.store), BTreeSet::from([first]), "{:?}", earlier.store.report());
             handed.extend(named_lost(&earlier.store));
             drop(earlier);
             wait(&mut sim, Duration::from_nanos(super::GRACE_NS + 1_000_000_000));
             rot_segment(&mut sim, second);
-            let mut r = [Actor::injecting(cfg(2, 3, false), plant, Some(place))];
+            let mut r = [Actor::injecting(cfg(2, 3, false, &root), &root, plant, Some(place))];
             settle(&mut sim, &mut r);
             let [r] = r;
             assert!(r.store.broken().is_some_and(injected), "{place:?}: {:?}", r.store.broken());
-            (r.fired, reader(&mut sim, 3, 3))
+            (r.fired, reader(&mut sim, 3, 3, &root))
         }
         Place::Map => {
             // No cut: the writer lives on (its commits are durable, so the rot alone stands for
             // what a cut did not let reach the disk), and the reader is of a later boot.
             rot_segment(&mut sim, first);
-            let mut r = Actor::injecting(cfg(1, 2, false), plant, Some(place));
+            let mut r = Actor::injecting(cfg(1, 2, false, &root), &root, plant, Some(place));
             run_until_it_asks_the_lock(&mut sim, &mut r);
             commit_local(&mut sim, &mut w, 6..12, &mut ledger);
             settle(&mut sim, std::slice::from_mut(&mut r));
             assert!(r.store.broken().is_some_and(injected), "{place:?}: {:?}", r.store.broken());
             drop(w);
-            (r.fired, reader(&mut sim, 2, 2))
+            (r.fired, reader(&mut sim, 2, 2, &root))
         }
         Place::HeadSync => {
             drop(w);
             sim.crash();
             rot_segment(&mut sim, first);
-            let mut r = [Actor::injecting(cfg(1, 2, true), plant, Some(place))];
+            let mut r = [Actor::injecting(cfg(1, 2, true, &root), &root, plant, Some(place))];
             settle(&mut sim, &mut r);
             let [r] = r;
             assert!(r.store.broken().is_some_and(injected), "{place:?}: {:?}", r.store.broken());
-            (r.fired, reader(&mut sim, 2, 2))
+            (r.fired, reader(&mut sim, 2, 2, &root))
         }
     };
     (oracle_with(&r2.store, &ledger, true, false, &handed), fired)
@@ -1473,20 +1506,21 @@ fn the_oracle_catches_a_mark_cleared_in_the_flip_that_sets_it() {
 /// once a flip of a process that handed the report clears it, no open reports it again.
 #[test]
 fn a_loss_is_reported_until_a_flip_after_its_report_clears_it() {
+    let root = test_root();
     let mut sim = Sim::new(33, Faults::default());
-    let (segment, ledger) = one_local_commit(&mut sim, 0..6);
+    let (segment, ledger) = one_local_commit(&mut sim, 0..6, &root);
     sim.crash();
     rot_segment(&mut sim, segment);
     let file = FileName::new(&format!("plain/seg-{segment:016x}")).unwrap();
-    let first = reader_with(&mut sim, 1, 2, Plant::None);
-    let named = |it: &Actor| it.store.report().lost.iter().map(|it| (it.file.clone(), it.segment, it.records)).collect::<Vec<_>>();
+    let first = reader_with(&mut sim, 1, 2, Plant::None, &root);
+    let named = |it: &Actor<'_>| it.store.report().lost.iter().map(|it| (it.file.clone(), it.segment, it.records)).collect::<Vec<_>>();
     assert_eq!(named(&first), vec![(file.clone(), Some(segment), Some(6))]);
     drop(first);
-    let mut second = reader_with(&mut sim, 2, 2, Plant::None);
+    let mut second = reader_with(&mut sim, 2, 2, Plant::None, &root);
     assert_eq!(named(&second), vec![(file, Some(segment), Some(6))], "the mark the first open's flip wrote reports it again");
     oracle(&second.store, &ledger, true, false).unwrap();
     assert!(acknowledged(&mut sim, &mut second, &mut 0, &mut None));
-    let third = reader_with(&mut sim, 3, 2, Plant::None);
+    let third = reader_with(&mut sim, 3, 2, Plant::None, &root);
     assert!(third.store.report().lost.is_empty(), "reported after its mark was cleared: {:?}", third.store.report());
     oracle_with(&third.store, &ledger, true, false, &BTreeSet::from([segment])).unwrap();
 }
@@ -1496,13 +1530,14 @@ fn a_loss_is_reported_until_a_flip_after_its_report_clears_it() {
 /// count; the plant that trusts it returns a corrupt record instead.
 #[test]
 fn the_oracle_catches_a_segment_of_an_earlier_boot_read_unchecked() {
+    let root = test_root();
     let outcome = |plant: Plant| {
         let mut sim = Sim::new(3, Faults::default());
-        let (segment, ledger) = one_local_commit(&mut sim, 0..10);
+        let (segment, ledger) = one_local_commit(&mut sim, 0..10, &root);
         sim.crash();
         let file = FileName::new(&format!("plain/seg-{segment:016x}")).unwrap();
         sim.rot(&file, HEADER as u64 + 3, &[0xff, 0x00, 0xff]);
-        let mut r = [Actor::new(cfg(1, 2, false), plant)];
+        let mut r = [Actor::new(cfg(1, 2, false, &root), &root, plant)];
         settle(&mut sim, &mut r);
         let report = r[0].store.report().clone();
         // The rot stands for bytes a power cut did not let reach the disk: a loss to report.
@@ -1522,18 +1557,19 @@ fn the_oracle_catches_a_segment_of_an_earlier_boot_read_unchecked() {
 /// full check drops it and reports it by name.
 #[test]
 fn a_byte_rotted_after_its_proof_is_found_by_scrub_or_the_next_boot_not_by_a_read() {
+    let root = test_root();
     let mut sim = Sim::new(5, Faults::default());
-    let (segment, _) = one_local_commit(&mut sim, 9..10);
+    let (segment, _) = one_local_commit(&mut sim, 9..10, &root);
     let file = FileName::new(&format!("plain/seg-{segment:016x}")).unwrap();
     sim.rot(&file, HEADER as u64, &[!value(9)[0]]);
-    let r = reader(&mut sim, 1, 1);
+    let r = reader(&mut sim, 1, 1, &root);
     let read = r.store.get(&key(9)).map(|it| it.bytes.to_vec());
     assert_ne!(read, Some(value(9)), "the read returned the bytes as they lie, unchecked");
     assert_eq!(r.store.checks(), super::Checks { full: 0, reads: 1, per_read: 0 });
     let found = r.store.scrub();
     assert_eq!(found.iter().map(|it| (it.key, it.pack.clone())).collect::<Vec<_>>(), vec![(key(9), file.clone())]);
     // The next boot proves the segment once, from its digest, and drops it by name.
-    let next = reader(&mut sim, 2, 2);
+    let next = reader(&mut sim, 2, 2, &root);
     assert_eq!(next.store.checks().full, 1);
     assert_eq!(next.store.report().lost.iter().map(|it| (it.file.clone(), it.records)).collect::<Vec<_>>(), vec![(file, Some(1))]);
     assert_eq!(next.store.get(&key(9)).map(|it| it.bytes.len()), None);
@@ -1544,14 +1580,15 @@ fn a_byte_rotted_after_its_proof_is_found_by_scrub_or_the_next_boot_not_by_a_rea
 /// makes (no segment fully checked in a second open of one boot) sees it.
 #[test]
 fn the_oracle_catches_a_full_check_made_twice_in_one_boot() {
+    let root = test_root();
     let second_open_checks = |plant: Plant| {
         let mut sim = Sim::new(8, Faults::default());
-        one_local_commit(&mut sim, 0..6);
+        one_local_commit(&mut sim, 0..6, &root);
         sim.crash();
-        let mut first = [Actor::new(cfg(1, 2, false), plant)];
+        let mut first = [Actor::new(cfg(1, 2, false, &root), &root, plant)];
         settle(&mut sim, &mut first);
         assert_eq!(first[0].store.checks().full, 1);
-        let second = reader(&mut sim, 2, 2);
+        let second = reader(&mut sim, 2, 2, &root);
         second.store.fully_checked().len()
     };
     assert_eq!(second_open_checks(Plant::None), 0, "an honest open records its check");
@@ -1564,9 +1601,9 @@ fn files(sim: &mut Sim) -> BTreeMap<String, Vec<u8>> {
     listed.into_iter().filter(|(_, meta)| !meta.dir).map(|(name, _)| (name.as_str().to_owned(), sim.contents(&name))).collect()
 }
 
-fn build(seed: u64) -> (BTreeMap<String, Vec<u8>>, Sim) {
+fn build(seed: u64, root: &Frame) -> (BTreeMap<String, Vec<u8>>, Sim) {
     let mut sim = Sim::new(seed, Faults::default());
-    let mut w = [Actor::new(cfg(0, 1, false), Plant::None)];
+    let mut w = [Actor::new(cfg(0, 1, false, root), root, Plant::None)];
     settle(&mut sim, &mut w);
     for round in 0..5u32 {
         for n in round * 10..round * 10 + 10 {
@@ -1584,11 +1621,12 @@ fn build(seed: u64) -> (BTreeMap<String, Vec<u8>>, Sim) {
 /// a reopen reads every record back byte for byte, under its namespace.
 #[test]
 fn the_same_puts_write_the_same_bytes_and_read_back() {
-    let (a, mut sim) = build(11);
-    let (b, _) = build(11);
+    let root = test_root();
+    let (a, mut sim) = build(11, &root);
+    let (b, _) = build(11, &root);
     assert_eq!(a, b, "two builds of one history wrote different bytes");
     assert!(a.keys().any(|it| it.ends_with("CACHEDIR.TAG")), "{:?}", a.keys());
-    let r = reader(&mut sim, 1, 1);
+    let r = reader(&mut sim, 1, 1, &root);
     for n in 0..50 {
         let got = r.store.get(&key(n));
         assert_eq!(got.map(|it| (it.bytes.to_vec(), it.namespace)), Some((value(n), space(n))), "record {n}");
@@ -1614,11 +1652,12 @@ fn the_same_puts_write_the_same_bytes_and_read_back() {
 /// loses nothing. A second open reports nothing again.
 #[test]
 fn a_head_cut_at_any_length_reads_the_slot_before_or_the_orphans_and_says_so() {
+    let root = test_root();
     let mut sim = Sim::new(21, Faults::default());
-    let mut w = [Actor::new(cfg(0, 1, false), Plant::None)];
+    let mut w = [Actor::new(cfg(0, 1, false, &root), &root, Plant::None)];
     settle(&mut sim, &mut w);
     let mut ledger = Ledger::default();
-    let mut rounds: Vec<Vec<u64>> = Vec::new_in(Global);
+    let mut rounds: Vec<Vec<u64, &Frame>, &Frame> = Vec::new_in(&root);
     for round in 0..3u32 {
         let keys: Vec<u32> = (round * 4..round * 4 + 4).collect();
         for &n in &keys {
@@ -1644,11 +1683,13 @@ fn a_head_cut_at_any_length_reads_the_slot_before_or_the_orphans_and_says_so() {
             let file = FileName::new(name).unwrap();
             assert!(matches!(ask(&mut sim, Effect::Write { file, bytes, tag: EffectTag(OWN) }), Done::Written));
         }
-        let r = reader(&mut sim, 1, 2);
+        // Each cut's two readers in a frame of that cut, given back before the next.
+        let cut_root = test_root();
+        let r = reader(&mut sim, 1, 2, &cut_root);
         let report = r.store.report().clone();
         let lost: BTreeSet<u64> = report.lost.iter().filter_map(|it| it.segment).collect();
         oracle(&r.store, &ledger, true, false).unwrap_or_else(|why| panic!("head cut to {cut}: {why}"));
-        let (whole, gone): (Option<u64>, &[Vec<u64>]) = match cut {
+        let (whole, gone): (Option<u64>, &[Vec<u64, &Frame>]) = match cut {
             format::HEAD_LEN => (Some(3), &[]),
             c if c >= format::SLOT => (Some(2), &rounds[2..]),
             _ => (None, &rounds[..]),
@@ -1668,7 +1709,7 @@ fn a_head_cut_at_any_length_reads_the_slot_before_or_the_orphans_and_says_so() {
                 assert_eq!(r.store.get(&key(n)).map(|it| it.bytes.to_vec()), Some(value(n)), "head cut to {cut}: record {n}");
             }
         }
-        let again = reader(&mut sim, 2, 2);
+        let again = reader(&mut sim, 2, 2, &cut_root);
         assert!(again.store.report().lost.is_empty(), "head cut to {cut}: reported again: {:?}", again.store.report());
         assert!(again.store.fully_checked().is_empty(), "head cut to {cut}: checked twice in one boot");
     }
@@ -1682,11 +1723,12 @@ fn a_head_cut_at_any_length_reads_the_slot_before_or_the_orphans_and_says_so() {
 /// marked rows round-trips.
 #[test]
 fn a_previous_layout_is_refused_by_name() {
+    let root = test_root();
     let refused = |head: Vec<u8>| {
         let mut sim = Sim::new(1, Faults::default());
         let file = FileName::new("plain/head").unwrap();
         assert!(matches!(ask(&mut sim, Effect::Write { file: file.clone(), bytes: head.clone(), tag: EffectTag(OWN) }), Done::Written));
-        let mut r = [Actor::new(cfg(0, 1, false), Plant::None)];
+        let mut r = [Actor::new(cfg(0, 1, false, &root), &root, Plant::None)];
         settle(&mut sim, &mut r);
         let why = r[0].store.broken().cloned().expect("refused");
         assert_eq!(sim.contents(&file), head, "a refused head is left as it was");
@@ -1790,8 +1832,9 @@ fn check_segment_accepts_exactly_what_seal_segment_sealed_case(tape: &Tape) {
 /// it was retired, and goes after it.
 #[test]
 fn compaction_keeps_roots_and_the_grace_period() {
+    let root = test_root();
     let mut sim = Sim::new(9, Faults::default());
-    let mut w = [Actor::new(cfg(0, 1, false), Plant::None)];
+    let mut w = [Actor::new(cfg(0, 1, false, &root), &root, Plant::None)];
     settle(&mut sim, &mut w);
     let mut named = BTreeSet::new();
     for n in 0..40u32 {
@@ -1804,7 +1847,7 @@ fn compaction_keeps_roots_and_the_grace_period() {
         settle(&mut sim, &mut w);
         named.extend(w[0].store.take_committed().unwrap().unwrap().segments);
     }
-    let before = reader(&mut sim, 1, 1);
+    let before = reader(&mut sim, 1, 1, &root);
     // A merge first (no cap): fewer segments, everything kept.
     let mut slices = 0;
     loop {
@@ -1818,7 +1861,7 @@ fn compaction_keeps_roots_and_the_grace_period() {
         }
     }
     assert!(w[0].store.segments().len() <= super::SEGMENTS_MOST, "{} segments", w[0].store.segments().len());
-    let fresh = reader(&mut sim, 2, 1);
+    let fresh = reader(&mut sim, 2, 1, &root);
     for n in 0..40 {
         assert_eq!(fresh.store.get(&key(n)).map(|it| it.bytes.to_vec()), Some(value(n)), "merged record {n}");
         assert_eq!(before.store.get(&key(n)).map(|it| it.bytes.to_vec()), Some(value(n)), "a reader of before, record {n}");
@@ -1842,13 +1885,14 @@ fn compaction_keeps_roots_and_the_grace_period() {
 /// Over a cap, records no root names that are older than the window go; rooted ones stay.
 #[test]
 fn pruning_keeps_what_roots_name() {
+    let root = test_root();
     let mut sim = Sim::new(13, Faults::default());
-    let mut c = cfg(0, 1, false);
+    let mut c = cfg(0, 1, false, &root);
     // Above any one commit here (the first holds four records and the root, about 720 bytes;
     // each later one record of at most 699 bytes), below what the 18 commits hold together: the
     // store goes over the cap, and no commit is refused as larger than it alone.
     c.cap_bytes = 2048;
-    let mut w = [Actor::new(c, Plant::None)];
+    let mut w = [Actor::new(c, &root, Plant::None)];
     settle(&mut sim, &mut w);
     w[0].store.root("kept", &[key(0), key(1)]).unwrap();
     for n in 0..4u32 {
@@ -1870,7 +1914,7 @@ fn pruning_keeps_what_roots_name() {
     settle(&mut sim, &mut w);
     let sliced = w[0].store.take_sliced().unwrap();
     assert!(sliced.dropped >= 2, "{sliced:?}");
-    let r = reader(&mut sim, 1, 1);
+    let r = reader(&mut sim, 1, 1, &root);
     for n in [0, 1] {
         assert_eq!(r.store.get(&key(n)).map(|it| it.bytes.to_vec()), Some(value(n)), "rooted record {n}");
     }
@@ -1971,15 +2015,15 @@ fn scratch(name: &str) -> std::path::PathBuf {
 }
 
 /// A store over the simulation, through the driver, reading `reads`.
-fn driven(n: u64, reads: Vec<Namespace>) -> Driven<Sim> {
-    let mut c = cfg(n, 1, false);
-    c.reads = reads;
-    Driven::with(Sim::new(n, Faults::default()), Path::new("/sim"), c).unwrap()
+fn driven(n: u64, reads: Vec<Namespace>, root: &Frame) -> Driven<Sim, &Frame> {
+    let mut c = cfg(n, 1, false, root);
+    c.reads = spaces_in(reads, root);
+    Driven::with(Sim::new(n, Faults::default()), Path::new("/sim"), c, root).unwrap()
 }
 
 /// The record under `k` through `d`'s get (mapping at a first probe) and got: its bytes and
 /// namespace.
-fn read(d: &mut Driven<Sim>, k: &Key) -> Option<(Vec<u8>, Namespace)> {
+fn read(d: &mut Driven<Sim, &Frame>, k: &Key) -> Option<(Vec<u8>, Namespace)> {
     let found = d.get(k).expect("a get with no failure")?;
     let got = d.got(found);
     Some((got.bytes.to_vec(), got.namespace))
@@ -1992,8 +2036,8 @@ fn refs(keys: std::ops::Range<u32>) -> Vec<RecordRef> {
 /// A trusted builder's segment in the public namespace, its bytes as they lie, in a source; the
 /// bytes are also [`seal_segment`]'s of the same records (the commit and the push's sealing are
 /// one writer).
-fn published(source: &LocalDir, builder: &Builder) -> (Vec<u8>, ContentId) {
-    let mut ci = driven(0, reads());
+fn published(source: &LocalDir, builder: &Builder, root: &Frame) -> (Vec<u8>, ContentId) {
+    let mut ci = driven(0, reads(), root);
     for n in 0..8 {
         ci.put(key(n), Namespace::PUBLIC, TAG, &value(n)).unwrap();
     }
@@ -2016,13 +2060,14 @@ fn published(source: &LocalDir, builder: &Builder) -> (Vec<u8>, ContentId) {
 /// never answered from a namespace the caller did not ask for.
 #[test]
 fn a_fetched_segment_is_verified_before_it_is_used() {
+    let root = test_root();
     let builder = Builder { secret: "the trusted builder's secret" };
     let at = scratch("fetch");
     let mut source = LocalDir::new(&at);
-    let (bytes, digest) = published(&source, &builder);
+    let (bytes, digest) = published(&source, &builder, &root);
     let keys = refs(0..8);
 
-    let mut me = driven(1, reads());
+    let mut me = driven(1, reads(), &root);
     assert_eq!(read(&mut me, &key(0)).map(|it| it.0.len()), None);
     let pulled = me.fetch_missing(&mut source, &builder, Namespace::PUBLIC, &keys).unwrap();
     assert_eq!(pulled.len(), 1);
@@ -2037,7 +2082,7 @@ fn a_fetched_segment_is_verified_before_it_is_used() {
     forged[HEADER] ^= 1;
     let hex: String = digest.0.iter().map(|it| format!("{it:02x}")).collect();
     std::fs::write(at.join(format!("{hex}.seg")), &forged).unwrap();
-    let mut other = driven(2, vec![Namespace::LOCAL, Namespace::PUBLIC]);
+    let mut other = driven(2, vec![Namespace::LOCAL, Namespace::PUBLIC], &root);
     let why = other.fetch_missing(&mut source, &builder, Namespace::PUBLIC, &keys).expect_err("a forged segment is refused");
     assert!(matches!(why, StoreError::Layout { segment, .. } if segment == SegmentId(digest)), "{why}");
     assert_eq!(read(&mut other, &key(0)).map(|it| it.0.len()), None, "nothing of it was used");
@@ -2113,13 +2158,15 @@ const MACHINE: &[u8] = b"/Users/someone/checkout";
 /// is whole on the disk, and when the boot's last seal survived, the new boot's open checks no
 /// segment in full (it reads no segment's bytes to prove it).
 fn sealing(seed: u64, rounds: u32, per: u32, cut_after: Option<u32>, fail_one_in: u32, plant: Plant) -> Result<(), String> {
+    // A run of its own, its stores in a frame of this run.
+    let root = test_root();
     let mut sim = Sim::new(seed, Faults { fail_one_in, ..Faults::default() });
-    let mut actors = vec![Actor::new(cfg(0, 1, false), plant), Actor::new(cfg(1, 1, false), Plant::None)];
+    let mut actors = vec![Actor::new(cfg(0, 1, false, &root), &root, plant), Actor::new(cfg(1, 1, false, &root), &root, Plant::None)];
     let mut budget = cut_after;
     let mut ledger = Ledger { never: vec![500_000, 1_500_000], ..Ledger::default() };
     let mut next = [0u32, 1_000_000];
     let mut pending: [Option<Vec<u32>>; 2] = [None, None];
-    let mut early: Option<(Actor, Vec<u32>)> = None;
+    let mut early: Option<(Actor<'_>, Vec<u32>)> = None;
     let mut cut = false;
     for round in 0..=rounds {
         for (i, actor) in actors.iter_mut().enumerate() {
@@ -2158,14 +2205,14 @@ fn sealing(seed: u64, rounds: u32, per: u32, cut_after: Option<u32>, fail_one_in
         }
         if round == 0 && early.is_none() {
             let held: Vec<u32> = ledger.committed.keys().copied().collect();
-            early = Some((reader_with(&mut sim, 5, 1, Plant::None), held));
+            early = Some((reader_with(&mut sim, 5, 1, Plant::None, &root), held));
         }
     }
     drop(actors);
     // The generation the boot's last seal wrote, when it ran and completed.
     let mut sealed_at = None;
     if !cut {
-        let mut last = reader_with(&mut sim, 6, 1, plant);
+        let mut last = reader_with(&mut sim, 6, 1, plant, &root);
         if last.store.seal(&mut last.effects) {
             settle(&mut sim, std::slice::from_mut(&mut last));
         }
@@ -2183,7 +2230,7 @@ fn sealing(seed: u64, rounds: u32, per: u32, cut_after: Option<u32>, fail_one_in
     }
     drop(early);
     sim.crash();
-    let r = reader_with(&mut sim, 2, 2, Plant::None);
+    let r = reader_with(&mut sim, 2, 2, Plant::None, &root);
     oracle(&r.store, &ledger, true, false)?;
     for id in r.store.proved_by_seal() {
         let bytes = sim.contents(&FileName::new(&format!("plain/seg-{id:016x}")).expect("a name"));
@@ -2244,9 +2291,11 @@ fn the_oracle_catches_a_seal_before_its_barrier() {
 /// they were mapped, every other committed record reads back, and boot 3 walks the survivors
 /// again.
 fn scrubbing(seed: u64, segments: u32, cut_after: Option<u32>, plant: Plant) -> Result<(), String> {
+    // A run of its own, its stores in a frame of this run.
+    let root = test_root();
     let mut sim = Sim::new(seed, Faults::default());
     let mut ledger = Ledger::default();
-    let mut w = [Actor::new(cfg(0, 1, true), Plant::None)];
+    let mut w = [Actor::new(cfg(0, 1, true, &root), &root, Plant::None)];
     settle(&mut sim, &mut w);
     let mut keys_of = BTreeMap::new();
     for s in 0..segments {
@@ -2268,7 +2317,7 @@ fn scrubbing(seed: u64, segments: u32, cut_after: Option<u32>, plant: Plant) -> 
     let was = sim.contents(&file)[target.at as usize];
     sim.rot(&file, target.at, &[!was]);
 
-    let holder = reader(&mut sim, 1, 2);
+    let holder = reader(&mut sim, 1, 2, &root);
     assert_eq!(holder.store.proved_by_seal().len(), segments as usize, "boot 2 proves every segment by its seal");
     let kept = keys_of[&rotted].clone().find(|&n| n != bad && !value(n).is_empty()).expect("another record");
     let held = holder.store.get(&key(kept)).expect("mapped by the holder").bytes;
@@ -2281,7 +2330,7 @@ fn scrubbing(seed: u64, segments: u32, cut_after: Option<u32>, plant: Plant) -> 
     let mut budget = cut_after;
     let mut n = 2;
     let last = 'pass: loop {
-        let mut b = [Actor::new(cfg(n, 2, true), plant)];
+        let mut b = [Actor::new(cfg(n, 2, true, &root), &root, plant)];
         n += 1;
         settle(&mut sim, &mut b);
         if let Some(why) = b[0].store.broken() {
@@ -2336,7 +2385,7 @@ fn scrubbing(seed: u64, segments: u32, cut_after: Option<u32>, plant: Plant) -> 
     if held != value(kept).as_slice() {
         return Err(format!("record {kept}, held through the retire of {rotted:016x}, changed under its holder"));
     }
-    let after = reader_with(&mut sim, 20, 2, Plant::None);
+    let after = reader_with(&mut sim, 20, 2, Plant::None, &root);
     if after.store.get(&key(bad)).is_some() {
         return Err(format!("a later lookup of record {bad} hit the retired segment {rotted:016x}"));
     }
@@ -2348,7 +2397,7 @@ fn scrubbing(seed: u64, segments: u32, cut_after: Option<u32>, plant: Plant) -> 
     drop(after);
     drop(holder);
     sim.crash();
-    let next = reader(&mut sim, 21, 3);
+    let next = reader(&mut sim, 21, 3, &root);
     let survivors: BTreeSet<u64> = all.iter().copied().filter(|it| *it != rotted).collect();
     if next.store.unscrubbed().into_iter().collect::<BTreeSet<u64>>() != survivors {
         return Err(format!("boot 3 has {:x?} left to walk, not every surviving segment {survivors:x?}", next.store.unscrubbed()));
@@ -2391,8 +2440,8 @@ fn the_oracle_catches_a_segment_marked_scrubbed_before_its_walk_ends() {
 const SHARED: u32 = 900_000;
 
 /// A durable store over `sim` behind the handle, opened with `plant` at `boot`.
-fn handle(sim: Sim, n: u64, boot: u64, plant: Plant) -> PlainStore<Sim> {
-    PlainStore::new(Driven::planted(sim, Path::new("/sim"), cfg(n, boot, true), plant).expect("an open with no cut and no failure")).expect("made whole with no cut and no failure")
+fn handle(sim: Sim, n: u64, boot: u64, plant: Plant, root: &Frame) -> PlainStore<Sim, &Frame> {
+    PlainStore::new(Driven::planted(sim, Path::new("/sim"), cfg(n, boot, true, root), root, plant).expect("an open with no cut and no failure")).expect("made whole with no cut and no failure")
 }
 
 /// One history of the lanes (store-next.md, "Puts on every worker"): `workers` lanes put into
@@ -2404,15 +2453,17 @@ fn handle(sim: Sim, n: u64, boot: u64, plant: Plant) -> PlainStore<Sim> {
 /// seen by another lane before its commit's flip; each worker sees its own puts at once; the
 /// key every worker put is one record of equal bytes.
 fn lanes(seed: u64, workers: u32, rounds: u32, cut_at: Option<Cut>, plant: Plant) -> Result<(), String> {
+    // A run of its own: its stores, and the reads' copies, in a frame of this run.
+    let root = test_root();
     let mut boot = 1;
-    let mut store = handle(Sim::new(seed, Faults::default()), 1, boot, plant);
+    let mut store = handle(Sim::new(seed, Faults::default()), 1, boot, plant, &root);
     store.writer().cut(cut_at);
     let mut promised: BTreeSet<u32> = BTreeSet::new();
     let mut ids: Vec<LaneId> = (0..workers).map(|_| store.lane().expect("under the cap")).collect();
     let mut reader = store.lane().expect("under the cap");
     let mut cut = false;
     for round in 0..rounds {
-        let mut put: Vec<u32> = Vec::new_in(Global);
+        let mut put: Vec<u32, &Frame> = Vec::new_in(&root);
         for turn in 0..workers {
             let w = (turn + round + seed as u32) % workers;
             let lane = ids[w as usize];
@@ -2423,14 +2474,14 @@ fn lanes(seed: u64, workers: u32, rounds: u32, cut_at: Option<Cut>, plant: Plant
                 if !matches!(got, Ok(Put::Written | Put::Same)) {
                     return Err(format!("worker {w}'s put of record {n}: {got:?}"));
                 }
-                if store.get(Some(lane), &key(n), Global).map(|it| it.1) != Some(value(n)) {
+                if !store.get(Some(lane), &key(n), &root).is_some_and(|it| it.1 == value(n)) {
                     return Err(format!("worker {w} does not see its own put of record {n}"));
                 }
                 put.push(n);
             }
         }
         for &n in put.iter().filter(|n| !promised.contains(n)) {
-            if store.get(Some(reader), &key(n), Global).is_some() {
+            if store.get(Some(reader), &key(n), &root).is_some() {
                 return Err(format!("record {n} seen by another lane before its commit's flip"));
             }
         }
@@ -2439,7 +2490,7 @@ fn lanes(seed: u64, workers: u32, rounds: u32, cut_at: Option<Cut>, plant: Plant
             Ok(_) => {
                 promised.extend(put.iter().copied());
                 for &n in &put {
-                    if store.get(Some(reader), &key(n), Global).map(|it| it.1) != Some(value(n)) {
+                    if !store.get(Some(reader), &key(n), &root).is_some_and(|it| it.1 == value(n)) {
                         return Err(format!("record {n} not seen by another lane after its commit returned"));
                     }
                 }
@@ -2454,11 +2505,11 @@ fn lanes(seed: u64, workers: u32, rounds: u32, cut_at: Option<Cut>, plant: Plant
                 let mut sim = store.into_writer().into_driver();
                 sim.crash();
                 boot += 1;
-                store = handle(sim, 2, boot, plant);
+                store = handle(sim, 2, boot, plant, &root);
                 ids = (0..workers).map(|_| store.lane().expect("under the cap")).collect();
                 reader = store.lane().expect("under the cap");
                 for &n in &promised {
-                    if store.get(None, &key(n), Global).map(|it| it.1) != Some(value(n)) {
+                    if !store.get(None, &key(n), &root).is_some_and(|it| it.1 == value(n)) {
                         return Err(format!("record {n}, promised by a flip that landed, does not read back after the power cut"));
                     }
                 }
@@ -2469,9 +2520,9 @@ fn lanes(seed: u64, workers: u32, rounds: u32, cut_at: Option<Cut>, plant: Plant
     // Every promise kept after a last cut, and the shared keys one record each.
     let mut sim = store.into_writer().into_driver();
     sim.crash();
-    let last = handle(sim, 99, boot + 1, Plant::None);
+    let last = handle(sim, 99, boot + 1, Plant::None, &root);
     for &n in &promised {
-        if last.get(None, &key(n), Global).map(|it| it.1) != Some(value(n)) {
+        if !last.get(None, &key(n), &root).is_some_and(|it| it.1 == value(n)) {
             return Err(format!("record {n}, promised, does not read back at the next boot"));
         }
     }
@@ -2528,8 +2579,9 @@ fn the_oracle_catches_a_lane_commit_flipped_before_its_bytes_are_durable() {
 /// commit to a segment of equal bytes.
 #[test]
 fn two_builders_on_other_lanes_write_equal_segments() {
+    let root = test_root();
     let bytes_of = |seed: u64, workers: u32, reversed: bool| -> Vec<u8> {
-        let store = handle(Sim::new(seed, Faults::default()), 1, 1, Plant::None);
+        let store = handle(Sim::new(seed, Faults::default()), 1, 1, Plant::None, &root);
         let ids: Vec<LaneId> = (0..workers).map(|_| store.lane().expect("under the cap")).collect();
         let mut keys: Vec<u32> = (0..40).collect();
         if reversed {
@@ -2760,8 +2812,9 @@ fn a_lookup_finds_every_key_of_an_uneven_run() {
 /// and kept under the local one. The control: the same puts with no path listed go through.
 #[test]
 fn a_record_naming_the_machine_never_reaches_a_shared_namespace() {
+    let root = test_root();
     let mut sim = Sim::new(3, Faults::default());
-    let mut w = [Actor::new(cfg(0, 1, false), Plant::None)];
+    let mut w = [Actor::new(cfg(0, 1, false, &root), &root, Plant::None)];
     settle(&mut sim, &mut w);
     let mut leaky = b"a record built at ".to_vec();
     leaky.extend_from_slice(MACHINE);
@@ -2776,9 +2829,9 @@ fn a_record_naming_the_machine_never_reaches_a_shared_namespace() {
     let refused = w[0].store.commit(&[&batch],sim.wall_ns(), &mut w[0].effects);
     assert!(matches!(refused, Err(StoreError::Other { .. })), "{refused:?}");
     // The control: a store that lists no path of the machine takes both.
-    let mut open = cfg(1, 1, false);
+    let mut open = cfg(1, 1, false, &root);
     open.machine.clear();
-    let mut c = [Actor::new(open, Plant::None)];
+    let mut c = [Actor::new(open, &root, Plant::None)];
     settle(&mut sim, &mut c);
     assert!(c[0].store.put(key(3), Namespace::PUBLIC, TAG, &leaky).is_ok());
     let mut batch = super::core::Batch::new(org());
@@ -2793,9 +2846,10 @@ fn a_record_naming_the_machine_never_reaches_a_shared_namespace() {
 #[test]
 fn a_startup_image_round_trips_and_reads_in_place_order() {
     use super::image::{ImageError, Placement, StartupImage};
+    let root = test_root();
     let manifest = ContentId::of("a program's manifest", b"hello");
     let mut sim = Sim::new(5, Faults::default());
-    let mut w = [Actor::new(cfg(0, 1, false), Plant::None)];
+    let mut w = [Actor::new(cfg(0, 1, false, &root), &root, Plant::None)];
     settle(&mut sim, &mut w);
     // Placed before main in this order: 7, 3, 9, 1, 5 (slots 0..5); committed in two batches.
     let order = [7u32, 3, 9, 1, 5];
@@ -2807,23 +2861,23 @@ fn a_startup_image_round_trips_and_reads_in_place_order() {
         settle(&mut sim, &mut w);
         assert!(matches!(w[0].store.take_committed(), Some(Ok(_))));
     }
-    let mut placed = Vec::new_in(Global);
+    let mut placed = Vec::new_in(&root);
     placed.extend(order.iter().enumerate().map(|(slot, n)| Placement { slot: slot as u32, code: key(*n).0 }));
     placed.push(Placement { slot: 5, code: key(400_000).0 });
     let image = StartupImage { manifest, placed };
-    let mut bytes = Vec::new_in(Global);
+    let mut bytes = Vec::new_in(&root);
     image.encode_into(&mut bytes);
-    let mut again = Vec::new_in(Global);
-    StartupImage::decode_in(&bytes, &manifest, Global).unwrap().encode_into(&mut again);
+    let mut again = Vec::new_in(&root);
+    StartupImage::decode_in(&bytes, &manifest, &root).unwrap().encode_into(&mut again);
     assert_eq!(bytes, again, "decode then encode is the same bytes");
-    assert_eq!(StartupImage::decode_in(&bytes, &manifest, Global).unwrap(), image);
+    assert_eq!(StartupImage::decode_in(&bytes, &manifest, &root).unwrap(), image);
     let other = ContentId::of("a program's manifest", b"another");
-    assert_eq!(StartupImage::decode_in(&bytes, &other, Global), Err(ImageError::Manifest { found: manifest, wanted: other }));
+    assert_eq!(StartupImage::decode_in(&bytes, &other, &root), Err(ImageError::Manifest { found: manifest, wanted: other }));
     let mut old = bytes.clone();
     old[4..8].copy_from_slice(&2u32.to_le_bytes());
-    assert_eq!(StartupImage::decode_in(&old, &manifest, Global), Err(ImageError::Format { found: 2, wanted: 1 }));
-    assert!(matches!(StartupImage::decode_in(&bytes[..bytes.len() - 1], &manifest, Global), Err(ImageError::Short { .. })));
-    let mut reads = Vec::new_in(Global);
+    assert_eq!(StartupImage::decode_in(&old, &manifest, &root), Err(ImageError::Format { found: 2, wanted: 1 }));
+    assert!(matches!(StartupImage::decode_in(&bytes[..bytes.len() - 1], &manifest, &root), Err(ImageError::Short { .. })));
+    let mut reads = Vec::new_in(&root);
     image.read_order(|k| w[0].store.locate(k), &mut reads);
     assert_eq!(reads.len(), 5, "the key the store does not hold is left out");
     for pair in reads.windows(2) {

@@ -661,7 +661,8 @@ pub struct PortableTys<'a> {
 
 /// Append-only storage whose elements never move once written: a reference from
 /// [`Stable::as_slice`] stays valid, reading what it read, while later `extend`s run through
-/// `&self`. Implemented by the caller (blaze-ladder over `blaze_mem::AppendVec`).
+/// `&self`. Implemented by the caller (blaze-ladder front2 rows.rs `StableColumn`, in the
+/// allocator it is handed).
 pub trait Stable<T> {
     /// Appends `values` and returns the index of the first; [`Full`] at the storage's cap (or
     /// when its memory cannot be had), appending nothing.

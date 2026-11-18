@@ -25,7 +25,7 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::alloc::{Allocator, Global};
+use std::alloc::Allocator;
 
 use blaze_ids::ContentId;
 use blaze_keyed::kind::Tag;
@@ -49,12 +49,12 @@ pub struct Placement {
 }
 
 /// The code records one run placed before `main`, in order, for the program `manifest` names.
-pub struct StartupImage<A: Allocator = Global> {
+pub struct StartupImage<A: Allocator> {
     pub manifest: ContentId,
     pub placed: Vec<Placement, A>,
 }
 
-// By hand: a derive would ask the allocator for `PartialEq` and `Debug`, which `Global` lacks.
+// By hand: a derive would ask the allocator for `PartialEq` and `Debug`, which a handle lacks.
 impl<A: Allocator> PartialEq for StartupImage<A> {
     fn eq(&self, other: &Self) -> bool {
         self.manifest == other.manifest && self.placed[..] == other.placed[..]
