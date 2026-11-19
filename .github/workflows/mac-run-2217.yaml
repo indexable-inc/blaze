@@ -198,7 +198,7 @@ jobs:
             local label=$1 probe
             run_prog "$label" hello-blaze "$B/crates/blaze-cli/tests/e2e/hello-blaze" 300
             if [ "$(cat "$LOGS/$label-hello-blaze.rc")" != 124 ]; then repeat_run "$label" hello-blaze 120; fi
-            for probe in p-const p-fn p-fntable p-local; do
+            for probe in p-const p-fn p-fntable p-local p-triple p-tuple p-array p-consttuple p-slicepat p-fnslicepat p-localpat; do
               run_prog "$label" "$probe" "$M/probes/$probe" 180
             done
           }
@@ -284,7 +284,105 @@ jobs:
               Ok(())
           }
           RS
-          head -n 50 "$M"/probes/*/src/main.rs
+          # Run 3: indexing in `main` is refused at 8a530e450 on both commits (the `#[track_caller]`
+          # location of the bounds check), so these read the same shapes through patterns only.
+          probe p-triple $'t 9\n' <<'RS'
+          fn t() -> &'static &'static &'static i32 {
+              &&&9
+          }
+
+          fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+              match ***t() {
+                  9 => out.line(cx, "t 9")?,
+                  _ => out.line(cx, "t other")?,
+              }
+              Ok(())
+          }
+          RS
+          probe p-tuple $'g 1 2\n' <<'RS'
+          fn g() -> &'static (&'static i32, &'static i32) {
+              &(&1, &2)
+          }
+
+          fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+              let (a, b) = *g();
+              match *a {
+                  1 => match *b {
+                      2 => out.line(cx, "g 1 2")?,
+                      _ => out.line(cx, "g b other")?,
+                  },
+                  _ => out.line(cx, "g a other")?,
+              }
+              Ok(())
+          }
+          RS
+          probe p-array $'h 3 4\n' <<'RS'
+          fn h() -> &'static [&'static i32; 2] {
+              &[&3, &4]
+          }
+
+          fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+              let [a, b] = *h();
+              match *a {
+                  3 => match *b {
+                      4 => out.line(cx, "h 3 4")?,
+                      _ => out.line(cx, "h b other")?,
+                  },
+                  _ => out.line(cx, "h a other")?,
+              }
+              Ok(())
+          }
+          RS
+          probe p-consttuple $'c 5 6\n' <<'RS'
+          const C: &(&i32, &i32) = &(&5, &6);
+
+          fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+              let (a, b) = *C;
+              match *a {
+                  5 => match *b {
+                      6 => out.line(cx, "c 5 6")?,
+                      _ => out.line(cx, "c b other")?,
+                  },
+                  _ => out.line(cx, "c a other")?,
+              }
+              Ok(())
+          }
+          RS
+          probe p-slicepat $'*.ads\n' <<'RS'
+          const T: &[(&[&str], &[&str])] = &[(&["ada"], &["*.adb", "*.ads"])];
+
+          fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+              match T {
+                  [(_, [_, d])] => out.line(cx, *d)?,
+                  _ => out.line(cx, "T other")?,
+              }
+              Ok(())
+          }
+          RS
+          probe p-fnslicepat $'*.ads\n' <<'RS'
+          fn table() -> &'static [(&'static [&'static str], &'static [&'static str])] {
+              &[(&["ada"], &["*.adb", "*.ads"])]
+          }
+
+          fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+              match table() {
+                  [(_, [_, d])] => out.line(cx, *d)?,
+                  _ => out.line(cx, "table other")?,
+              }
+              Ok(())
+          }
+          RS
+          probe p-localpat $'x 2 3\n' <<'RS'
+          fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+              let x: &[&[u8]] = &[&[1u8, 2], &[3]];
+              match x {
+                  [[_, 2], [3]] => out.line(cx, "x 2 3")?,
+                  _ => out.line(cx, "x other")?,
+              }
+              Ok(())
+          }
+          RS
+          head -n 30 "$M"/probes/*/src/main.rs
 
       - name: Rust (the nightly in harness/toolchain) and the lock's sources
         timeout-minutes: 20
