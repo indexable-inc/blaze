@@ -16,7 +16,10 @@
 //! fallback to a temporary: that is the wrong code this replaces). The record's allocations are
 //! the function's data rows (the walk's `data_rows`, one home with a constant path's), so two
 //! promotions of equal bytes in one function share nothing promised: Rust promises no address
-//! equality between promotions.
+//! equality between promotions. A shared borrow inside the operand (`&&7`) is promoted too, and
+//! its value is an allocation of the outer record: the outer row points at a row made from that
+//! allocation, not at the row of the inner borrow's own record (the same bytes, no promised
+//! address).
 //!
 //! A fn pointer in the value (the vtable's four entries) is a relocation to a fn instance by
 //! its [`InstanceKey`]. The walk can reference only an instance it names as an [`Instance`], so
@@ -90,6 +93,14 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     work.extend_from_slice(l);
                     work.push(callee);
                 }
+                // A shared borrow inside the operand (`&&7`, ignore's `&[(&["ada"], &["*.adb"])]`)
+                // is one the checker promoted too (blaze-typeck rules/promote.rs): its value is
+                // in this record as an allocation of its own (`DataTarget::Local`, as a constant
+                // path's referent is), made a data row by `data_rows`, so the outer row points at
+                // a row, never at the frame. Its operand may name fn items, so the walk goes on
+                // into it. A borrow the checker did not promote is a runtime temporary: refused.
+                Expr::Ref { mutbl: blaze_typeck::Mutbl::Not, operand: inner } if self.is_promoted(x) => work.push(inner),
+                Expr::Ref { .. } => return Err(unsupported(x, "a borrow inside a promoted operand that the checker did not promote")),
                 Expr::Path(_) => {
                     let t = self.expr_ty(x)?;
                     if let PNode::FnDef(item, args) = self.node_at(x, t)? {
