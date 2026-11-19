@@ -110,7 +110,7 @@ jobs:
           build_bins() {
             local label=$1 n=$2 log="$LOGS/$1-build-$2.log" t0 rc
             t0=$(date +%s)
-            if (cd "$B" && cargo +"$TC" build --locked --release -p blaze-cli -p blaze-launcher -p scripts \
+            if (cd "$B" && cargo +"$TC" build --release -p blaze-cli -p blaze-launcher -p scripts \
                   --bin blaze --bin blaze-fact-shim --bin blaze-launcher --bin toolchain_cut) > "$log" 2>&1; then rc=0; else rc=$?; fi
             row step "$label" "build $n" "$rc" "$(( $(date +%s) - t0 )) s; $(grep -E '^(error|warning: unused)' "$log" | head -n 1)"
             [ "$rc" = 0 ] || { echo "::error::$label: build $n failed (exit $rc)"; tail -n 60 "$log"; }
@@ -220,7 +220,7 @@ jobs:
                      "blaze-ladder --test front2_promoted_value --test front2_promote_member"; do
               name=${t%% *}; log="$LOGS/$label-test-$name.log"
               # shellcheck disable=SC2086
-              if (cd "$B" && cargo +"$TC" test --locked --release --no-fail-fast -p $t) > "$log" 2>&1; then rc=0; else rc=$?; fi
+              if (cd "$B" && cargo +"$TC" test --release --no-fail-fast -p $t) > "$log" 2>&1; then rc=0; else rc=$?; fi
               counts=$(grep -E '^test result:' "$log" | awk '{ p += $4; f += $6 } END { printf "%d passed, %d failed", p, f }')
               names=$(grep -E '^test [^ ]+ \.\.\. ' "$log" | sed -E 's/^test //; s/ \.\.\. /: /' | tr '\n' ';')
               row test "$label" "$name" "$rc" "$counts" "$names"
@@ -297,7 +297,9 @@ jobs:
           fi
           rustup toolchain install "$TC" --profile minimal
           rustc +"$TC" -vV | tee "$LOGS/rustc.txt"
-          (cd "$B" && cargo +"$TC" fetch --locked)
+          # Not --locked: the committed Cargo.lock is behind the manifests at these commits (run 1 stopped here).
+          (cd "$B" && cargo +"$TC" fetch)
+          git -C "$B" status --short
           ls -d "$CARGO_HOME0"/registry/cache/index.crates.io-*
 
       - name: c2723984c (head) - build, toolchain cut
@@ -370,7 +372,7 @@ jobs:
             if [ "$label" = fix ]; then checkout_sha "$FIX_SHA"; else checkout_sha "$HEAD_SHA"; fi
             if (cd "$B" && HOME="$M/$label/home" CARGO_HOME="$CARGO_HOME0" RUSTUP_HOME="$RUSTUP_HOME0" \
                 BLAZE_RUNGS_BIN="$M/$label/bin/blaze" COMMAND_RUNGS_LIST="$LOGS/$label-command-rungs.txt" \
-                cargo +"$TC" test --locked --release -p blaze-cli --test command_rungs -- --nocapture) > "$LOGS/$label-command-rungs.log" 2>&1; then rc=0; else rc=$?; fi
+                cargo +"$TC" test --release -p blaze-cli --test command_rungs -- --nocapture) > "$LOGS/$label-command-rungs.log" 2>&1; then rc=0; else rc=$?; fi
             row test "$label" command_rungs "$rc" "$(grep -E '^command rungs:' "$LOGS/$label-command-rungs.log" | tail -n 1)" "$(grep -E '^hello-blaze' "$LOGS/$label-command-rungs.log" | tr '\n' ';')"
           done
           if [ -f "$LOGS/fix-command-rungs.txt" ] && [ -f "$LOGS/head-command-rungs.txt" ]; then
