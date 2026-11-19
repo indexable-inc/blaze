@@ -15,6 +15,25 @@ use crate::form::*;
 use crate::machine::{Machine, V, idx};
 
 /// The byte offsets of a string token's contents in `text`: `"..."` and `r#"..."#`.
+/// Whether the string token `text` is raw (`r"..."`, `r#"..."#`): its contents are its value as
+/// written, where a plain string's hold escapes (`\n`, `\u{..}`) that are not yet its value.
+fn is_raw(text: &str) -> bool {
+    text.starts_with('r')
+}
+
+/// The length of the escape that starts `bytes` (its first byte a backslash), as written in a
+/// plain string: `\u{..}` through its closing brace, any other escape its backslash and the
+/// byte after. A `{` or `}` inside an escape is no placeholder brace: rustc reads a format
+/// template after its escapes are decoded, and `\u{1}` is one character.
+fn escape_len(bytes: &[u8]) -> usize {
+    if bytes.get(1) == Some(&b'u') && bytes.get(2) == Some(&b'{') {
+        if let Some(close) = bytes[3..].iter().position(|b| *b == b'}') {
+            return 3 + close + 1;
+        }
+    }
+    bytes.len().min(2)
+}
+
 pub(crate) fn string_contents(text: &str) -> Option<(usize, usize)> {
     if let Some(raw) = text.strip_prefix('r') {
         let hashes = raw.len() - raw.trim_start_matches('#').len();
@@ -69,6 +88,7 @@ impl Machine<'_, '_, '_> {
         if !matches!(Expr::decode(self.out.exprs[t.0 as usize]), Ok(Expr::Lit(_))) {
             return Err(Why::NonStringTemplate);
         }
+        let raw = is_raw(tr.of(self.text()));
         let Some((cs, ce)) = string_contents(tr.of(self.text())) else { return Err(Why::NonStringTemplate) };
         let template = Range::new(tr.start + idx(cs), tr.start + idx(ce));
         let alloc = *self.vals.allocator();
@@ -77,7 +97,7 @@ impl Machine<'_, '_, '_> {
             let a = FmtArg::decode(node).map_err(|_| Why::NonStringTemplate)?;
             written.push(Written { name: a.name, expr: a.expr, range });
         }
-        self.format_args_of(template, &written, false, r)
+        self.format_args_of(template, raw, &written, false, r)
     }
 
     /// Lowers `format_args!(input)` (`input` the token tree's range, delimiters included).
@@ -99,6 +119,7 @@ impl Machine<'_, '_, '_> {
         }
         let tok_start = inner.start + idx(lexed.text_start(first));
         let tok_text = lexed.text(first);
+        let raw = is_raw(tok_text);
         let Some((cs, ce)) = string_contents(tok_text) else { return Err(Why::NonStringTemplate) };
         let template = Range::new(tok_start + idx(cs), tok_start + idx(ce));
         let mut at = inner.start + idx(lexed.text_start(first) + lexed.text_len(first));
@@ -158,12 +179,13 @@ impl Machine<'_, '_, '_> {
             }
             at = end_at;
         }
-        self.format_args_of(template, &written, newline, r)
+        self.format_args_of(template, raw, &written, newline, r)
     }
 
-    /// The node of `format_args!` with `template` (its string's contents) and the `written`
-    /// arguments: the template's pieces, and the arguments it captures.
-    fn format_args_of(&mut self, template: Range, written: &[Written], newline: bool, r: Range) -> Result<ExprId, Why> {
+    /// The node of `format_args!` with `template` (its string's contents, as written: `raw` when
+    /// the string is raw, else holding escapes) and the `written` arguments: the template's
+    /// pieces, and the arguments it captures.
+    fn format_args_of(&mut self, template: Range, raw: bool, written: &[Written], newline: bool, r: Range) -> Result<ExprId, Why> {
         let alloc = *self.vals.allocator();
         let mut owned = blaze_own::AString::new_in(alloc);
         owned.push_str(template.of(self.text()));
@@ -178,6 +200,7 @@ impl Machine<'_, '_, '_> {
         let mut run = 0usize;
         while i < bytes.len() {
             match bytes[i] {
+                b'\\' if !raw => i += escape_len(&bytes[i..]),
                 b'{' if bytes.get(i + 1) == Some(&b'{') => i += 2,
                 b'}' if bytes.get(i + 1) == Some(&b'}') => i += 2,
                 b'{' => {
