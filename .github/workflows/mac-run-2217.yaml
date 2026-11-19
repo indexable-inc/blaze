@@ -479,8 +479,17 @@ jobs:
             sed -E 's/^[^:]*: ([A-Z]+).*/\1/' "$LOGS/$label-rung-lines.txt" | sort | uniq -c || true
           done
           echo "==== rung lines, head against fix (diff; empty means the same) ===="
-          diff "$LOGS/head-rung-lines.txt" "$LOGS/fix-rung-lines.txt" | cut -c1-400 | head -n 120 || true
-          echo "==== rung-line diff lines: $(diff "$LOGS/head-rung-lines.txt" "$LOGS/fix-rung-lines.txt" | wc -l)"
+          diff -a "$LOGS/head-rung-lines.txt" "$LOGS/fix-rung-lines.txt" | LC_ALL=C tr -c '[:print:]\n' '?' | cut -c1-900 | head -n 120 || true
+          echo "==== rung-line diff lines: $(diff -a "$LOGS/head-rung-lines.txt" "$LOGS/fix-rung-lines.txt" | wc -l)"
+          echo "==== name and verdict only, head against fix ===="
+          diff -a <(LC_ALL=C sed -E 's/^([^:]*: [A-Z]+).*/\1/' "$LOGS/head-rung-lines.txt") <(LC_ALL=C sed -E 's/^([^:]*: [A-Z]+).*/\1/' "$LOGS/fix-rung-lines.txt") | head -n 60 || true
+          echo "==== every head rung line, name and verdict ===="
+          LC_ALL=C sed -E 's/^([^:]*: [A-Z]+).*/\1/' "$LOGS/head-rung-lines.txt" | tr '\n' ';' | fold -w 900
+          echo
+          echo "==== lines naming promotion, head then fix ===="
+          grep -a -i 'promot' "$LOGS/head-rung-lines.txt" | LC_ALL=C tr -c '[:print:]\n' '?' | cut -c1-500 | head -n 20 || true
+          echo "---- fix"
+          grep -a -i 'promot' "$LOGS/fix-rung-lines.txt" | LC_ALL=C tr -c '[:print:]\n' '?' | cut -c1-500 | head -n 20 || true
           if [ -f "$LOGS/fix-command-rungs.txt" ] && [ -f "$LOGS/head-command-rungs.txt" ]; then
             diff "$LOGS/head-command-rungs.txt" "$LOGS/fix-command-rungs.txt" > "$LOGS/command-rungs.diff" || true
             head -n 80 "$LOGS/command-rungs.diff"
