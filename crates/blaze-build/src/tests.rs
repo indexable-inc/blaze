@@ -307,6 +307,8 @@ struct TestWorld {
     param_names: Vec<(Name, u32), Global>,
     /// What `Adts::const_fn_instance` answers: the instance a constant's fn relocation names.
     const_fns: Vec<(crate::InstanceKey, Instance), Global>,
+    /// What `Adts::promoted_fn_key` answers: the key of a fn item a promoted operand names.
+    promoted_fns: Vec<(Instance, crate::InstanceKey), Global>,
     /// `#[lang = "deref"] trait Deref { type Target; }` (`DEREF`) and its one impl (`DEREF_IMPL`):
     /// `impl Deref for <self> { type Target = <target>; }`, both types of this world's table.
     deref: Option<(PTy, PTy)>,
@@ -389,6 +391,7 @@ impl TestWorld {
             const_params: Vec::new_in(Global),
             param_names: Vec::new_in(Global),
             const_fns: Vec::new_in(Global),
+            promoted_fns: Vec::new_in(Global),
             deref: None,
             deref_defs: Vec::new_in(Global),
             deref_assoc: Vec::new_in(Global),
@@ -843,6 +846,10 @@ impl Adts for TestAdts<'_> {
 
     fn const_fn_instance(&self, key: crate::InstanceKey, _: &mut PortableTys<'_>) -> Option<Instance> {
         self.world.const_fns.iter().find(|(k, _)| *k == key).map(|&(_, i)| i)
+    }
+
+    fn promoted_fn_key(&self, instance: Instance, _: &mut PortableTys<'_>) -> Option<crate::InstanceKey> {
+        self.world.promoted_fns.iter().find(|(i, _)| *i == instance).map(|&(_, k)| k)
     }
 
     fn int_lit(&self, _: ItemKey, expr: ExprId) -> Option<u128> {

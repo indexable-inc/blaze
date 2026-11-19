@@ -19,7 +19,8 @@
 //! - its operand is promotable: a literal; a path to a `const`, a fn item or a unit or tuple
 //!   ctor; a tuple, array or struct literal (no `..base`) of promotable operands; a call of a
 //!   fn item whose attributes carry `#[rustc_promotable]` ([`TypeAttrs::PROMOTABLE`]), or of a
-//!   tuple ctor, with promotable arguments; parentheses around one of these;
+//!   tuple ctor, with promotable arguments; a shared borrow of a promotable operand whose own
+//!   type is `Freeze` with no drop glue (as below: `&&1`); parentheses around one of these;
 //! - and the operand's type is `Freeze` with no drop glue, decided structurally where the type
 //!   says so (scalars, `&T`, raw and fn pointers, fn items, tuples and arrays of such) and by
 //!   the lang `freeze` trait (`may_hold`, an auto trait: core/src/marker.rs `pub unsafe auto
@@ -121,6 +122,15 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         return Ok(false);
                     }
                     work.extend_from_slice(self.body.expr_list(args)?);
+                }
+                // A shared borrow of a promotable operand whose value is `Freeze` with no drop
+                // glue: it could be written in a constant (`&(&1)`, ignore's `DEFAULT_TYPES`
+                // `&[(&["ada"], &["*.adb"])]`), so it is itself promotable.
+                Expr::Ref { mutbl: Mutbl::Not, operand } => {
+                    if !self.freeze_without_drop(self.expr_ty[operand.ix()])? {
+                        return Ok(false);
+                    }
+                    work.push(operand);
                 }
                 _ => return Ok(false),
             }
