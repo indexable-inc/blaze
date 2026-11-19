@@ -1,5 +1,5 @@
 /**
- * The few line icons the page scripts draw themselves (the lesson player's Back and speaker, the intro's speaker), in
+ * The few line icons the page scripts draw themselves (the lesson player's Back and speaker), in
  * the stroke of the sidebar's (renderer core icons.rs).
  *
  * Under client/lib/ (not bundled as an entry).
