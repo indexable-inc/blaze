@@ -36,7 +36,7 @@ env:
   OWNER_SHA: 1bcb1084ab7239fb2894669484df42851e4bb062
   # "true" also runs tests/command_rungs.rs (hello-blaze and all 241 front2 rungs through the
   # release binary) on both commits: up to 241 x 120 s each, so off unless asked for.
-  COMMAND_RUNGS: "false"
+  COMMAND_RUNGS: "true"
   CARGO_TERM_COLOR: never
   CARGO_INCREMENTAL: "1"
 
@@ -476,6 +476,9 @@ jobs:
           if [ -f "$LOGS/fix-command-rungs.txt" ] && [ -f "$LOGS/head-command-rungs.txt" ]; then
             diff "$LOGS/head-command-rungs.txt" "$LOGS/fix-command-rungs.txt" > "$LOGS/command-rungs.diff" || true
             head -n 80 "$LOGS/command-rungs.diff"
+            echo "RUNGS DIFF LINES: $(wc -l < "$LOGS/command-rungs.diff")"
+            echo "RUNGS LIST LINES: head $(wc -l < "$LOGS/head-command-rungs.txt") fix $(wc -l < "$LOGS/fix-command-rungs.txt")"
+            awk '{ print $NF }' "$LOGS/head-command-rungs.txt" | sort | uniq -c | sort -rn | head -n 12 || true
           fi
 
       - name: summary
