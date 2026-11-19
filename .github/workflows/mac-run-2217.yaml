@@ -472,7 +472,15 @@ jobs:
                 BLAZE_RUNGS_BIN="$M/$label/bin/blaze" COMMAND_RUNGS_LIST="$LOGS/$label-command-rungs.txt" \
                 cargo +"$TC" test --release -p blaze-cli --test command_rungs -- --nocapture) > "$LOGS/$label-command-rungs.log" 2>&1; then rc=0; else rc=$?; fi
             row test "$label" command_rungs "$rc" "$(grep -E '^command rungs:' "$LOGS/$label-command-rungs.log" | tail -n 1)" "$(grep -E '^hello-blaze' "$LOGS/$label-command-rungs.log" | tr '\n' ';')"
+            echo "==== $label command_rungs: cargo status $rc; the log without cargo's own lines, last 150 ===="
+            grep -vE '^[[:space:]]*(Compiling|Finished|Running|Downloaded|Downloading|warning|-->|\||=|[0-9]+ )' "$LOGS/$label-command-rungs.log" | cut -c1-300 | tail -n 150 || true
+            grep -E '^(hello-blaze|front2/)[^:]*: (PASS|REFUSED|WRONG|HUNG|CRASHED)' "$LOGS/$label-command-rungs.log" | cut -c1-400 > "$LOGS/$label-rung-lines.txt" || true
+            echo "==== $label rung lines: $(wc -l < "$LOGS/$label-rung-lines.txt"); by verdict:"
+            sed -E 's/^[^:]*: ([A-Z]+).*/\1/' "$LOGS/$label-rung-lines.txt" | sort | uniq -c || true
           done
+          echo "==== rung lines, head against fix (diff; empty means the same) ===="
+          diff "$LOGS/head-rung-lines.txt" "$LOGS/fix-rung-lines.txt" | cut -c1-400 | head -n 120 || true
+          echo "==== rung-line diff lines: $(diff "$LOGS/head-rung-lines.txt" "$LOGS/fix-rung-lines.txt" | wc -l)"
           if [ -f "$LOGS/fix-command-rungs.txt" ] && [ -f "$LOGS/head-command-rungs.txt" ]; then
             diff "$LOGS/head-command-rungs.txt" "$LOGS/fix-command-rungs.txt" > "$LOGS/command-rungs.diff" || true
             head -n 80 "$LOGS/command-rungs.diff"
