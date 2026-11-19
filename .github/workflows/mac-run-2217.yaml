@@ -1,7 +1,7 @@
 # One question, on a GitHub-hosted macos-15 runner (arm64): does `blaze run` of the owner's hello
 # world (crates/blaze-cli/tests/e2e/hello-blaze, as tests/command_rungs.rs runs it) print the same
-# at a06c29bee (#2217, branch promote-nested-borrow-rebuild-1117: a shared borrow of a promotable
-# Freeze value is promotable) as at its base c2723984c (rebuild-1115)? blaze-build's
+# at 774196d1f (#2217, branch promote-nested-borrow-rebuild-1118: a shared borrow of a promotable
+# Freeze value is promotable) as at its base 8a530e450 (rebuild-1115)? blaze-build's
 # walk/promote.rs `promoted_fns` has no arm for a borrow inside a promoted operand, so a body on
 # hello's run path with a nested promoted borrow could now be refused. Linux cannot answer it: its
 # `blaze run` stops at the native image (`Write(NotMac)`).
@@ -29,8 +29,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  HEAD_SHA: c2723984cd1eb927824375f54b5aa6223a13825b
-  FIX_SHA: a06c29beed280f323ff19804039f00f467884763
+  HEAD_SHA: 8a530e450c1c3d1e2e66393b21614a5638204e76
+  FIX_SHA: 774196d1f4120bf2f4dbe3769cfa2048895bd4a6
   # The owner's last commit (1bcb1084a, "hello world prints"): built and run only when hello does
   # not print at HEAD_SHA, to tell a runner problem from a regression of the ten commits after it.
   OWNER_SHA: 1bcb1084ab7239fb2894669484df42851e4bb062
@@ -46,7 +46,7 @@ defaults:
 
 jobs:
   run:
-    name: blaze run hello, c2723984c vs a06c29bee
+    name: blaze run hello, 8a530e450 vs 774196d1f
     runs-on: macos-15
     timeout-minutes: 330
     steps:
@@ -302,7 +302,7 @@ jobs:
           git -C "$B" status --short
           ls -d "$CARGO_HOME0"/registry/cache/index.crates.io-*
 
-      - name: c2723984c (head) - build, toolchain cut
+      - name: 8a530e450 (head) - build, toolchain cut
         id: head-build
         continue-on-error: true
         timeout-minutes: 120
@@ -312,7 +312,7 @@ jobs:
           cut_shelf head
           df -h "$GITHUB_WORKSPACE"
 
-      - name: c2723984c (head) - blaze run
+      - name: 8a530e450 (head) - blaze run
         continue-on-error: true
         timeout-minutes: 40
         run: |
@@ -320,7 +320,7 @@ jobs:
           [ -f "$M/head/ready" ] || { echo "head did not build: nothing to run"; row run head hello-blaze - - "NOT BUILT" - - - -; exit 0; }
           run_all head
 
-      - name: a06c29bee (#2217) - checkout, build, toolchain cut
+      - name: 774196d1f (#2217) - checkout, build, toolchain cut
         continue-on-error: true
         timeout-minutes: 90
         run: |
@@ -330,7 +330,7 @@ jobs:
           cut_shelf fix
           diff -rq "$M/head/home/.blaze/v2/toolchain" "$M/fix/home/.blaze/v2/toolchain" > "$LOGS/shelf-diff.txt" 2>&1 && echo "the two shelves are equal" || { echo "the shelves differ:"; head -n 20 "$LOGS/shelf-diff.txt"; }
 
-      - name: a06c29bee (#2217) - blaze run
+      - name: 774196d1f (#2217) - blaze run
         continue-on-error: true
         timeout-minutes: 40
         run: |
@@ -396,15 +396,15 @@ jobs:
           if [ -z "$hs" ] || [ -z "$fs" ] || [ "$hs" = - ] || [ "$fs" = - ]; then
             answer="NOT ANSWERED: a commit did not build or run (head status '${hs}', fix status '${fs}')."
           elif [ "$hp" = no ]; then
-            answer="NOT ANSWERED: hello world does not print at c2723984c on this runner (status $hs); see the 1bcb1084a row."
+            answer="NOT ANSWERED: hello world does not print at 8a530e450 on this runner (status $hs); see the 1bcb1084a row."
           elif [ "$fp" = yes ] && [ "$hs" = "$fs" ] && cmp -s "$LOGS/head-hello-blaze.out" "$LOGS/fix-hello-blaze.out"; then
-            answer="#2217 keeps hello world printing: the same stdout and the same status ($hs) at c2723984c and a06c29bee."
+            answer="#2217 keeps hello world printing: the same stdout and the same status ($hs) at 8a530e450 and 774196d1f."
             [ "$he" = "$fe" ] || answer="$answer The first error line differs: head '$he', fix '$fe'."
           else
             answer="#2217 CHANGES hello world: head printed it (status $hs), the fix's stdout as expected: $fp, status $fs, first error line '$fe'."
           fi
           {
-            echo "## blaze run of the owner's hello world: c2723984c (head) against a06c29bee (#2217)"
+            echo "## blaze run of the owner's hello world: 8a530e450 (head) against 774196d1f (#2217)"
             echo
             echo "**$answer**"
             echo
