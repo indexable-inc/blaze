@@ -823,4 +823,9 @@ pub(crate) enum Plant {
     /// `Fs::ancestors` asks the driver for every folder above the start, not only the granted
     /// ones: the bound not checked.
     AncestorsUnbounded,
+    /// A publish's temporary file is named by the world's counter alone, not its process's
+    /// id: two processes running the same calls share it (fs.rs `beside`).
+    SharedTemporary,
+    /// `Dir::publish_new` renames over what its path holds rather than linking beside it.
+    ReplaceOnPublish,
 }

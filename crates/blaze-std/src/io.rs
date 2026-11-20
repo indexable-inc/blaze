@@ -282,6 +282,8 @@ pub(crate) enum Ends {
 struct World {
     driver: Backend,
     next: u64,
+    /// The numbers [`Io::fresh`] gave: a publish's temporary files'.
+    temps: u64,
     /// Effects made and not yet handed to the driver.
     effects: Vec<Effect>,
     /// What the last poll moved, before it is sorted into `got`.
@@ -821,6 +823,7 @@ impl World {
             driver,
             above,
             next: 0,
+            temps: 0,
             // alloc: the effects' queue, grown once to the most made between waits.
             effects: Vec::new(),
             // alloc: the poll's buffer, grown once to the most a poll moves.
@@ -1643,13 +1646,32 @@ impl Io {
         self.world().lock().changed.get(name).copied().unwrap_or(0)
     }
 
-    /// A number no other call of this world was given: a tag's, taken for a name made beside
-    /// another (a publish's temporary file).
+    /// A number no other call of this world was given, for a name made beside another (a
+    /// publish's temporary file): its own count, apart from the tags', so that a test can run
+    /// another process's calls on this world ([`Io::as_process`]).
     pub(crate) fn fresh(&self) -> u64 {
         let mut world = self.world().lock();
-        let fresh = world.next;
-        world.next += 1;
+        let fresh = world.temps;
+        world.temps += 1;
         fresh
+    }
+
+    /// The calls that follow made as another process's on this simulated world's one disk:
+    /// `pid` its id ([`HostFacts::pid`]) and `next` the count its publishes' temporary files
+    /// are numbered from; what the world had is handed back, to switch to the next. Those two
+    /// are what a process of its own has apart from another on one disk, for a publish (the
+    /// simulation has one process a disk): for tests that interleave several commands' file
+    /// calls (bstd tests/writers.rs, blaze-cli's store). `None` on a world that is not
+    /// simulated, which this changes nothing of.
+    pub fn as_process(&self, pid: u32, next: u64) -> Option<(u32, u64)> {
+        if !self.is_sim() {
+            return None;
+        }
+        let mut world = self.world().lock();
+        let was = (world.host.pid, world.temps);
+        world.host.pid = pid;
+        world.temps = next;
+        Some(was)
     }
 
     /// What the simulated disk was asked to do so far ([`DiskCounts`]): bytes written and

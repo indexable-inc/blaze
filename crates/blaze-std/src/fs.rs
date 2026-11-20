@@ -28,7 +28,9 @@
 //!
 //! **Say what a path should hold.** [`Dir::publish`] makes a path hold a [`Content`] (bytes,
 //! a clone of a flushed file, a copy of any file, a flushed file with ranges changed),
-//! replaced all at once by a rename, and says [`How`] it did it.
+//! replaced all at once by a rename, and says [`How`] it did it. [`Dir::publish_new`] makes a
+//! path that is its content's digest hold it once, never replacing it, so that several
+//! processes may publish one name at once: what is there already is the content ([`Put`]).
 //!
 //! **What a crash keeps**, on the simulated disk ([`crate::disk`]):
 //!
@@ -36,6 +38,8 @@
 //! |---|---|
 //! | `publish_synced` returned | exactly the content |
 //! | `publish_unsynced` returned | what it held durably before, or any prefix of the content |
+//! | `publish_new_synced` returned (made or held) | exactly the content |
+//! | `publish_new_unsynced` returned | nothing, or any prefix of the content (or the content, if it was durable before) |
 //! | `remove_synced` returned | nothing |
 //! | `remove_unsynced` returned | nothing, or what it held |
 //! | an append, a write at an offset or a cut, then `flush` returned | every byte of them |
@@ -501,6 +505,22 @@ impl<'a> Content<'a> {
     }
 }
 
+/// What [`Dir::publish_new`] found at its path: it made the name, or the name held the content
+/// already (put by another process, or by this one before).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Put {
+    Made,
+    Held,
+}
+
+/// A [`Dir::publish_new`] cut in two: its content in this process's temporary file, the name
+/// not yet made ([`Dir::stage`], [`Dir::commit_new`]).
+pub(crate) struct Staged {
+    temp: FileName,
+    name: FileName,
+    how: How,
+}
+
 /// What a publish made: the file at its path, typed by whether its bytes reached the disk,
 /// and how it was made.
 #[derive(Clone, Debug)] // clone: authority held, copied: refcounts
@@ -616,6 +636,10 @@ pub enum FsKind {
     Driver(String),
     /// The driver answered with a completion of another kind: a driver's bug.
     Answered(String),
+    /// [`Dir::publish_new`]'s name is there with another length than this publish wrote
+    /// (`wrote`, `None` when its own temporary file is gone): two contents under one name,
+    /// which a name that is its content's digest never has. Nothing was replaced.
+    TwoContents { there: u64, wrote: Option<u64> },
 }
 
 /// A file call that failed: the call, the file (under the driver's root) and how.
@@ -670,6 +694,14 @@ impl fmt::Display for FsError {
             FsKind::Driver(said) => write!(f, "bstd::fs {op} of {path}: {said}"),
             FsKind::Answered(done) => {
                 write!(f, "bstd::fs {op} of {path}: the driver answered {done} (a driver's bug)")
+            }
+            FsKind::TwoContents { there, wrote } => {
+                let wrote = wrote.map_or_else(|| String::from("its temporary file is gone"), |len| format!("it wrote {len}"));
+                write!(
+                    f,
+                    "bstd::fs {op} of {path}: it holds {there} bytes and this publish's content is not that ({wrote}): \
+                     two contents under one name, which publish_new never replaces"
+                )
             }
         }
     }
@@ -726,7 +758,7 @@ impl FsError {
     pub fn stopped(&self) -> Option<&Stopped> {
         match &self.kind {
             FsKind::Stopped(stopped) => Some(stopped),
-            FsKind::NotFound | FsKind::IsADirectory | FsKind::NotADirectory | FsKind::Exists | FsKind::OverQuota(..) | FsKind::Stale { .. } | FsKind::Driver(..) | FsKind::Answered(..) => None,
+            FsKind::NotFound | FsKind::IsADirectory | FsKind::NotADirectory | FsKind::Exists | FsKind::OverQuota(..) | FsKind::Stale { .. } | FsKind::Driver(..) | FsKind::Answered(..) | FsKind::TwoContents { .. } => None,
         }
     }
 }
@@ -962,15 +994,29 @@ fn copy_file(
     }
 }
 
-/// A name beside `name`, in its directory, that no other call of this world was given: a
-/// publish's temporary file, `.<leaf>.<n>.bstd-new`.
+/// A name beside `name`, in its directory, that no other call of this process or of another
+/// live process is given: a publish's temporary file, `.<leaf>.<pid>-<n>.bstd-new`. `n` is
+/// this world's ([`Io::fresh`]), one a call on every thread; `pid` ([`HostFacts::pid`]) tells
+/// it from every other process's, whose counters run the same sequence. Without it two
+/// `blaze check`s sealing one pack (2026-11-17, traced) both wrote `.<pack>.67.bstd-new`:
+/// both truncated it and appended, so it held the pack twice; the first rename took it, its
+/// read-back found it torn, and the second rename failed `No such file`. A process that died
+/// leaves its temporary under its pid; one given that pid later truncates it before writing,
+/// and no live process shares it. Under [`Plant::SharedTemporary`] the pid is left out.
+///
+/// [`HostFacts::pid`]: crate::host::HostFacts::pid
 fn beside(io: &Io, name: &FileName) -> FileName {
     let fresh = io.fresh();
-    let joined = match name.as_str().rsplit_once('/') {
+    let pid = io.host_facts(|host| host.pid);
+    let joined = match (io.plant() == Plant::SharedTemporary, name.as_str().rsplit_once('/')) {
+        // alloc: a planted control's temporary file's name.
+        (true, Some((dir, leaf))) => format!("{dir}/.{leaf}.{fresh}.bstd-new"),
+        // alloc: a planted control's temporary file's name.
+        (true, None) => format!(".{name}.{fresh}.bstd-new"),
         // alloc: once per publish, its temporary file's name.
-        Some((dir, leaf)) => format!("{dir}/.{leaf}.{fresh}.bstd-new"),
+        (false, Some((dir, leaf))) => format!("{dir}/.{leaf}.{pid}-{fresh}.bstd-new"),
         // alloc: once per publish, its temporary file's name.
-        None => format!(".{name}.{fresh}.bstd-new"),
+        (false, None) => format!(".{name}.{pid}-{fresh}.bstd-new"),
     };
     FileName::new(&joined).expect("a name beside a name is a name")
 }
@@ -1159,7 +1205,7 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         let base = match self.io.plant() {
             // clone: the planted bug keeps the parent's name, a refcount.
             Plant::SubdirKeepsParent => self.base.clone(),
-            Plant::None | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded => DirName::Named(self.beneath(path)),
+            Plant::None | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded | Plant::SharedTemporary | Plant::ReplaceOnPublish => DirName::Named(self.beneath(path)),
         };
         // clone: the quota shared, a refcount.
         Dir { io: self.io.clone(), base, quota: self.quota.clone(), rights: PhantomData }
@@ -1380,6 +1426,14 @@ impl Dir<ReadWrite> {
     /// it was made. A failure leaves the temporary file where it is; the error names it.
     fn place(&self, cx: &Cx, name: &FileName, content: Content<'_>) -> Result<(FileName, How), FsError> {
         let temp = beside(&self.io, name);
+        let how = self.place_at(cx, &temp, content)?;
+        Ok((temp, how))
+    }
+
+    /// [`Dir::place`]'s writing, into the temporary file `temp`.
+    fn place_at(&self, cx: &Cx, temp: &FileName, content: Content<'_>) -> Result<How, FsError> {
+        // clone: the temporary's name, a refcount, for the effects below.
+        let temp = temp.clone();
         let quota = self.quota.as_deref();
         let how = match content.kind {
             Kind::Bytes(bytes) => {
@@ -1496,7 +1550,7 @@ impl Dir<ReadWrite> {
                 How::Derived
             }
         };
-        Ok((temp, how))
+        Ok(how)
     }
 
     /// `path` made to hold `content`, replaced all at once, as durable as `durable` says:
@@ -1559,6 +1613,113 @@ impl Dir<ReadWrite> {
         // and nothing changed them since.
         let seen = self.io.generation(&name);
         Ok(Published { file: Flushed::of(&self.io, name, seen), how })
+    }
+
+    /// `path`, a name that is a digest of its content (a store's pack), made to hold
+    /// `content` once and never replaced, as durably as `durable` says: one name, one content
+    /// (rule 21), so a path already there holds it ([`Put::Held`]) and that is done, whoever
+    /// put it. For files several processes write at once (commands on one home): the temporary
+    /// file is this process's alone ([`beside`]), and the name is made by [`Effect::Link`],
+    /// which never replaces (`link(2)` and `CreateHardLinkW` fail on a name that is there), then
+    /// the temporary removed. So a reader sees the name absent or whole, a name that was
+    /// whole stays the file it was (a replace would let an unsynced rename over a durable
+    /// file tear it in a crash), and a second writer is not failed by the first. A name that
+    /// is there with another length than this publish wrote is two contents under one name: an
+    /// error naming it, never taken. [`Dir::publish_new_unsynced`] or
+    /// [`Dir::publish_new_synced`], chosen at run time.
+    pub fn publish_new(&self, cx: &Cx, path: &Path, content: Content<'_>, durable: Durable) -> Result<Put, FsError> {
+        let staged = self.stage(cx, path, content)?;
+        self.commit_new(cx, staged, durable)
+    }
+
+    /// [`Dir::publish_new`] with nothing synced: after a crash the path is absent, or holds
+    /// any prefix of the content (derived data, checked by its reader or made again).
+    pub fn publish_new_unsynced(&self, cx: &Cx, path: &Path, content: Content<'_>, unsynced: Unsynced) -> Result<Put, FsError> {
+        let durable = match unsynced {
+            Unsynced::No => Durable::No,
+            Unsynced::Started => Durable::Started,
+        };
+        self.publish_new(cx, path, content, durable)
+    }
+
+    /// [`Dir::publish_new`], durable once it returns: the bytes at the path flushed (this
+    /// publish's before its link, or the file found there) and the directory's names synced.
+    pub fn publish_new_synced(&self, cx: &Cx, path: &Path, content: Content<'_>) -> Result<Put, FsError> {
+        self.publish_new(cx, path, content, Durable::Yes)
+    }
+
+    /// The first half of [`Dir::publish_new`]: `content` written to this process's temporary
+    /// file beside `path`, nothing visible at `path` yet. A stage dropped uncommitted leaves the
+    /// temporary file, as a crash would: never read, under no name a reader takes.
+    ///
+    /// A stage that fails removes what it made of its temporary file, then says the failure
+    /// (a store's merge whose source pack another command removed meanwhile gives up this
+    /// way, and every such give-up would otherwise leave a file no one reads).
+    pub(crate) fn stage(&self, cx: &Cx, path: &Path, content: Content<'_>) -> Result<Staged, FsError> {
+        let name = self.beneath(path);
+        let temp = beside(&self.io, &name);
+        match self.place_at(cx, &temp, content) {
+            Ok(how) => Ok(Staged { temp, name, how }),
+            Err(failed) => {
+                // The failure is the one said; a remove that fails too leaves the file, as a
+                // crash would, under a name no reader takes.
+                let _ = remove(&self.io, cx, FsOp::Publish, &temp);
+                Err(failed)
+            }
+        }
+    }
+
+    /// The second half of [`Dir::publish_new`]: the staged file made the path's, never
+    /// replacing it, as durably as `durable` says.
+    pub(crate) fn commit_new(&self, cx: &Cx, staged: Staged, durable: Durable) -> Result<Put, FsError> {
+        let Staged { temp, name, how } = staged;
+        let io = &self.io;
+        if durable == Durable::Yes {
+            flush_wait(io, cx, FsOp::Publish, &temp)?;
+        }
+        let put = match io.plant() {
+            Plant::ReplaceOnPublish => {
+                rename_by(io, cx, FsOp::Publish, &temp, &name, |from, to, tag| Effect::RenameUnsynced { from, to, tag })?;
+                Put::Made
+            }
+            _ => {
+                // clone: the effect's names, refcounts.
+                let (from, to) = (temp.clone(), name.clone());
+                match call(io, cx, FsOp::Publish, &name, |tag| Effect::Link { from, to, tag })? {
+                    Done::Linked => Put::Made,
+                    // `EEXIST` comes back as words (blaze-core's `IoError`): the name is looked
+                    // at to say which. There: another process put it; not there: the link's
+                    // own failure, said as the driver said it.
+                    Done::Failed(error) => match (stat(io, cx, FsOp::Publish, &name)?, stat(io, cx, FsOp::Publish, &temp)?) {
+                        (Some(there), Some(ours)) if there.len == ours.len => Put::Held,
+                        (Some(there), ours) => {
+                            let kind = FsKind::TwoContents { there: there.len, wrote: ours.map(|it| it.len) };
+                            return Err(FsError::new(FsOp::Publish, &name, kind));
+                        }
+                        (None, _) => return Err(FsError::new(FsOp::Publish, &name, FsKind::Driver(error.0))),
+                    },
+                    done => return Err(unexpected(FsOp::Publish, &name, done)),
+                }
+            }
+        };
+        // Linked: the file has its name, the temporary goes. Held: ours was not needed. Gone
+        // already (a planted rename took it) is done.
+        remove(io, cx, FsOp::Publish, &temp)?;
+        match durable.unsynced() {
+            Some(unsynced) => {
+                started(io, &name, unsynced);
+                names_started(io, &name, unsynced);
+            }
+            None => {
+                // Held: the bytes there are another process's, flushed or not: flushed here.
+                if put == Put::Held {
+                    flush_wait(io, cx, FsOp::Publish, &name)?;
+                }
+                sync_names(io, cx, FsOp::Publish, &name, None)?;
+            }
+        }
+        cx.event(how.says());
+        Ok(put)
     }
 
     /// The file at `path` gone, as durably as `durable` says; gone already is done.
