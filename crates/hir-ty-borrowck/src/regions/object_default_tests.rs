@@ -34,6 +34,23 @@ fn passes_back<'a>(x: &'a (dyn T + 'a)) -> &'a (dyn T + 'a) {
     back(x)
 }
 
+fn apply<A, U, F: FnOnce(A) -> U>(a: A, f: F) -> U {
+    f(a)
+}
+fn back_mut(x: &mut dyn T) -> &mut dyn T {
+    x
+}
+fn passes_through_a_fn_item(x: &mut dyn T) -> &mut dyn T {
+    apply(x, back_mut)
+}
+
+struct W<X>(X);
+fn take_wrapped(_x: W<&mut dyn T>) {}
+fn passes_from_a_closure_parameter() {
+    let c = |x: W<&mut dyn T>| take_wrapped(x);
+    let _ = c;
+}
+
 fn escapes<'a>(x: &'a (dyn T + 'a)) -> &'static (dyn T + 'static) {
     back(x)
 }
@@ -115,4 +132,14 @@ fn an_elided_dyn_return_is_still_tied_to_its_parameter() {
         let messages: Vec<&str> = result.diagnostics.iter().map(|it| it.message.as_str()).collect();
         assert_eq!(messages, ["lifetime may not live long enough"]);
     }
+}
+
+#[test]
+fn passing_a_fn_item_with_an_elided_dyn_mut_return_as_a_value_is_accepted() {
+    accepted("passes_through_a_fn_item");
+}
+
+#[test]
+fn a_closure_parameter_with_an_elided_dyn_mut_in_a_type_argument_is_accepted() {
+    accepted("passes_from_a_closure_parameter");
 }
