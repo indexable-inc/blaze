@@ -256,6 +256,17 @@ pub(crate) struct MachineSnapshot<S> {
     union_fields: usize,
 }
 
+/// Where an overloaded dereference is asked ([`Machine::overloaded_deref_at`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DerefAt {
+    /// An autoderef step (method probe, field access, coercion). It needs the target now, as
+    /// rustc's `Autoderef` stops at a type it cannot structurally normalize.
+    Autoderef,
+    /// The operator `*`. Once `t: Deref` may hold, the target may be a variable that is
+    /// decided later (rustc's `lookup_derefing`).
+    Operator,
+}
+
 /// An autoderef step: the type, and whether it was reached by `Deref::deref`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Step {
@@ -2456,7 +2467,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 // An object can itself implement Deref, e.g. `impl Deref for dyn Inspector`.
                 // Its Target is another receiver step with its own inherent methods.
                 TyView::Adt(..) | TyView::Param(_) | TyView::Opaque(..) | TyView::Dynamic(_) => {
-                    match self.overloaded_deref(cur)? {
+                    match self.overloaded_deref_at(cur, DerefAt::Autoderef)? {
                         Some(t) => (t, true),
                         None => return Ok((steps, false)),
                     }
@@ -2469,8 +2480,9 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         Ok((steps, true))
     }
 
-    /// `<t as Deref>::Target`, if `t: Deref` may hold and selects now.
-    pub(crate) fn overloaded_deref(&mut self, t: Ty) -> Result<Option<Ty>, Stop> {
+    /// `<t as Deref>::Target`, if `t: Deref` may hold. Whether the target must also select
+    /// now is `at`'s ([`DerefAt`]).
+    pub(crate) fn overloaded_deref_at(&mut self, t: Ty, at: DerefAt) -> Result<Option<Ty>, Stop> {
         let Some(deref) = self.lang(LangItem::Deref)? else {
             return Ok(None);
         };
@@ -2490,6 +2502,19 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 let cause = self.place;
                 self.ty.register(Obligation { goal: Goal::Projection { trait_: deref, args, name: target, term: t }, cause })?;
                 Ok(Some(t))
+            }
+            // The operator `*`: `t: Deref` may hold, and the target is not decided yet. One
+            // case is turso's `s.iter().map(|e| *e)` on a `SkipSet<?T>`: the impl's implied
+            // `?T: Sized` is ambiguous, and the target is `?T` itself. The target is then a
+            // fresh variable, and the projection is an obligation proved or refused with the
+            // rest. rustc does the same: `lookup_method_for_operator` checks only
+            // `predicate_may_hold`, and the method's output is normalized with its
+            // obligations registered.
+            None if at == DerefAt::Operator => {
+                let u = self.fresh()?;
+                let cause = self.place;
+                self.ty.register(Obligation { goal: Goal::Projection { trait_: deref, args, name: target, term: u }, cause })?;
+                Ok(Some(u))
             }
             None => Ok(None),
         }

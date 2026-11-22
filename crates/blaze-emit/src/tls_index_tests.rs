@@ -15,8 +15,9 @@ use blaze_lir::{
 
 use crate::{Isa, Os, RelocTo, tests::emitted_for};
 
-/// `bump() { N += 1; N }` for thread-local place 0.
-fn bump() -> Func<Global> {
+/// `bump() { N += 1; N }` for thread-local place 0 (tier_tests/thread_locals.rs runs it through
+/// both tiers).
+pub(crate) fn bump() -> Func<Global> {
     let mut b = Builder::<Global, Full>::new_in(64, Global);
     let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
     b.set_signature(sig);
@@ -45,16 +46,17 @@ fn the_indexed_access_names_the_descriptor_the_getter_and_the_index() {
     }
 }
 
+/// The test getter, shared with tier_tests/thread_locals.rs.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-mod run {
-    use std::sync::atomic::{AtomicU64, Ordering};
+pub(crate) mod run {
+    use std::cell::Cell;
 
     use super::{Isa, Os, RelocTo, bump, emitted_for};
     use crate::tests::run::place_all;
 
     unsafe extern "C" {
-        fn pthread_key_create(key: *mut usize, destructor: Option<unsafe extern "C" fn(*mut u8)>) -> i32;
-        fn pthread_getspecific(key: usize) -> *mut u8;
+        pub(crate) fn pthread_key_create(key: *mut usize, destructor: Option<unsafe extern "C" fn(*mut u8)>) -> i32;
+        pub(crate) fn pthread_getspecific(key: usize) -> *mut u8;
         fn pthread_setspecific(key: usize, value: *const u8) -> i32;
         fn calloc(count: usize, size: usize) -> *mut u8;
     }
@@ -62,21 +64,34 @@ mod run {
     /// D2's descriptor: `key`, `root`, `count`, `cap`, `vars` (the test's getter reads only
     /// `key`; the sequence reads `root`).
     #[repr(C)]
-    struct Desc {
-        key: u64,
-        root: u64,
-        count: u64,
-        cap: u64,
-        vars: u64,
+    pub(crate) struct Desc {
+        pub(crate) key: u64,
+        pub(crate) root: u64,
+        pub(crate) count: u64,
+        pub(crate) cap: u64,
+        pub(crate) vars: u64,
     }
 
-    static GETTER_CALLS: AtomicU64 = AtomicU64::new(0);
+    impl Desc {
+        /// A descriptor of a fresh pthread key, leaked for the test.
+        pub(crate) fn leaked() -> &'static Desc {
+            let mut key = 0usize;
+            // SAFETY: `key` is a live out-parameter.
+            assert_eq!(unsafe { pthread_key_create(&mut key, None) }, 0);
+            Box::leak(Box::new(Desc { key: key as u64, root: key as u64 * 8, count: 1, cap: 1, vars: 0 }))
+        }
+    }
+
+    std::thread_local! {
+        /// The getter's calls on this thread (per thread, so tests running at once do not mix).
+        pub(crate) static GETTER_CALLS: Cell<u64> = const { Cell::new(0) };
+    }
 
     /// D2's getter contract, cut to what the test needs: a table of 16 slots (header 32 bytes),
     /// made on the thread's first call, and a zeroed 8-byte copy per index. Leaks at thread exit
     /// (the test's key has no destructor).
-    extern "C" fn getter(desc: *const Desc, index: u64, root_at: *mut *mut u8) -> *mut u8 {
-        GETTER_CALLS.fetch_add(1, Ordering::Relaxed);
+    pub(crate) extern "C" fn getter(desc: *const Desc, index: u64, root_at: *mut *mut u8) -> *mut u8 {
+        GETTER_CALLS.with(|n| n.set(n.get() + 1));
         assert!(index < 16, "the test's table has 16 slots");
         // SAFETY: `desc` is the test's descriptor, leaked for the test.
         let desc = unsafe { &*desc };
@@ -113,11 +128,8 @@ mod run {
     #[test]
     fn the_indexed_access_gives_each_thread_its_own_copy() {
         let func = bump();
-        let mut key = 0usize;
-        // SAFETY: `key` is a live out-parameter.
-        assert_eq!(unsafe { pthread_key_create(&mut key, None) }, 0);
-        let desc: &'static Desc =
-            Box::leak(Box::new(Desc { key: key as u64, root: key as u64 * 8, count: 1, cap: 1, vars: 0 }));
+        let desc = Desc::leaked();
+        let key = desc.key as usize;
         let code = emitted_for(func.view(), &[], Isa { lse: true, os: Os::MacOs }).expect("emits");
         let exec = place_all(&code, |_| unreachable!(), |to| match to {
             RelocTo::TlsDesc => desc as *const Desc as u64,
@@ -126,7 +138,6 @@ mod run {
             other => panic!("{other:?}"),
         });
         let entry = exec.code_address() as usize;
-        GETTER_CALLS.store(0, Ordering::Relaxed);
         let gate = std::sync::Barrier::new(2);
         let run = || {
             // SAFETY: an emitted C function of no parameters returning an integer; its words
@@ -138,7 +149,7 @@ mod run {
             let table = unsafe { pthread_getspecific(key) } as usize;
             // Both threads alive here, so neither table is freed and reused for the other.
             gate.wait();
-            (counts, table)
+            (counts, table, GETTER_CALLS.with(Cell::get))
         };
         let (a, b) = std::thread::scope(|s| {
             let one = s.spawn(run);
@@ -148,7 +159,7 @@ mod run {
         assert_eq!(a.0, [1, 2, 3], "thread one");
         assert_eq!(b.0, [1, 2, 3], "thread two, from its own copy");
         assert_ne!(a.1, b.1, "two tables");
-        assert_eq!(GETTER_CALLS.load(Ordering::Relaxed), 2, "the getter once per thread");
+        assert_eq!((a.2, b.2), (1, 1), "the getter once per thread");
         drop(exec);
     }
 }

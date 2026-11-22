@@ -50,11 +50,22 @@
 //! front2 program.rs `Tabled`, about 6 KB a row with a `Body` and a `Checked` inline, the same
 //! rows in three vectors.)
 //!
-//! OPEN, said rather than guessed: (a) a crate's fact must cover that crate's exports AND its
-//! dependencies' (an argument type's field of a third crate): asked of the command's lane;
-//! until it does, a record is stale after an edit of only such a field's type. (b) What the
-//! build reads of a constant's value or a static's initializer is in no fact yet (code_records.rs
-//! "NOT IN THE KEY" still holds for those two).
+//! THE READ LIST (F20): what the build of an instance reads beyond its key (a dependency's
+//! layouts, constants, statics, callee ABIs, vtable shapes, projections, drop impls, resolved
+//! calls, C symbols: code_reads.rs) is not in the key. The make records it at the one world the
+//! builders take (run/make_one.rs `Asking`), the entry carries it, and an entry found under its
+//! key is taken only after the maker asks every row again today ([`Make::verify`]). Code
+//! records are no engine rows with cells (they live in the [`CodeStore`]), so nothing dirties
+//! them forward: the check is here, at lookup. A row answered otherwise makes the instance
+//! again; the new entry goes under its CONTENT key and the instance's key points to it
+//! (`CodeStore::point`), so a key never holds two values (rule 21) and a found entry is read
+//! through the pointer.
+//!
+//! OPEN, said rather than guessed: a static's entry (its initializer's reads) carries no read
+//! list yet; closure facts read from an owner other than the instance's fn are in neither
+//! (code_reads.rs "FORWARDED, NOT RECORDED"). A coroutine state an entry read is laid again
+//! by the verifier and its rows asked of that lay (code_reads.rs `ReadKind::Laid`,
+//! `CoroutineState`).
 
 use core::fmt;
 
@@ -65,11 +76,16 @@ use blaze_own::{AVec, Alloc, Vec};
 pub use blaze_run::parent::Read;
 use blaze_typeck::ItemKey;
 
+use crate::code_records::reads::Verdict;
 use crate::code_records::statics::{STATIC_ENTRY_MAGIC, StaticEntryView};
 use crate::code_records::{Builder, CodeClass, CodeKey, CodeStore, ENTRY_FORM, EntryError, EntryView, PanicStrategy, StoreError, triple};
 use crate::symbols::{fn_symbol_of_name, static_symbol, tls_symbol};
 
-const KEY_DOMAIN: &str = "blaze-ladder code record key 2";
+/// Version 3 (F20): an entry found under its key is taken only when its read list holds today,
+/// and a key names its entry through a pointer to the entry's content key. Every key of version
+/// 2 named an entry that carried no read list (run/make_one.rs passed `ReadList::empty()`), so
+/// none of them is read again.
+const KEY_DOMAIN: &str = "blaze-ladder code record key 3";
 
 /// One fn's BodyCheck identity, as the command read it.
 #[derive(Clone, Copy, Debug)]
@@ -300,6 +316,13 @@ impl<'a> DeclaredList<'a> {
 pub trait Form {
     /// Appends each instance `entry` declares to `out`, in the entry's order.
     fn declared(&self, entry: &[u8], out: &mut DeclaredList<'_>) -> Result<(), EntryError>;
+    /// The rows of `entry`'s read list (code_reads.rs): a found entry with any is taken only
+    /// when [`Make::verify`] says it holds. A form whose entries hold no read list (the walk's
+    /// model forms) has none to say: 0.
+    fn reads(&self, entry: &[u8]) -> Result<u32, EntryError> {
+        let _ = entry;
+        Ok(0)
+    }
 }
 
 /// The run path's entry form: a code record's (code_records.rs `make_entry`, read by
@@ -333,6 +356,15 @@ impl Form for EntryForm {
         view.each_thread_local(|item| out.push_thread_local(item));
         Ok(())
     }
+
+    /// A code entry's read-list rows (code_records.rs `EntryView::reads_count`); a static's
+    /// entry carries none (the module doc's OPEN).
+    fn reads(&self, entry: &[u8]) -> Result<u32, EntryError> {
+        if entry.get(..8) == Some(&STATIC_ENTRY_MAGIC[..]) {
+            return Ok(0);
+        }
+        Ok(EntryView::read(entry)?.reads_count())
+    }
 }
 
 /// The on-demand side: the front end and the builder, made on first need. One call checks,
@@ -357,6 +389,15 @@ pub trait Make {
     /// Appends to `entry` the TEMPLATE entry of thread-local `item` (code_records.rs
     /// `statics::make_template_entry`): its initial value made a read-only datum.
     fn make_thread_local(&mut self, grant: &Self::Grant, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error>;
+    /// Whether `entry`, found under the key of the instance `name` tabled as `tabled`, still
+    /// holds: every row of its read list asked again today (code_reads.rs `verify_today`).
+    /// Asked only of an entry with rows ([`Form::reads`]), with no grant: nothing is made.
+    /// `Ok(None)`: this maker asks no read list again, and the walk refuses the entry by name
+    /// ([`WalkError::Unverified`]); it is never taken unasked (rule 3).
+    fn verify(&mut self, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<Verdict>, Self::Error> {
+        let _ = (tabled, name, entry);
+        Ok(None)
+    }
 }
 
 /// A proof a make takes ([`Make::Grant`]). It is held, not read: the make path's signature is
@@ -485,9 +526,12 @@ pub enum Begun<'w> {
 /// answer with no key cannot be written).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stepped {
-    /// Its entry was in the store under its key: nothing checked, lowered or built.
+    /// Its entry was in the store under its key, its read list holding today: nothing checked,
+    /// lowered or built. The key is the one the entry's bytes are under (`CodeStore::get`): its
+    /// content key, which the instance's key points to.
     Found(CodeKey),
-    /// Made and put under its key.
+    /// Made and put under its content key, which the instance's key now points to; the content
+    /// key is held.
     Made(CodeKey),
     /// Made and not put: why it has no key.
     Unkeyed(Unkeyed),
@@ -528,6 +572,11 @@ pub enum WalkError<E> {
     Entry { tabled: ItemKey, found: bool, why: EntryError },
     /// The maker refused the instance of `tabled`.
     Make { tabled: ItemKey, why: E },
+    /// The entry of an instance of `tabled` was found with `rows` read-list rows, and the
+    /// walk's maker asks no read list again ([`Make::verify`]): refused, never taken unasked.
+    Unverified { tabled: ItemKey, rows: u32 },
+    /// The maker could not ask the found entry's read list of an instance of `tabled` again.
+    Verify { tabled: ItemKey, why: E },
     /// More instances than `most` (rule 18).
     Cap { most: usize },
     /// An instance name of `bytes` bytes, past `most` ([`NAME_MOST_BYTES`] and the forest's
@@ -570,6 +619,12 @@ impl<E: fmt::Display> fmt::Display for WalkError<E> {
             WalkError::Entry { tabled, found: true, why } => write!(f, "the stored entry of an instance of fn {:#x}: {why}", tabled.0),
             WalkError::Entry { tabled, found: false, why } => write!(f, "the entry just made for an instance of fn {:#x}: {why}", tabled.0),
             WalkError::Make { tabled, why } => write!(f, "the instance of fn {:#x} was not made: {why}", tabled.0),
+            WalkError::Unverified { tabled, rows } => write!(
+                f,
+                "the stored entry of an instance of fn {:#x} has {rows} read-list rows, and this walk's maker asks none again (body_ids.rs `Make::verify`): it is not taken unasked (rule 3)",
+                tabled.0
+            ),
+            WalkError::Verify { tabled, why } => write!(f, "the read list of the stored entry of an instance of fn {:#x} was not asked again: {why}", tabled.0),
             WalkError::Cap { most } => write!(f, "the record walk met more than {most} instances (its cap, rule 18)"),
             WalkError::NameTooLarge { tabled, declarer, bytes, most, heads } => {
                 write!(f, "an instance of fn {:#x}", tabled.0)?;
@@ -621,6 +676,13 @@ pub struct Counts {
     pub most_name_items: usize,
     /// The bytes of every name reached (the walk's arena).
     pub arena: usize,
+    /// Found entries whose read list was asked again and held (counted in `found`).
+    pub verified: usize,
+    /// Found entries whose read list answered otherwise today: made again (counted in `made`).
+    pub stale_reads: usize,
+    /// The first found entry whose read list did not hold: its fn and the verdict (the row's
+    /// kind and item). What a test prints when a walk it expects to find everything makes one.
+    pub first_moved: Option<(ItemKey, Verdict)>,
 }
 
 impl Counts {
@@ -631,15 +693,17 @@ impl Counts {
 }
 
 impl fmt::Display for Counts {
-    /// `code records: reached R, found F, made M, unkeyed U (no record N, stale S); names:
-    /// longest B bytes, most items I, arena A bytes`.
+    /// `code records: reached R, found F (read lists held V), made M (read lists moved L),
+    /// unkeyed U (no record N, stale S); names: longest B bytes, most items I, arena A bytes`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "code records: reached {}, found {}, made {}, unkeyed {} (no record {}, stale {}); names: longest {} bytes, most items {}, arena {} bytes",
+            "code records: reached {}, found {} (read lists held {}), made {} (read lists moved {}), unkeyed {} (no record {}, stale {}); names: longest {} bytes, most items {}, arena {} bytes",
             self.reached,
             self.found,
+            self.verified,
             self.made,
+            self.stale_reads,
             self.no_record + self.stale,
             self.no_record,
             self.stale,
@@ -684,6 +748,11 @@ pub struct Walk<'a> {
     recursion_limit: u32,
     /// The most distinct items of one name stepped with a key ([`Counts::most_name_items`]).
     most_name_items: usize,
+    /// [`Counts::verified`] and [`Counts::stale_reads`].
+    verified: usize,
+    stale_reads: usize,
+    /// [`Counts::first_moved`].
+    first_moved: Option<(ItemKey, Verdict)>,
 }
 
 /// A row index that is no row: a root's declarer.
@@ -753,6 +822,9 @@ impl<'a> Walk<'a> {
             depth: Vec::new_in(alloc),
             recursion_limit: DEFAULT_RECURSION_LIMIT,
             most_name_items: 0,
+            verified: 0,
+            stale_reads: 0,
+            first_moved: None,
         }
     }
 
@@ -833,7 +905,16 @@ impl<'a> Walk<'a> {
 
     pub fn counts(&self) -> Counts {
         let longest_name = self.names.iter().map(|&(_, len)| len as usize).max().unwrap_or(0);
-        let mut c = Counts { reached: self.len(), longest_name, most_name_items: self.most_name_items, arena: self.arena.len(), ..Counts::default() };
+        let mut c = Counts {
+            reached: self.len(),
+            longest_name,
+            most_name_items: self.most_name_items,
+            arena: self.arena.len(),
+            verified: self.verified,
+            stale_reads: self.stale_reads,
+            first_moved: self.first_moved,
+            ..Counts::default()
+        };
         for how in self.how.iter() {
             match how {
                 How::Waiting | How::Making => {}
@@ -1020,7 +1101,7 @@ impl<'a> Walk<'a> {
         // The same three parts the pool drives apart (D194: begin and finish on the relay, the
         // make on a worker), here in one call: the seam test `split_steps_equal_one` holds the
         // two equal (rule 78).
-        let pending = match self.start(row, ids, store, builder, producer, form, most, scratch)? {
+        let pending = match self.start(row, ids, store, builder, producer, make, form, most, scratch)? {
             Began::Stepped(stepped) => return Ok(One { stepped, declared: self.declared(row) }),
             Began::Make(pending) => pending,
         };
@@ -1041,19 +1122,21 @@ impl<'a> Walk<'a> {
     /// [`Walk::finish`], or gives the row back by [`Walk::abandon`]. A row done before answers
     /// what it holds, with no store or seam call; a row being made is refused
     /// ([`WalkError::Making`]). On an error the row stays [`How::Waiting`]. [`Scratch::made`] is
-    /// not touched.
-    pub fn begin<'w, E>(
+    /// not touched. A found entry with a read list is taken only when `verify`'s
+    /// [`Make::verify`] says it holds; nothing is made here.
+    pub fn begin<'w, M: Make>(
         &'w mut self,
         row: usize,
         ids: &dyn BodyIds,
         store: &mut dyn CodeStore,
         builder: &Builder,
         producer: &ProducerId<CodeBuilder>,
+        verify: &mut M,
         form: &dyn Form,
         most: usize,
         scratch: &mut Scratch<'a>,
-    ) -> Result<Begun<'w>, WalkError<E>> {
-        Ok(match self.start(row, ids, store, builder, producer, form, most, scratch)? {
+    ) -> Result<Begun<'w>, WalkError<M::Error>> {
+        Ok(match self.start(row, ids, store, builder, producer, verify, form, most, scratch)? {
             Began::Stepped(stepped) => Begun::Stepped(One { stepped, declared: self.declared(row) }),
             Began::Make(pending) => Begun::Make(pending),
         })
@@ -1078,6 +1161,18 @@ impl<'a> Walk<'a> {
         Ok(())
     }
 
+    /// The entry `key` names and the key its bytes are under: its pointer's content key, or
+    /// `key` itself when it holds a plain entry (code_records.rs `entry_of`, which this is with
+    /// the content key kept). A pointer to no entry is the store's failure, named.
+    fn found(store: &dyn CodeStore, key: CodeKey) -> Result<Option<(CodeKey, &[u8])>, StoreError> {
+        let under = store.pointed(key)?.unwrap_or(key);
+        match store.get(under)? {
+            Some(bytes) => Ok(Some((under, bytes))),
+            None if under != key => Err(StoreError::Failed { key, what: "a code key's pointer names a content key with no entry" }),
+            None => Ok(None),
+        }
+    }
+
     /// `pending`'s row, when this walk began it for that fn and it is being made.
     fn begun<E>(&self, pending: &Pending) -> Result<usize, WalkError<E>> {
         let row = pending.row();
@@ -1090,17 +1185,19 @@ impl<'a> Walk<'a> {
 
     /// [`Walk::begin`]'s work, its answer holding no borrow of the walk (so `one` may go on
     /// to the make after it).
-    fn start<E>(
+    #[allow(clippy::too_many_arguments)]
+    fn start<M: Make>(
         &mut self,
         row: usize,
         ids: &dyn BodyIds,
         store: &mut dyn CodeStore,
         builder: &Builder,
         producer: &ProducerId<CodeBuilder>,
+        verify: &mut M,
         form: &dyn Form,
         most: usize,
         scratch: &mut Scratch<'a>,
-    ) -> Result<Began, WalkError<E>> {
+    ) -> Result<Began, WalkError<M::Error>> {
         let Scratch { name, made: _, facts, items, declared } = scratch;
         match self.how[row] {
             How::Done(stepped) => return Ok(Began::Stepped(stepped)),
@@ -1141,13 +1238,36 @@ impl<'a> Walk<'a> {
                 Ok(record_key(self.symbols[row], &body, facts.as_slice(), builder, producer))
             }
         };
+        // Found: through the key's pointer to its content key (a key of an older walk may hold
+        // its entry itself), and taken only when its read list holds today (the module doc,
+        // "The read list"). A list that moved: made again, as a missing entry is.
         if let Ok(key) = keyed
-            && let Some(bytes) = store.get(key).map_err(WalkError::Store)?
+            && let Some((under, bytes)) = Walk::found(&*store, key).map_err(WalkError::Store)?
         {
-            form.declared(bytes, declared).map_err(|why| WalkError::Entry { tabled, found: true, why })?;
-            let stepped = Stepped::Found(key);
-            self.reach_declared(row, stepped, most, declared)?;
-            return Ok(Began::Stepped(stepped));
+            let rows = form.reads(bytes).map_err(|why| WalkError::Entry { tabled, found: true, why })?;
+            let holds = match rows {
+                0 => true,
+                rows => match verify.verify(tabled, name.as_slice(), bytes).map_err(|why| WalkError::Verify { tabled, why })? {
+                    None => return Err(WalkError::Unverified { tabled, rows }),
+                    Some(Verdict::Holds) => {
+                        self.verified += 1;
+                        true
+                    }
+                    // `Needs` is answered inside the verifier (make_one.rs `verify_instance`);
+                    // one handed back is a need it could not make: built again.
+                    Some(moved @ (Verdict::Stale { .. } | Verdict::Needs { .. })) => {
+                        self.stale_reads += 1;
+                        self.first_moved.get_or_insert((tabled, moved));
+                        false
+                    }
+                },
+            };
+            if holds {
+                form.declared(bytes, declared).map_err(|why| WalkError::Entry { tabled, found: true, why })?;
+                let stepped = Stepped::Found(under);
+                self.reach_declared(row, stepped, most, declared)?;
+                return Ok(Began::Stepped(stepped));
+            }
         }
         // The toolchain's when every item of its name is (`items` is the name's, filled when it
         // was keyed above), else the program's; an unkeyed entry is never put, so its class is
@@ -1165,16 +1285,20 @@ impl<'a> Walk<'a> {
         let Pending { order, keyed, class, .. } = pending;
         let tabled = order.tabled;
         declared.clear();
+        // Put under its content key, and the instance's key pointed to it: an entry made again
+        // because its read list moved has other bytes under the same instance key, which a put
+        // under that key would refuse as two values (rule 21).
+        let content = crate::code_records::content_key(made);
         let done = form
             .declared(made, declared)
             .map_err(|why| WalkError::Entry { tabled, found: false, why })
             .and_then(|()| match keyed {
-                Ok(key) => store.put(class, key, made).map_err(WalkError::Store),
+                Ok(key) => store.put(class, content, made).and_then(|()| store.point(class, key, content)).map_err(WalkError::Store),
                 Err(_) => Ok(()),
             })
             .and_then(|()| {
                 let stepped = match keyed {
-                    Ok(key) => Stepped::Made(key),
+                    Ok(_) => Stepped::Made(content),
                     Err(why) => Stepped::Unkeyed(why),
                 };
                 self.reach_declared(row, stepped, most, declared).map(|()| stepped)
@@ -1802,7 +1926,7 @@ mod tests {
                     if split.how(row) != How::Waiting {
                         continue;
                     }
-                    let begun = split.begin::<NameError>(row, &ids, &mut split_store, &builder, &producer, &Toy, 64, &mut scratch).expect("begun");
+                    let begun = split.begin(row, &ids, &mut split_store, &builder, &producer, &mut split_model, &Toy, 64, &mut scratch).expect("begun");
                     let pending = match begun {
                         Begun::Stepped(_) => continue,
                         Begun::Make(pending) => pending,
@@ -1814,7 +1938,7 @@ mod tests {
                     wave.push((pending, made));
                 }
                 let Some((first, _)) = wave.first() else { break };
-                let again = split.begin::<NameError>(first.row(), &ids, &mut split_store, &builder, &producer, &Toy, 64, &mut scratch);
+                let again = split.begin(first.row(), &ids, &mut split_store, &builder, &producer, &mut split_model, &Toy, 64, &mut scratch);
                 assert!(matches!(again, Err(WalkError::Making { .. })), "control: a row being made is begun again: {again:?}");
                 while let Some((pending, made)) = wave.pop() {
                     split.finish::<NameError>(pending, &made, &mut split_store, &Toy, 64, &mut scratch).expect("finished");
@@ -1838,7 +1962,7 @@ mod tests {
             let mut stranger = Walk::new_in(alloc);
             stranger.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main is reached");
             let mut empty = MemoryStore::new_in(alloc);
-            let Begun::Make(foreign) = stranger.begin::<NameError>(0, &ids, &mut empty, &builder, &producer, &Toy, 64, &mut scratch).expect("begun") else {
+            let Begun::Make(foreign) = stranger.begin(0, &ids, &mut empty, &builder, &producer, &mut split_model, &Toy, 64, &mut scratch).expect("begun") else {
                 panic!("an empty store found main");
             };
             let before = split.how(0);

@@ -723,38 +723,29 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// into the sorted `statics`. A refused static stops the run, naming it (as `make_from`'s
     /// run does: never an empty answer to the getter).
     fn body_statics(&mut self, checked: &Checked<'static>, function: &str) -> Result<(), LazyRefusal> {
-        let mut new: std::vec::Vec<ItemKey, Global> = std::vec::Vec::new_in(Global);
-        for d in checked.expr_defs.column::<1>().iter() {
-            if let tc::Def::Static(k, _) = d
-                && self.statics.kind(*k).is_none()
-            {
-                new.push(*k);
-            }
-        }
-        if new.is_empty() {
+        let new = checked.expr_defs.column::<1>().iter().any(|d| match d {
+            tc::Def::Static(k, _) => self.statics.kind(*k).is_none(),
+            _ => false,
+        });
+        if !new {
             return Ok(());
         }
-        // A static an `extern` block declares is a place at its C symbol: its kind filed, no
-        // value evaluated ([`Self::foreign_static_of`]). secp256k1-sys's `extern "C" { pub
-        // static secp256k1_context_no_precomp: *const Context; }` was evaluated as a Rust
-        // static and refused for its missing body (tempo t1855d).
-        for &k in new.iter() {
-            self.foreign_static_of(k, function)?;
-        }
-        // Every foreign static met so far (sorted, as `foreign_statics` is): one an earlier
-        // body named is in this body's defs too.
-        let mut foreign: std::vec::Vec<ItemKey, Global> = std::vec::Vec::with_capacity_in(self.foreign_statics.len(), Global);
-        foreign.extend(self.foreign_statics.iter().map(|(k, _)| *k));
         let (made, refused) = {
-            let is_foreign = |k: ItemKey| foreign.binary_search(&k).is_ok();
             let mut r = self.records(true);
-            crate::front2::statics::static_values_but(&mut r, core::iter::once(checked), &is_foreign)
+            crate::front2::statics::static_values(&mut r, core::iter::once(checked))
         };
         if let Some((k, why)) = refused.into_iter().next() {
             let static_ = self.static_shown(k);
             return Err(LazyRefusal::Row { function: Box::from(function), refusal: Box::new(Front2Refusal::Static { static_, why }) });
         }
-        let crate::front2::statics::Statics { values, kinds } = made;
+        let crate::front2::statics::Statics { values, kinds, foreign } = made;
+        // A static an `extern` block declares: its C symbol, no record (statics.rs
+        // `static_values`).
+        for (k, symbol) in foreign {
+            if let Err(at) = self.statics.foreign.binary_search_by_key(&k, |(x, _)| *x) {
+                self.statics.foreign.insert(at, (k, symbol));
+            }
+        }
         for (k, record) in values {
             if let Err(at) = self.statics.values.binary_search_by_key(&k, |(x, _)| *x) {
                 self.statics.values.insert(at, (k, record));
@@ -776,53 +767,6 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         crate::front2::static_shown::static_shown_in(self.front.names, &self.front.keys, &self.store, item).into_boxed_str()
     }
 
-    /// Whether static `k` is one an `extern` block declares (a module-level block's by its
-    /// names row's `extern_abi`, [`Self::placed_of`]; a block in a body's by
-    /// `Locals::foreign`). When it is, its C symbol (`#[link_name]`, else its name, as a
-    /// foreign fn's row takes it: [`Self::row`]) and its kind are filed once: the seam's
-    /// `foreign_static` and `static_item`. A refusal names the static and the body `function`.
-    fn foreign_static_of(&mut self, k: ItemKey, function: &str) -> Result<bool, LazyRefusal> {
-        if self.foreign_statics.binary_search_by_key(&k, |(x, _)| *x).is_ok() {
-            return Ok(true);
-        }
-        let refuse = |this: &Self, why: Box<str>| LazyRefusal::Row { function: Box::from(function), refusal: Box::new(Front2Refusal::Static { static_: this.static_shown(k), why }) };
-        let Some(head) = self.store.fns.get(&k) else {
-            return Err(refuse(self, Box::from("no static head in the store (heads.rs `Store::fns`)")));
-        };
-        let (lib, text) = (head.lib, head.text);
-        let shown = self.static_shown(k);
-        let (_, block) = self.placed_of(k, lib, &shown)?;
-        if block.is_none() && self.store.locals.foreign(k).is_none() {
-            return Ok(false);
-        }
-        let symbol: Box<str> = {
-            let row_path = crate::front2::row_path::RowPath::of(self.front.names, &self.front.keys, &self.store, k)
-                .map_err(|no| LazyRefusal::Row { function: Box::from(function), refusal: Box::new(Front2Refusal::NoRowPath(no)) })?;
-            let values_at = crate::front2::links::values_key(self.front.names, &self.store, lib);
-            let symbols = symbols_of(self.front.names, lib, values_at, text, &shown).map_err(|r| LazyRefusal::Row { function: Box::from(function), refusal: Box::new(r) })?;
-            let declared = crate::front2::panic_entry::local_name(&self.store, k).map_err(|why| refuse(self, why.form().into()))?;
-            Box::from(symbols.link_name.as_deref().or(declared).unwrap_or(row_path.ident()))
-        };
-        let kind = {
-            let r = self.records(false);
-            crate::front2::statics::foreign_kind(&r, k)
-        };
-        let kind = kind.map_err(|why| refuse(self, why))?;
-        if let Err(at) = self.foreign_statics.binary_search_by_key(&k, |(x, _)| *x) {
-            self.foreign_statics.insert(at, (k, symbol));
-        }
-        if let Err(at) = self.statics.kinds.binary_search_by_key(&k, |(x, _)| *x) {
-            self.statics.kinds.insert(at, (k, kind));
-        }
-        Ok(true)
-    }
-
-    /// Static `item`'s C symbol when an `extern` block declares it and a checked body named
-    /// it ([`Self::foreign_static_of`]); `None` for any other item.
-    pub fn foreign_static_symbol(&self, item: ItemKey) -> Option<&str> {
-        let at = self.foreign_statics.binary_search_by_key(&item, |(x, _)| *x).ok()?;
-        Some(&self.foreign_statics[at].1)
-    }
 
     /// Make static `item`'s value and kind available for its run record (code_records.rs
     /// `statics`): the one this program made when a body named it, or evaluated now, alone
@@ -881,8 +825,53 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         Ok(())
     }
 
+    /// The tables of the principals a checked body's types (and the heads made so far) name: a
+    /// prefetch only. What an instance's build reads is asked by name when it is missing
+    /// ([`Self::object_asked`], the seam's `object_table`), so no make depends on which bodies
+    /// were checked before it (D194: a `dyn` only an instance's ground arguments hold).
     fn body_objects(&mut self, checked: &Checked<'static>, function: &str) -> Result<(), LazyRefusal> {
-        let mut asked = dyn_principals([self.store.tys.view(), checked.types.view()].into_iter());
+        let asked = dyn_principals([self.store.tys.view(), checked.types.view()].into_iter());
+        self.objects_made(asked, function)
+    }
+
+    /// The seam's `object_table`: trait `t`'s table and every supertrait's under it, made from
+    /// their heads (program.rs `object_tables`, the one maker) when the build asked for it and
+    /// found none. `Ok(false)` when it is there already: the build's `NoTrait` is then not a
+    /// missing table, and stays the refusal.
+    pub(super) fn object_asked(&mut self, t: ItemKey) -> Result<bool, LazyRefusal> {
+        if self.objects.contains_key(&t) {
+            return Ok(false);
+        }
+        let mut asked: Vec<ItemKey, Global> = Vec::new_in(Global);
+        asked.push(t);
+        let function = format!("the trait object table of {} (asked by an instance's build)", self.shown(t));
+        self.objects_made(asked, &function)?;
+        Ok(self.objects.contains_key(&t))
+    }
+
+    /// The seam's `site_heads` (D194): the head of each item enclosing body-local `owner`,
+    /// innermost out, made from its own want, so a `#[track_caller]` site of `owner`'s body
+    /// (seam_rules.rs `body_anchor`, which counts a written local's place from its enclosing
+    /// item's text) never depends on whether this program checked the enclosing body before.
+    /// A non-local `owner` asks nothing. Bounded by the locals kept (rule 18), as `body_anchor`.
+    pub(super) fn site_heads_asked(&mut self, owner: ItemKey) -> Result<(), LazyRefusal> {
+        let mut at = owner;
+        for _ in 0..=self.store.locals.kept() {
+            let Some(enclosing) = self.store.locals.head(at).map(|local| local.enclosing) else {
+                return Ok(());
+            };
+            if !self.store.fns.contains_key(&enclosing) {
+                let (_, want) = self.target_of(enclosing)?;
+                self.make_want(want, enclosing, "site_heads (the enclosing item a body-local's `#[track_caller]` site counts from)")?;
+            }
+            at = enclosing;
+        }
+        Ok(())
+    }
+
+    /// Each of `asked` not made yet, made into the program's tables; `function` names the asker
+    /// in a refusal.
+    fn objects_made(&mut self, mut asked: Vec<ItemKey, Global>, function: &str) -> Result<(), LazyRefusal> {
         asked.retain(|k| !self.objects.contains_key(k));
         if asked.is_empty() {
             return Ok(());

@@ -131,6 +131,7 @@ fn cfg(opens: u64) -> PlainConfig<System> {
         writes,
         reads,
         liveness: Liveness::Everything,
+        lock_step: crate::plain::LockStep::Backoff,
     }
 }
 

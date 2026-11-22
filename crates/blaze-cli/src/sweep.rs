@@ -153,6 +153,17 @@ pub trait Stamps {
     fn swept_at_ns(&self) -> u64;
     /// The coarsest step of the stamps' clock.
     fn granularity_ns(&self) -> u64;
+    /// Whether a batched look ([`bstd::fs::Look`]) of a path proves it the version `old` was
+    /// stamped of: a file (`dir` false) or a directory. `false`, the default: a source whose
+    /// stamps are not the system's (a test's model) proves nothing by a look, and every row is
+    /// statted one by one as before ([`Stamps::proves_by_looks`]).
+    fn look_proves(&self, _old: Stamp, _look: &bstd::fs::Look, _dir: bool) -> bool {
+        false
+    }
+    /// Whether [`Stamps::look_proves`] can prove anything: else no look is asked.
+    fn proves_by_looks(&self) -> bool {
+        false
+    }
 }
 
 /// The stamps bstd's `Meta` gives, set against the wall clock the program is handed
@@ -184,6 +195,22 @@ impl Stamps for FromMeta {
         // Linux's file times step with the kernel's tick (`current_time`, up to 10 ms at
         // HZ=100); APFS's in ns. The coarser, until bstd says the file system's.
         10_000_000
+    }
+
+    /// What a stat proves, no more and no less: the kind, and every part of the stamp equal
+    /// to the look's (the length, both times, the inode and the device: blaze-core's batched
+    /// stamp says the device as its stat's `Meta` does), the stamp settled; an inode of 0
+    /// proves nothing (as [`FromMeta::stamp`]).
+    fn look_proves(&self, old: Stamp, look: &bstd::fs::Look, dir: bool) -> bool {
+        let kind = if dir { bstd::fs::EntryKind::Dir } else { bstd::fs::EntryKind::File };
+        look.kind == kind
+            && look.ino != 0
+            && old == Stamp { len: look.len, mtime_ns: look.modified_ns, ctime_ns: look.changed_ns, ino: look.ino, dev: look.dev }
+            && old.settled(self.swept_at_ns, self.granularity_ns())
+    }
+
+    fn proves_by_looks(&self) -> bool {
+        true
     }
 }
 
@@ -299,11 +326,37 @@ pub enum Plant {
 pub struct Rows<'f> {
     pub names: Texts<&'f Frame>,
     pub rows: Vec<Leaf, &'f Frame>,
+    /// The checkout's workspace, when this request read its lock's bytes (the layout's
+    /// [`read_manifest`] of it, or the follow of its row when its stamp did not prove it): what
+    /// the save keys the home's bases by (engine_answer.rs `BASES_ROOT`). `None` when the lock
+    /// was not read, or names no path package.
+    pub workspace: Option<crate::engine_answer::Workspace>,
 }
+
+/// The checkout's lock, at its root: the one manifest row whose bytes name the workspace.
+const LOCK_ROW: &str = "Cargo.lock";
 
 impl<'f> Rows<'f> {
     pub fn new_in(frame: &'f Frame) -> Rows<'f> {
-        Rows { names: Texts::new_in(frame), rows: Vec::new_in(frame) }
+        Rows { names: Texts::new_in(frame), rows: Vec::new_in(frame), workspace: None }
+    }
+
+    /// The workspace of the lock read as `text`, when `path` is the checkout's lock.
+    fn lock_read(&mut self, path: &str, text: &[u8], frame: &Frame) {
+        if path == LOCK_ROW {
+            self.workspace = crate::engine_answer::Workspace::of_lock(text, frame);
+        }
+    }
+
+    /// The workspace of the members' own lock (graph.rs `members_lock`), for a layout that reads
+    /// no `Cargo.lock` (nothing outside the workspace, units.rs `lay`).
+    pub(crate) fn members_read(&mut self, members_lock: &[u8], frame: &Frame) {
+        self.workspace = crate::engine_answer::Workspace::of_lock(members_lock, frame);
+    }
+
+    /// The id of the checkout's lock row, when there is one and a file was there.
+    pub(crate) fn lock_id(&self) -> Option<ContentId> {
+        self.rows.iter().rev().find(|leaf| leaf.kind == LeafKind::Manifest && self.path(leaf) == LOCK_ROW && !leaf.absent()).map(|leaf| leaf.id)
     }
 
     pub fn path(&self, leaf: &Leaf) -> &str {
@@ -485,6 +538,8 @@ pub fn read_manifest(
     match look(cx, root, stamps, Plant::None, path, None, text)? {
         Some((stamp, id)) => {
             rows.push(LeafKind::Manifest, 0, path, stamp, id);
+            // No `old` was given: the bytes were read, so `text` holds them.
+            rows.lock_read(path, text.as_slice(), cx.frame());
             Ok(true)
         }
         None => {
@@ -692,6 +747,217 @@ fn home_listing_now(
     })
 }
 
+// ---- The batched looks (thoughts2 1.1): the follow's stats in one call a folder ----
+//
+// Until 2026-11-21 the follow statted each row it looked at with its own `Dir::stat`: one trip
+// through the effect layer a path (a kqueue file thread and back on macOS), in a serial loop,
+// so a sweep after a restart (no journal: every row looked at) cost the SUM of its paths'
+// trips (tempo, 2026-11-16: 8.8 ms on one worker for its rows, the trip not the call). Now,
+// before the loop, every path the loop would stat for a slot, a module slot's two probes, a
+// manifest, a macro crate's file or a listing's folder is asked at once ([`Looked::of`], bstd
+// `Dir::facts_of`): grouped by folder, a folder with 8 or more asked names listed whole by one
+// `getattrlistbulk` on macOS, every other path in ONE `Effect::Stamp` (io_uring: one
+// submission of `statx`es, 64 a chunk, blaze-core uring.rs `STAMP_CHUNK`; kqueue: `fstatat`s
+// relative to the root on a file thread, blaze-core threads/inline.rs), every effect handed
+// to the driver before the first is waited for. A row whose look proves it the version its
+// stamp was of ([`Stamps::look_proves`]), or a row absent last time whose paths are all gone,
+// stands as the table has it with nothing more asked; every other row (moved, unstamped, a
+// symbolic link, a look the system said nothing of) takes the loop's path as before: its stat,
+// and its read where the stamp does not prove it.
+//
+// THE FLOOR (rule 67): one batched call a folder (a listing on macOS, a stamp chunk on Linux),
+// the wall time bounded by the slowest folder, not the sum of the paths; the row decisions are
+// a merge over sorted columns in the request's frame. The counts say how near ([`LookCounts`],
+// the `sweep:` line).
+//
+// THE SEAM (rule 78): [`Walk`], `Batched` the default, `Serial` the control (each row statted
+// one by one), tested equal on a simulated world whose completions are shuffled
+// (tests/sweep_looks_tests.rs). A home listing, a macro crate's folder and a script's read stay
+// serial: a handful of rows, each in another directory or the scripts' own reader.
+
+/// How the follow asks the system for its rows' stamps: the one seam (rule 78).
+pub trait Walk {
+    /// Every path asked in batched looks before the loop ([`Looked::of`]).
+    const BATCHED: bool;
+    /// The bug the looks' test plants in the walk; [`LookPlant::None`] for every real one.
+    const PLANT: LookPlant = LookPlant::None;
+}
+
+/// A bug the looks' test (tests/sweep_looks_tests.rs) plants in a batched walk, to show it is
+/// caught.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LookPlant {
+    None,
+    /// A file's look proves it by its length alone: its times, inode and device unread.
+    #[cfg_attr(not(test), allow(dead_code, reason = "planted by the looks' test alone (`TimesIgnored`)"))]
+    TimesIgnored,
+    /// A look proves a row with its device unread: a file replaced by one on another mount
+    /// with the same inode number, length and times is missed.
+    #[cfg_attr(not(test), allow(dead_code, reason = "planted by the looks' test alone (`DevIgnored`)"))]
+    DevIgnored,
+}
+
+/// The batched looks: the default.
+pub enum Batched {}
+
+impl Walk for Batched {
+    const BATCHED: bool = true;
+}
+
+/// Each row statted one by one, as before 2026-11-21: the control.
+pub enum Serial {}
+
+impl Walk for Serial {
+    const BATCHED: bool = false;
+}
+
+/// [`Batched`] with [`LookPlant::TimesIgnored`].
+#[cfg(test)]
+pub(crate) enum TimesIgnored {}
+
+#[cfg(test)]
+impl Walk for TimesIgnored {
+    const BATCHED: bool = true;
+    const PLANT: LookPlant = LookPlant::TimesIgnored;
+}
+
+/// [`Batched`] with [`LookPlant::DevIgnored`].
+#[cfg(test)]
+pub(crate) enum DevIgnored {}
+
+#[cfg(test)]
+impl Walk for DevIgnored {
+    const BATCHED: bool = true;
+    const PLANT: LookPlant = LookPlant::DevIgnored;
+}
+
+/// What the follow's batched looks did: the `sweep:` line's `looks:` part.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct LookCounts {
+    /// Paths asked, each once.
+    pub asked: u32,
+    /// Asks of `facts_of` (one a `STAMP_MOST` paths).
+    pub batches: u32,
+    /// Folders listed whole (macOS `getattrlistbulk`), and names stamped in the batches' stamp
+    /// effects (bstd `Facts::listed`, `Facts::stamped`).
+    pub listed: u32,
+    pub stamped: u32,
+    /// Rows the looks proved: nothing more asked of them.
+    pub proved: u32,
+}
+
+/// The looks of the rows' paths ([`Looked::of`]): per row, the index of its path's look (a
+/// module slot's second, its `x/mod.rs`), [`NO_LOOK`] where none was asked.
+struct Looked<'f> {
+    at: Vec<[u32; 2], &'f Frame>,
+    looks: Vec<bstd::fs::Look, &'f Frame>,
+    counts: LookCounts,
+}
+
+const NO_LOOK: u32 = u32::MAX;
+
+impl<'f> Looked<'f> {
+    fn none(frame: &'f Frame) -> Looked<'f> {
+        Looked { at: Vec::new_in(frame), looks: Vec::new_in(frame), counts: LookCounts::default() }
+    }
+
+    /// Every path of the rows to be looked at (`asked(i)`), sorted and each once, in batches
+    /// of at most `STAMP_MOST` (blaze-core): the module's doc.
+    fn of(cx: &Cx, root: &Dir<ReadWrite>, last: &Leaves<'_>, asked: impl Fn(usize) -> bool, frame: &'f Frame) -> Result<Looked<'f>, CliError> {
+        let cx = cx.span("sweep: the rows' paths looked at in one batch a folder (bstd facts_of)");
+        let mut at = Vec::with_capacity_in(last.len(), frame);
+        // (path, row, which): which 1 is a module slot's `x/mod.rs`.
+        let mut wanted: Vec<(&str, u32, u8), &Frame> = Vec::new_in(frame);
+        for i in 0..last.len() {
+            at.push([NO_LOOK; 2]);
+            if !asked(i) {
+                continue;
+            }
+            let old = last.row(i);
+            let path = last.path(i);
+            let row = u32::try_from(i).map_err(|_| CliError::Text { what: "sweep.rs looks: a leaf table past 2^32 rows" })?;
+            match old.kind {
+                LeafKind::Slot => {
+                    wanted.push((path, row, 0));
+                    if old.flags & MODULE != 0 {
+                        let mod_rs = mod_rs_of(path, frame).leak();
+                        let mod_rs = core::str::from_utf8(mod_rs).map_err(|_| CliError::Text { what: "a module path is not UTF-8" })?;
+                        wanted.push((mod_rs, row, 1));
+                    }
+                }
+                LeafKind::Manifest | LeafKind::MacroFile => wanted.push((path, row, 0)),
+                // The checkout's root is listed again whatever its stamp (`dir_stamp`).
+                LeafKind::Listing if !path.is_empty() => wanted.push((path, row, 0)),
+                _ => {}
+            }
+        }
+        wanted.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let mut paths: Vec<Path, &Frame> = Vec::new_in(frame);
+        for (text, row, which) in wanted.iter() {
+            if paths.last().is_none_or(|last: &Path| last.as_str() != *text) {
+                paths.push(Path::new(text)?);
+            }
+            let index = u32::try_from(paths.len() - 1).map_err(|_| CliError::Text { what: "sweep.rs looks: past 2^32 paths" })?;
+            at[*row as usize][usize::from(*which)] = index;
+        }
+        let mut looks = Vec::with_capacity_in(paths.len(), frame);
+        let mut counts = LookCounts { asked: u32::try_from(paths.len()).unwrap_or(u32::MAX), ..LookCounts::default() };
+        for batch in paths.chunks(blaze_core::STAMP_MOST) {
+            let facts = root.facts_of(&cx, batch, frame).map_err(facts_error)?;
+            counts.batches = counts.batches.saturating_add(1);
+            counts.listed = counts.listed.saturating_add(facts.listed());
+            counts.stamped = counts.stamped.saturating_add(facts.stamped());
+            looks.extend(facts.iter());
+        }
+        Ok(Looked { at, looks, counts })
+    }
+
+    /// Row `i`'s look of its path (`which` 0) or of a module slot's `x/mod.rs` (1).
+    fn look(&self, i: usize, which: usize) -> Option<&bstd::fs::Look> {
+        let index = *self.at.get(i)?.get(which)?;
+        (index != NO_LOOK).then(|| self.looks.get(index as usize)).flatten()
+    }
+
+    /// Row `old`'s (at `i`) state as the table has it, when its looks prove it stands; `None`:
+    /// the loop's own path decides it.
+    fn proves<W: Walk>(&self, stamps: &impl Stamps, i: usize, old: &Leaf) -> Option<(u8, Option<Stamp>, ContentId)> {
+        let gone = |which: usize| self.look(i, which).is_some_and(|look| look.kind == bstd::fs::EntryKind::Gone);
+        let proved = |which: usize, dir: bool| match (old.stamp, self.look(i, which)) {
+            (Some(stamp), Some(look)) => match W::PLANT {
+                LookPlant::None => stamps.look_proves(stamp, look, dir),
+                LookPlant::TimesIgnored if !dir => look.kind == bstd::fs::EntryKind::File && look.len == stamp.len,
+                LookPlant::TimesIgnored => stamps.look_proves(stamp, look, dir),
+                LookPlant::DevIgnored => stamps.look_proves(stamp, &bstd::fs::Look { dev: stamp.dev, ..*look }, dir),
+            },
+            _ => false,
+        };
+        let module = old.flags & MODULE != 0;
+        let stands = match old.kind {
+            LeafKind::Slot if old.flags & BOTH != 0 => false,
+            LeafKind::Slot if old.absent() => gone(0) && (!module || gone(1)),
+            LeafKind::Slot if old.flags & AT_MOD_RS != 0 => module && gone(0) && proved(1, false),
+            LeafKind::Slot => proved(0, false) && (!module || gone(1)),
+            LeafKind::Manifest | LeafKind::MacroFile if old.absent() => gone(0),
+            LeafKind::Manifest | LeafKind::MacroFile => proved(0, false),
+            LeafKind::Listing if old.absent() => gone(0),
+            LeafKind::Listing => proved(0, true),
+            _ => false,
+        };
+        stands.then_some((old.flags, old.stamp, old.id))
+    }
+}
+
+/// A batched look's refusal as the command's error. Unsorted and too many cannot be (the paths
+/// are sorted, each once, and cut at the cap above): named, never quietly passed.
+fn facts_error(error: bstd::fs::FactsError) -> CliError {
+    match error {
+        bstd::fs::FactsError::Fs(error) => CliError::Fs(error),
+        bstd::fs::FactsError::OutOfMemory(_) => CliError::Text { what: "sweep.rs looks: a column of the batched looks had no room in the request's frame" },
+        bstd::fs::FactsError::Unsorted { .. } => CliError::Text { what: "sweep.rs looks: the paths asked were not sorted (a bug of `Looked::of`)" },
+        bstd::fs::FactsError::TooMany { .. } => CliError::Text { what: "sweep.rs looks: more paths than one batch takes (a bug of `Looked::of`)" },
+    }
+}
+
 /// A repeat of the last answer's reads: each row looked at again.
 pub struct Follow<S> {
     pub stamps: S,
@@ -706,6 +972,8 @@ pub struct Followed<'f> {
     pub was: Vec<(u8, ContentId), &'f Frame>,
     /// A manifest or a listing moved: the layout is read again.
     pub layout_moved: bool,
+    /// What the batched looks did ([`Walk`]); all zero under [`Serial`].
+    pub looks: LookCounts,
 }
 
 impl Followed<'_> {
@@ -716,10 +984,11 @@ impl Followed<'_> {
 }
 
 impl<S: Stamps> Follow<S> {
-    /// Serial: on the bstd pool it was slower (tempo, 2026-11-16: 8.8 ms on one worker, 11.9 to
-    /// 12.3 ms on 18), the cost being each stat's trip through the effect layer, not the call.
-    /// `home`: blaze's folder in the home, where a [`LeafKind::HomeListing`] row is (none: such
-    /// a row is absent today).
+    /// The rows' paths in batched looks first ([`Batched`], the module's "batched looks"; on
+    /// the bstd pool, each stat a task, it was slower: tempo, 2026-11-16, 8.8 ms on one worker,
+    /// 11.9 to 12.3 ms on 18, the cost being each stat's trip through the effect layer, not
+    /// the call). `home`: blaze's folder in the home, where a [`LeafKind::HomeListing`] row is
+    /// (none: such a row is absent today).
     pub fn follow<'f>(&self, cx: &Cx, root: &Dir<ReadWrite>, home: Option<&Dir<ReadWrite>>, last: &Leaves<'_>, frame: &'f Frame) -> Result<Followed<'f>, CliError> {
         self.follow_marked(cx, root, home, last, None, frame).map(|(followed, _)| followed)
     }
@@ -733,12 +1002,32 @@ impl<S: Stamps> Follow<S> {
         self.follow_served(cx, root, home, last, marked, None, frame)
     }
 
+    /// [`Follow::follow_marked`] by the walk `W` ([`Batched`] or the control [`Serial`]).
+    #[cfg_attr(not(test), allow(dead_code, reason = "the walks' test (tests/sweep_looks_tests.rs) asks each walk by name"))]
+    pub(crate) fn follow_marked_by<'f, W: Walk>(&self, cx: &Cx, root: &Dir<ReadWrite>, home: Option<&Dir<ReadWrite>>, last: &Leaves<'_>, marked: Option<&[bool]>, frame: &'f Frame) -> Result<(Followed<'f>, u32), CliError> {
+        self.follow_served_by::<W>(cx, root, home, last, marked, None, frame)
+    }
+
+    /// [`Follow::follow_served_by`] with the batched looks.
+    pub(crate) fn follow_served<'f>(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        home: Option<&Dir<ReadWrite>>,
+        last: &Leaves<'_>,
+        marked: Option<&[bool]>,
+        served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
+        frame: &'f Frame,
+    ) -> Result<(Followed<'f>, u32), CliError> {
+        self.follow_served_by::<Batched>(cx, root, home, last, marked, served, frame)
+    }
+
     /// A served script observation can depend on paths beyond its recorded name, including
     /// symlink targets and, for a git fact, every tracked file: whether the journal reaches it
     /// is journal_sweep.rs `ServedReach`'s, folded into `marked`, so an unmarked row is kept
     /// here as any other. Each served row's ask is bracketed by two events in a span naming its
     /// kind, so the profile says what the served reads cost.
-    pub(crate) fn follow_served<'f>(
+    pub(crate) fn follow_served_by<'f, W: Walk>(
         &self,
         cx: &Cx,
         root: &Dir<ReadWrite>,
@@ -759,13 +1048,18 @@ impl<S: Stamps> Follow<S> {
         // The `MacroFiles` rows, decided after the loop: their files' and folders' rows come
         // after them in the table's (kind, path) order.
         let mut crates: Vec<usize, &Frame> = Vec::new_in(frame);
+        let unmarked = |i: usize| marked.is_some_and(|marked| !marked.get(i).copied().unwrap_or(true));
+        // The rows' paths in one batch a folder, first (the module's "batched looks").
+        let mut looked = match W::BATCHED && self.plant == Plant::None && self.stamps.proves_by_looks() {
+            true => Looked::of(&cx, root, last, |i| !unmarked(i), frame)?,
+            false => Looked::none(frame),
+        };
         for i in 0..last.len() {
             let old = last.row(i);
             let path = last.path(i);
             let old_state = old.state();
-            let unmarked = marked.is_some_and(|marked| !marked.get(i).copied().unwrap_or(true));
             let fact_file = old.kind == LeafKind::ScriptFile && path.starts_with(FACT_MOUNT);
-            if unmarked && !fact_file && old.kind != LeafKind::MacroFiles {
+            if unmarked(i) && !fact_file && old.kind != LeafKind::MacroFiles {
                 now.push(old.kind, old.flags, path, old.stamp, old.id);
                 was.push(old_state);
                 continue;
@@ -773,13 +1067,26 @@ impl<S: Stamps> Follow<S> {
             if old.kind != LeafKind::MacroFiles {
                 statted = statted.saturating_add(1);
             }
+            if let Some((flags, stamp, id)) = looked.proves::<W>(&self.stamps, i, &old) {
+                looked.counts.proved = looked.counts.proved.saturating_add(1);
+                now.push(old.kind, flags, path, stamp, id);
+                was.push(old_state);
+                continue;
+            }
             let (flags, stamp, id) = match old.kind {
                 LeafKind::Slot => slot_now(&cx, root, &self.stamps, self.plant, path, old.flags & MODULE != 0, Some(&old), &mut bytes, frame)?,
                 LeafKind::Manifest if old.absent() && self.plant == Plant::AbsentForgotten => (ABSENT, None, old.id),
                 LeafKind::Manifest | LeafKind::MacroFile => {
                     let reuse = old.stamp.filter(|_| !old.absent()).map(|stamp| (stamp, old.id));
+                    // Emptied first: after the look, bytes are there only when it read them.
+                    bytes.truncate(0);
                     match look(&cx, root, &self.stamps, self.plant, path, reuse, &mut bytes)? {
-                        Some((stamp, id)) => (0, stamp, id),
+                        Some((stamp, id)) => {
+                            if old.kind == LeafKind::Manifest && !bytes.as_slice().is_empty() {
+                                now.lock_read(path, bytes.as_slice(), frame);
+                            }
+                            (0, stamp, id)
+                        }
                         None => (ABSENT, None, ContentId([0; 32])),
                     }
                 }
@@ -799,7 +1106,13 @@ impl<S: Stamps> Follow<S> {
                     crates.push(i);
                     (old.flags, None, old.id)
                 }
-                LeafKind::MacroFolder => crate::macro_files::folder_now(&cx, root, &self.stamps, self.plant, path, Some(&old), frame)?,
+                LeafKind::MacroFolder => {
+                    // A crate's own folder is the one its `MacroFiles` row names: those rows
+                    // come first in the table's (kind, path) order, so all are in `crates` here.
+                    let own = crates.iter().any(|&at| last.path(at) == path);
+                    let place = if own { blaze_build_script::served::InPackage::Root } else { blaze_build_script::served::InPackage::Beneath };
+                    crate::macro_files::folder_now(&cx, root, &self.stamps, self.plant, path, place, Some(&old), frame)?
+                }
                 LeafKind::ScriptFile if fact_file => (0, None, fact_files.read(path, erased.handle())?),
                 LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat | LeafKind::ScriptGit => {
                     let kind = crate::engine_script_reads::ReadKind::of_leaf(old.kind).ok_or(CliError::Text { what: "a script read's leaf row has no read kind (sweep.rs `follow_served`)" })?;
@@ -840,7 +1153,7 @@ impl<S: Stamps> Follow<S> {
                 layout_moved = true;
             }
         }
-        Ok((Followed { now, was, layout_moved }, statted))
+        Ok((Followed { now, was, layout_moved, looks: looked.counts }, statted))
     }
 }
 
@@ -1430,3 +1743,7 @@ mod tests {
         assert!(super::wanted("crates", "target", true, true), "control: only the root's `target` can be cargo's");
     }
 }
+
+#[cfg(test)]
+#[path = "tests/sweep_looks_tests.rs"]
+mod sweep_looks_tests;

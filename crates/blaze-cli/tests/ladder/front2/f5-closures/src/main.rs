@@ -13,6 +13,12 @@ trait Sized {}
 #[lang = "copy"]
 trait Copy {}
 
+// core's own impl (core/src/marker.rs `marker_impls!`): a primitive is `Copy` only by an impl,
+// never by a built-in rule (rustc select/mod.rs `copy_clone_conditions`: "libcore-provided
+// impl"). Without it `x * k` moves `k` (the Reference, "Closure types": a by-value use of a
+// non-`Copy` capture), the closure is only `FnOnce`, and `apply`'s `F: Fn(u8)` is unmet.
+impl Copy for u8 {}
+
 #[lang = "tuple_trait"]
 trait Tuple {}
 

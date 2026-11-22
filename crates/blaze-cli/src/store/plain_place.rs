@@ -1,6 +1,6 @@
 //! The command's store on blaze-cas's plain store (D114 piece (b); drive.md, "D114 rulings",
 //! "The store under the command"): ONE store a user of each form, at `<home>/.blaze/`
-//! [`STORE_DIR`] (`v2/store/f5s2`, D160), read and written by every checkout and worktree;
+//! [`STORE_DIR`] (`v2/store/f5s3`, D160), read and written by every checkout and worktree;
 //! records read IN PLACE.
 //!
 //! Every byte a get lends is owned by blaze-cas's [`Lent`] (the plain store's segment mappings,
@@ -25,10 +25,10 @@ use std::alloc::Allocator;
 
 use blaze_cas::Key as CasKey;
 use blaze_own::Alloc;
-use blaze_cas::plain::{Driven, Lent, LentCounts, LentError, Liveness, PlaceName, PlainConfig, Probes, ROOT_LIFE_NS, Settings, Snapshot, SnapshotError};
+use blaze_cas::plain::{Driven, Lent, LentCounts, LentError, Liveness, PlaceName, PlainConfig, Probes, ROOT_LIFE_NS, Settings, Snapshot, SnapshotError, Visibility};
 use blaze_core::{Driver, FileName};
 use blaze_drive::Key;
-use blaze_keyed::kind::{Namespace, Tag};
+use blaze_keyed::kind::{Namespace, ReservedTag, Tag};
 use blaze_keyed::store::StoreError;
 use bstd::cx::Cx;
 
@@ -50,7 +50,7 @@ pub(crate) mod forms;
 pub(crate) const STORE_ROOT: &str = "v2/store";
 
 /// THE PLACE OF THIS BLAZE'S STORE (D160): `v2/store/<forms>`, the forms every blaze must agree
-/// on to read it, named by blaze-cas alone ([`PlaceName::THIS`], `f5s2` today: the store's
+/// on to read it, named by blaze-cas alone ([`PlaceName::THIS`], `f5s3` today: the store's
 /// files' format and its segments'). Nothing else names the store's folder: every reader of it
 /// goes through this constant, and a bump of either form moves it, so a blaze of a new form
 /// makes its own folder beside the old, and none stops because another wrote a store.
@@ -91,23 +91,40 @@ impl Joined {
     }
 }
 
-/// The kind every drive record is filed under in the plain store's index. The drive record's
-/// own head says which drive kind it is; the store needs one number apart from its roots'
-/// ([`blaze_cas::plain::ROOT_TAG`], `u16::MAX`) and the startup image's (`u16::MAX - 1`).
-pub(crate) const DRIVE_TAG: Tag = Tag(u16::MAX - 2);
-
-/// The kind an expansion record is filed under (blaze-scope expansion_records.rs: a macro
-/// call's text and origin column, keyed by their bytes, put after its crate's `CrateScope`
-/// record): a family apart from the drive records', read only when a body reads a text a macro
-/// wrote. `u16::MAX - 3` is [`crate::code_store::CODE_TAG`], `- 4` blaze-cas's pointers, `- 5`
-/// [`crate::start_list::START_LIST_TAG`].
-pub(crate) const EXPANSION_TAG: Tag = Tag(u16::MAX - 6);
+// Every drive record is filed under [`ReservedTag::Drive`] in the plain store's index (the
+// drive record's own head says which drive kind it is), and an expansion record (blaze-scope
+// expansion_records.rs: a macro call's text and origin column, keyed by their bytes, put after
+// its crate's `CrateScope` record) under [`ReservedTag::Expansion`]: a family apart from the
+// drive records', read only when a body reads a text a macro wrote. Both are blaze-keyed's
+// reservations, the one registry of reserved tags.
 
 /// The store's effect tags on the lent driver (`PlainConfig::tags`).
 const STORE_TAGS: u64 = 1 << 50;
 
 /// Past this many uncommitted bytes in the arena, a put commits first.
 pub(crate) const COMMIT_BYTES: u64 = 256 << 20;
+
+/// THE PUT PATH'S SEAM (blaze-cas plain/arena.rs, rule 78): where a reader finds a record this
+/// command put and has not committed. `AfterCommit` (today's): each phase commits its puts
+/// (`CommandStore::commit_puts`) before the next phase's workers read them from a segment.
+/// `InArena`: the one copy a put makes is read in place by every reader and snapshot; a phase
+/// boundary is a checkpoint ([`PlainPlace::checkpoint`]: a commit only past [`COMMIT_BYTES`] or
+/// [`CHECKPOINT_AGE_NS`]), and the commit after the answer writes the rest.
+pub(crate) const VISIBILITY: Visibility = Visibility::AfterCommit;
+
+/// Under `Visibility::InArena`, a phase boundary commits what is put when the oldest of it has
+/// waited this long (first value, accepted 2026-11-21): a command killed after a long phase
+/// keeps at most this much of its work uncommitted, while a command of a few seconds (an edit's
+/// check) writes ONE segment a namespace, after its answer. Only where a segment boundary falls
+/// depends on it, never a record's bytes or key (blaze-cas plain/arena_tests.rs
+/// `checkpoints_at_any_points_give_the_same_records_and_answer_pointer`).
+pub(crate) const CHECKPOINT_AGE_NS: u64 = 30_000_000_000;
+
+/// The checkpoint rule, alone (`checkpoint_tests` below): `uncommitted` bytes put
+/// and not committed, the oldest seen `waited_ns` ago at a phase boundary.
+pub(crate) fn checkpoint_due(uncommitted: u64, waited_ns: u64) -> bool {
+    uncommitted > COMMIT_BYTES || (uncommitted > 0 && waited_ns >= CHECKPOINT_AGE_NS)
+}
 
 /// Why the store refused, by name (rule 19).
 #[derive(Debug)]
@@ -118,6 +135,9 @@ pub enum PlaceError {
     Lent(LentError),
     /// A snapshot of the committed segments could not be taken (blaze-cas plain/snapshot.rs).
     Snapshot(SnapshotError),
+    /// The calling thread could not be held at the after-answer class ([`after_answer`]).
+    #[cfg(target_os = "macos")]
+    Qos(blaze_core::threads::qos::QosError),
 }
 
 impl fmt::Display for PlaceError {
@@ -126,6 +146,8 @@ impl fmt::Display for PlaceError {
             PlaceError::Open { why } => write!(f, "the store under the home's .blaze/{STORE_DIR} would not open: {why}"),
             PlaceError::Lent(error) => write!(f, "the store under the home's .blaze/{STORE_DIR}: {error}"),
             PlaceError::Snapshot(error) => write!(f, "the store under the home's .blaze/{STORE_DIR}: {error}"),
+            #[cfg(target_os = "macos")]
+            PlaceError::Qos(error) => write!(f, "the store's work after the answer under the home's .blaze/{STORE_DIR}: {error}"),
         }
     }
 }
@@ -174,6 +196,9 @@ pub(crate) fn config(dir: FileName, settings: &Settings, facts: Facts, alloc: St
         // rooted by decision: it goes with the old path, and a sweep before the switch would
         // drop it after each command.
         liveness: Liveness::Everything,
+        // The jittered doubling, its jitter the nonce (drawn from the granted `Rng`: the
+        // simulation's draw under it); `Fixed` is a test's control only.
+        lock_step: blaze_cas::plain::LockStep::Backoff,
     }
 }
 
@@ -182,7 +207,7 @@ pub(crate) fn config(dir: FileName, settings: &Settings, facts: Facts, alloc: St
 pub fn open<D: Driver>(driver: D, cfg: PlainConfig<StoreAlloc>, alloc: StoreAlloc) -> Result<Lent<D, StoreAlloc>, PlaceError> {
     // The root path is read only by the native pread path, which this module never takes.
     let store = Driven::with(driver, std::path::Path::new("/"), cfg, alloc).map_err(|why| PlaceError::Open { why })?;
-    Ok(Lent::new(store, alloc))
+    Ok(Lent::with_visibility(store, alloc, VISIBILITY))
 }
 
 /// The proof that [`Held::bytes`] are the bytes filed under the key asked (rule 74). Only this
@@ -265,16 +290,41 @@ pub struct PlainPlace<'m, D: Driver> {
     plant: PlacePlant,
     commits: u32,
     segments_written: u32,
+    /// `Visibility::InArena`: the wall time (the store's driver's clock) of the first phase
+    /// boundary that saw uncommitted puts, from which [`CHECKPOINT_AGE_NS`] runs; cleared by
+    /// each commit.
+    aging_since: Option<u64>,
 }
 
 impl<'m, D: Driver> PlainPlace<'m, D> {
+    /// A phase boundary under `Visibility::InArena`: a commit when what is put and not committed
+    /// is past [`COMMIT_BYTES`], or has waited [`CHECKPOINT_AGE_NS`] since the first boundary
+    /// that saw it; else nothing (the phase's records are read from the shared arena). Whether
+    /// it committed. Under `AfterCommit`, every boundary commits (today's).
+    pub fn checkpoint(&mut self) -> Result<bool, PlaceError> {
+        let uncommitted = self.lent.uncommitted_bytes();
+        if self.lent.visibility() == Visibility::AfterCommit {
+            self.commit()?;
+            return Ok(true);
+        }
+        if uncommitted == 0 {
+            return Ok(false);
+        }
+        let now = self.lent.wall_ns();
+        let since = *self.aging_since.get_or_insert(now);
+        if checkpoint_due(uncommitted, now.saturating_sub(since)) {
+            self.commit()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
     /// `public_writer`: whether the settings name this machine a trusted writer.
     pub fn new(lent: &'m Lent<D, StoreAlloc>, public_writer: bool) -> PlainPlace<'m, D> {
         PlainPlace::planted(lent, public_writer, PlacePlant::None)
     }
 
     pub(crate) fn planted(lent: &'m Lent<D, StoreAlloc>, public_writer: bool, plant: PlacePlant) -> PlainPlace<'m, D> {
-        PlainPlace { lent, public_writer, plant, commits: 0, segments_written: 0 }
+        PlainPlace { lent, public_writer, plant, commits: 0, segments_written: 0, aging_since: None }
     }
 
     /// The record's namespace (drive.md ruling 2): `PUBLIC` only when every name in it is
@@ -309,14 +359,14 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         if self.lent.uncommitted_bytes() > COMMIT_BYTES {
             self.commit()?;
         }
-        self.lent.put_parts(&CasKey(key.0), self.namespace(all_names_public), DRIVE_TAG, parts)?;
+        self.lent.put_parts(&CasKey(key.0), self.namespace(all_names_public), ReservedTag::Drive.tag(), parts)?;
         Ok(())
     }
 
-    /// A record keyed by its own bytes (an expansion record: `tag` [`EXPANSION_TAG`]) that many
+    /// A record keyed by its own bytes (an expansion record: `tag` [`ReservedTag::Expansion`]) that many
     /// owners of either namespace may name: equal bytes already held under `key`, this
     /// command's or committed, in any namespace and under any tag (a record a remote fetch
-    /// filed under [`DRIVE_TAG`]), is [`Put::Same`], so a toolchain crate's public record and a
+    /// filed under [`ReservedTag::Drive`]), is [`Put::Same`], so a toolchain crate's public record and a
     /// workspace crate's local one share it; else put in the namespace `all_names_public` (its
     /// owner's) says. Other bytes under `key` are refused (rule 21).
     pub fn put_record(&mut self, key: Key, all_names_public: bool, tag: Tag, bytes: &[u8]) -> Result<blaze_keyed::store::Put, PlaceError> {
@@ -386,7 +436,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     pub(crate) fn renew(&self, name: &str, life_ns: u64) -> Result<bool, PlaceError> {
         let Some(key) = self.lent.root_named(name) else { return Ok(false) };
         let Some(held) = self.lent.get(&key)? else { return Ok(false) };
-        let indexed = held.tag == blaze_cas::plain::INDEXED_ROOT_TAG;
+        let indexed = ReservedTag::IndexedRoot.is(held.tag);
         let mut named: Vec<CasKey, StoreAlloc> = Vec::with_capacity_in(held.bytes.len() / 32, *self.lent.alloc());
         named.extend(held.bytes.chunks_exact(32).map(|it| CasKey(blaze_ids::ContentId(it.try_into().expect("32 bytes")))));
         if indexed {
@@ -409,7 +459,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// its tag): `None` when `owner` was put with no records beside it.
     pub(crate) fn beside(&self, owner: Key) -> Result<Option<CasKey>, PlaceError> {
         let key = blaze_cas::plain::beside_key(CasKey(owner.0));
-        Ok(self.lent.get(&key)?.filter(|held| held.tag == blaze_cas::plain::INDEX_TAG).map(|_| key))
+        Ok(self.lent.get(&key)?.filter(|held| ReservedTag::Index.is(held.tag)).map(|_| key))
     }
 
     /// The store's owner, for a class root of store/roots.rs written beside the engine's
@@ -427,6 +477,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// What is not yet committed, laid out as one segment per namespace, and one flip.
     pub fn commit(&mut self) -> Result<(), PlaceError> {
         let committed = self.lent.commit()?;
+        self.aging_since = None;
         self.commits += 1;
         self.segments_written += u32::try_from(committed.segments.len()).unwrap_or(u32::MAX);
         Ok(())
@@ -456,6 +507,44 @@ pub struct AfterAnswer {
     pub compaction_slices: u32,
     /// The cleanup line: roots set, keys named, what the slice swept, carried, leases.
     pub cleanup: super::roots::CleanupLine,
+    /// The calling thread's QoS class around it (the measure of [`AFTER_ANSWER_QOS`]).
+    pub qos: QosSeen,
+}
+
+/// The seam (rule 78) of the class the work after the answer runs at (thoughts.md 2.5).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AfterAnswerQos {
+    /// The calling thread as it is: blaze-cas lowers it to `utility` inside `fold_slice` and
+    /// `seal` (`lower_this_thread`) and never gives it back, so a commit with no slice folded
+    /// before it runs at the caller's class, and the caller's thread stays lowered after. The
+    /// control.
+    AsCalled,
+    /// The whole stretch held at most at `blaze_core::threads::qos::AFTER_ANSWER` (`utility`),
+    /// the caller's class given back after on every way out, a panic's included
+    /// (`blaze_core::threads::qos::Lowered`). macOS only: Linux has no class, and its lowering
+    /// (nice 19, the idle IO class) cannot be given back by an unprivileged thread, so there it
+    /// is `AsCalled` (blaze_core::threads::qos's module doc).
+    Scoped,
+}
+
+/// The choice [`after_answer`] makes: scoped (2026-11-21), `AsCalled` kept as the tested
+/// control.
+pub const AFTER_ANSWER_QOS: AfterAnswerQos = AfterAnswerQos::Scoped;
+
+/// The calling thread's QoS class (a `qos_class_t`; 0 off macOS, which has no classes) as
+/// [`after_answer`] was called and as its last step ended.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct QosSeen {
+    pub called_at: u32,
+    pub ran_at: u32,
+}
+
+/// The calling thread's class, as [`QosSeen`] holds it.
+fn qos_now() -> Result<u32, PlaceError> {
+    #[cfg(target_os = "macos")]
+    return Ok(blaze_core::threads::qos::this_thread().map_err(PlaceError::Qos)?.0.raw());
+    #[cfg(not(target_os = "macos"))]
+    return Ok(0);
 }
 
 /// After the answer is printed, never waited on by it (the command's outer function calls it
@@ -494,8 +583,34 @@ pub struct AfterAnswer {
 ///   segment of this boot not sealed yet (`Plain::seal`), this command's phase commits'
 ///   (store.rs `commit_puts`) and a merge's copy among them, then one flip: the "fsync" calls
 ///   of a store that is not durable are these.
+///
+/// At [`AFTER_ANSWER_QOS`]: the class it ran at and the caller's are in [`AfterAnswer::qos`].
 pub fn after_answer<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32) -> Result<AfterAnswer, PlaceError> {
+    after_answer_at(cx, lent, slices, AFTER_ANSWER_QOS)
+}
+
+/// [`after_answer`] at the class choice `qos`: the seam's two sides, for its test.
+pub(crate) fn after_answer_at<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32, qos: AfterAnswerQos) -> Result<AfterAnswer, PlaceError> {
+    let called_at = qos_now()?;
+    #[cfg(target_os = "macos")]
+    let _held = match qos {
+        AfterAnswerQos::Scoped => {
+            Some(blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?)
+        }
+        AfterAnswerQos::AsCalled => None,
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (AfterAnswerQos::AsCalled | AfterAnswerQos::Scoped) = qos;
+    let mut done = after_answer_steps(cx, lent, slices)?;
+    done.qos = QosSeen { called_at, ran_at: qos_now()? };
+    Ok(done)
+}
+
+/// [`after_answer`]'s steps, on the calling thread at the class it has.
+fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32) -> Result<AfterAnswer, PlaceError> {
     let cx = cx.span("store after answer");
+    // The put path's tally up to here: the phases' commits and every copy before the answer.
+    let before = lent.put_tally();
     if slices > 0 {
         let _cx = cx.span("store after answer: fold a cleanup slice (map, merge copy hashed whole)");
         lent.fold_slice()?;
@@ -523,7 +638,14 @@ pub fn after_answer<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32)
     if slices > 0 {
         cleanup.slices = swept;
     }
-    Ok(AfterAnswer { segments_written: u32::try_from(committed.segments.len()).unwrap_or(u32::MAX), sealed, compaction_slices: cleanup.slices, cleanup })
+    cleanup.put = super::roots::PutLine { before_answer: before, after_answer: lent.put_tally().since(before) };
+    Ok(AfterAnswer {
+        segments_written: u32::try_from(committed.segments.len()).unwrap_or(u32::MAX),
+        sealed,
+        compaction_slices: cleanup.slices,
+        cleanup,
+        qos: QosSeen::default(),
+    })
 }
 
 /// The tests' context for [`after_answer`] (its spans): a simulated world's root, its own
@@ -538,3 +660,61 @@ pub(crate) fn test_cx() -> Cx {
 #[cfg(test)]
 #[path = "plain_place_tests.rs"]
 mod tests;
+
+/// The checkpoint rule's bounds (`checkpoint_due`): nothing put is never due; past
+/// `COMMIT_BYTES` always; at `CHECKPOINT_AGE_NS` waited, any bytes; below both, not due. Under
+/// the simulation, a store's clock is the sim's (`Lent::wall_ns`), so `PlainPlace::checkpoint`
+/// falls where its tape says.
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::{CHECKPOINT_AGE_NS, COMMIT_BYTES, checkpoint_due};
+
+    #[test]
+    fn a_checkpoint_is_due_past_the_bytes_or_the_age_and_never_with_nothing_put() {
+        assert!(!checkpoint_due(0, u64::MAX), "nothing put: nothing to commit");
+        assert!(checkpoint_due(COMMIT_BYTES + 1, 0), "past the bytes, at once");
+        assert!(!checkpoint_due(COMMIT_BYTES, CHECKPOINT_AGE_NS - 1), "at the bytes and under the age: not yet");
+        assert!(checkpoint_due(1, CHECKPOINT_AGE_NS), "one byte, waited the age");
+    }
+}
+
+/// The after-answer class's seam, on the simulation's store: scoped, the steps run at `utility`
+/// and the caller's class comes back; the control (as called, the cause removed) leaves the
+/// caller lowered after, blaze-cas's `lower_this_thread` never giving it back.
+#[cfg(all(test, target_os = "macos"))]
+mod qos_tests {
+    use blaze_cas::plain::Settings;
+    use blaze_core::{
+        FileName,
+        sim::{Faults, Sim},
+        threads::qos::{self, Qos},
+    };
+
+    use super::{AfterAnswerQos, Facts, after_answer_at, config, open, test_cx};
+
+    fn at(choice: AfterAnswerQos) -> (super::QosSeen, Qos) {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    qos::set_this_thread(Qos::UserInitiated, 0).expect("the caller's class");
+                    let alloc = blaze_own::testing::heap().alloc();
+                    let cfg = config(FileName::new("store").expect("a name"), &Settings::default(), Facts { boot: Some(1), nonce: 4242 }, alloc);
+                    let lent = open(Sim::new(1, Faults::default()), cfg, alloc).expect("the store opens");
+                    let done = after_answer_at(&test_cx(), &lent, 0, choice).expect("the work after the answer");
+                    (done.qos, qos::this_thread().expect("the class after").0)
+                })
+                .join()
+                .expect("the caller's thread")
+        })
+    }
+
+    #[test]
+    fn scoped_the_work_after_the_answer_runs_at_utility_and_the_caller_gets_its_class_back() {
+        let (seen, after) = at(AfterAnswerQos::Scoped);
+        assert_eq!(seen, super::QosSeen { called_at: Qos::UserInitiated.raw(), ran_at: qos::AFTER_ANSWER.raw() });
+        assert_eq!(after, Qos::UserInitiated, "the caller's class given back");
+        let (seen, after) = at(AfterAnswerQos::AsCalled);
+        assert_eq!(seen.called_at, Qos::UserInitiated.raw());
+        assert_eq!(after, Qos::Utility, "as called, blaze-cas's lowering stays");
+    }
+}

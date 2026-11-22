@@ -25,6 +25,10 @@ impl Names for ByPlace {
     fn name(&self, of: Outside) -> Option<Named<'_>> {
         Some(Named::Symbol(blaze_code::record::Symbol::of_name(&format!("{of:?}"))))
     }
+
+    fn routines(&self) -> crate::RoutinePlaces {
+        crate::RoutinePlaces::NONE
+    }
 }
 
 /// `plain(); invoke may_panic() to normal unwind pad; normal: ret; pad(e): dropper(e); resume e`.

@@ -189,7 +189,7 @@ fn the_runs_reader_reads_each_crates_sections_in_place() {
     for one in crates.iter() {
         store.put(&cx, one.input.at, &one.whole).unwrap_or_else(|e| panic!("the put of {:?}: {e}", one.input.name));
         for (key, bytes) in one.extras.iter() {
-            store.put_record(&cx, *key, crate::store::plain_place::EXPANSION_TAG, &[&one.whole], bytes).unwrap_or_else(|e| panic!("the expansion record {key:?} of {:?}: {e}", one.input.name));
+            store.put_record(&cx, *key, blaze_keyed::kind::ReservedTag::Expansion.tag(), &[&one.whole], bytes).unwrap_or_else(|e| panic!("the expansion record {key:?} of {:?}: {e}", one.input.name));
         }
     }
     store.place.commit().unwrap_or_else(|e| panic!("the commit: {e:?}"));

@@ -157,6 +157,7 @@ impl<'w> ProjectAsk<'w> {
             traits: &[],
             blocks: &blocks,
             path_marks: &[],
+            path_ns: &[],
             fills: RefCell::new(Vec::new_in(Global)),
             gaps: RefCell::new(Vec::new_in(Global)),
             // A constant's evaluation is after analysis (rustc's CTFE runs post-analysis):

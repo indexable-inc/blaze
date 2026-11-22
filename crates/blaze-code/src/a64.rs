@@ -48,14 +48,55 @@ pub fn expect(code: &[u8], at: u64, (mask, value): (u32, u32), symbol: Symbol, w
     }
 }
 
-/// `adrp` at `pc` made to reach the 4 KiB page of `to`.
-pub fn adrp(inst: u32, pc: u64, to: u64, symbol: Symbol) -> Result<u32, ImageError> {
+/// An instruction field that cannot hold its target: the instruction at `from` (`what`: which
+/// instruction and its reach) asked to reach `to`. Every encoder here that can miss says so with
+/// it; its caller names the function or slot the instruction is in (rule 19).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OutOfReach {
+    pub what: &'static str,
+    pub from: u64,
+    pub to: u64,
+}
+
+impl core::fmt::Display for OutOfReach {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let OutOfReach { what, from, to } = *self;
+        write!(f, "{what}: {to:#x} is out of reach of {from:#x}")
+    }
+}
+
+impl core::error::Error for OutOfReach {}
+
+/// What [`adrp_to`] says when the page is past its reach.
+pub const ADRP_REACH: &str = "adrp (4 GiB of pages)";
+
+/// The one `adrp` encoder (every layout and the launcher's thunks call it): `inst` (an `adrp`:
+/// its opcode bits and register stand, its immediate is replaced) at `pc`, made to reach the
+/// 4 KiB page of `to` (A64 "ADRP": `Xd = (PC & ~0xFFF) + (imm21 << 12)`), or [`OutOfReach`] when
+/// the pages are not within the signed 21-bit field (plus or minus 4 GiB).
+pub const fn adrp_to(inst: u32, pc: u64, to: u64) -> Result<u32, OutOfReach> {
     let pages = (to >> 12) as i64 - (pc >> 12) as i64;
-    if !(-(1i64 << 20)..(1i64 << 20)).contains(&pages) {
-        return Err(ImageError::OutOfReach { symbol, at: pc, what: "adrp (4 GiB)" });
+    if pages < -(1i64 << 20) || pages >= (1i64 << 20) {
+        return Err(OutOfReach { what: ADRP_REACH, from: pc, to });
     }
     let imm = (pages as u32) & 0x1F_FFFF;
     Ok((inst & 0x9F00_001F) | ((imm & 3) << 29) | (((imm >> 2) & 0x7_FFFF) << 5))
+}
+
+/// The low 12 bits of `to`, scaled by the access size `1 << scale_log2`, into imm12 (bits
+/// 10..21) of an `add` (scale 0) or an `ldr`/`str` (unsigned offset) `inst`; `None` when the low
+/// bits are not a multiple of the access size, which the field cannot say.
+pub const fn lo12(inst: u32, to: u64, scale_log2: u8) -> Option<u32> {
+    let low = (to & 0xFFF) as u32;
+    if low & ((1u32 << scale_log2) - 1) != 0 {
+        return None;
+    }
+    Some((inst & !(0xFFF << 10)) | ((low >> scale_log2) << 10))
+}
+
+/// [`adrp_to`] in a placed function `symbol`: its refusal names the function and the site.
+pub fn adrp(inst: u32, pc: u64, to: u64, symbol: Symbol) -> Result<u32, ImageError> {
+    adrp_to(inst, pc, to).map_err(|e| ImageError::OutOfReach { symbol, at: e.from, what: e.what })
 }
 
 /// `ldr Xt, [Xn, #lo12(to)]`; `to` is 8-aligned (an import word).

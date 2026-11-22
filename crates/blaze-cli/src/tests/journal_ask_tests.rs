@@ -34,7 +34,9 @@ fn side(tape: &Tape, label: &'static str) -> StdVec<&'static str> {
 
 /// The oracle's answer: `ours`' compared names that no compared name of `theirs` covers.
 fn alone(ours: &[&'static str], theirs: &[&'static str]) -> BTreeSet<&'static str> {
-    let own = |name: &str| name.is_empty() || name.starts_with(".blaze/v2/fsevents") || name.starts_with(".blaze/v2/journal");
+    // The socket is under the home since 2026-11-21: an old checkout's `.blaze/v2/journal` is
+    // a name like any other.
+    let own = |name: &str| name.is_empty() || name.starts_with(".blaze/v2/fsevents");
     ours.iter().copied().filter(|name| !own(name)).filter(|name| !theirs.iter().any(|other| !own(other) && since::covers(other, name))).collect()
 }
 
@@ -70,31 +72,56 @@ fn control_a_name_covered_only_by_itself() {
 #[test]
 fn a_checkout_key_is_its_root() {
     let frame = test_frame();
-    let tempo = checkout_key(Some("/Volumes/Projects/tempo"), &frame);
-    assert_eq!(tempo, checkout_key(Some("/Volumes/Projects/tempo"), &frame), "one root, one key");
-    assert_ne!(tempo, checkout_key(Some("/Volumes/Projects/reth"), &frame), "two roots, two keys");
+    let tempo = checkout_key(Some("/checkout/project/tempo"), &frame);
+    assert_eq!(tempo, checkout_key(Some("/checkout/project/tempo"), &frame), "one root, one key");
+    assert_ne!(tempo, checkout_key(Some("/checkout/project/reth"), &frame), "two roots, two keys");
     assert_ne!(tempo, checkout_key(None, &frame), "a simulated world's key is no checkout's");
 }
 
-/// The socket's fit at its boundary: a root whose `<root>/<SOCKET>` and NUL are exactly the
-/// platform's most fits, one byte more does not, and the refusal names the socket, both
-/// counts and the limit. A simulated world (no root text) has no path to fit.
+/// The socket's fit at its boundary: a home whose `<home>/.blaze/v2/journal/<16 hex>.sock` and
+/// NUL are exactly the platform's most fits, one byte more does not, and the refusal names the
+/// socket's folder, both counts and the limit. No home has no path to fit; the checkout's depth
+/// counts for nothing.
 #[test]
 fn a_socket_path_one_byte_over_the_limit_is_too_long() {
-    let room = bstd::local::SOCKET_PATH_MOST - helper::SOCKET.len() - 2;
+    let room = bstd::local::SOCKET_PATH_MOST - PAST_HOME;
     let fits = format!("/{:r<width$}", "", width = room - 1);
-    assert_eq!(fits.len() + 1 + helper::SOCKET.len() + 1, bstd::local::SOCKET_PATH_MOST);
+    assert_eq!(fits.len() + 1 + crate::store::HOME_FOLDER.len() + 1 + helper::SOCKET_PATH_BYTES + 1, bstd::local::SOCKET_PATH_MOST);
     assert_eq!(SocketFits::of(Some(&fits)), SocketFits::Fits, "exactly the most fits");
+    assert_eq!(SocketFits::of(Some(&format!("{fits}/"))), SocketFits::Fits, "a home's trailing slash is not counted");
     let over = format!("{fits}r");
     let too_long = SocketFits::of(Some(&over));
-    assert_eq!(too_long, SocketFits::TooLong { bytes: bstd::local::SOCKET_PATH_MOST + 1, root: over.len() });
+    assert_eq!(too_long, SocketFits::TooLong { bytes: bstd::local::SOCKET_PATH_MOST + 1, home: over.len() });
     let said = format!("{too_long}");
-    assert!(said.contains(helper::SOCKET), "{said:?} does not name the socket");
+    assert!(said.contains(helper::SOCKET_FOLDER), "{said:?} does not name the socket's folder");
     for count in [bstd::local::SOCKET_PATH_MOST + 1, bstd::local::SOCKET_PATH_MOST, over.len()] {
         assert!(said.contains(&format!("{count}")), "{said:?} does not say {count}");
     }
-    assert_eq!(SocketFits::of(None), SocketFits::Fits, "a simulated world");
-    assert_eq!(SocketFits::of(Some("/Volumes/Projects/tempo")), SocketFits::Fits, "tempo's checkout");
+    assert_eq!(SocketFits::of(None), SocketFits::Fits, "no home");
+    assert_eq!(SocketFits::of(Some("/homes/someone")), SocketFits::Fits, "a home on macOS");
+}
+
+/// A checkout's socket is named by its key alone: one checkout, one name, under the folder;
+/// two checkouts, two; no part of the checkout's path is in it, and a deep checkout's name is
+/// as short as any.
+#[test]
+fn a_socket_is_named_by_its_checkouts_key() {
+    let frame = test_frame();
+    let build = bstd::host::BuildId::of(b"a build").expect("a build id");
+    let deep = format!("/checkout/project/{:d<200}", "");
+    let tempo = Me::of(&build, Some("/checkout/project/tempo"), Some("/homes/someone"), &frame);
+    let reth = Me::of(&build, Some("/checkout/project/reth"), Some("/homes/someone"), &frame);
+    let far = Me::of(&build, Some(&deep), Some("/homes/someone"), &frame);
+    let text = |me: &Me| std::string::String::from(core::str::from_utf8(&me.socket_path).expect("UTF-8"));
+    assert_eq!(text(&tempo), text(&Me::of(&build, Some("/checkout/project/tempo"), Some("/homes/other"), &frame)), "one checkout, one name");
+    assert_ne!(text(&tempo), text(&reth), "two checkouts, two names");
+    for me in [&tempo, &reth, &far] {
+        let name = text(me);
+        let hex = name.strip_prefix(&format!("{}/", helper::SOCKET_FOLDER)).and_then(|it| it.strip_suffix(".sock")).expect("in the folder, a .sock");
+        assert!(hex.len() == 16 && hex.bytes().all(|it| it.is_ascii_hexdigit() && !it.is_ascii_uppercase()), "{name:?}: 16 lower hex digits");
+        assert!(!name.contains("Projects") && me.socket == SocketFits::Fits, "{name:?}: no path in the name, and it fits");
+        assert_eq!(me.socket_beneath_home().expect("a path").as_str(), name);
+    }
 }
 
 /// A helper place is asked from only beside the checkout's own journal place (its pair); a

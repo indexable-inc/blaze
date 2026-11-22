@@ -831,5 +831,6 @@ pub fn lay_out_records<'a, 'r>(
         fixups,
         entry: entry_at,
         placed,
+        tables_room: tail,
     })
 }

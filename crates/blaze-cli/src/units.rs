@@ -60,6 +60,9 @@ pub struct Laid<'f> {
     pub parts: Option<crate::graph::Parts>,
     /// The `UnitGraph` job, made from `parts` once the units' source is known (main.rs).
     pub graph: Option<crate::graph::Graph<'f>>,
+    /// The `rustflags` of the checkout's cargo config (graph.rs `rustflags_config`), each file a
+    /// row the layout read: what `graph::target_of` gives the units' cfg.
+    pub rustflags: blaze_manifest::rustflags::RustflagsConfig<'static>,
 }
 
 impl Laid<'_> {
@@ -219,7 +222,12 @@ pub fn lay<'f, 'l>(
     let mut text = Bytes::new_in(frame, "Cargo.lock");
     let lock_text: Option<&[u8]> = match &facts {
         None => None,
-        Some((_, Some(own))) => Some(own),
+        Some((_, Some(own))) => {
+            // The members' own lock names the workspace the save keeps its base by
+            // (engine_answer.rs `BASES_ROOT`).
+            rows.members_read(own, frame);
+            Some(own)
+        }
         Some((_, None)) => match sweep::read_manifest(&cx, root, stamps, LOCK, rows, &mut text)? {
             false => None,
             true => Some(Vec::from_slice_in(text.as_slice(), frame).leak()),
@@ -246,10 +254,13 @@ pub fn lay<'f, 'l>(
         },
         _ => None,
     };
+    // The cargo config's rustflags: its files are the layout's reads, so an edit to one moves the
+    // units' source and lays the graph again (rule 21).
+    let rustflags = crate::graph::rustflags_config(&cx, root, stamps, rows, heap, frame)?;
     root_made.parts.sort_unstable_by_key(|part| part.name);
     root_made.parts.dedup_by_key(|part| part.name);
     root_made.out = parts_out(&root_made.parts);
-    Ok(Laid { root: root_made, members, lock, parts, graph: None })
+    Ok(Laid { root: root_made, members, lock, parts, graph: None, rustflags })
 }
 
 /// Where a refusal is: the manifest's id and the span, when it names one.
@@ -697,5 +708,75 @@ mod tests {
             assert_eq!(findings.len(), 1, "{findings:?}");
             assert!(findings[0].contains("depends back on it"), "{findings:?}");
         });
+    }
+
+    /// What the layout of `files` gives a build script's unit from the cargo config's rustflags
+    /// (no `--target`: the twin of a `--target` build is blaze-manifest rustflags_tests.rs), the
+    /// units' source, and the config rows the layout read with whether each was there.
+    #[allow(clippy::type_complexity, reason = "a test's three answers")]
+    fn rustflags_laid(files: &[(&str, &str)]) -> Result<(std::vec::Vec<std::string::String>, ContentId, std::vec::Vec<(std::string::String, bool)>), std::string::String> {
+        let io = Io::simulated(SimWorld::new(1, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let frame = cx.frame();
+        let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("data").expect("a path")).expect("open");
+        for (path, text) in files {
+            root.publish(&cx, &Path::new(path).expect("a path"), Content::bytes(text.as_bytes()), Durable::No).expect("write");
+        }
+        let erased = blaze_own::Erased::new(frame);
+        let mut rows = Rows::new_in(frame);
+        let laid = lay(&cx, &root, &FromMeta { swept_at_ns: 0 }, &mut rows, blaze_toolchain::ToolchainId([0; 32]), blaze_own::testing::heap(), frame, erased.handle()).map_err(|error| format!("{error:?}"))?;
+        let unit = blaze_manifest::rustflags::Unit { target_given: false, host_unit: true };
+        let atoms = [("unix", None), ("target_vendor", Some("apple"))];
+        let chosen = blaze_manifest::rustflags::choose(&laid.rustflags, blaze_manifest::rustflags::RustflagsEnv::default(), "aarch64-apple-darwin", &atoms, unit, blaze_own::testing::heap().alloc()).map_err(|error| error.to_string())?;
+        let cfg = chosen.cfg.iter().map(|(name, _)| name.as_str().to_owned()).collect();
+        let source = sweep::units_source(rows.rows.iter().map(|leaf| (rows.path(leaf), leaf)), frame);
+        let config = rows.rows.iter().filter(|leaf| rows.path(leaf).starts_with(".cargo/")).map(|leaf| (rows.path(leaf).to_owned(), !leaf.absent())).collect();
+        Ok((cfg, source, config))
+    }
+
+    const MEMBER: [(&str, &str); 2] = [("Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"), ("src/lib.rs", "")];
+
+    /// turso's `.cargo/config.toml` `--cfg=tokio_unstable` reaches the units' cfg (ORACLE); with
+    /// no config nothing does (TWIN), and both config names are read absent, so making one lays
+    /// the graph again; `--cfg=other` gives `other` (CONTROL, rule 23) and moves the units' source
+    /// (the graph's key, rule 21).
+    #[test]
+    fn a_cargo_config_rustflags_cfg_is_a_read_of_the_layout_and_reaches_the_units_cfg() {
+        let with = |flag: &str| {
+            let config = format!("[build]\nrustflags = [\"--cfg={flag}\"]\n");
+            let mut files = MEMBER.to_vec();
+            files.push((".cargo/config.toml", config.leak()));
+            rustflags_laid(&files).expect("laid")
+        };
+        let (cfg, tokio, rows) = with("tokio_unstable");
+        assert_eq!(cfg, ["tokio_unstable"]);
+        assert_eq!(rows, [(".cargo/config".to_owned(), false), (".cargo/config.toml".to_owned(), true)]);
+        let (cfg, other, _) = with("other");
+        assert_eq!(cfg, ["other"]);
+        assert_ne!(tokio, other, "an edited rustflags moves the units' source");
+        let (cfg, none, rows) = rustflags_laid(&MEMBER).expect("laid");
+        assert!(cfg.is_empty(), "{cfg:?}");
+        assert_eq!(rows, [(".cargo/config".to_owned(), false), (".cargo/config.toml".to_owned(), false)]);
+        assert_ne!(none, tokio);
+    }
+
+    /// tempo's `.cargo/config.toml` includes an optional `orb.toml`: absent, it is a row read
+    /// absent and nothing else; present, its flags merge under the including file's. A missing
+    /// include that is not optional is refused by name.
+    #[test]
+    fn a_cargo_config_include_is_read_under_the_including_file() {
+        let tempo = "include = [{ path = \"orb.toml\", optional = true }]\n\n[alias]\nx = \"run --bin x\"\n";
+        let mut files = MEMBER.to_vec();
+        files.push((".cargo/config.toml", tempo));
+        let (cfg, _, rows) = rustflags_laid(&files).expect("tempo's config");
+        assert!(cfg.is_empty(), "{cfg:?}");
+        assert!(rows.contains(&(".cargo/orb.toml".to_owned(), false)), "{rows:?}");
+        files.push((".cargo/orb.toml", "[build]\nrustflags = [\"--cfg=orb\"]\n"));
+        let (cfg, _, _) = rustflags_laid(&files).expect("with orb.toml");
+        assert_eq!(cfg, ["orb"]);
+        let mut files = MEMBER.to_vec();
+        files.push((".cargo/config.toml", "include = [\"gone.toml\"]\n"));
+        let refused = rustflags_laid(&files).expect_err("a missing include");
+        assert!(refused.contains("gone.toml"), "{refused}");
     }
 }

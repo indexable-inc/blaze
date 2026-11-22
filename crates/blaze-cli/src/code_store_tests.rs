@@ -24,7 +24,8 @@ use blaze_ladder::symbols::fn_symbol_of_name;
 use blaze_ladder::code_records::TierName;
 use blaze_toolchain::ToolchainId;
 
-use super::{CODE_TAG, HomeCodeStore};
+use super::HomeCodeStore;
+use blaze_keyed::kind::ReservedTag;
 use crate::store::plain_place::{Facts, StoreAlloc, after_answer, config, open, test_cx as root_cx};
 
 /// Process `n` of one boot over `sim`: the command's store as `open_for_command` opens it.
@@ -105,7 +106,7 @@ fn entries_reach_the_next_process_and_are_read_in_place() {
     // A record of the drive's (or any other) tag under a key the code index asks.
     let other = CodeKey(ContentId::of("code store test other tag", b"x"));
     lent.put(&CasKey(other.0), Namespace::LOCAL, Tag(1), b"not a code entry").expect("a put of another tag");
-    assert_ne!(Tag(1), CODE_TAG);
+    assert_ne!(Tag(1), ReservedTag::Code.tag());
     match store.get(other) {
         Err(StoreError::Failed { key, .. }) => assert_eq!(key, other),
         found => panic!("a record of another tag was read as a code entry: {found:?}"),

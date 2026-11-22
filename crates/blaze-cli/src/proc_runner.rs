@@ -36,8 +36,8 @@ use blaze_expand::{Edition, HostAsk, HostError, HostWhy, MacroDefinition, ProcCa
 use blaze_id::CrateItemKey;
 use blaze_own::Alloc;
 
-/// What the command gives [`make`]: the lock as read (its text is what the dependency closure
-/// of a module identity is read from) and the macro crates' place (the home holding the module
+/// What the command gives [`make`]: the lock as read (its packages are what the dependency
+/// closure of a module identity is walked over) and the macro crates' place (the home holding the module
 /// store, the checkout, the members' folders and their `MacroFiles` rows).
 pub(crate) struct MacroSide<'s, 'p, 'r> {
     pub lock: &'s crate::fetch::Lockfile<'s>,
@@ -53,8 +53,6 @@ pub(crate) enum MakeError {
     NoSandbox,
     /// No home: the module store is under it.
     NoHome,
-    /// The lock's text is not UTF-8.
-    LockText,
     /// The module store could not be listed (its git folders).
     Store(std::string::String),
     /// The Wasmtime runtime could not be made.
@@ -84,7 +82,6 @@ impl core::fmt::Display for MakeError {
         match self {
             MakeError::NoSandbox => f.write_str("this blaze was built without the proc-macro sandbox (feature `sandbox`), so no proc macro can run"),
             MakeError::NoHome => f.write_str("no home: the proc-macro module store is under it, and HOME is not set"),
-            MakeError::LockText => f.write_str("Cargo.lock is not UTF-8"),
             MakeError::Store(why) => write!(f, "the proc-macro module store: {why}"),
             MakeError::Runtime(why) => write!(f, "the proc-macro runtime (Wasmtime): {why}"),
             MakeError::Module { krate, why } => write!(f, "the proc-macro module of {krate} could not be read: {why}"),
@@ -100,6 +97,11 @@ impl core::fmt::Display for MakeError {
 
 /// Where [`ProcRunner::keep`] writes: the store [`make`] opens under the home.
 pub(crate) const ANSWERS_STORE: &str = "<home>/.blaze/v2/proc-macro/expansions";
+
+/// The expansion records' folder beneath scripts.rs `STORE_UNDER_HOME` ([`make`] joins it; the
+/// layout's row, layout.rs, is this joined, a test holds [`ANSWERS_STORE`] to it).
+#[cfg_attr(not(any(test, feature = "sandbox")), expect(dead_code, reason = "only the sandboxed `make` opens the expansions; layout.rs's test reads it"))]
+pub(crate) const EXPANSIONS: &str = "proc-macro/expansions";
 
 /// The answers this command's proc-macro calls made could not be written to their store
 /// ([`ProcRunner::keep`]): names the store and the record that refused (rule 19). The command
@@ -206,13 +208,12 @@ mod with_sandbox {
     pub(crate) fn make(names: &crate::names::NamesWorld<'_>, side: &MacroSide<'_, '_, '_>) -> Result<&'static ProcRunner<'static>, MakeError> {
         let home = side.place.home.ok_or(MakeError::NoHome)?;
         let modules = std::path::Path::new(home).join(".blaze/v2");
-        let text = core::str::from_utf8(side.lock.text).map_err(|_| MakeError::LockText)?;
-        let locked = LockedPackages::read(text);
+        let locked = LockedPackages::of(side.lock.lock);
         let folders = git_folders(&modules).map_err(|e| MakeError::Store(e.to_string()))?;
         // The process's heap, handed from `main` through the side (D102, D120).
         let runtime = blaze_proc_macro::host::Runtime::new(side.heap).map_err(|e| MakeError::Runtime(e.to_string()))?;
         let runtime: &'static blaze_proc_macro::host::Runtime = std::boxed::Box::leak(std::boxed::Box::new_in(runtime, Global));
-        let records = blaze_proc_macro::record::DirStore::new(&modules.join("proc-macro/expansions"));
+        let records = blaze_proc_macro::record::DirStore::new(&modules.join(super::EXPANSIONS));
         let records: &'static blaze_proc_macro::record::DirStore = std::boxed::Box::leak(std::boxed::Box::new_in(records, Global));
         let mut procs = ProcMacros::new(runtime, records, blaze_proc_macro::host::Limits::STANDARD);
         let world = names.world();

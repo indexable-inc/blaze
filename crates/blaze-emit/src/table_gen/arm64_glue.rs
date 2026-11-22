@@ -1,6 +1,7 @@
 //! The arm64 recipes of the composer's own instructions (compose/emit.rs, `glue`), and the
 //! single-word forms T1 left out: the frame steps (`stack_pointer` variants 1 to 7), register
-//! moves within and across the classes, cell loads and stores of float registers, `ret`, the
+//! moves within and across the classes (a near cell's load and store of either class is the
+//! access grid's, arm64.rs `memory`), `ret`, the
 //! poll, `eor` by a logical immediate, shifted-register operands, `cbz`, and the far frame (the
 //! stack probe, `stack_pointer` variant 8, and the cell and slot forms past the near reach).
 //!
@@ -22,7 +23,7 @@
 use blaze_lir::Op;
 use blaze_tier::{Form, ImmClass, Inner, Pattern, Reg, RegClass, RegSet};
 
-use super::{BLOCK, Each, GPR, NONE, WIDTHS, branch, frame, imm, narrow, one, pattern, r, reg, s, u};
+use super::{BLOCK, Each, GPR, NONE, WIDTHS, branch, imm, narrow, one, pattern, r, reg, s, u};
 use crate::compose::emit::glue;
 use crate::enc::{self, Cond, FP, LR, SP, Size, X16, ZR};
 use crate::enc_probe;
@@ -37,7 +38,8 @@ pub(crate) const BR_IF_ZERO: u8 = 1;
 pub(super) fn recipes(each: &mut Each<'_>) -> Result<(), GenError> {
     frame_steps(each)?;
     moves(each)?;
-    float_cells(each)?;
+    // A cell's near load and store (`glue::cell_load`, `glue::cell_store`) of either class are
+    // the access grid's fused `slot_addr` cells (arm64.rs `memory`): one generator a pattern.
     poll_and_return(each)?;
     xor_immediates(each)?;
     shifted_operands(each)?;
@@ -146,16 +148,6 @@ fn moves(each: &mut Each<'_>) -> Result<(), GenError> {
     one(each, glue::mov(RegClass::Fpr), &slots, &|v, c| c.word(fmov_d(r(v, RES), r(v, 0))))?;
     one(each, glue::cross(true), &slots, &|v, c| c.word(enc::fmov_to_d(r(v, RES), r(v, 0))))?;
     one(each, glue::cross(false), &slots, &|v, c| c.word(enc::fmov_from_d(r(v, RES), r(v, 0))))
-}
-
-/// `ldr d, [sp, #off]` and `str d, [sp, #off]`: a float register's cell (`Frame { scale: 3 }`).
-fn float_cells(each: &mut Each<'_>) -> Result<(), GenError> {
-    one(each, glue::cell_load(RegClass::Fpr), &[frame(2, 3), reg(RES)], &|v, c| {
-        c.word(ldr_d(r(v, RES), SP, u(v, 2, 12)));
-    })?;
-    one(each, glue::cell_store(RegClass::Fpr), &[reg(0), frame(3, 3)], &|v, c| {
-        c.word(str_d(r(v, 0), SP, u(v, 3, 12)));
-    })
 }
 
 /// The poll (`adrp x16, #0; ldr xzr, [x16, #0]`: no fields, the composer writes its `Page21` and

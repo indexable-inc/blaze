@@ -155,6 +155,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             if matches!(v, TyView::Future(..) | TyView::CoroutineOf { .. } | TyView::Opaque(..)) {
                 return Ok(true);
             }
+            // A closure holds its captures, its environment (the Reference, "Closure types":
+            // "a closure is `Send` if all of its captures are `Send`"), which `ty_children`
+            // does not reach (it walks the signature): turso sync/engine
+            // database_sync_lazy_storage.rs:589, `Box::new(move || generator.resume_with(..))`
+            // to `Box<dyn FnMut() -> bool + Send>`, the `Gen` captured holding an async block's
+            // `Pin<Box<F>>`, was E0283 on the block's undecided interior, never deferred to
+            // its exact one. The same walk as `stored_witness_source` (rules/async_fn.rs).
+            if let Some((_, Some(env))) = self.closure_witness(v) {
+                work.push(env);
+            }
             self.ty_children(v, &mut work);
         }
         Ok(false)

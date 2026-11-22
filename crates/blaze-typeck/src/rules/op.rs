@@ -189,7 +189,29 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             || matches!(self.view(t), TyView::Bool | TyView::Char | TyView::Ptr(..) | TyView::FnPtr(..))
     }
 
-    /// `is_builtin_binop`.
+    /// rustc op.rs `deref_ty_if_possible`: `T` for `&T` (a shared reference only), else `t`.
+    fn peel_shared_ref(&mut self, t: Ty) -> Ty {
+        match self.view(t) {
+            TyView::Ref(Mutbl::Not, inner) => inner,
+            _ => t,
+        }
+    }
+
+    /// Records the operator `e` as the call of its trait's method at `[lhs, rhs]`. That is the
+    /// row `operator_settled_builtin` drops when the final types are builtin scalars.
+    fn push_binop_callee(&mut self, e: ExprId, op: BinOp, assign: bool, lhs: Ty, rhs: Ty) -> Result<(), Stop> {
+        if let Some(item) = op_lang(op, assign)
+            && let Some(tr) = self.lang(item)?
+            && let Some(name) = binop_method(op, assign)
+            && let Some(m) = self.reads.assoc_item(tr, Name::of(name))?
+        {
+            let args = self.mk_list(&[lhs, rhs])?;
+            self.callees.push((e, m.item, args));
+        }
+        Ok(())
+    }
+
+    /// `is_builtin_binop` on types already peeled ([`Machine::peel_shared_ref`]).
     fn is_builtin_binop(&mut self, lhs: Ty, rhs: Ty, op: BinOp) -> bool {
         if self.is_err(lhs) || self.is_err(rhs) {
             return true;
@@ -362,24 +384,33 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     rhs_ty = self.try_structurally_resolve(f.u)?;
                 }
                 let out = Ty(f.a);
-                if !self.is_ty_var(lhs_ty) && !self.is_ty_var(rhs_ty) && self.is_builtin_binop(lhs_ty, rhs_ty, op) {
-                    let builtin = self.enforce_builtin(e, lhs_ty, rhs_ty, op, assign)?;
+                // rustc's `is_builtin_binop` and `enforce_builtin_binop_types` peel one shared
+                // reference from each side first ("Special-case a single layer of referencing,
+                // so that things like `5.0 + &6.0f32` work", rust-lang/rust#57447). So
+                // `header_byte >> 4` on `header_byte: &u8` is `u8` before `&u8: Shr<{integer}>`
+                // is selected (turso core/json/jsonb.rs:1041). The trait's output is made equal
+                // to it, and the callee row stays: writeback's `fix_scalar_builtin_expr` tests
+                // `is_scalar` on the unpeeled types, as `operator_settled_builtin` does.
+                // A peeled side is taken only once the trait is registered (`f.b == 1`). Where
+                // `&T: Op<..>` cannot hold, the error below is still the trait's (E0369).
+                let (lhs_b, rhs_b) = match (self.peel_shared_ref(lhs_ty), self.peel_shared_ref(rhs_ty)) {
+                    (l, r) if f.b == 1 => (l, r),
+                    _ => (lhs_ty, rhs_ty),
+                };
+                if !self.is_ty_var(lhs_ty) && !self.is_ty_var(rhs_ty) && self.is_builtin_binop(lhs_b, rhs_b, op) {
+                    let builtin = self.enforce_builtin(e, lhs_b, rhs_b, op, assign)?;
                     if f.b == 1 {
                         self.unify(builtin, out)?;
+                        // A peeled reference: the operator is still the trait's method on
+                        // the reference (core's `forward_ref_binop` impls).
+                        if lhs_b != lhs_ty || rhs_b != rhs_ty {
+                            self.push_binop_callee(e, op, assign, f.t, f.u)?;
+                        }
                     }
                     return Ok(Flow::Done(builtin));
                 }
                 if f.b == 1 {
-                    // The operator is the trait's method at `[lhs, rhs]` (the row
-                    // `operator_settled_builtin` drops when the final types are builtin).
-                    if let Some(item) = op_lang(op, assign)
-                        && let Some(tr) = self.lang(item)?
-                        && let Some(name) = binop_method(op, assign)
-                        && let Some(m) = self.reads.assoc_item(tr, Name::of(name))?
-                    {
-                        let args = self.mk_list(&[f.t, f.u])?;
-                        self.callees.push((e, m.item, args));
-                    }
+                    self.push_binop_callee(e, op, assign, f.t, f.u)?;
                     return Ok(Flow::Done(out));
                 }
                 if f.b == 2
@@ -415,7 +446,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     TyView::Error => return Ok(Flow::Done(t)),
                     _ => {}
                 }
-                if let Some(target) = self.overloaded_deref(t)? {
+                if let Some(target) = self.overloaded_deref_at(t, crate::machine::DerefAt::Operator)? {
                     let kind = crate::columns::AdjustKind::Deref { overloaded: Some(Mutbl::Not) };
                     self.adjust.push((operand, kind, target));
                     return Ok(Flow::Done(target));

@@ -130,9 +130,193 @@ pub(super) fn alias_opaque_preds<'n, 'a, H: Heads, S: NamesSource<'n>>(
     Ok(out)
 }
 
+/// The most segments a `#[define_opaque]` path is read with ([`names_alias`]).
+const MOST_SEGMENTS: usize = 32;
+
+/// Why [`defining_fn`] found no fn that defines an alias (rule 19).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefinerMiss {
+    /// A front end that does not search for defining fns (the seam's default).
+    NotAnswered,
+    /// The alias's checker key has no library key (it is no item the names hold).
+    NoLibraryKey,
+    /// The names source holds no crate for the alias.
+    NoCrate,
+    /// The alias's crate's items were not read (`NamesSource::each_item` said `false`).
+    NotRead,
+    /// No fn of the alias's crate writes `#[define_opaque(..)]` with a path naming it. rustc
+    /// reports this as "unconstrained opaque type" (rustc_hir_analysis collect/type_of/opaque.rs
+    /// `find_opaque_ty_constraints_for_tait`). A fn declared in a body, or a member of an impl
+    /// or trait, is not searched yet (it is no row of `each_item`).
+    NoDefiner,
+}
+
+impl DefinerMiss {
+    /// The words of the refusal.
+    pub fn form(self) -> &'static str {
+        match self {
+            DefinerMiss::NotAnswered => "this front end does not find a type alias's defining fn",
+            DefinerMiss::NoLibraryKey => "the type alias has no library key: it is no item the names hold",
+            DefinerMiss::NoCrate => "the names source holds no crate for the type alias",
+            DefinerMiss::NotRead => "the type alias's crate's items were not read",
+            DefinerMiss::NoDefiner => "no fn of the type alias's crate writes `#[define_opaque(..)]` naming it (a fn in a body or an impl is not searched yet)",
+        }
+    }
+}
+
+/// The fn that defines the `impl Trait` types of type alias `alias`: the first fn of its crate,
+/// in key order, whose `#[define_opaque(..)]` lists a path that resolves (in the type namespace,
+/// at the fn's module) to the alias. rustc searches the WHOLE crate for an alias's defining uses
+/// (`find_opaque_ty_constraints_for_tait`: `hir_walk_toplevel_module`), and makes every defining
+/// fn give the same hidden type (an error otherwise), so any one of them answers. The hidden
+/// type is in that fn's check record: its written output names the alias, which the checker
+/// opens as its own (blaze-typeck rules/opaque_def.rs, machine.rs `PNode::Opaque` when
+/// `opening`). std's `type LazyResolve = impl ..` (backtrace.rs:433) is defined by
+/// `#[define_opaque(LazyResolve)] fn lazy_resolve` (:435). Before (tempo t1935d, 10 lines: eyre's
+/// `DefaultHandler::default_with`), the alias itself was taken for the fn to check: "`LazyResolve`'s
+/// body did not lower: .. NotAHead(.., "a type alias")".
+///
+/// INTERIM (D197, audit F14): replaced by the items record's `define_opaque` column: delete
+/// this crate-wide text read then. It reads the text of every fn of the alias's crate, ONCE per
+/// crate per command ([`Definers`] keeps the crate's answer): N aliases of one crate cost one
+/// read of its fns, and the memo holds one row per `#[define_opaque]` path that names a type.
+/// It runs only when a layout meets an alias's opaque.
+pub fn defining_fn<'n, S: NamesSource<'n>>(definers: &Definers<'_>, names: S, alias: LibKey) -> Result<LibKey, DefinerMiss> {
+    let krate = names.crate_of(alias).ok_or(DefinerMiss::NoCrate)?;
+    let mut crates = definers.crates.borrow_mut();
+    let at = match crates.iter().position(|row| row.0 == krate) {
+        Some(at) => at,
+        None => {
+            crates.push((krate, crate_definers(names, krate, definers.alloc)));
+            crates.len() - 1
+        }
+    };
+    let rows = crates[at].1.as_ref().map_err(|miss| *miss)?;
+    rows.iter().find(|row| row.0 == alias).map(|row| row.1).ok_or(DefinerMiss::NoDefiner)
+}
+
+/// Each crate's `(type, the first fn whose #[define_opaque] names it)` rows, made the first time
+/// [`defining_fn`] asks about one of the crate's aliases (or why the crate could not be read).
+/// One per command, held by the program (program.rs `Front2Program`, lazy `LazyProgram`).
+pub struct Definers<'a> {
+    crates: core::cell::RefCell<Vec<(usize, Result<Vec<(LibKey, LibKey), Alloc<'a>>, DefinerMiss>), Alloc<'a>>>,
+    alloc: Alloc<'a>,
+}
+
+impl<'a> Definers<'a> {
+    /// No crate read yet.
+    pub fn new_in(alloc: Alloc<'a>) -> Definers<'a> {
+        Definers { crates: core::cell::RefCell::new(Vec::new_in(alloc)), alloc }
+    }
+}
+
+/// Every fn of crate `krate` (in key order, `each_item`) with each type its `#[define_opaque]`
+/// paths name; a type named by two fns keeps the first.
+fn crate_definers<'n, 'a, S: NamesSource<'n>>(names: S, krate: usize, alloc: Alloc<'a>) -> Result<Vec<(LibKey, LibKey), Alloc<'a>>, DefinerMiss> {
+    let mut rows: Vec<(LibKey, LibKey), Alloc<'a>> = Vec::new_in(alloc);
+    let read = names.each_item(krate, &mut |key, module| {
+        if names.kind_of_item(key) != Some(blaze_surface::ItemKind::Function) {
+            return;
+        }
+        let Some(it) = names.text_of(key) else { return };
+        for path in define_opaque_paths(it.text) {
+            if let Some(ty) = named_type(names, module, path)
+                && !rows.iter().any(|row| row.0 == ty)
+            {
+                rows.push((ty, key));
+            }
+        }
+    });
+    if !read {
+        return Err(DefinerMiss::NotRead);
+    }
+    Ok(rows)
+}
+
+/// What `path`, written in `module`, names in the type namespace. A path with generic
+/// arguments or a `$crate` names nothing here: `#[define_opaque]` takes plain paths to aliases
+/// (rustc_attr_parsing, `define_opaque`). A path of more than [`MOST_SEGMENTS`] segments is
+/// refused as naming nothing (rule 18: the segments are held on the stack).
+fn named_type<'n, S: NamesSource<'n>>(names: S, module: LibKey, path: &str) -> Option<LibKey> {
+    use blaze_scope::PathKind;
+    let path = path.trim();
+    let absolute = path.starts_with("::");
+    let mut held: [&str; MOST_SEGMENTS] = [""; MOST_SEGMENTS];
+    let mut len = 0usize;
+    for s in path.split("::").map(str::trim).filter(|s| !s.is_empty()) {
+        if len == MOST_SEGMENTS || s.contains(['<', '>', '$', ' ']) || (len > 0 && matches!(s, "crate" | "self")) {
+            return None;
+        }
+        held[len] = s;
+        len += 1;
+    }
+    let segments = &held[..len];
+    let (kind, rest) = match *segments.first()? {
+        _ if absolute => (PathKind::Abs, 0),
+        "crate" => (PathKind::Crate, 1),
+        "self" => (PathKind::SelfMod, 1),
+        "super" => {
+            let supers = segments.iter().take_while(|s| **s == "super").count();
+            (PathKind::Super(u8::try_from(supers).ok()?), supers)
+        }
+        _ => (PathKind::Plain, 0),
+    };
+    let tail = &segments[rest..];
+    if tail.is_empty() {
+        return None;
+    }
+    let written = blaze_scope::names::Written { kind, segments: tail };
+    Some(names.walk(module, blaze_surface::Namespace::Types, written).ok()?.whole(tail.len())?.key)
+}
+
+/// Each path an item's `#[define_opaque(..)]` attributes list, in order: the text between the
+/// parentheses of each `#[define_opaque(` (spaces allowed between the tokens), split at its
+/// top-level commas. Words of the attribute's name elsewhere (a comment, a string, a call of a
+/// macro of that name) are not an attribute and give nothing.
+fn define_opaque_paths(text: &str) -> impl Iterator<Item = &str> {
+    const NAME: &str = "define_opaque";
+    let mut from = 0usize;
+    let mut args: Option<core::str::Split<'_, char>> = None;
+    core::iter::from_fn(move || {
+        loop {
+            if let Some(split) = args.as_mut() {
+                if let Some(a) = split.find(|a| !a.trim().is_empty()) {
+                    return Some(a);
+                }
+                args = None;
+            }
+            let at = from + text.get(from..)?.find(NAME)?;
+            from = at + NAME.len();
+            let before = text[..at].trim_end();
+            let after = text[from..].trim_start();
+            if !before.ends_with('[') || !before[..before.len() - 1].trim_end().ends_with('#') || !after.starts_with('(') {
+                continue;
+            }
+            let inner = &after[1..];
+            let Some(close) = inner.find(')') else { return None };
+            args = Some(inner[..close].split(','));
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ALIAS_OPAQUE, of_alias};
+    use super::{ALIAS_OPAQUE, define_opaque_paths, of_alias};
+
+    /// The paths of `#[define_opaque(..)]` as rustc reads them: one or several, any spacing; the
+    /// name in a doc comment or a call (`define_opaque!(X)`) is no attribute. The site: std
+    /// backtrace.rs:435 `#[define_opaque(LazyResolve)]`.
+    #[test]
+    fn a_define_opaque_attribute_lists_its_paths() {
+        let paths = |t: &'static str| define_opaque_paths(t).map(str::trim).collect::<std::vec::Vec<_>>();
+        assert_eq!(paths("#[define_opaque(LazyResolve)]\npub(super) fn lazy_resolve() {}"), ["LazyResolve"]);
+        assert_eq!(paths("# [ define_opaque ( a::B , super::C, ) ]\nfn f() {}"), ["a::B", "super::C"]);
+        assert_eq!(paths("#[inline]\n#[define_opaque(A)]\n#[define_opaque(crate::B)]\nfn f() {}"), ["A", "crate::B"]);
+        // The twins: no attribute.
+        assert!(paths("/// see define_opaque(A)\nfn f() { define_opaque!(A); }").is_empty());
+        assert!(paths("fn f() {}").is_empty());
+        println!("define_opaque paths: one, several, two attributes; none in a comment or a call");
+    }
 
     /// An alias's opaque row says so and keeps its number; a fn's never does. A row that lost
     /// the bit would send the auto-trait question to a fn body that does not exist (the alias

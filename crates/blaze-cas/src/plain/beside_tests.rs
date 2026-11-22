@@ -16,7 +16,9 @@ use std::{alloc::Global, time::Duration};
 use blaze_core::sim::{Faults, Sim};
 use blaze_mem::Frame;
 
-use super::core::{GRACE_NS, INDEX_TAG, LEASE_NS, Plant, ROOT_LIFE_NS, beside_key};
+use blaze_keyed::kind::ReservedTag;
+
+use super::core::{GRACE_NS, LEASE_NS, Plant, ROOT_LIFE_NS, beside_key};
 use super::index_tests::{World, key, readable};
 use super::test_root;
 use crate::Key;
@@ -55,7 +57,7 @@ fn history(beside: bool, root: &Frame) -> Result<Vec<String>, String> {
     {
         let r = w.open(Plant::None)?;
         match r.get(&beside_key(key(OWNER))) {
-            Some(got) if got.tag == INDEX_TAG && got.bytes.len() == BESIDE.len() * 32 => {}
+            Some(got) if ReservedTag::Index.is(got.tag) &&got.bytes.len() == BESIDE.len() * 32 => {}
             other => problems.push(format!("the index beside does not read as an index of {} keys: {:?}", BESIDE.len(), other.map(|it| (it.tag, it.bytes.len())))),
         }
     }

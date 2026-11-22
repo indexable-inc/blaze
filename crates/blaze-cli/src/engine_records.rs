@@ -9,10 +9,13 @@
 //!   record.rs `PAYLOAD_ALIGN`), each section at a multiple of sixteen inside that
 //!   (names/sections.rs). Each is taken as an [`Aligned16`] once, where it is cut; a misaligned
 //!   one is [`ReadError::Misaligned`], never a copy to an aligned place (rule 3).
-//! - A record of this command's own arena (put and not yet committed) is
-//!   [`ReadError::NotInPlace`]: a phase's records are committed before the next phase reads them
-//!   (engine_check.rs, `commit_puts` after each put), so a get from the arena here is a bug of
-//!   that order, named.
+//! - A record of this command's own PRIVATE arena (put and not yet committed, under the store's
+//!   `Visibility::AfterCommit`) is [`ReadError::NotInPlace`]: there a phase's records are
+//!   committed before the next phase reads them (engine_check.rs, `commit_puts` after each
+//!   put), so a get from the arena here is a bug of that order, named. Under
+//!   `Visibility::InArena` (store/plain_place.rs `VISIBILITY`), an own put lies in the shared
+//!   arena at a block boundary and is read here in place, as a segment's record is (blaze-cas
+//!   lent.rs `Lend::in_place`), valid for `'r` (`lend`'s contract keeps a lent arena).
 //! - The bytes stay valid for `'r` and never change: the `Lent` keeps every segment it mapped
 //!   mapped while it is open (blaze-cas lent.rs `lend`'s contract), and a segment file is named
 //!   by the digest of its bytes and never written again under that name (core.rs

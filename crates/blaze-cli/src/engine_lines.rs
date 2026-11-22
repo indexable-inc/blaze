@@ -20,15 +20,24 @@
 //! (engine_answer.rs), its bytes pinned with the answer's pages.
 //!
 //! ```text
-//! record  "BEF9" | blocks u32 | per block, by name: kind u8 | subject [32] | bytes u32 | entries
-//!         "BEFA" | placement digest [32] | identical block count and entries
+//! record  "BEFB" | blocks u32 | per block, by name: kind u8 | subject [32] | bytes u32 | entries
+//!         "BEFC" | placement digest [32] | identical block count and entries
 //! entry   0 | rule u16 | start u32 | end u32 | path bytes u32 (NO_PATH: none) | path | words u32 | words
 //!         1 | class u8 | words u32 | words
 //!         2 | rule u16 | start u32 | end u32 | path u32 | path | chain u64 | edition u8 | words u32 | words
 //!         3 | rule u16 | first u32 | last u32 | inside u8 | inside.0 u32 | inside.1 u32 | path u32 | path | chain u64 | edition u8 | words u32 | words
 //!         4 | noted u32 | noted (blaze_report::finding `encode`: subject | cause)
 //!         5 | base kind u8 | base subject [32] | at u32 | units u32 | per unit: test u8 | name u32 | name
+//!         6 | rule u16 | start u32 | end u32 | path u32 | path | in item u8 | chain u64 | edition u8 | words u32 | words
 //! ```
+//!
+//! An OWN-PLACED finding (6) is a lint unit's (lints.rs): `start..end` a range of the unit's own
+//! text, each child of the unit one mark there (blaze-lint `Units::own`), so no child's length is
+//! stored; the unit is the item whose chain is `chain` (in item 1) or the file's (0, chain 0).
+//! The printer gives each child before the range its length again from the file's outline of
+//! `edition` as it is today (print.rs `Place::Own`, lints.rs `own_to_item`), so a unit's finding
+//! that stands while a child above it grew is drawn where it is now. ("BEF9" and "BEFA", before
+//! it: refused, rule 26.)
 //!
 //! A VIEW entry (5, D191) opens the block of one row of a body two or more units reach: the
 //! body's base name, this row's place among the units (0: the base row) and every such unit's
@@ -83,13 +92,16 @@ use crate::print::RenderOutput;
 use crate::{CliError, print, work};
 
 /// The record's form.
-pub(crate) const LINES_MAGIC: &[u8; 4] = b"BEF9";
+pub(crate) const LINES_MAGIC: &[u8; 4] = b"BEFB";
 /// The record's form with its placement digest (module docs).
-const LINES_PLACED_MAGIC: &[u8; 4] = b"BEFA";
+const LINES_PLACED_MAGIC: &[u8; 4] = b"BEFC";
 /// The forms before a body's note was a noted finding (module docs): refused, never migrated.
 const OLDER_FORMS: [&[u8; 4]; 4] = [b"BEF3", b"BEF4", b"BEF5", b"BEF6"];
 /// The forms before a body's row named its view (D191, [`VIEW`]): refused, never migrated.
 const PRE_VIEW_FORMS: [&[u8; 4]; 2] = [b"BEF7", b"BEF8"];
+/// The forms before a lint unit's finding was placed in its own text ([`PLACED_OWN`]): refused,
+/// never migrated (their lint blocks hold ranges with children's lengths in them).
+const PRE_OWN_FORMS: [&[u8; 4]; 2] = [b"BEF9", b"BEFA"];
 const LINES_DOMAIN: &str = "blaze-cli engine-check lines";
 /// A finding with no path of its own.
 const NO_PATH: u32 = u32::MAX;
@@ -99,6 +111,7 @@ const PLACED: u8 = 2;
 const PLACED_TOKENS: u8 = 3;
 const NOTED: u8 = 4;
 const VIEW: u8 = 5;
+const PLACED_OWN: u8 = 6;
 
 /// One unit a body's rows are at, as a [`VIEW`] entry names it: a test build or not, and its
 /// crate's name.
@@ -289,6 +302,25 @@ impl<'a> Lines<'a> {
         word(block, len_of(path));
         block.extend_from_slice(path);
         block.extend_from_slice(&chain.to_le_bytes());
+        block.push(edition.byte());
+        word(block, len_of(words));
+        block.extend_from_slice(words);
+    }
+
+    /// A lint unit's finding of `name` (module docs, [`PLACED_OWN`]): `start..end` a range of the
+    /// unit's own text, the unit the item whose chain is `chain` in the outline of `edition` of
+    /// the file at `path` (`None`: the file's unit).
+    #[expect(clippy::too_many_arguments, reason = "one entry's fields, each written as it is stored")]
+    pub(crate) fn placed_own(&mut self, name: Name, rule: u16, start: u32, end: u32, path: &[u8], chain: Option<u64>, edition: blaze_surface::Edition, words: &[u8]) {
+        let block = self.block(name);
+        block.push(PLACED_OWN);
+        block.extend_from_slice(&rule.to_le_bytes());
+        word(block, start);
+        word(block, end);
+        word(block, len_of(path));
+        block.extend_from_slice(path);
+        block.push(u8::from(chain.is_some()));
+        block.extend_from_slice(&chain.unwrap_or(0).to_le_bytes());
         block.push(edition.byte());
         word(block, len_of(words));
         block.extend_from_slice(words);
@@ -506,6 +538,8 @@ enum Entry<'m> {
     Placed { rule: u16, start: u32, end: u32, path: &'m str, chain: u64, edition: blaze_surface::Edition, words: &'m [u8] },
     /// A body's finding placed by its tokens in its item (module docs, lane K1).
     PlacedTokens { rule: u16, at: parser::token_key::TokenPlace, path: &'m str, chain: u64, edition: blaze_surface::Edition, words: &'m [u8] },
+    /// A lint unit's finding, its range of the unit's own text (module docs, [`PLACED_OWN`]).
+    PlacedOwn { rule: u16, start: u32, end: u32, path: &'m str, chain: Option<u64>, edition: blaze_surface::Edition, words: &'m [u8] },
     /// A body's note as a record (module docs, D164): read whole, every text UTF-8.
     Noted { finding: blaze_report::finding::Finding<'m> },
     /// The view the block's row is at (module docs, D191): every label checked here.
@@ -576,6 +610,25 @@ fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
             let words = reader.sized("a token-placed finding's words")?;
             Ok(Entry::PlacedTokens { rule, at: parser::token_key::TokenPlace { first, last, inside }, path, chain, edition, words })
         }
+        PLACED_OWN => {
+            let rule = reader.u16("a lint unit's finding's rule")?;
+            let start = reader.u32("a lint unit's finding's start")?;
+            let end = reader.u32("a lint unit's finding's end")?;
+            let at = reader.at;
+            let path = core::str::from_utf8(reader.sized("a lint unit's finding's path")?).map_err(|_| LinesError { at, what: "a lint unit's finding's path is not UTF-8" })?;
+            let at = reader.at;
+            let in_item = reader.byte("a lint unit's finding's item flag")?;
+            let chain = reader.u64("a lint unit's finding's item chain")?;
+            let chain = match (in_item, chain) {
+                (0, 0) => None,
+                (1, chain) => Some(chain),
+                _ => return Err(LinesError { at, what: "a lint unit's finding's item flag is neither 0 (with no chain) nor 1" }),
+            };
+            let at = reader.at;
+            let edition = blaze_surface::Edition::from_byte(reader.byte("a lint unit's finding's edition")?).ok_or(LinesError { at, what: "a lint unit's finding's edition byte is no edition" })?;
+            let words = reader.sized("a lint unit's finding's words")?;
+            Ok(Entry::PlacedOwn { rule, start, end, path, chain, edition, words })
+        }
         VIEW => {
             let at_kind = reader.at;
             let kind = Kind::from_u8(reader.byte("a view's base kind")?).ok_or(LinesError { at: at_kind, what: "a view's base kind is no task kind" })?;
@@ -599,7 +652,7 @@ fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
             }
             Ok(Entry::View(RowView { base, at, units, labels: &reader.bytes[from..reader.at] }))
         }
-        _ => Err(LinesError { at: reader.at - 1, what: "an entry's tag is none of finding, note, placed finding, token-placed finding, noted finding and view" }),
+        _ => Err(LinesError { at: reader.at - 1, what: "an entry's tag is none of finding, note, placed finding, token-placed finding, noted finding, view and own-placed finding" }),
     }
 }
 
@@ -611,11 +664,14 @@ pub(crate) fn decode<'m, 'a>(bytes: &'m [u8], alloc: SharedAlloc<'a>) -> Result<
         form if form == LINES_MAGIC => None,
         // Before a body's note was a noted finding (D164) it was its words: refused as an older
         // form, and the request is answered in full (rule 26), as BEF1 and BEF2 were.
-        form if OLDER_FORMS.iter().any(|old| form == *old) => return Err(LinesError { at: 0, what: "the form is BEF3 to BEF6, older than BEF9 and BEFA (a body's note was its words, not a noted finding)" }),
+        form if OLDER_FORMS.iter().any(|old| form == *old) => return Err(LinesError { at: 0, what: "the form is BEF3 to BEF6, older than BEFB and BEFC (a body's note was its words, not a noted finding)" }),
         // Before a body's rows at its units' views named their view (D191): refused, and the
         // request is answered in full (rule 26).
-        form if PRE_VIEW_FORMS.iter().any(|old| form == *old) => return Err(LinesError { at: 0, what: "the form is BEF7 or BEF8, older than BEF9 and BEFA (a body was one row, checked under its first holder: D191)" }),
-        _ => return Err(LinesError { at: 0, what: "the form is neither BEF9 nor BEFA" }),
+        form if PRE_VIEW_FORMS.iter().any(|old| form == *old) => return Err(LinesError { at: 0, what: "the form is BEF7 or BEF8, older than BEFB and BEFC (a body was one row, checked under its first holder: D191)" }),
+        // Before a lint unit's finding was placed in its own text: refused, and the request is
+        // answered in full (rule 26).
+        form if PRE_OWN_FORMS.iter().any(|old| form == *old) => return Err(LinesError { at: 0, what: "the form is BEF9 or BEFA, older than BEFB and BEFC (a lint unit's finding held its children's lengths)" }),
+        _ => return Err(LinesError { at: 0, what: "the form is neither BEFB nor BEFC" }),
     };
     let count = reader.u32("the block count")?;
     let mut blocks: SVec<'a, (Name, &'m [u8])> = SVec::new_in(alloc);
@@ -1106,6 +1162,9 @@ fn print_with<'f, 'b, O: print::RenderOutput, F: Files<'f, O>, VF: ViewFold>(
                 // item's text today (print.rs `list`), so a comment above it moves no key. Its
                 // first and last tokens stand as its range in what makes two findings one.
                 Entry::PlacedTokens { rule, at, path, chain, edition, words } => (rule, at.first, at.last, words, Some(work::held_str(path, frame)), print::Place::Tokens(chain, edition, at), words),
+                // A lint unit's finding: its own range, given its children's lengths from the
+                // file as it is now (print.rs `Place::Own`), so a child that grew moves no key.
+                Entry::PlacedOwn { rule, start, end, path, chain, edition, words } => (rule, start, end, words, Some(work::held_str(path, frame)), print::Place::Own(chain, edition), words),
             };
             let kept: &'f [u8] = Vec::from_slice_in(words, frame).leak();
             let at = prints.len();
@@ -1114,6 +1173,8 @@ fn print_with<'f, 'b, O: print::RenderOutput, F: Files<'f, O>, VF: ViewFold>(
                 print::Place::At(start) => (0, u64::from(start)),
                 print::Place::Counted => (2, 0),
                 print::Place::Tokens(chain, ..) => (3, chain),
+                print::Place::Own(Some(chain), _) => (4, chain),
+                print::Place::Own(None, _) => (5, 0),
             };
             let inside = match place {
                 print::Place::Tokens(_, _, at) => at.inside,
@@ -1945,6 +2006,7 @@ fn findings_digest(prints: &[Print<'_>], wanted: &[print::Wanted<'_>]) -> Conten
                     .update(&at.last.to_le_bytes()).update(&[inside]).update(&from.to_le_bytes()).update(&to.to_le_bytes())
             }
             print::Place::Counted => h.update(&[3]),
+            print::Place::Own(chain, edition) => h.update(&[4, u8::from(chain.is_some())]).update(&chain.unwrap_or(0).to_le_bytes()).update(&[edition.byte()]),
         };
         h.opt_part(wanted.path.map(str::as_bytes)).part(wanted.words);
     }

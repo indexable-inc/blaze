@@ -14,8 +14,10 @@
 //! Memory (docs/v2/plan/design/memory.md): processes, listens, connects, connections and
 //! watches sit in [`Slab`]s tagged [`MemTag::Io`], named by their handles (a [`Conn`] is one's
 //! bits), with maps from the caller's [`Tag`] to the handle reserved at setup. A file effect
-//! goes to the threads through a bounded channel and comes back through another, each holding
-//! [`FILES`], the most at the threads at once (more wait in a backlog the driver keeps), so
+//! goes to its lane's threads (crate::threads::lanes: a fast lane, and a device lane for what
+//! waits on the drive; each effect at its asker's QoS class) through a bounded channel of the lane's and comes
+//! back through another, each holding [`FILES`] a lane, the most at its threads at once (more
+//! wait in a backlog the driver keeps a lane, up to [`BACKLOG`]), so
 //! neither ever waits and a round trip allocates nothing. Watches tell through a channel of
 //! their own, and a stopped watch is kept with its buffers for the next. A warm submit and
 //! poll allocate only what a completion carries.
@@ -54,6 +56,11 @@ use crate::{
     fsevents::{self, Tell},
     handoff::Wake,
     net, process,
+    threads::{
+        lanes::{self, Dispatch, LANES, Lane, Limits, Placed, Split, Ticket},
+        opening::{self, OpenCount, Opening},
+        qos::{self, Lowered, Qos},
+    },
     wait::{self, Clock as _, Deadline, Monotonic, Waited},
     wheel::{self, Wheel},
 };
@@ -67,6 +74,10 @@ const EVENTS: usize = 64;
 /// channel between the driver and the threads holds this many, so neither a submit nor a file
 /// thread ever waits on one; more wait in the driver's backlog.
 const FILES: usize = 1024;
+/// File effects a lane holds in its backlog past its [`FILES`] at the threads: past it an effect
+/// is refused with [`lanes::Full`], naming the lane. A bound, not a budget: the store asks a few
+/// thousand at once at most; the backlog's memory is taken only as it fills.
+const BACKLOG: usize = 1 << 20;
 /// Completions of watches not yet taken: a watch that hears more waits for room (its queue
 /// holds fseventsd back, which drops what it cannot hold and says so).
 const WATCHED: usize = 4096;
@@ -111,10 +122,30 @@ const _: () = assert!(
         && align_of::<Kevent>() == align_of::<sys_io::Kevent>()
 );
 
+/// A file effect on its way to its lane's threads: its ticket, and when it was asked on the
+/// driver's clock.
+struct Queued {
+    effect: Effect,
+    ticket: Ticket,
+    asked: Duration,
+    /// The class of the thread that asked for it, at the ask: the taking thread runs it at most
+    /// there (`work_on`), so an effect asked after the answer (in a [`Lowered`] stretch) runs
+    /// lowered and one asked before it at the command's class, whichever lane it waits in.
+    asker: Qos,
+}
+
+/// A file effect's completion handed back: its ticket, and how long it waited in its lane's
+/// queue before a thread took it.
+struct Finished {
+    completion: Completion,
+    ticket: Ticket,
+    waited_ns: u64,
+}
+
 /// The kqueue and the channels, shared with the file threads and the watches' queues.
 struct Notify {
     kq: OwnedFd,
-    files: Sender<Completion>,
+    files: Sender<Finished>,
     watched: Sender<Completion>,
     /// Whether a hand-back since the driver last drained the channels has fired the trigger:
     /// a batch of them costs one `kevent`, not one each.
@@ -129,6 +160,9 @@ struct Notify {
     /// Triggers fired.
     #[cfg(test)]
     triggers: std::sync::atomic::AtomicU64,
+    /// The class the last file effect ran at, on its thread (`Qos::raw`).
+    #[cfg(test)]
+    ran_at: std::sync::atomic::AtomicU32,
 }
 
 impl Notify {
@@ -413,30 +447,36 @@ fn first_use<V>(tags: &mut Map<Tag, V, FixedState, Global>) -> &mut Map<Tag, V, 
     tags
 }
 
-pub struct Kqueue {
+/// The macOS driver. `S` is which lane of file threads each file effect waits in
+/// (crate::threads::lanes), `O` how those threads open the file of an effect a kept descriptor
+/// serves (crate::threads::opening): the defaults are the shipped choice, the other the
+/// tested control.
+pub struct Kqueue<S: Split = lanes::TwoLanes, O: Opening = opening::Kept> {
     start: Instant,
     /// The machine's boot, read once as the driver is made ([`crate::Driver::boot`]).
     boot: Result<crate::Boot, crate::NoBoot>,
     root: Arc<Path>,
     notify: Arc<Notify>,
-    files: Receiver<Completion>,
+    files: Receiver<Finished>,
     watched: Receiver<Completion>,
     /// What the host told ([`HostSink`]).
     hosted: Receiver<Completion>,
     /// The datagrams, the standard streams, the clock and randomness ([`crate::host`]).
     host: crate::host::Host,
-    work: Option<Sender<Effect>>,
-    /// File effects asked for beyond the [`FILES`] at the threads, in the order asked.
-    backlog: VecDeque<Effect>,
-    /// File effects at the threads whose completions are not taken yet.
-    at_threads: usize,
-    /// The file threads started so far: one more each time a file effect finds every one
-    /// busy, up to [`Kqueue::most_threads`].
+    /// Each lane's queue to its threads, by [`Lane::index`].
+    work: Option<[Sender<Queued>; LANES]>,
+    /// File effects of each lane asked for beyond the [`FILES`] at its threads, in the order
+    /// asked.
+    backlog: [VecDeque<Queued>; LANES],
+    /// Which lane each file effect waits in; each lane's threads, room and backlog counted;
+    /// the waits (crate::threads::lanes).
+    dispatch: Dispatch<S>,
+    /// The file threads started so far, of both lanes: one more in a lane each time a file
+    /// effect finds every one of its lane busy, up to the lane's cap (the `threads` it was made
+    /// with).
     workers: Vec<JoinHandle<()>>,
-    /// The most file threads it starts.
-    most_threads: usize,
-    /// The file threads' end of the queue, cloned into each as it starts.
-    queue: Receiver<Effect>,
+    /// Each lane's threads' end of its queue, cloned into each as it starts.
+    queues: [Receiver<Queued>; LANES],
     // dyn: the platform's sandbox, given once at setup and asked once per spawn.
     confine: Option<Arc<dyn Confine>>,
     /// Where each sandboxed spawn's own directory is made: `root/.blaze-spawn` unless
@@ -479,28 +519,69 @@ pub struct Kqueue {
     /// What the watches' callbacks allocated beyond their payloads, as each watch stopped.
     #[cfg(test)]
     watch_overhead: u64,
-    /// The descriptors the file threads keep for reads into memory: a file opened once.
+    /// The descriptors the file threads keep for reads into memory, and under
+    /// [`opening::Kept`] for maps, write-backs and queued reads: a file opened once.
     descriptors: Arc<Descriptors>,
+    /// The opens by name of the effects a kept descriptor could have served.
+    opened_by_name: Arc<OpenCount>,
+    _opening: core::marker::PhantomData<O>,
+    /// The class and relative priority of the thread that made the driver: every file thread's
+    /// own, set at its start whatever thread started it (one started inside a [`Lowered`]
+    /// stretch would otherwise keep that class for the driver's life); each effect then runs at
+    /// most at its asker's ([`Queued::asker`]).
+    class: (Qos, i32),
+    /// The file locks this driver holds now ([`Effect::Lock`] answered `Locked`, not yet
+    /// unlocked). While any is held, a file effect runs at the driver's class whatever its
+    /// asker's: `flock` lends no priority to its holder, so a holder lowered after its answer
+    /// (the store's flip, whose writes and barriers are asked one at a time under the lock)
+    /// would keep another process's commit, at its command's class, waiting on throttled IO.
+    /// Never above the driver's class.
+    locks_held: usize,
 }
 
 impl Kqueue {
-    /// How many files the threads opened for reads into memory, and closed.
+    /// A driver whose files are under `root`, with `threads` threads a lane for the file calls.
+    pub fn new(root: impl Into<PathBuf>, threads: usize) -> io::Result<Kqueue> {
+        Self::made(root, threads)
+    }
+}
+
+impl<S: Split, O: Opening> Kqueue<S, O> {
+    /// How many files the threads opened through the kept descriptors, and closed.
     pub fn opens(&self) -> crate::Opens {
         self.descriptors.opens()
     }
 
-    /// A driver whose files are under `root`, with `threads` threads for the file calls.
-    pub fn new(root: impl Into<PathBuf>, threads: usize) -> io::Result<Kqueue> {
+    /// How many files the threads opened by name for an effect a kept descriptor could serve
+    /// (crate::threads::opening): zero under [`opening::Kept`].
+    pub fn opens_by_name(&self) -> u64 {
+        self.opened_by_name.by_name()
+    }
+
+    /// Each lane's waits in its queue, and the longest wait of a fast effect behind a device one
+    /// (crate::threads::lanes).
+    pub fn lanes(&self) -> lanes::Waits {
+        self.dispatch.waits()
+    }
+
+    /// [`Kqueue::new`] of the lanes `S` and the opening `O`: for a choice not the default (the
+    /// tests' controls).
+    pub fn made(root: impl Into<PathBuf>, threads: usize) -> io::Result<Kqueue<S, O>> {
         let root: Arc<Path> = root.into().into();
         let kq = sys_io::kqueue()
             .map_err(|errno| io::Error::from_raw_os_error(i32::from(errno.raw())))?;
         // SAFETY: into_raw transfers sole ownership of the new kqueue descriptor.
         let kq = unsafe { OwnedFd::from_raw_fd(kq.into_raw()) };
         net::set_cloexec(kq.as_raw_fd())?;
+        // Each lane's room at its threads; one lane's driver makes the device lane's channel of
+        // one slot, which nothing is ever sent through.
+        let room = [FILES, if S::TWO { FILES } else { 1 }];
         // alloc: setup, once per driver: each channel's slots.
-        let (files_done, files) = crate::chan::bounded(FILES);
+        let (files_done, files) = crate::chan::bounded(room[0] + room[1]);
         let (watched_done, watched) = crate::chan::bounded(WATCHED); // alloc: as above.
-        let (work, queue) = crate::chan::bounded::<Effect>(FILES); // alloc: as above.
+        let (fast_work, fast_queue) = crate::chan::bounded::<Queued>(room[0]); // alloc: as above.
+        let (device_work, device_queue) = crate::chan::bounded::<Queued>(room[1]); // alloc: as above.
+        let limits = |at_threads| Limits { threads: threads.max(1), at_threads, backlog: BACKLOG };
         let notify = Arc::new(Notify {
             kq,
             files: files_done,
@@ -511,6 +592,8 @@ impl Kqueue {
             file_allocations: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             triggers: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            ran_at: std::sync::atomic::AtomicU32::new(0),
         });
         notify.change(
             TRIGGER as usize,
@@ -528,10 +611,10 @@ impl Kqueue {
         let host = crate::host::Host::new(Arc::new(sink)); // alloc: setup, once per driver.
         // alloc: setup, once per driver: the table the file threads share.
         let descriptors = Arc::new(Descriptors::new());
-        // No file thread yet: each is started when a file effect finds every one busy
-        // ([`Kqueue::to_threads`]), up to `threads`.
+        // No file thread yet: each is started when a file effect finds every one of its lane
+        // busy ([`Kqueue::to_threads`]), up to `threads` a lane.
         // alloc: setup, once per driver: the handles, at their most.
-        let workers = Vec::with_capacity(threads.max(1));
+        let workers = Vec::with_capacity(threads.max(1) * if S::TWO { 2 } else { 1 });
         // Each table of tags, the backlog, the spares and the output buffer are empty until
         // their first use, then made at their usual most at once (`LazySlab`'s reason: a
         // program that never watches, spawns or listens dirties none of their pages; measured
@@ -549,12 +632,11 @@ impl Kqueue {
             watched,
             hosted,
             host,
-            work: Some(work),
-            backlog: VecDeque::new(),
-            at_threads: 0,
+            work: Some([fast_work, device_work]),
+            backlog: [VecDeque::new(), VecDeque::new()],
+            dispatch: Dispatch::new([limits(room[0]), limits(room[1])]),
             workers,
-            most_threads: threads.max(1),
-            queue,
+            queues: [fast_queue, device_queue],
             confine: None,
             spawn_dirs,
             buffer: Vec::new(),
@@ -581,18 +663,23 @@ impl Kqueue {
             #[cfg(test)]
             watch_overhead: 0,
             descriptors,
+            // alloc: setup, once per driver: the count the file threads share.
+            opened_by_name: Arc::new(OpenCount::default()),
+            _opening: core::marker::PhantomData,
+            class: qos::this_thread()?,
+            locks_held: 0,
         })
     }
 
     /// The driver, starting each process whose sandbox is on as `confine` makes it.
     // dyn: the platform's sandbox, given once at setup
-    pub fn confined(mut self, confine: Arc<dyn Confine>) -> Kqueue {
+    pub fn confined(mut self, confine: Arc<dyn Confine>) -> Self {
         self.confine = Some(confine);
         self
     }
 
     /// The driver, making each sandboxed spawn's own directory under `dir`, made here.
-    pub fn scratch(mut self, dir: impl Into<PathBuf>) -> io::Result<Kqueue> {
+    pub fn scratch(mut self, dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
         self.spawn_dirs = dir;
@@ -669,25 +756,22 @@ impl Kqueue {
             | Effect::Stamp { .. }
             | Effect::Entries { .. }
             | Effect::Map { .. }
-            | Effect::MapWrite { .. }) => {
-                match self.at_threads < FILES && self.backlog.is_empty() {
-                    true => self.to_threads(effect),
-                    false => {
-                        // alloc: once per driver, at the first effect beyond the threads.
-                        self.backlog.reserve(FILES);
-                        self.backlog.push_back(effect);
-                        Ok(())
-                    }
-                }
-            }
+            | Effect::MapWrite { .. }) => self.to_lane(effect),
             // A lock never waits, so it is taken here rather than on the threads.
             Effect::Lock { file, mode, tag } => {
                 let done = self.locks.lock(&self.root, &file, mode, tag)?;
+                if done == Done::Locked {
+                    self.locks_held += 1;
+                }
                 self.ready.push(Completion { tag, done });
                 Ok(())
             }
             Effect::Unlock { lock, tag } => {
                 let done = self.locks.unlock(lock)?;
+                if done == Done::Unlocked {
+                    // Only a held lock unlocks, and each was counted at its `Locked`.
+                    self.locks_held -= 1;
+                }
                 self.ready.push(Completion { tag, done });
                 Ok(())
             }
@@ -773,27 +857,67 @@ impl Kqueue {
         }
     }
 
-    /// A file effect onto the threads' queue, which has room: at most [`FILES`] are there.
-    /// When every file thread started so far is busy with one, another is started first (up
-    /// to [`Kqueue::most_threads`]), so a driver that is asked no file call starts no thread
-    /// and one asked one at a time starts one. A thread the system refuses fails this
-    /// effect, naming it; the effect is not queued.
-    fn to_threads(&mut self, effect: Effect) -> io::Result<()> {
-        if self.workers.len() <= self.at_threads && self.workers.len() < self.most_threads {
-            let n = self.workers.len();
+    /// A file effect into its lane (crate::threads::lanes `lane_of`, then `S`): onto the lane's
+    /// threads where they have room and its backlog is empty, else into its backlog, else
+    /// refused naming the lane and its caps.
+    fn to_lane(&mut self, effect: Effect) -> io::Result<()> {
+        let class = lanes::lane_of(&effect).expect("a file effect, which a lane's threads run");
+        // Under a held lock, the driver's class ([`Kqueue::locks_held`]).
+        let asker = if self.locks_held > 0 { self.class.0 } else { qos::this_thread()?.0 };
+        let (ticket, placed) = self.dispatch.place(class).map_err(io::Error::other)?;
+        let queued = Queued { effect, ticket, asked: self.start.elapsed(), asker };
+        match placed {
+            Placed::Threads { start } => self.to_threads(queued, start),
+            Placed::Backlog => {
+                let backlog = &mut self.backlog[ticket.lane.index()];
+                if backlog.capacity() == 0 {
+                    // alloc: once per driver and lane, at its first effect beyond its threads.
+                    backlog.reserve(FILES);
+                }
+                backlog.push_back(queued);
+                Ok(())
+            }
+        }
+    }
+
+    /// A file effect onto its lane's queue, which has room (the dispatcher's word): at most
+    /// [`FILES`] are there. With `start` (every thread of the lane started so far is busy, and
+    /// fewer than its cap are started) one more is started first, so a driver that is asked no
+    /// file call starts no thread and one asked one at a time starts one a lane. Every thread,
+    /// of either lane, runs at the driver's class ([`Kqueue::class`]). A thread the system
+    /// refuses fails this effect, naming it; the effect is not queued.
+    fn to_threads(&mut self, queued: Queued, start: bool) -> io::Result<()> {
+        let lane = queued.ticket.lane;
+        if start {
+            let n = self.dispatch.started(lane) - 1;
             // clone: one count of each per file thread, at its start.
-            let (root, queue, notify) = (Arc::clone(&self.root), self.queue.clone(), Arc::clone(&self.notify));
+            let (root, queue, notify) = (Arc::clone(&self.root), self.queues[lane.index()].clone(), Arc::clone(&self.notify));
             let kept = Arc::clone(&self.descriptors); // clone: as above.
+            let count = Arc::clone(&self.opened_by_name); // clone: as above.
+            let (clock, class) = (self.clock(), self.class);
             let started = std::thread::Builder::new()
                 // alloc: once per thread.
-                .name(format!("blaze-kqueue-{n}"))
-                .spawn(move || work_on(&root, &kept, &queue, &notify))
-                .map_err(|error| io::Error::new(error.kind(), format!("file thread {n} of the kqueue driver: {error}")))?;
-            self.workers.push(started);
+                .name(match lane {
+                    Lane::Fast => format!("blaze-kqueue-{n}"),
+                    Lane::Device => format!("blaze-kqueue-device-{n}"),
+                })
+                .spawn(move || work_on::<O>(lane, class, &root, &kept, &count, &queue, &notify, &clock))
+                .map_err(|error| {
+                    // alloc: an error path.
+                    io::Error::new(error.kind(), format!("file thread {n} of the kqueue driver's {} lane: {error}", lane.name()))
+                });
+            match started {
+                Ok(started) => self.workers.push(started),
+                Err(error) => {
+                    self.dispatch.not_started(queued.ticket);
+                    return Err(error);
+                }
+            }
         }
         let work = self.work.as_ref().expect("the driver is running");
-        work.try_send(effect).expect("room for a file effect at the threads, which are running");
-        self.at_threads += 1;
+        if work[lane.index()].try_send(queued).is_err() {
+            unreachable!("room for a file effect at the {} lane's threads, which are running (the dispatcher's count)", lane.name());
+        }
         Ok(())
     }
 
@@ -1424,16 +1548,18 @@ impl Kqueue {
         // Cleared before the channels are read: a hand-back that finds it set was made before
         // this, so the reads below see it (`Wake`, model-checked in `handoff`).
         self.notify.woke.drain();
-        while let Ok(completion) = self.files.try_recv() {
-            self.at_threads -= 1;
+        while let Ok(Finished { completion, ticket, waited_ns }) = self.files.try_recv() {
+            self.dispatch.ended(ticket, waited_ns);
             out.push(completion);
         }
-        while self.at_threads < FILES {
-            let Some(effect) = self.backlog.pop_front() else { break };
-            let tag = effect.tag();
-            if let Err(error) = self.to_threads(effect) {
-                // alloc: an error path.
-                out.push(Completion { tag, done: Done::Failed(IoError(error.to_string())) });
+        for lane in Lane::ALL {
+            while let Some(start) = self.dispatch.promote(lane) {
+                let queued = self.backlog[lane.index()].pop_front().expect("the dispatcher's backlog count is the driver's");
+                let tag = queued.effect.tag();
+                if let Err(error) = self.to_threads(queued, start) {
+                    // alloc: an error path.
+                    out.push(Completion { tag, done: Done::Failed(IoError(error.to_string())) });
+                }
             }
         }
         while let Ok(completion) = self.watched.try_recv() {
@@ -1445,7 +1571,7 @@ impl Kqueue {
     }
 }
 
-impl Drop for Kqueue {
+impl<S: Split, O: Opening> Drop for Kqueue<S, O> {
     fn drop(&mut self) {
         for (_, watch) in self.watches.iter_mut() {
             watch.stop(|_| {});
@@ -1469,7 +1595,7 @@ impl Drop for Kqueue {
     }
 }
 
-impl Driver for Kqueue {
+impl<S: Split, O: Opening> Driver for Kqueue<S, O> {
     fn submit(&mut self, effects: &mut Vec<Effect>) {
         for effect in effects.drain(..) {
             let tag = effect.tag();
@@ -1600,7 +1726,7 @@ impl Driver for Kqueue {
     }
 }
 
-impl Kqueue {
+impl<S: Split, O: Opening> Kqueue<S, O> {
     /// [`Driver::now`]'s clock as a value read with no `&self`: what an asker holds beside
     /// the lock it keeps the driver under, so a clock read takes no lock (std.md, "End state:
     /// efficiency", piece 6). On the instant the driver began, as `now` and every poll's
@@ -1610,17 +1736,52 @@ impl Kqueue {
     }
 }
 
-/// Runs the file effects this thread takes off `queue`, which every file thread takes from
-/// with no lock, until the driver drops its end. The completions channel has room for each:
-/// the driver keeps at most [`FILES`] at the threads.
-fn work_on(root: &Path, kept: &Descriptors, queue: &Receiver<Effect>, notify: &Notify) {
-    while let Ok(effect) = queue.recv() {
+/// Runs the file effects this thread takes off its lane's `queue`, which every thread of the
+/// lane takes from with no lock, until the driver drops its end; each as `O` opens its file
+/// (crate::threads::opening), timed from its ask to its take on the driver's `clock`. The
+/// completions channel has room for each: the driver keeps at most [`FILES`] a lane at the
+/// threads. The thread first takes the driver's `class` (the lane does not choose it: a
+/// barrier a command's answer waits on runs at the command's class, unthrottled), then runs
+/// each effect at most at its asker's class ([`Lowered`], which never raises), given back
+/// before it hands the effect back. A class the system refuses fails the effect, or every
+/// effect for the thread's own, naming why.
+fn work_on<O: Opening>(
+    lane: Lane,
+    class: (Qos, i32),
+    root: &Path,
+    kept: &Descriptors,
+    count: &OpenCount,
+    queue: &Receiver<Queued>,
+    notify: &Notify,
+    clock: &Monotonic,
+) {
+    let refused = match qos::this_thread() {
+        Ok(now) if now == class => None,
+        Ok(_) => qos::set_this_thread(class.0.settable(), class.1).err(),
+        Err(error) => Some(error),
+    };
+    while let Ok(Queued { effect, ticket, asked, asker }) = queue.recv() {
+        let waited_ns = u64::try_from(clock.now().saturating_sub(asked).as_nanos()).unwrap_or(u64::MAX);
         let sent = counted(notify, || {
             let tag = effect.tag();
-            let done = crate::threads::run(root, kept, effect)
+            let done = match refused {
                 // alloc: an error path.
-                .unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
-            let sent = notify.files.send(Completion { tag, done }).is_ok();
+                Some(error) => Done::Failed(IoError(format!("a thread of the kqueue driver's {} lane: {error}", lane.name()))),
+                None => match Lowered::at_most(asker) {
+                    Ok(_lowered) => {
+                        #[cfg(test)]
+                        if let Ok((now, _)) = qos::this_thread() {
+                            notify.ran_at.store(now.raw(), std::sync::atomic::Ordering::Relaxed);
+                        }
+                        opening::run::<O>(root, kept, count, effect)
+                            // alloc: an error path.
+                            .unwrap_or_else(|error| Done::Failed(IoError(error.to_string())))
+                    }
+                    // alloc: an error path.
+                    Err(error) => Done::Failed(IoError(format!("{tag:?} at its asker's class on the kqueue driver's {} lane: {error}", lane.name()))),
+                },
+            };
+            let sent = notify.files.send(Finished { completion: Completion { tag, done }, ticket, waited_ns }).is_ok();
             if sent {
                 notify.wake();
             }
@@ -2220,10 +2381,14 @@ mod tests {
             }).expect("the effects end");
             seen
         }
-        let (ours, theirs) = (dir("files"), dir("files-threads"));
+        let (ours, theirs, control) = (dir("files"), dir("files-threads"), dir("files-control"));
         let kqueue = script(&mut Kqueue::new(&ours, 2).unwrap(), &file);
         let threads = script(&mut Threads::new(&theirs, 2), &file);
         assert_eq!(kqueue, threads);
+        // The controls of the two seams (one lane, opens by name) end the same.
+        let before = script(&mut Kqueue::<lanes::OneLane, opening::ByName>::made(&control, 2).unwrap(), &file);
+        assert_eq!(kqueue, before);
+        std::fs::remove_dir_all(control).unwrap();
         assert_eq!(kqueue[5], format!("{:?}", Done::Read(b"onet".to_vec())));
         assert_eq!(kqueue[3], format!("{:?}", Done::Read(b"etw".to_vec())));
         assert_eq!(kqueue[6], "stat 4 false");
@@ -2263,11 +2428,220 @@ mod tests {
         let seen = run(&mut driver, effects);
         assert_eq!(seen.len() as u64, n);
         assert!(seen.values().all(|it| *it == Done::Appended));
-        assert!(driver.backlog.is_empty() && driver.at_threads == 0);
+        assert!(driver.backlog.iter().all(VecDeque::is_empty));
+        assert_eq!((driver.dispatch.held(Lane::Fast), driver.dispatch.held(Lane::Device)), ((0, 0), (0, 0)));
         let bytes = std::fs::read(root.join("log")).unwrap();
         let wanted: Vec<u8> = (0..n).flat_map(u64::to_le_bytes).collect();
         assert!(bytes == wanted, "appended out of order");
         drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Two lanes: a barrier runs on the device lane's thread and a stat on the fast lane's, both
+    /// threads at the class of the thread that made the driver; each lane's waits are counted.
+    /// Control: one lane starts no device thread and counts both in the fast lane.
+    #[test]
+    fn a_barrier_runs_on_the_device_lane_and_a_stat_on_the_fast_lane() {
+        use std::os::unix::thread::JoinHandleExt as _;
+        fn class_of(handle: &JoinHandle<()>) -> crate::threads::qos::Qos {
+            let mut class = blaze_sys::posix::proc::QOS_CLASS_UNSPECIFIED;
+            let mut relative = 0;
+            // SAFETY: a live thread of the driver's (joined only at its drop); the two locals
+            // are written by the call.
+            let got = unsafe {
+                blaze_sys::posix::thread::pthread_get_qos_class_np(handle.as_pthread_t() as _, &mut class, &mut relative)
+            };
+            assert_eq!(got, 0, "pthread_get_qos_class_np");
+            crate::threads::qos::Qos::of_raw(class).expect("a class sys/qos.h lists")
+        }
+        let root = dir("lanes");
+        std::fs::write(root.join("f"), b"bytes").unwrap();
+        let effects = || vec![Effect::Barrier { file: name("f"), tag: Tag(1) }, Effect::Stat { file: name("f"), tag: Tag(2) }];
+        let mut two = Kqueue::<lanes::TwoLanes, opening::Kept>::made(&root, 1).unwrap();
+        let done = run(&mut two, effects());
+        assert_eq!(done.get(&1), Some(&Done::Ordered));
+        let waits = two.lanes();
+        assert_eq!((waits.lanes[Lane::Fast.index()].taken, waits.lanes[Lane::Device.index()].taken), (1, 1), "{waits:?}");
+        assert_eq!(waits.fast_behind_device, 0, "{waits:?}");
+        assert_eq!(two.workers.len(), 2, "one thread a lane");
+        let names: Vec<_> = two.workers.iter().map(|it| it.thread().name().unwrap().to_owned()).collect();
+        let device = two.workers.iter().position(|it| it.thread().name() == Some("blaze-kqueue-device-0")).expect("a device thread");
+        let fast = 1 - device;
+        for lane in [device, fast] {
+            assert_eq!(class_of(&two.workers[lane]), qos::this_thread().unwrap().0, "the driver's class: {names:?}");
+        }
+        drop(two);
+        let mut one = Kqueue::<lanes::OneLane, opening::ByName>::made(&root, 1).unwrap();
+        run(&mut one, effects());
+        let waits = one.lanes();
+        assert_eq!((waits.lanes[Lane::Fast.index()].taken, waits.lanes[Lane::Device.index()].taken), (2, 0), "{waits:?}");
+        assert_eq!(one.workers.len(), 1);
+        drop(one);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An effect runs at its asker's class, not its lane's: a barrier asked at the command's
+    /// class (`user-initiated`) runs there, one asked inside a [`Lowered`] stretch (after the
+    /// answer) at `utility`, and the thread is given back its class after it. A device thread
+    /// first started inside the stretch still takes the driver's class for the effects asked
+    /// after it. Inside the stretch, a barrier asked while the driver holds a file lock runs
+    /// at the driver's class, the asker's own left lowered, and the next after the unlock is
+    /// lowered again. Control: the effect asked lowered does run lowered (the class changes).
+    #[test]
+    fn an_effect_runs_at_its_askers_class_on_either_lane() {
+        let root = dir("asker-class");
+        std::fs::write(root.join("f"), b"bytes").unwrap();
+        let ran_at = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    qos::set_this_thread(Qos::UserInitiated, 0).unwrap();
+                    let mut driver = Kqueue::<lanes::TwoLanes, opening::Kept>::made(&root, 1).unwrap();
+                    let barrier = |driver: &mut Kqueue<lanes::TwoLanes, opening::Kept>, n: u64| {
+                        let done = run(driver, vec![Effect::Barrier { file: name("f"), tag: Tag(n) }]);
+                        assert_eq!(done.get(&n), Some(&Done::Ordered));
+                        Qos::of_raw(driver.notify.ran_at.load(Ordering::Relaxed)).expect("a class")
+                    };
+                    let mut seen = Vec::new();
+                    {
+                        // The device thread starts here, inside the stretch.
+                        let lowered = Lowered::at_most(Qos::Utility).unwrap();
+                        assert_eq!(lowered.was(), Some(Qos::UserInitiated));
+                        seen.push(barrier(&mut driver, 1));
+                    }
+                    seen.push(barrier(&mut driver, 2));
+                    {
+                        let _lowered = Lowered::at_most(Qos::Utility).unwrap();
+                        seen.push(barrier(&mut driver, 3));
+                        // The critical section of a lock taken after the answer: the driver's
+                        // class, given up at the unlock.
+                        let lock = run(&mut driver, vec![Effect::Lock { file: name("lock"), mode: crate::LockMode::Exclusive, tag: Tag(10) }]);
+                        assert_eq!(lock.get(&10), Some(&Done::Locked));
+                        seen.push(barrier(&mut driver, 11));
+                        let unlock = run(&mut driver, vec![Effect::Unlock { lock: Tag(10), tag: Tag(12) }]);
+                        assert_eq!(unlock.get(&12), Some(&Done::Unlocked));
+                        seen.push(barrier(&mut driver, 13));
+                        assert_eq!(qos::this_thread().unwrap().0, Qos::Utility, "the asker stays lowered");
+                    }
+                    seen.push(barrier(&mut driver, 4));
+                    assert_eq!(driver.workers.len(), 1, "one device thread for the barriers");
+                    assert_eq!(driver.locks_held, 0);
+                    drop(driver);
+                    seen
+                })
+                .join()
+                .unwrap()
+        });
+        assert_eq!(
+            ran_at,
+            [Qos::Utility, Qos::UserInitiated, Qos::Utility, Qos::UserInitiated, Qos::Utility, Qos::UserInitiated]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A map, a write-back, a read and a map again of one file open it once, through the kept
+    /// descriptors. Control: by name, each opens it, and the table opens nothing.
+    #[test]
+    fn an_effect_sequence_on_one_file_opens_it_once() {
+        fn sequence(driver: &mut impl Driver) {
+            let file = name("f");
+            let steps = [
+                Effect::Map { file: file.clone(), extent: crate::Extent::Whole, tag: Tag(1) },
+                Effect::WriteBack { file: file.clone(), tag: Tag(2) },
+                Effect::Read { file: file.clone(), at: 1, len: 3, tag: Tag(3) },
+                Effect::Map { file: file.clone(), extent: crate::Extent::Range { at: 1, len: 3 }, tag: Tag(4) },
+                Effect::Read { file: file.clone(), at: 0, len: 5, tag: Tag(5) },
+            ];
+            // One at a time: no two threads race to the first open.
+            for effect in steps {
+                let tag = effect.tag();
+                let done = run(driver, vec![effect]);
+                match &done[&tag.0] {
+                    Done::Mapped(mapping) => assert_eq!(mapping.bytes(), if tag.0 == 1 { &b"bytes"[..] } else { &b"yte"[..] }),
+                    Done::WrittenBack => {}
+                    Done::Read(bytes) => assert_eq!(&bytes[..], if tag.0 == 3 { &b"yte"[..] } else { &b"bytes"[..] }),
+                    other => panic!("effect {tag:?}: {other:?}"),
+                }
+            }
+        }
+        let root = dir("opens-once");
+        std::fs::write(root.join("f"), b"bytes").unwrap();
+        let mut kept = Kqueue::<lanes::TwoLanes, opening::Kept>::made(&root, 1).unwrap();
+        sequence(&mut kept);
+        assert_eq!((kept.opens().opened, kept.opens_by_name()), (1, 0), "kept: {:?}", kept.opens());
+        drop(kept);
+        let mut by_name = Kqueue::<lanes::TwoLanes, opening::ByName>::made(&root, 1).unwrap();
+        sequence(&mut by_name);
+        assert_eq!((by_name.opens().opened, by_name.opens_by_name()), (0, 5), "by name: {:?}", by_name.opens());
+        drop(by_name);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Writes in place and a cut of one file, as a segment is written and sealed: under the kept
+    /// opening the writes open its writable descriptor once, its barrier and sync one read-only
+    /// descriptor, and nothing opens by name; a barrier and a cut of a file that is missing make
+    /// it by its name (opening.rs's rule). The by-name control opens each by name. Both leave the
+    /// same bytes.
+    #[test]
+    fn a_write_sequence_on_one_file_opens_it_once() {
+        /// The opens of the table and by name after the writes, after the syncs, after the
+        /// effects on missing files.
+        fn sequence<S: Split, O: Opening>(driver: &mut Kqueue<S, O>) -> [(u64, u64); 3] {
+            let file = name("w");
+            let mut seen = [(0, 0); 3];
+            let steps = [
+                Effect::WriteAt { file: file.clone(), at: 0, bytes: b"B".to_vec(), tag: Tag(1) },
+                Effect::Truncate { file: file.clone(), len: 4, tag: Tag(2) },
+                Effect::WriteAt { file: file.clone(), at: 4, bytes: b"S!".to_vec(), tag: Tag(3) },
+                Effect::WriteAt { file: file.clone(), at: 1, bytes: b"Y".to_vec(), tag: Tag(4) },
+                Effect::Barrier { file: file.clone(), tag: Tag(5) },
+                Effect::Sync { file: file.clone(), tag: Tag(6) },
+                // The cut makes `made/` too; a barrier makes its file, not its directory.
+                Effect::Truncate { file: name("made/cut"), len: 3, tag: Tag(7) },
+                Effect::Barrier { file: name("made/barrier"), tag: Tag(8) },
+            ];
+            // One at a time: no two threads race to the first open.
+            for effect in steps {
+                let tag = effect.tag();
+                let done = run(driver, vec![effect]);
+                match (tag.0, &done[&tag.0]) {
+                    (1 | 3 | 4, Done::Written) | (2 | 7, Done::Truncated) | (5 | 8, Done::Ordered) | (6, Done::Synced) => {}
+                    (_, other) => panic!("effect {tag:?}: {other:?}"),
+                }
+                let now = (driver.opens().opened, driver.opens_by_name());
+                match tag.0 {
+                    4 => seen[0] = now,
+                    6 => seen[1] = now,
+                    8 => seen[2] = now,
+                    _ => {}
+                }
+            }
+            seen
+        }
+        let ends = |root: &Path| {
+            (
+                std::fs::read(root.join("w")).unwrap(),
+                std::fs::read(root.join("made/barrier")).unwrap(),
+                std::fs::read(root.join("made/cut")).unwrap(),
+            )
+        };
+        let root = dir("writes-open-once");
+        std::fs::write(root.join("w"), b"bytes").unwrap();
+        let mut kept = Kqueue::<lanes::TwoLanes, opening::Kept>::made(&root, 1).unwrap();
+        let opens = sequence(&mut kept);
+        // The writes: one writable open. The syncs: one read-only open more (a sealed file
+        // refuses a writable one). The missing files: two made by name, none in the table.
+        assert_eq!(opens, [(1, 0), (2, 0), (2, 2)], "kept: {:?}", kept.opens());
+        drop(kept);
+        let kept_ends = ends(root.path());
+        assert_eq!(kept_ends, (b"BYteS!".to_vec(), Vec::new(), vec![0; 3]));
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("w"), b"bytes").unwrap();
+        let mut by_name = Kqueue::<lanes::TwoLanes, opening::ByName>::made(&root, 1).unwrap();
+        let opens = sequence(&mut by_name);
+        assert_eq!(opens, [(0, 4), (0, 6), (0, 8)], "by name: {:?}", by_name.opens());
+        drop(by_name);
+        assert_eq!(ends(root.path()), kept_ends);
         std::fs::remove_dir_all(root).unwrap();
     }
 

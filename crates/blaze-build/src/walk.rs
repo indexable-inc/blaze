@@ -483,6 +483,8 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     vtables: Vec<crate::vtable::VtableRef, A>,
     /// Each `unreachable` written to end a construct ([`Walk::unreachable_of`]), in order.
     trap_marks: Vec<TrapMark, A>,
+    /// The LIR instructions [`Walk::copy`] wrote (`Built::copy_insts`).
+    copy_insts: u64,
     /// The expression of the task being stepped (`walk_root`), the body's root after the last:
     /// the site of an `unreachable` a step writes with no expression of its own (an enum
     /// copy's no-variant arm, `copy`), so a trap row names where in the text the copy is.
@@ -737,7 +739,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
     /// The walk's function, finished and verified, with its tables: every walk ends here.
     pub(crate) fn into_built(self) -> Result<Built<A>, BuildError> {
-        let Walk { b, refs, statics, thread_locals, vtables, trap_marks, alloc, .. } = self;
+        let Walk { b, refs, statics, thread_locals, vtables, trap_marks, alloc, copy_insts, .. } = self;
         let func = b.finish().map_err(|error| match error {
             blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
             other => BuildError::Lir(other),
@@ -746,7 +748,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         // The one verification of the walk's function: its proof travels in `Built` to the
         // emitter, which takes it and checks nothing again (D163).
         let func = blaze_lir::VerifiedFunc::new(func).map_err(BuildError::Verify)?;
-        Ok(Built { func, refs, statics, thread_locals, vtables, traps })
+        Ok(Built { func, refs, statics, thread_locals, vtables, traps, copy_insts })
     }
 }
 
@@ -831,6 +833,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         thread_locals: Vec::new_in(alloc.clone()),
         vtables: Vec::new_in(alloc.clone()),
         trap_marks: Vec::new_in(alloc.clone()),
+        copy_insts: 0,
         task_at: None,
         ls: Layouts::new_in(alloc.clone()),
         layouts: Vec::new_in(alloc.clone()),
@@ -1226,7 +1229,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     // A packed struct's or union's parts may sit below their alignment: `ls`
                     // places them (layout.rs `univariant`), and once the row is made every
                     // plain access of this function claims at most the cap (below).
-                    packed = adts.facts().repr(k).packed;
+                    packed = adts.facts().repr(k).map_err(|m| TyErr::Other(BuildError::NoAdt { adt: m.item }))?.packed;
                     drop_fn = adts.drop_impl(t, self.ground).map_err(TyErr::Other)?;
                     keeps_fields = adts.lang_adt(LangItem::ManuallyDrop) == Some(k);
                     let adt = adts.adt(k).ok_or(TyErr::Other(BuildError::NoAdt { adt: k }))?;
@@ -1734,6 +1737,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// the padding), by a work list: a struct's or tuple's fields in turn, an array's elements
     /// unrolled up to `UNROLL_LEAVES` leaves and in a loop beyond.
     fn copy(&mut self, repr: Repr, from: (Value, i32), to: (Value, i32)) -> Result<(), BuildError> {
+        let before = self.b.func().ops.len();
+        let copied = self.copy_leaves(repr, from, to);
+        self.copy_insts += (self.b.func().ops.len() - before) as u64;
+        copied
+    }
+
+    /// [`Walk::copy`]'s work, counted by it.
+    fn copy_leaves(&mut self, repr: Repr, from: (Value, i32), to: (Value, i32)) -> Result<(), BuildError> {
         let mut stack = Vec::new_in(self.alloc.clone());
         stack.push(CopyStep::Copy { repr, from, to });
         while let Some(step) = stack.pop() {

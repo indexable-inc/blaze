@@ -164,6 +164,9 @@ fn stamp_of(handle: &OwnedHandle) -> io::Result<Stamp> {
         size: u64::from(info.nFileSizeHigh) << 32 | u64::from(info.nFileSizeLow),
         mtime_ns: ns(basic.LastWriteTime),
         ctime_ns: ns(basic.ChangeTime),
+        // 0, as this system's `Meta` (fs.rs `meta_of`: std's stable `Metadata` has no volume
+        // serial): a stamp proves what a stat does, no more and no less.
+        dev: 0,
         mode: mode(basic.FileAttributes, tag.ReparseTag),
     })
 }
@@ -269,6 +272,8 @@ fn entry(bytes: &[u8]) -> Option<(&[u8], Stamp)> {
             size: i64_at(40)? as u64,
             mtime_ns: ns(i64_at(24)?),
             ctime_ns: ns(i64_at(32)?),
+            // As `stamp_of`'s.
+            dev: 0,
             mode: mode(attributes, tag),
         },
     ))
@@ -381,7 +386,7 @@ mod tests {
         assert_eq!(name, "lib.rs".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
         assert_eq!(
             stamp,
-            Stamp { ino: 42, size: 7, mtime_ns: 3000, ctime_ns: 4000, mode: 0o100444 }
+            Stamp { ino: 42, size: 7, mtime_ns: 3000, ctime_ns: 4000, dev: 0, mode: 0o100444 }
         );
         assert_eq!(entry(&bytes[..bytes.len() - 1]), None);
     }

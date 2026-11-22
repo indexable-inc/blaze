@@ -18,6 +18,12 @@ trait Sized {}
 #[lang = "copy"]
 trait Copy {}
 
+// core's own impls (core/src/marker.rs `marker_impls!`): a primitive is `Copy` only by an impl.
+impl Copy for usize {}
+impl Copy for u8 {}
+impl Copy for u16 {}
+impl Copy for u32 {}
+
 #[rustc_intrinsic]
 unsafe fn transmute<T, U>(x: T) -> U;
 

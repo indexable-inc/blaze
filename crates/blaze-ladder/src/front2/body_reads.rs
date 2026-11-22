@@ -131,7 +131,7 @@ pub(super) fn question_item(q: &tc::Question) -> Option<ItemKey> {
     use tc::Question as Q;
     match *q {
         Q::FnSig(k) | Q::Predicates(k) | Q::Adt(k) | Q::ImplsOf(k, _) | Q::ImplHeader(k) | Q::AssocItem(k, _) | Q::Const(k) | Q::Opaque(k) | Q::Attrs(k) | Q::TraitDef(k) | Q::AssocParent(k) => Some(k),
-        Q::ConstHolds(k, _) | Q::ConstParams(k) | Q::Closure(k, _) | Q::Coroutine(k, _) | Q::AssocGenerics(k, _) | Q::TypeAlias(k) | Q::FieldDefaults(k) | Q::MemberVisible(k, _) => Some(k),
+        Q::ConstHolds(k, _) | Q::ConstParams(k) | Q::Closure(k, _) | Q::Coroutine(k, _) | Q::AssocGenerics(k, _) | Q::TypeAlias(k) | Q::FieldDefaults(k) | Q::MemberVisible(k, _) | Q::MemberUnstable(k, _) => Some(k),
         Q::Inherent(tc::Shape::Adt(k), _) => Some(k),
         Q::Inherent(..) | Q::TraitsInScope(_) | Q::Path(..) | Q::Lang(_) | Q::LangPath(_) => None,
     }

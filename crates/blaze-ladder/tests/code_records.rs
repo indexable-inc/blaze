@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 use blaze_code::record::{Space, Symbol};
 use blaze_emit::{Isa, Os};
 use blaze_ladder::code_records::{
-    Builder, CodeKey, CodeStore, EntryView, entry_of, InstanceNames, KeyPlant, LirSeen, MemoryStore, Met, RecordRun, Settings, code_key, code_key_planted,
+    Builder, CodeKey, CodeStore, EntryView, entry_of, KeyPlant, LirSeen, MemoryStore, Met, RecordRun, SeenInstance, Settings, code_key, code_key_planted,
     getter_parts,
 };
 use blaze_ladder::refusal::SourceFile;
@@ -423,8 +423,8 @@ fn the_overflow_setting_moves_every_key() {
 struct Seen(Vec<(Symbol, usize)>);
 
 impl LirSeen for Seen {
-    fn seen(&mut self, _function: &str, symbol: Symbol, func: blaze_lir::Verified<'_>, _names: &InstanceNames<'_>) {
-        self.0.push((symbol, func.view().len()));
+    fn seen(&mut self, instance: SeenInstance<'_>) {
+        self.0.push((instance.symbol, instance.func.view().len()));
     }
 }
 

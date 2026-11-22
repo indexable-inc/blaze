@@ -225,9 +225,24 @@ pub(crate) fn opaque_hidden<P: FrontEnd>(
     scratch: Alloc<'_>,
 ) -> Result<PTy, BuildError> {
     let refused = |what| BuildError::UnsupportedSig { what };
-    let Some((owner, _)) = program.opaque_of(opaque) else {
+    let Some((owner, index)) = program.opaque_of(opaque) else {
         return Err(refused("an `impl Trait` type no fn head of the program made (the seam's `opaque_of`)"));
     };
+    // A type alias's `impl Trait` (its owner row is the alias: tait.rs `of_alias`) has its
+    // hidden type in the check record of the fn that defines it, `#[define_opaque(Alias)]`
+    // (tait.rs `defining_fn`), never the alias's own (an alias has no body). Before (tempo
+    // t1935d, 10 lines, eyre's `default_with` over std's `LazyResolve`): the alias was taken for
+    // the fn and its check refused "NotAHead(.., \"a type alias\")". No trait selects an alias,
+    // so no `resolve`. A generic alias's opaque is refused by name: its arguments are the
+    // alias's parameters, and the defining fn's hidden type is written over the fn's own,
+    // which are not mapped to them here.
+    if super::tait::of_alias(index) {
+        if !args.is_empty() {
+            return Err(refused("a generic type alias's `impl Trait` laid out (its defining fn's parameters are not mapped to the alias's yet)"));
+        }
+        let definer = program.alias_definer(owner).map_err(|miss| refused(miss.form()))?;
+        return defined_hidden(program, checked, facts, opaque, definer, args, ground, scratch);
+    }
     // A trait fn's `impl Trait` (its `async fn`'s future) is an associated type of the trait
     // (RFC 3425; front2 rpitit.rs): at a ground `Self` its value is the SELECTED impl's, never
     // the trait fn's default body's. The impl is selected as the call is (the seam's
@@ -248,8 +263,25 @@ pub(crate) fn opaque_hidden<P: FrontEnd>(
     if callee != owner {
         return opaque_at_impl(program, checked, facts, opaque, owner, callee, callee_args, ground, scratch);
     }
-    // A type alias's `impl Trait` is met by the layout of a type that holds it, never by a
-    // call of its defining fn (std's `Backtrace` holds `LazyLock<Capture, LazyResolve>`, whose
+    defined_hidden(program, checked, facts, opaque, owner, args, ground, scratch)
+}
+
+/// The hidden type of `opaque` at `args` from the check record of `owner`, the fn that defines
+/// it (its own return opaque, or an alias's: [`opaque_hidden`]), grounded.
+#[expect(clippy::too_many_arguments, reason = "the reveal's question, its defining fn and the grounding's tables")]
+fn defined_hidden<P: FrontEnd>(
+    program: &P,
+    checked: &[Option<Checked<'static>>],
+    facts: &dyn LayoutFacts,
+    opaque: ItemKey,
+    owner: ItemKey,
+    args: &[PTy],
+    ground: &mut PortableTys<'_>,
+    scratch: Alloc<'_>,
+) -> Result<PTy, BuildError> {
+    let refused = |what| BuildError::UnsupportedSig { what };
+    // An opaque may be met by the layout of a type that holds it, never by a call of its
+    // defining fn (std's `Backtrace` holds `LazyLock<Capture, LazyResolve>`, whose
     // `#[define_opaque(LazyResolve)] fn lazy_resolve` eyre's `DefaultHandler::default_with` never
     // calls; t1800): a program that checks on demand has no row for it yet. Named, so that
     // driver checks it and builds again (run/make_one.rs).

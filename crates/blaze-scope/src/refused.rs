@@ -104,6 +104,12 @@ impl<C: ExpandCx> ExpandCx for Watched<'_, '_, C> {
         self.inner.place(what)
     }
 
+    // A wrapper answers what its inner host answers, for a told call too (the default would
+    // ask the inner `place` and lose the call).
+    fn place_of_call(&self, what: PlaceOf, call: u32) -> Result<Place<'_>, HostError> {
+        self.inner.place_of_call(what, call)
+    }
+
     fn run_proc_macro<'b>(&self, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'b>) -> Result<Produced<'b>, HostError> {
         self.inner.run_proc_macro(def, call, alloc)
     }

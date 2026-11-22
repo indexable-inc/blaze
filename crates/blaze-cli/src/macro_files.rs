@@ -2,8 +2,9 @@
 //! member-macro-module-2; rules 10, 21 and 65).
 //!
 //! A member macro crate's module is keyed by `files <sha256>`: `blaze_proc_macro::module::
-//! files_digest` over every regular file under its folder (folders named `target` or starting
-//! with `.` left out), each by its package-relative path and its bytes. That digest has one home,
+//! files_digest` over every regular file of its folder the one package rule takes
+//! (blaze-build-script `served::in_package`: no VCS entry, no `target` or `.blaze` folder at the
+//! crate's root), each by its package-relative path and its bytes. That digest has one home,
 //! blaze-proc-macro's, and the bootstrap builder computes the same one for a path package
 //! (scripts/src/bin/proc_macro_modules.rs `Origin::Path`).
 //!
@@ -27,6 +28,7 @@
 use std::alloc::Global;
 use std::string::String;
 
+use blaze_build_script::served::{InPackage, in_package};
 use blaze_ids::ContentId;
 use bstd::cx::Cx;
 use bstd::fs::{Dir, EntryKind, ReadWrite};
@@ -70,12 +72,13 @@ fn under(dir: &str, rel: &str) -> String {
     }
 }
 
-/// The entries of the folder `at` (relative to the checkout, "" for its root) that the files
-/// digest walks, in name order (bstd's `Dir::entries` sorts them): each folder but those named
-/// `target` or starting with `.`, and each regular file. A link and a device are left out, as
-/// `blaze_proc_macro::module::package_files` leaves them out; an entry whose kind the listing
-/// cannot tell is refused by name. `None` when no folder is there.
-pub(crate) fn walked<'f>(cx: &Cx, root: &Dir<ReadWrite>, at: &str, frame: &'f Frame) -> Result<Option<Listing<'f>>, CliError> {
+/// The entries of the folder `at` (relative to the checkout, "" for its root; `place`: the
+/// macro crate's own folder or one beneath it) that the files digest walks, in name order
+/// (bstd's `Dir::entries` sorts them): each folder and regular file the one package rule takes
+/// (blaze-build-script `served::in_package`, as `blaze_proc_macro::module::package_files`
+/// walks). A link and a device are left out, as `package_files` leaves them out; an entry
+/// whose kind the listing cannot tell is refused by name. `None` when no folder is there.
+pub(crate) fn walked<'f>(cx: &Cx, root: &Dir<ReadWrite>, at: &str, place: InPackage, frame: &'f Frame) -> Result<Option<Listing<'f>>, CliError> {
     let listed = match at.is_empty() {
         true => root.own_entries(cx)?,
         false => match root.entries(cx, &Path::new(at)?)? {
@@ -88,12 +91,14 @@ pub(crate) fn walked<'f>(cx: &Cx, root: &Dir<ReadWrite>, at: &str, frame: &'f Fr
     for i in 0..listed.len() {
         let name = listed.name(i);
         let is_dir = match listed.kind(i) {
-            EntryKind::Dir if name == "target" || name.starts_with('.') => continue,
             EntryKind::Dir => true,
             EntryKind::File => false,
             EntryKind::Link | EntryKind::Other => continue,
             EntryKind::Unknown | EntryKind::Gone => return Err(CliError::MacroFiles(MacroFilesError::Kind { at: under(at, name) })),
         };
+        if !in_package(name.as_bytes(), is_dir, place) {
+            continue;
+        }
         names.push(name);
         dirs.push(is_dir);
     }
@@ -101,15 +106,18 @@ pub(crate) fn walked<'f>(cx: &Cx, root: &Dir<ReadWrite>, at: &str, frame: &'f Fr
 }
 
 /// A [`LeafKind::MacroFolder`] row today: `old`'s id kept, no listing, when the folder's settled
-/// stamp equals `old`'s; else listed again ([`walked`], [`listing_id`]); absent when no folder
+/// stamp equals `old`'s; else listed again ([`walked`], [`listing_id`]; `place`: the crate's own
+/// folder, whose row's path is its `MacroFiles` row's, or one beneath it); absent when no folder
 /// is there. The stat comes before the listing: an entry made after it moves the stamp the next
 /// sweep sees.
+#[expect(clippy::too_many_arguments, reason = "the sweep's handles, the row and where it is in its crate")]
 pub(crate) fn folder_now(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     stamps: &impl Stamps,
     plant: Plant,
     dir: &str,
+    place: InPackage,
     old: Option<&Leaf>,
     frame: &Frame,
 ) -> Result<(u8, Option<Stamp>, ContentId), CliError> {
@@ -122,7 +130,7 @@ pub(crate) fn folder_now(
     {
         return Ok((0, Some(now), id));
     }
-    let entries = walked(cx, root, dir, frame)?;
+    let entries = walked(cx, root, dir, place, frame)?;
     let (flags, id) = listing_id(entries.as_ref().map(Listing::entries));
     Ok((flags, stamp.filter(|_| flags & ABSENT == 0), id))
 }
@@ -202,7 +210,7 @@ pub(crate) fn read_row(cx: &Cx, root: &Dir<ReadWrite>, stamps: &impl Stamps, dir
         let at = under(dir, &rel);
         let stamp = dir_stamp(&cx, root, stamps, Plant::None, &at)?;
         let listed = match stamp {
-            Some(_) => walked(&cx, root, &at, frame)?,
+            Some(_) => walked(&cx, root, &at, if rel.is_empty() { InPackage::Root } else { InPackage::Beneath }, frame)?,
             None => None,
         };
         let Some(listed) = listed else {

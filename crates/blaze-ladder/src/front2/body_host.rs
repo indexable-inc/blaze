@@ -147,7 +147,18 @@ impl<'s, 'a: 's, S: SourceTexts<'a>> BodySources for Sourced<'s, S> {
 /// The file the body of `item` is written in (the outermost call's file for a body a macro
 /// wrote): where its includes are placed from (here, and super::body_left's D111 filing).
 pub(super) fn body_file<'h, S: NamesSource<'h>>(names: S, krate: usize, item: LibKey) -> Option<FilePaths<'h>> {
-    let place = names.place_of(item)?;
+    let place = match names.place_of(item) {
+        Some(place) => place,
+        // A MEMBER (body.rs `body_at` places a method's body at its member row) is no item
+        // row of the items record (source/item_grain.rs `row_now` reads item rows; members
+        // are `member_now`'s): its text is in its container's, written there or by a call in
+        // it, so its file is the container's (the Reference, `include!` and `file!`: the file
+        // of the outermost call site). tempo rt-loop a2210: `include_str!` refused (`HostError
+        // Include`) in four members of crates/node/tests/it/utils.rs and zones' (`new`,
+        // `reference_genesis`, `launch`, the associated const `TESTNET_REFERENCE_GENESIS`)
+        // and in none of the same crate's free fns.
+        None => names.place_of(names.member_owner(item)?.0)?,
+    };
     if place.krate != krate {
         return None;
     }
@@ -169,12 +180,63 @@ pub(super) fn body_file<'h, S: NamesSource<'h>>(names: S, krate: usize, item: Li
     None
 }
 
+/// Where the text a body is lowered from stands in its file, as the library item `lib` whose
+/// file and first byte the names answer ([`Placed::of`]) and the text's place in that
+/// item's text: what `line!()`/`column!()` in eager input of the body's calls count from. Made
+/// by the lowering, which knows the body (front2 body.rs `body_at`): a free fn's or a member's
+/// own item at 0; a local item's (a fn, const or static declared in a body: tracing's
+/// callsite `static`) is its outermost enclosing item's, at the local's place in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BodyAt {
+    pub lib: LibKey,
+    /// Where the body's text starts in `lib`'s text (`fixed`: where every call in it is).
+    pub off: u32,
+    /// The body's text is a copy of an expansion's (a local a macro call in the enclosing body
+    /// wrote): every call in it is placed at that call, written at `off` (core `line!`: "the
+    /// first macro invocation leading up to the expansion"), not at its own byte in the copy.
+    pub fixed: bool,
+}
+
+/// [`BodyAt`] with its item's file text and first byte read: what [`BodyHost::place_of_call`]
+/// counts in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placed<'h> {
+    /// The whole text of the file.
+    pub text: &'h str,
+    /// The byte of `text` the body's text starts at (`fixed`: every call's).
+    pub start: u32,
+    pub fixed: bool,
+}
+
+impl<'h> Placed<'h> {
+    /// `at.lib`'s place in its file (program/lazy seam_rules.rs `body_place`, the rule a
+    /// `#[track_caller]` `Location` is placed by), the body's place in it added: the whole text
+    /// of the file and `at.lib`'s first byte there (rule 71: turned into a line only here, when
+    /// a call asks), each call at its item-relative start after it (blaze-lower by_name.rs
+    /// `BodyCx`). An item or member a macro call wrote (at module level, a derive, an attribute)
+    /// is at the OUTERMOST call's site, and so is every call in it, whatever `at` says (core
+    /// `line!`). `None`: no place in crate `krate` (an item of another crate, a call whose
+    /// origins are not kept): `line!()` refused by name.
+    fn of<S: NamesSource<'h>>(names: S, krate: usize, at: BodyAt, alloc: Alloc<'_>) -> Option<Placed<'h>> {
+        let (in_crate, text, start, by_call) = crate::front2::program::lazy::body_place(names, at.lib, alloc).ok()?;
+        if in_crate != krate {
+            return None;
+        }
+        if by_call {
+            return Some(Placed { text, start, fixed: true });
+        }
+        Some(Placed { text, start: start.checked_add(at.off)?, fixed: at.fixed })
+    }
+}
+
 /// The expansion host of one body: see the module's doc.
-pub struct BodyHost<'h, F = fn() -> Option<FilePaths<'h>>> {
+pub struct BodyHost<'h, F = fn() -> Option<FilePaths<'h>>, G = fn() -> Option<Placed<'h>>> {
     sources: Option<&'h dyn BodySources>,
     krate: usize,
     /// Only includes and file-place queries depend on the items record's file row.
     file: LazyCell<Option<FilePaths<'h>>, F>,
+    /// [`Placed`], read at the first `line!()`/`column!()` a call asks.
+    placed: LazyCell<Option<Placed<'h>>, G>,
     /// `file!()`'s answer, made on the first ask; `None` inside: refused.
     shown_file: core::cell::OnceCell<Option<AString<'h>>>,
     module_path: Option<&'h str>,
@@ -187,31 +249,55 @@ impl<'h> BodyHost<'h> {
     /// the crate at `krate`; `sources` is the run's ([`super::heads::Store::sources`]): `None`
     /// refuses every env read, include and proc macro by name.
     pub fn of<S: NamesSource<'h>>(names: S, sources: Option<&'h dyn BodySources>, krate: usize, item: LibKey, module: LibKey, alloc: Alloc<'h>) -> impl ExpandCx {
-        Self::from_file_lookup(names, sources, krate, module, alloc, move || body_file(names, krate, item))
+        Self::of_body(names, sources, krate, item, Some(BodyAt { lib: item, off: 0, fixed: false }), module, alloc)
+    }
+
+    /// [`Self::of`] for a body the lowering placed ([`BodyAt`]: a local item's is its
+    /// enclosing item's): `file!()` and the includes are `at.lib`'s file, `line!()`/`column!()`
+    /// count from its place. `None`: a text with no place in a file (an anonymous constant's
+    /// rendering): `file!()` is `item`'s, `line!()` refused by name.
+    pub(super) fn of_body<S: NamesSource<'h>>(names: S, sources: Option<&'h dyn BodySources>, krate: usize, item: LibKey, at: Option<BodyAt>, module: LibKey, alloc: Alloc<'h>) -> impl ExpandCx {
+        let file_of = at.map_or(item, |at| at.lib);
+        Self::from_file_lookup(names, sources, krate, module, alloc, move || body_file(names, krate, file_of), move || at.and_then(|at| Placed::of(names, krate, at, alloc)))
     }
 
     /// The host of a body whose item was written by a macro. The body stage supplies the
     /// physical file of the invocation because records do not retain the expansion-origin
     /// column needed to recover it from the item key alone.
     pub fn of_with_file<S: NamesSource<'h>>(names: S, sources: Option<&'h dyn BodySources>, krate: usize, item: LibKey, module: LibKey, file: FilePaths<'h>, alloc: Alloc<'h>) -> impl ExpandCx {
-        Self::from_file_lookup(names, sources, krate, module, alloc, move || {
-            body_file(names, krate, item).or_else(|| names.place_of(item).and_then(|place| matches!(place.at, At::Expansion(_)).then_some(file)))
-        })
+        Self::from_file_lookup(
+            names,
+            sources,
+            krate,
+            module,
+            alloc,
+            move || body_file(names, krate, item).or_else(|| names.place_of(item).and_then(|place| matches!(place.at, At::Expansion(_)).then_some(file))),
+            move || Placed::of(names, krate, BodyAt { lib: item, off: 0, fixed: false }, alloc),
+        )
     }
 
-    fn from_file_lookup<S: NamesSource<'h>, F: FnOnce() -> Option<FilePaths<'h>>>(
-        names: S, sources: Option<&'h dyn BodySources>, krate: usize, module: LibKey, alloc: Alloc<'h>, file: F,
-    ) -> BodyHost<'h, F> {
-        BodyHost { sources, krate, file: LazyCell::new(file), shown_file: core::cell::OnceCell::new(), module_path: names.module_path(module), atoms: names.cfg_atoms(krate).unwrap_or(&[]), alloc }
+    fn from_file_lookup<S: NamesSource<'h>, F: FnOnce() -> Option<FilePaths<'h>>, G: FnOnce() -> Option<Placed<'h>>>(
+        names: S, sources: Option<&'h dyn BodySources>, krate: usize, module: LibKey, alloc: Alloc<'h>, file: F, placed: G,
+    ) -> BodyHost<'h, F, G> {
+        BodyHost {
+            sources,
+            krate,
+            file: LazyCell::new(file),
+            placed: LazyCell::new(placed),
+            shown_file: core::cell::OnceCell::new(),
+            module_path: names.module_path(module),
+            atoms: names.cfg_atoms(krate).unwrap_or(&[]),
+            alloc,
+        }
     }
 
     #[cfg(test)]
     pub(super) fn planted_solved_file<S: NamesSource<'h>>(names: S, sources: &'h dyn BodySources, krate: usize, item: LibKey, module: LibKey, alloc: Alloc<'h>) -> impl ExpandCx {
-        Self::from_file_lookup(names, Some(sources), krate, module, alloc, move || body_file(names.solved()?, krate, item))
+        Self::from_file_lookup(names, Some(sources), krate, module, alloc, move || body_file(names.solved()?, krate, item), move || Placed::of(names, krate, BodyAt { lib: item, off: 0, fixed: false }, alloc))
     }
 }
 
-impl<'h, F: FnOnce() -> Option<FilePaths<'h>>> ExpandCx for BodyHost<'h, F> {
+impl<'h, F: FnOnce() -> Option<FilePaths<'h>>, G: FnOnce() -> Option<Placed<'h>>> ExpandCx for BodyHost<'h, F, G> {
     fn env(&self, name: &str) -> Result<Option<&str>, HostError> {
         self.sources.ok_or(refused(HostAsk::Env))?.env(self.krate, name)
     }
@@ -253,8 +339,30 @@ impl<'h, F: FnOnce() -> Option<FilePaths<'h>>> ExpandCx for BodyHost<'h, F> {
                 shown.as_ref().map(|text| Place::Text(text.as_str())).ok_or(refused(HostAsk::Place))
             }
             PlaceOf::ModulePath => self.module_path.map(Place::Text).ok_or(refused(HostAsk::Place)),
-            // Not told which call asks: no item-relative position to answer (module doc).
+            // Not told which call asks: no item-relative position to answer (module doc); the
+            // caller that knows asks `place_of_call`.
             PlaceOf::Line | PlaceOf::Column => Err(refused(HostAsk::Place)),
+        }
+    }
+
+    /// `line!()`/`column!()` in eager input of the body call written at byte `call` of the
+    /// body's text (tracing's `concat!(file!(), ":", line!())`, written by `event!` in a hand-
+    /// written fn): counted in the file's text at the item's first byte plus `call`
+    /// ([`Placed::of`]; `PlaceOf::counted`, the one count), the outermost written call as core
+    /// `line!` says; in an item a macro call wrote, at module level or as a local
+    /// ([`Placed::fixed`]), that call's place, whatever `call` is in the copy. Refused for a
+    /// body with no place ([`Placed::of`] `None`). The answer is a read of the expansion
+    /// ([`ExpandCx::place`]'s, cx.rs `Recorder::place`): the body's read list holds the line it
+    /// read, as the item host's does.
+    fn place_of_call(&self, what: PlaceOf, call: u32) -> Result<Place<'_>, HostError> {
+        match what {
+            PlaceOf::Line | PlaceOf::Column => {
+                let Placed { text, start, fixed } = (*self.placed).ok_or(refused(HostAsk::Place))?;
+                let unreadable = HostError { ask: HostAsk::Place, why: HostWhy::Unreadable };
+                let at = if fixed { start } else { start.checked_add(call).ok_or(unreadable)? };
+                what.counted(text, at as usize).map(Place::Number).ok_or(unreadable)
+            }
+            PlaceOf::File | PlaceOf::ModulePath => self.place(what),
         }
     }
 
@@ -268,7 +376,7 @@ mod tests {
     use blaze_expand::{ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, MacroDefinition, Place, PlaceOf, ProcCall, Produced};
     use blaze_own::Alloc;
 
-    use super::{BodyHost, BodySources, FilePaths, LazyCell};
+    use super::{BodyHost, BodySources, FilePaths, LazyCell, Placed};
 
     /// One crate (index 0) of package `/package/3/`: `CARGO_PKG_NAME` is `tempo-node`,
     /// `CARGO_PKG_AUTHORS` is cargo's but not known, and one file besides the body's.
@@ -314,11 +422,21 @@ mod tests {
         fn left_package(&self, _: usize, _: blaze_scope::include_place::LeftPackage<'_>) {}
     }
 
+    /// A file whose second item `fn b` starts at byte 10 (line 2, column 1) and writes
+    /// `tracing::info!` at its byte 13 (line 3, column 5).
+    const TEXT: &str = "fn a() {}\nfn b() {\n    tracing::info!(\"x\");\n}\n";
+
     fn host(sources: Option<&'static dyn BodySources>) -> BodyHost<'static> {
+        host_with(sources, || Some(Placed { text: TEXT, start: 10, fixed: false }))
+    }
+
+    /// [`host`] whose body is placed by `placed` ([`super::Placed::of`]'s answer).
+    fn host_with(sources: Option<&'static dyn BodySources>, placed: fn() -> Option<Placed<'static>>) -> BodyHost<'static> {
         BodyHost {
             sources,
             krate: 0,
             file: LazyCell::new(|| Some(FilePaths { package: blaze_scope::package_path::PackagePath::new("src/lib.rs").unwrap(), shown: "src/lib.rs" })),
+            placed: LazyCell::new(placed),
             shown_file: core::cell::OnceCell::new(),
             module_path: Some("tempo_node::rpc"),
             atoms: &[("unix", None)],
@@ -362,5 +480,50 @@ mod tests {
         assert_eq!(h.env("CARGO_PKG_AUTHORS"), Err(env_refused));
         assert_eq!(host(None).env("CARGO_PKG_NAME"), Err(env_refused));
         assert_eq!(h.place(PlaceOf::Line), Err(HostError { ask: HostAsk::Place, why: HostWhy::Refused }));
+    }
+
+    /// tempo t1855d: tracing's `event!` writes `concat!(file!(), ":", line!())` in a body;
+    /// `line!()` in that eager input was refused (`BodyHost::place`, no call told). Told the
+    /// written call's item-relative start (blaze-lower by_name.rs `BodyCx`), the host counts in
+    /// the file at the item's first byte plus it: `tracing::info!` at the body's byte 13 is
+    /// line 3, column 5 (core `line!`: "the first macro invocation leading up to the
+    /// expansion"; `column!`: 1-based, in characters). Twin: the body's byte 0 is the item's
+    /// own line 2, column 1. Control: `place` alone still refuses `line!()`, `file!()` is the
+    /// same answer either way, and an item a macro wrote (no text placed) is refused by name.
+    /// Prints nothing; passes.
+    #[test]
+    fn a_body_call_s_line_is_its_written_call_s_in_the_file() {
+        static SOURCES: One = One;
+        let h = host(Some(&SOURCES));
+        assert_eq!((h.place_of_call(PlaceOf::Line, 13), h.place_of_call(PlaceOf::Column, 13)), (Ok(Place::Number(3)), Ok(Place::Number(5))));
+        assert_eq!((h.place_of_call(PlaceOf::Line, 0), h.place_of_call(PlaceOf::Column, 0)), (Ok(Place::Number(2)), Ok(Place::Number(1))), "twin: the item's own first byte");
+        let refused = HostError { ask: HostAsk::Place, why: HostWhy::Refused };
+        assert_eq!(h.place(PlaceOf::Line), Err(refused), "control: no call told");
+        assert_eq!(h.place_of_call(PlaceOf::File, 13), h.place(PlaceOf::File), "control: `file!()` is the body's file either way");
+        let written_by_a_macro = host_with(Some(&SOURCES), || None);
+        assert_eq!(written_by_a_macro.place_of_call(PlaceOf::Line, 13), Err(refused), "control: an item a macro wrote is not placed here");
+        let past = h.place_of_call(PlaceOf::Line, 1000);
+        assert_eq!(past, Err(HostError { ask: HostAsk::Place, why: HostWhy::Unreadable }), "a call past the file is unreadable, never a line");
+    }
+
+    /// tempo rt-loop a2000 (394 items not checked): tracing's `event!` writes its callsite
+    /// `static` in the user's fn, and the static's initializer holds `concat!(file!(), ":",
+    /// line!())`. Since local statics are checked as bodies of their own (every_body.rs), that
+    /// initializer was lowered with a host placed at the LOCAL key, which the names do not place:
+    /// `line!()` was refused. Placed as a copy at the outermost call (`fixed`: the `info!` at
+    /// byte 13 of `fn b`, file byte 23), every call in the copy is that call's line 3, column 5
+    /// (core `line!`: "the first macro invocation leading up to the expansion"), whatever its
+    /// byte in the copy. Twin: the same place not fixed counts the call's own byte (byte 0 is
+    /// line 3, column 5; byte 5 is column 10). Control: `place` alone still refuses `line!()`.
+    /// Prints nothing; passes.
+    #[test]
+    fn a_call_in_a_local_a_macro_wrote_is_placed_at_the_outermost_call() {
+        static SOURCES: One = One;
+        let copy = host_with(Some(&SOURCES), || Some(Placed { text: TEXT, start: 23, fixed: true }));
+        assert_eq!((copy.place_of_call(PlaceOf::Line, 0), copy.place_of_call(PlaceOf::Column, 0)), (Ok(Place::Number(3)), Ok(Place::Number(5))));
+        assert_eq!((copy.place_of_call(PlaceOf::Line, 400), copy.place_of_call(PlaceOf::Column, 400)), (Ok(Place::Number(3)), Ok(Place::Number(5))), "any byte of the copy: the call's place");
+        let written = host_with(Some(&SOURCES), || Some(Placed { text: TEXT, start: 23, fixed: false }));
+        assert_eq!((written.place_of_call(PlaceOf::Line, 0), written.place_of_call(PlaceOf::Column, 5)), (Ok(Place::Number(3)), Ok(Place::Number(10))), "twin: a written local counts its own byte");
+        assert_eq!(copy.place(PlaceOf::Line), Err(HostError { ask: HostAsk::Place, why: HostWhy::Refused }), "control: no call told");
     }
 }

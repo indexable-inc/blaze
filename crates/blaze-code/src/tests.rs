@@ -155,3 +155,26 @@ fn edit_rewrites_only_the_words_naming_what_moved() {
     assert_eq!(image.home(func("g")), Some(base + 2 * PAGE));
     println!("edit: g moved to {:#x}, {} word rewritten at {:#x}", two.base, two.writes.len(), two.writes[0].at);
 }
+
+/// The one `adrp` encoder refuses a page past its 21-bit field by type, for every caller (the
+/// launcher's thunk once trusted a comment, "the pages are within 4 GiB"): the last page in
+/// reach, forward and back, encodes and reads back to its page through `adrp_add_target`; one
+/// page further is `OutOfReach` naming the place and the target. Control: an 8-aligned low-12
+/// load offset encodes and a misaligned one is refused.
+///
+/// Expected line: `test tests::adrp_refuses_a_page_past_its_field_by_type ... ok`
+#[test]
+fn adrp_refuses_a_page_past_its_field_by_type() {
+    use crate::a64::{ADD64, ADRP_REACH, OutOfReach, adrp_add_target, adrp_to, lo12};
+    let pc = 0x10_0000_0000u64;
+    for (to, back) in [(pc + ((1 << 20) - 1) * 4096 + 0x10, false), (pc - (1 << 20) * 4096 + 0x10, true)] {
+        let inst = adrp_to(ADRP_X16, pc, to).unwrap_or_else(|e| panic!("the last page in reach ({back}): {e}"));
+        assert_eq!(inst & 0x1F, 16, "the register stands");
+        let add = lo12(ADD64.1 | (16 << 5) | 16, to, 0).expect("an add takes any low 12 bits");
+        assert_eq!(adrp_add_target(inst, add, pc), Some(to), "the pair reads back to its target ({back})");
+        let past = if back { to - 4096 } else { to + 4096 };
+        assert_eq!(adrp_to(ADRP_X16, pc, past), Err(OutOfReach { what: ADRP_REACH, from: pc, to: past }), "one page further ({back})");
+    }
+    assert!(lo12(LDR_X16, pc + 0x18, 3).is_some(), "control: an 8-aligned load offset");
+    assert_eq!(lo12(LDR_X16, pc + 0x1C, 3), None, "a load offset the 8-byte scale cannot say");
+}

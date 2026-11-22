@@ -238,6 +238,7 @@ fn predicate_in<V: Truth, E>(
                 }
                 top.count += 1;
                 match list.get(at).map(|t| t.kind) {
+                    // astlog-ignore: expand-hand-extent (the separator after a predicate this fold read whole; the cfg grammar holds no generics)
                     Some(TokenKind::Punct { char: ',', .. }) => {
                         at += 1;
                         if !matches!(list.get(at).map(|t| t.kind), Some(TokenKind::Close(Delim::Paren))) {
@@ -315,6 +316,7 @@ pub fn cfg_attr_metas<'a, E>(
             match list[at].kind {
                 TokenKind::Open(_) => depth += 1,
                 TokenKind::Close(_) => depth = depth.saturating_sub(1),
+                // astlog-ignore: expand-hand-extent (LEFT: cfg_attr's metas by depth-0 commas; to move onto the MetaItem tree's CFG_ATTR_META with a CfgAttrError variant and blaze-ladder foreign_locals.rs in one batch)
                 TokenKind::Punct { char: ',', .. } if depth == 0 => {
                     pieces.push(start..at);
                     start = at + 1;

@@ -181,6 +181,9 @@ pub struct FetchEnv<'f> {
     /// client's roots are looked for, besides the machine's store.
     pub cert_file: Option<&'f str>,
     pub cert_dir: Option<&'f str>,
+    /// `CARGO_ENCODED_RUSTFLAGS`, `RUSTFLAGS` and the two config variables of cargo's rustflags
+    /// rule, read at the edge (rule 75): the units' `--cfg`s (graph.rs `target`).
+    pub rustflags: blaze_manifest::rustflags::RustflagsEnv<'f>,
     /// The user's home, read at the edge (rule 75): the shared store is under it (the module
     /// store, macros.rs). `None` when `HOME` is not set.
     pub home: Option<&'f str>,

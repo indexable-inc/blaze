@@ -132,10 +132,15 @@ pub fn class_of<A: Allocator + Clone>(ls: &mut Layouts<A>, ty: PTy, cx: &mut Lay
         // A transparent value has its field's ABI, including when it is a member of an HFA.
         let t = tl.call_ty;
         let node = cx.ground.view().get(t).copied();
+        // Its `repr`: answered, as the layout above read it; an unmade head refuses by name.
+        let simd = match node {
+            Some(PNode::Adt(key, _)) => cx.facts.repr(key).map_err(|m| LayoutError { ty: t, why: m.head() })?.simd,
+            _ => false,
+        };
         match node {
             // A short vector (layout/simd.rs) is a fundamental type of its own (AAPCS64 5.9):
             // passed in ONE SIMD register, never as an HFA of its lanes or in `x` registers.
-            Some(PNode::Adt(key, _)) if cx.facts.repr(key).simd => {
+            Some(PNode::Adt(..)) if simd => {
                 return Err(refused("a `repr(simd)` vector (AAPCS64 passes it in one SIMD register, which blaze's C calls do not build yet)"));
             }
             Some(PNode::Adt(key, _)) => match cx.facts.adt(key).map(|a| a.kind) {

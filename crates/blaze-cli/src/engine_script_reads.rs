@@ -47,6 +47,13 @@
 //!
 //! A read new this request (no leaf row yet, so no planned task) is made by the script that read
 //! it, as a [`Made`] record of wave 0 (engine.rs invariant 12: its maker reads it).
+//!
+//! A BODY's read of a checkout file as data that no `FileItems` task defines (a computed
+//! include, [`file_read`]) is the same `file:` read: the same cell, leaf kind and `Given` task,
+//! one a path whoever read it. It makes no record: its row keeps the answer it saw and its leaf
+//! row is kept by the request (engine_bodies.rs `BodiesStage::data_files`), so the next
+//! request's `Given` task defines the cell, equal to what the body saw unless the file moved
+//! (then the body is entered). A leaf stays while a row reads its cell ([`keep_rows`]).
 
 use blaze_build_script::git::{self, GitFiles};
 use blaze_drive::key::Kind;
@@ -403,10 +410,23 @@ pub(crate) fn made<'a>(read: &CheckoutRead, by: Name, tools: &Tools, alloc: Shar
     Made { planned: Planned { name, phase: PHASE, source, file: name }, done, by }
 }
 
-/// Pushes onto `out` the leaf rows of the script reads the answer still reads: each followed row
-/// whose cell has a row in `kept_cells`, then each read of this request's runs (`fresh`) not
-/// among them. A read no row reads any more leaves the table, so its task is retired.
-pub(crate) fn keep_rows<'r>(followed: Option<&Rows<'_>>, fresh: impl Iterator<Item = &'r CheckoutRead>, kept_cells: impl Fn(Name) -> bool, out: &mut Rows<'_>) {
+/// The `Given` cell and answer of a checkout file a BODY read as data with no `FileItems` record
+/// of today's plan to define it (a computed `include_str!(concat!(..))`, which data_include.rs
+/// cannot list from the text): the SAME read as a build script's `file:` read of that path, one
+/// cell and one leaf row whoever read it (rule 30), followed by the sweep ([`now`]) and planned
+/// as its `Given` task ([`plan`]) from the next request on. Its answer is what the body was
+/// handed (`bytes`), as the sandbox digests a file ([`script_sandbox::file_answer`]), [`NONE`]
+/// when it had nothing. `None`: the path is no checkout-relative one, so no cell names it.
+pub(crate) fn file_read(path: &str, bytes: Option<&[u8]>) -> Option<(Name, ContentId)> {
+    (relative(path) && !path.is_empty()).then(|| (cell_name(ReadKind::File, path), bytes.map_or(NONE, script_sandbox::file_answer)))
+}
+
+/// Pushes onto `out` the leaf rows of the checkout reads the answer still reads: each followed
+/// row whose cell `kept_cells` says a row still reads, then each read of this request (`fresh`:
+/// its scripts' runs and its bodies' computed data includes, [`file_read`]) not among them. A
+/// read no row reads any more leaves the table, so its task is no longer planned and is retired
+/// (rule 18: the followed set is bounded by the reads the answer holds).
+pub(crate) fn keep_rows<'r>(followed: Option<&Rows<'_>>, fresh: impl Iterator<Item = (ReadKind, &'r str, ContentId)>, kept_cells: impl Fn(Name) -> bool, out: &mut Rows<'_>) {
     let mut seen = blaze_own::BTreeSet::new_in(*out.rows.allocator());
     for followed in followed.into_iter() {
         for leaf in followed.rows.iter() {
@@ -418,10 +438,10 @@ pub(crate) fn keep_rows<'r>(followed: Option<&Rows<'_>>, fresh: impl Iterator<It
             }
         }
     }
-    for read in fresh {
-        let name = read.name();
+    for (kind, path, answer) in fresh {
+        let name = cell_name(kind, path);
         if kept_cells(name) && seen.insert(name) {
-            out.push(read.kind.leaf(), 0, &read.path, None, read.answer);
+            out.push(kind.leaf(), 0, path, None, answer);
         }
     }
 }

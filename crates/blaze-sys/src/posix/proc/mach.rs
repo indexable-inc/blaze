@@ -68,6 +68,39 @@ pub const PROC_PIDLISTFDS: c_int = 1;
 /// replaces libc::PROC_PIDTASKINFO
 pub const PROC_PIDTASKINFO: c_int = 4;
 
+/// `PROC_PIDFDVNODEPATHINFO` (sys/proc_info.h): `proc_pidfdinfo`'s flavor for a
+/// `vnode_fdinfowithpath`, a file descriptor's vnode and its path.
+pub const PROC_PIDFDVNODEPATHINFO: c_int = 2;
+
+/// `PROC_PIDFDSOCKETINFO` (sys/proc_info.h): `proc_pidfdinfo`'s flavor for a `socket_fdinfo`.
+pub const PROC_PIDFDSOCKETINFO: c_int = 3;
+
+/// `PROX_FDTYPE_VNODE` (sys/proc_info.h): a `proc_fdinfo.proc_fdtype` of a file, directory
+/// or device. replaces libc::PROX_FDTYPE_VNODE
+pub const PROX_FDTYPE_VNODE: c_uint = 1;
+
+/// `PROX_FDTYPE_SOCKET` (sys/proc_info.h): a `proc_fdinfo.proc_fdtype` of a socket.
+/// replaces libc::PROX_FDTYPE_SOCKET
+pub const PROX_FDTYPE_SOCKET: c_uint = 2;
+
+/// `SOCKINFO_IN` (sys/proc_info.h): a `socket_info.soi_kind` whose `soi_proto` is an
+/// `in_sockinfo` (an IP socket other than TCP: UDP, raw).
+pub const SOCKINFO_IN: c_int = 1;
+
+/// `SOCKINFO_TCP` (sys/proc_info.h): a `socket_info.soi_kind` whose `soi_proto` is a
+/// `tcp_sockinfo` (an `in_sockinfo`, then the connection's state).
+pub const SOCKINFO_TCP: c_int = 2;
+
+/// `INI_IPV4` (sys/proc_info.h): `in_sockinfo.insi_vflag`'s bit for a v4 address (in the last
+/// four bytes of its 16).
+pub const INI_IPV4: u8 = 0x1;
+
+/// `INI_IPV6` (sys/proc_info.h): `in_sockinfo.insi_vflag`'s bit for a v6 address.
+pub const INI_IPV6: u8 = 0x2;
+
+/// `VREG` (sys/vnode.h, `enum vtype`): `vnode_info.vi_type` of a regular file.
+pub const VREG: c_int = 1;
+
 /// `VM_FLAGS_SUPERPAGE_SIZE_2MB` (mach/vm_statistics.h): `mach_vm_allocate` with 2 MiB pages
 /// (x86-64 alone; arm64 refuses it).
 /// replaces libc::VM_FLAGS_SUPERPAGE_SIZE_2MB

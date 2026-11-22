@@ -177,6 +177,21 @@ pub enum Unreadable {
     NoView,
 }
 
+/// What an undecided goal rests on (rule 19). The solver's undecided walk
+/// (`TypeCtx::why_maybe_chain`, blaze-solve why_maybe.rs) goes from the goal down to the first
+/// goal under it that is undecided by itself.
+/// - `trait_`: that goal's trait, or the deepest step's whose goal the walk kept (a step
+///   naming an inference variable is not kept); `None` when no step was kept.
+/// - `depth`: how many steps down from the root that goal stood.
+/// - `leaf`: why it is undecided by itself (a type not known yet, two candidates, a limit, an
+///   opaque or interior not known yet).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UndecidedLeaf {
+    pub trait_: Option<ItemKey>,
+    pub depth: u32,
+    pub leaf: crate::diag::WhyLeaf,
+}
+
 /// The driver's own failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckError {
@@ -198,7 +213,8 @@ pub enum CheckError {
     ForeignWitness { gap: &'static str, item: ItemKey, ordinal: Option<u32>, at: crate::ids::Range },
     /// The given exact state still leaves the obligation undecided. When the
     /// unresolved goal is on a stored value, its source range is in the same item.
-    FutureWitnessGoal { trait_: ItemKey, at: crate::ids::Range, stored_at: Option<crate::ids::Range> },
+    /// `undecided`: the goal under it that is undecided by itself, and why.
+    FutureWitnessGoal { trait_: ItemKey, at: crate::ids::Range, stored_at: Option<crate::ids::Range>, undecided: Option<UndecidedLeaf> },
     /// `dyn Trait` where the world has not read `by`'s members (`TraitMembers::NotKnown`) or
     /// cannot decide it (a supertrait's arguments naming `Self`): a named gap, never compatible.
     DynUndecided { trait_: crate::ids::ItemKey, by: crate::ids::ItemKey, why: crate::dyn_compat::GapWhy },
@@ -311,12 +327,18 @@ impl core::fmt::Display for CheckError {
                 "{gap}: the hidden type of opaque {:032x} (another fn's future) has no record here at item bytes {}..{}",
                 item.0, at.start, at.end
             ),
-            CheckError::FutureWitnessGoal { trait_, at, stored_at } => {
+            CheckError::FutureWitnessGoal { trait_, at, stored_at, undecided } => {
                 write!(f, "future's exact state leaves trait {:032x} undecided at item bytes {}..{}", trait_.0, at.start, at.end)?;
                 if let Some(field) = stored_at {
                     write!(f, " on the value stored from item bytes {}..{}", field.start, field.end)?;
                 }
-                Ok(())
+                match undecided {
+                    Some(UndecidedLeaf { trait_: Some(t), depth, leaf }) => {
+                        write!(f, "; undecided {depth} step(s) down at trait {:032x}: {leaf:?}", t.0)
+                    }
+                    Some(UndecidedLeaf { trait_: None, depth, leaf }) => write!(f, "; undecided {depth} step(s) down: {leaf:?}"),
+                    None => write!(f, "; the solver's walk named no undecided goal under it"),
+                }
             }
             CheckError::DynUndecided { trait_, by, why } => {
                 write!(f, "blaze-typeck: `dyn` of trait {:032x}: dyn compatibility not decided at {:032x}: {why:?}", trait_.0, by.0)

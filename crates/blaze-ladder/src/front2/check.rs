@@ -50,6 +50,9 @@ pub struct BodyScope<'s> {
     /// Parallel to the checked body's paths: each path's first word's mark (blaze-lower
     /// `TypeckBody::path_marks`), where `BodyWorld::path` reads it.
     pub path_marks: &'s [Option<blaze_lower::mark_site::TextMark>],
+    /// Parallel to the same paths: the namespace each is resolved in (blaze-lower
+    /// `TypeckBody::path_ns`).
+    pub path_ns: &'s [blaze_lower::typeck::PathNs],
 }
 
 /// Why a body did not check.
@@ -283,6 +286,10 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     }
     // The body's gate (front2 asks.rs `Gate`): round 0's syntactic prefetch, before the walk.
     r.store.gate.borrow_mut().start(alloc);
+    // How this body's world meets a hole (world_items.rs `BodyWorld::stops_at_holes`): the
+    // same test, read once; the store's seeds and asks do not change during a check.
+    let stops_at_holes = r.store.stops_at_holes();
+    let mut holes = RoundHoles::new();
     for round in 0..MOST_ROUNDS {
         r.store.hidden.set_leaking(&leaks);
         // Facts made on the spot this round (world_items.rs `BodyWorld::store_want`; under the
@@ -429,6 +436,7 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             }
             Outcome::Need(needs) => needs,
         };
+        holes.round(round, &needs.missing);
         if let Some(cost) = meter {
             cost.again(&needs, &r.store.gate.borrow());
         }
@@ -451,7 +459,10 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             return Err(CheckFail::NothingToFill { owner, questions });
         }
         let filling = fills.len() as u64;
-        let dropped = make_round(r, fills, owner)?;
+        // Under the one ask over frozen heads the run stopped at its first hole
+        // (`World::stops_at_holes`, world_items.rs): no fill is speculative, so every one is
+        // made and a refusal is the body's (`make_all`), never dropped as `make_round` drops one.
+        let dropped = if stops_at_holes { make_all(r, fills, owner).map(|()| 0)? } else { make_round(r, fills, owner)? };
         made += filling - dropped;
         if let Some((tally, _)) = &mut count {
             tally.dropped += dropped;
@@ -465,7 +476,72 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     }
     let mut last = Vec::new_in(Global);
     last.extend_from_slice(&hints.missing);
-    Err(rounds_fail(r, owner, "the body's check", made, last))
+    let mut fail = rounds_fail(r, owner, "the body's check", made, last);
+    if let CheckFail::Rounds { last, shown, .. } = &mut fail {
+        *shown = format!("{shown}; {}", holes.said(last)).into_boxed_str();
+    }
+    Err(fail)
+}
+
+/// The holes each round of a body's check met (item 9's measure, rt-loop a1850: `tempo_main_with`
+/// made 2942 records over 256 rounds): per round how many, and how many were never met before;
+/// each distinct hole with the round it was first met. What [`CheckFail::Rounds`] then says:
+/// a chain found a link a round (new holes every round) or one hole met again and again (a fill
+/// that does not make what is asked). Questions are `Copy` and `Ord`: no text is made per round.
+struct RoundHoles {
+    /// `(holes, new)` of each round, in order.
+    per_round: Vec<(u32, u32), Global>,
+    /// Each distinct hole and the first round it was met in, sorted by the question.
+    seen: Vec<(Question, u32), Global>,
+}
+
+impl RoundHoles {
+    fn new() -> RoundHoles {
+        RoundHoles { per_round: Vec::new_in(Global), seen: Vec::new_in(Global) }
+    }
+
+    fn round(&mut self, round: u32, missing: &[Question]) {
+        let mut new = 0u32;
+        for &q in missing {
+            if let Err(at) = self.seen.binary_search_by(|(s, _)| s.cmp(&q)) {
+                self.seen.insert(at, (q, round));
+                new += 1;
+            }
+        }
+        self.per_round.push((missing.len() as u32, new));
+    }
+
+    /// `holes per round (new): r0 12 (12), .. ; N distinct over R rounds, the last new one in
+    /// round K; the last round's holes: <kind> first met in round F, ..`.
+    fn said(&self, last: &[Question]) -> String {
+        use core::fmt::Write as _;
+        let mut s = String::from("holes per round (new among them):");
+        let n = self.per_round.len();
+        for (i, (holes, new)) in self.per_round.iter().enumerate() {
+            // The first 4 and the last 8 rounds: the shape at both ends.
+            if i < 4 || i + 8 >= n {
+                let _ = write!(s, " r{i} {holes} ({new})");
+            } else if i == 4 {
+                s.push_str(" ..");
+            }
+        }
+        let last_new = self.per_round.iter().rposition(|(_, new)| *new > 0);
+        let _ = write!(s, "; {} distinct holes over {n} rounds", self.seen.len());
+        match last_new {
+            Some(r) => { let _ = write!(s, ", the last new one in round {r}"); }
+            None => s.push_str(", none new"),
+        }
+        s.push_str("; the last round's holes:");
+        for q in last.iter().take(MOST_HOLES_SHOWN) {
+            let text = format!("{q:?}");
+            let kind = text.split('(').next().unwrap_or("");
+            match self.seen.binary_search_by(|(s, _)| s.cmp(q)) {
+                Ok(at) => { let _ = write!(s, " {kind} first met in round {}", self.seen[at].1); }
+                Err(_) => { let _ = write!(s, " {kind} met in no round counted"); }
+            }
+        }
+        s
+    }
 }
 
 /// [`CheckFail::Rounds`] of `owner`: loop `what` ran [`MOST_ROUNDS`] rounds, made `made`
@@ -1056,6 +1132,16 @@ pub(super) fn diag_about_held<'n, S: NamesSource<'n>>(
 ) -> Box<str> {
     let ty = |t: Option<tc::PTy>| t.map(|t| ty_shown(r, tys, t));
     let s = match d.because {
+        // E0599 in rustc's words (method/suggest.rs): "the method `get` exists for `W<B>`, but
+        // its trait bounds were not satisfied", then the bound (rule 19).
+        Some(tc::Because::Unmet { goal, .. }) if d.code == tc::DiagCode::NoMethod => {
+            let method = d.name.map_or_else(|| String::from("the method"), |n| match spell.get(n) {
+                Ok(text) => format!("the method `{text}`"),
+                Err(_) => String::from("the method"),
+            });
+            let on = ty(d.found).map_or_else(String::new, |t| format!(" for `{t}`"));
+            format!("{method} exists{on}, but its trait bounds were not satisfied: {}", unmet_shown(r, tys, goal))
+        }
         Some(tc::Because::Unmet { goal, leaf }) => {
             let shown = |g: tc::UnmetGoal| unmet_shown(r, tys, g);
             let unmet = match leaf {
@@ -1467,6 +1553,7 @@ pub(super) fn world_at<'w, 'n, S: NamesSource<'n>>(r: &'w Records<'_, 'n, S>, sc
         traits: scope.traits,
         blocks: scope.blocks,
         path_marks: scope.path_marks,
+        path_ns: scope.path_ns,
         fills: core::cell::RefCell::new(Vec::new_in(Global)),
         gaps: core::cell::RefCell::new(Vec::new_in(Global)),
         reveal: super::opaque_auto::Reveal::InBody,

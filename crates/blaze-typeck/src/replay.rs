@@ -154,6 +154,9 @@ fn ask<'w, 'a, W: World>(reads: &mut Reads<'w, 'a, W>, body: &BodyView<'_>, q: Q
         Question::MemberVisible(container, name) => {
             reads.member_visible(container, name)?;
         }
+        Question::MemberUnstable(container, name) => {
+            reads.member_unstable(container, name)?;
+        }
     }
     Ok(Asked::Answered)
 }

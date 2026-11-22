@@ -486,12 +486,12 @@ fn another_tree_is_no_certificate() {
 fn reached(lent: &crate::store::CommandLent, name: &str) -> std::collections::BTreeSet<Key> {
     let named = lent.root_named(name).expect("a named root");
     let root = lent.get(&named).expect("root lookup").expect("the named root exists");
-    assert_eq!(root.tag, blaze_cas::plain::INDEXED_ROOT_TAG);
+    assert_eq!(root.tag, blaze_keyed::kind::ReservedTag::IndexedRoot.tag());
     let mut reached = std::collections::BTreeSet::new();
     for index in root.bytes.as_chunks::<32>().0 {
         let index = blaze_cas::Key(ContentId(*index));
         let held = lent.get(&index).expect("index lookup").expect("the indexed root's child exists");
-        assert_eq!(held.tag, blaze_cas::plain::INDEX_TAG);
+        assert_eq!(held.tag, blaze_keyed::kind::ReservedTag::Index.tag());
         assert_eq!(held.bytes.len() % 32, 0);
         reached.extend(held.bytes.as_chunks::<32>().0.iter().map(|key| Key(ContentId(*key))));
     }

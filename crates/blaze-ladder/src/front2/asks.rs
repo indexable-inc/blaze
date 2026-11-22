@@ -159,6 +159,15 @@ impl Store<'_> {
         }
     }
 
+    /// Whether a check over this store stops at its first hole (blaze-typeck
+    /// `World::stops_at_holes`): under the one ask over frozen heads every fact that can be
+    /// made inline is, so a hole is real and nothing runs past it (no stand-in is read), and the
+    /// round's fills are made whole (check.rs `make_all`, no refusal dropped as speculative).
+    /// THE ONE TEST of the new mode: world_items.rs and check.rs read it here.
+    pub fn stops_at_holes(&self) -> bool {
+        self.seeds.is_some() && self.asks.once()
+    }
+
     /// An impl or inherent question answered on the spot under `Once` (check.rs
     /// `trait_question` / `inherent_question` filed its answer row): one fact made.
     pub(super) fn answered(&self, fact: Fact) {

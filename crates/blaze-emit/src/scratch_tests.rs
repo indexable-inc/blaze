@@ -6,7 +6,7 @@
 
 use blaze_tier::{ARM64, Reg, RegSet};
 
-use super::scratch::{Pool, ScratchError, Use};
+use crate::scratch::{Pool, ScratchError, Use};
 
 const X16: Reg = Reg(16);
 const X17: Reg = Reg(17);
@@ -93,6 +93,39 @@ fn a_clobbered_held_register_is_refused_or_spent() {
     assert_eq!(p.lend(plain(RegSet::EMPTY.with(s.reg()), None, 0, RegSet::EMPTY)), Ok([None, None]));
     p.give(s).expect("held");
     assert!(p.is_idle());
+}
+
+/// The Reference tier's pool (T3 step 1, `Pool::over` and `REFERENCE_SCRATCH`): x9 to x17,
+/// taken lowest first and never twice, each as the encoder's number; a template clobbering a
+/// held one is refused (the class of the x12 bug of 2026-11-21: the overflow flag held in x12
+/// while the far store wrote x12); a set of one register gives no pool (the control: a pool
+/// that accepted it could hand one register to a held use and a temporary at once).
+/// Expected: passes. Fails if a take returns a held register or a clobbered hold is accepted.
+#[test]
+fn the_reference_pool_holds_x9_to_x17() {
+    let mut p = match Pool::over(crate::scratch::REFERENCE_SCRATCH) {
+        Ok(pool) => pool,
+        Err(error) => panic!("the Reference tier's set gives no pool: {}", error.what()),
+    };
+    let mut held = std::vec::Vec::new();
+    for n in 9u8..=17 {
+        let s = p.take().expect("a register of x9..x17 is free");
+        assert_eq!(s.reg(), Reg(n), "lowest first");
+        assert_eq!(s.enc(), u32::from(n), "the encoder's number");
+        held.push(s);
+    }
+    assert_eq!(p.take().map(|s| s.reg()), Err(ScratchError::Exhausted));
+    let x12 = held.remove(3);
+    assert_eq!(x12.reg(), Reg(12));
+    let far_store = plain(RegSet::EMPTY, None, 0, RegSet::EMPTY.with(Reg(12)));
+    assert_eq!(p.lend(far_store), Err(ScratchError::Clobbered(Reg(12))), "a template writing the held x12");
+    p.give(x12).expect("held");
+    assert_eq!(p.lend(far_store), Ok([None, None]), "x12 given back: the template may write it");
+    for s in held {
+        p.give(s).expect("held");
+    }
+    assert!(p.is_idle());
+    assert!(matches!(Pool::over(RegSet::EMPTY.with(Reg(9))), Err(ScratchError::Description(_))));
 }
 
 /// A description with one scratch register, or one the allocator may also hand out, gives no

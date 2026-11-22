@@ -626,13 +626,15 @@ fn r6_a_private_fn_added_enters_its_head_and_body() {
     let row = settle(&io, "R6 a private fn added", &now, Oracle::Equal);
     assert_eq!(helper, Seen::Last, "R6: the new fn's body was entered");
     // FLOOR: existing bodies 0, (1 outline, 1 head, 1 body), names at most `a`'s two units (row
-    // "A private fn added"). Today: 2 existing bodies entered by a `CrateScope` read (both
-    // identical), 3 heads (2 by a `CrateScope` read, 1 new), and 6 names tasks (4 by
-    // `CrateScope`, 2 by `FileItems`).
-    assert_eq!((from_base, total, existing), (Seen::Earlier, Seen::Earlier, 2), "R6: floor no existing body of a, b or c entered: {PINNED}");
+    // "A private fn added"). Today: 0 existing bodies, 3 heads (2 by a `CrateScope` read, 1
+    // new), and 6 names tasks (4 by `CrateScope`, 2 by `FileItems`).
+    // 2026-11-21 (s2255): the because list's Bodies "read moved" `CrateScope` group is gone (the
+    // Names and Heads `CrateScope` groups stand), so the 2 existing bodies are 0. A RATCHET: not
+    // loosened again without a reason written here.
+    assert_eq!((from_base, total, existing), (Seen::Earlier, Seen::Earlier, 0), "R6: floor no existing body of a, b or c entered: {FLOOR}");
     // D191: the new body is 2 rows (`a`'s library's and its test build's): the floor in rows is
-    // (1, 1, 2), and today's 3 bodies are 4 rows.
-    assert_eq!((row.outlines, row.heads, row.bodies), (1, 3, 4), "R6: floor 1 outline, 1 head, 1 body (its 2 units' rows, D191): {PINNED}");
+    // (1, 1, 2); the bodies are at it (2 rows), the heads not.
+    assert_eq!((row.outlines, row.heads, row.bodies), (1, 3, 2), "R6: floor 1 outline, 1 head, 1 body (its 2 units' rows, D191): {PINNED}");
     assert_eq!(row.names, 6, "R6: floor at most `a`'s two units' names (1 names group a unit): {PINNED}");
 }
 
@@ -677,12 +679,15 @@ fn r8_an_unused_pub_fn_added_enters_its_head_and_body() {
     let existing = entered_existing(&now.checked, Stage::Bodies);
     let row = settle(&io, "R8 an unused pub fn added", &now, Oracle::Equal);
     assert_eq!(spare, Seen::Last, "R8: the new fn's body was entered");
-    // FLOOR: 0 existing bodies, (1 head, 1 body). Today as R6: 2 existing bodies by a
-    // `CrateScope` read (identical), 3 heads, 6 names tasks.
-    assert_eq!((doubled, total, existing), (Seen::Earlier, Seen::Earlier, 2), "R8: floor no existing body entered: {PINNED}");
+    // FLOOR: 0 existing bodies, (1 head, 1 body). Today as R6: 0 existing bodies, 3 heads, 6
+    // names tasks.
+    // 2026-11-21 (s2255): as R6, the Bodies "read moved" `CrateScope` group is gone from the
+    // because list, so the 2 existing bodies are 0. A RATCHET: not loosened again without a
+    // reason written here.
+    assert_eq!((doubled, total, existing), (Seen::Earlier, Seen::Earlier, 0), "R8: floor no existing body entered: {FLOOR}");
     // D191: the new body is 2 rows (`a`'s library's and its test build's): the floor in rows is
-    // (1, 2), and today's 3 bodies are 4 rows.
-    assert_eq!((row.heads, row.bodies), (3, 4), "R8: floor its head and its body (1, 1; its body's 2 units' rows, D191): {PINNED}");
+    // (1, 2); the bodies are at it, the heads not.
+    assert_eq!((row.heads, row.bodies), (3, 2), "R8: floor its head and its body (1, 1; its body's 2 units' rows, D191): {PINNED}");
 }
 
 /// R9, A GENERIC FN'S BODY EDITED (row "A generic fn's body edited": at check time no caller is
@@ -719,12 +724,16 @@ fn r10_a_private_field_added_enters_no_body_that_names_the_type() {
     let unit = seen(&io, "R10", "a/src/shapes.rs::unit");
     let row = settle(&io, "R10 a private field added", &now, Oracle::Equal);
     // FLOOR: `holds` not entered; (1 head, 0 bodies) (plan row A5, head aspects, not built).
-    // Today `holds` is entered by `Marker`'s `Signature` cell, 2 more bodies by a `CrateScope`
-    // read, and 3 heads (`Marker`'s by its key, 2 by `FileItems`).
+    // Today `holds` is entered by `Marker`'s `Signature` cell (the head record holds every
+    // field, private ones too, and `holds` reads the whole cell: plan row A5's head aspects
+    // would split it), and 2 heads (`Marker`'s by its key, 1 by `FileItems`).
+    // 2026-11-21 (s2255): the 2 more bodies a `CrateScope` read entered are gone (the because
+    // list holds Bodies "read moved" by `Signature` alone), so 4 rows are 2. A RATCHET: not
+    // loosened again without a reason written here.
     assert_eq!((holds, area_of, unit), (Seen::Last, Seen::Earlier, Seen::Earlier), "R10: floor no body that only names `Marker` entered (plan row A5): {PINNED}");
     // D191: today's bodies are counted in rows, a body `a`'s or `b`'s library and its test build
-    // both hold being 2: 3 rows before D191, 4 now.
-    assert_eq!((row.heads, row.bodies), (2, 4), "R10: floor `Marker`'s head alone, 0 bodies (plan row A5); bodies in rows (D191): {PINNED}");
+    // both hold being 2: `holds`'s 2 rows.
+    assert_eq!((row.heads, row.bodies), (2, 2), "R10: floor `Marker`'s head alone, 0 bodies (plan row A5); bodies in rows (D191): {PINNED}");
 }
 
 /// R11, AN IMPL OF A TRAIT ADDED IN `b` FOR A NEW TYPE (plan row D3: "an unrelated impl enters
@@ -741,15 +750,18 @@ fn r11_an_unrelated_impl_added_enters_no_existing_body() {
     let row = settle(&io, "R11 an unrelated impl added", &now, Oracle::Equal);
     println!("row R11: bodies entered that existed before {existing}, new {}", row.bodies.saturating_sub(existing));
     // FLOOR: 0 existing bodies, at most the new method's body (plan row D3, question cells, not
-    // built). Today 2 existing bodies are entered by a `CrateScope` read: 2 existing, 3 in all
-    // with the new method. (Until lane RU3's naming fix, 2026-11-17 22:50, two impls of one trait
-    // in a file shared ONE head task, so the new `impl Measure for Fresh` re-froze `impl Measure
-    // for Boxed` and entered its readers too, `c::measured` among them: 4 existing, 5 in all.)
-    assert_eq!((measured, area_of), (Seen::Earlier, Seen::Earlier), "R11: floor no existing body that asks a trait question entered (plan row D3): {PINNED}");
-    assert_eq!(existing, 2, "R11: floor 0 existing bodies entered (plan row D3): {PINNED}");
-    // D191: the new method's body is 2 rows (`b`'s library's and its test build's): 2 existing
+    // built). Today at it: 0 existing, the new method alone. (Until lane RU3's naming fix,
+    // 2026-11-17 22:50, two impls of one trait in a file shared ONE head task, so the new `impl
+    // Measure for Fresh` re-froze `impl Measure for Boxed` and entered its readers too,
+    // `c::measured` among them: 4 existing, 5 in all.)
+    // 2026-11-21 (s2255): the 2 existing bodies a `CrateScope` read entered are gone (the
+    // because list holds Bodies "new" alone), so 2 existing are 0. A RATCHET: not loosened again
+    // without a reason written here.
+    assert_eq!((measured, area_of), (Seen::Earlier, Seen::Earlier), "R11: floor no existing body that asks a trait question entered (plan row D3): {FLOOR}");
+    assert_eq!(existing, 0, "R11: floor 0 existing bodies entered (plan row D3): {FLOOR}");
+    // D191: the new method's body is 2 rows (`b`'s library's and its test build's): 0 existing
     // and 2 new rows.
-    assert_eq!(row.bodies, 4, "R11: floor at most the new impl's one method body (its 2 units' rows, D191): {PINNED}");
+    assert_eq!(row.bodies, 2, "R11: floor at most the new impl's one method body (its 2 units' rows, D191): {FLOOR}");
 }
 
 /// R12, X1 "A BRANCH SWITCHED AWAY AND BACK": R5's edit, a request, then the original bytes

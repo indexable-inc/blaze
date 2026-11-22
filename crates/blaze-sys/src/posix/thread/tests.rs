@@ -106,6 +106,79 @@ fn the_macos_layouts_are_libcs() {
     same_shape!(proc_fdinfo, libc::proc_fdinfo);
     same_offsets!(proc_fdinfo, libc::proc_fdinfo, proc_fd, proc_fdtype);
     same_shape!(rusage_info_v4, libc::rusage_info_v4);
+    // libc has the vnode answers, not the socket ones: those rest on mach.rs's const asserts
+    // and on `this_process_lists_its_own_socket_and_file` reading real answers through them.
+    same_shape!(vinfo_stat, libc::vinfo_stat);
+    same_offsets!(vinfo_stat, libc::vinfo_stat, vst_dev, vst_mode, vst_nlink, vst_ino, vst_uid, vst_gid, vst_atime, vst_mtime, vst_ctime, vst_birthtime, vst_size, vst_blocks, vst_blksize, vst_flags, vst_gen, vst_rdev, vst_qspare);
+    same_shape!(vnode_info, libc::vnode_info);
+    same_offsets!(vnode_info, libc::vnode_info, vi_stat, vi_type, vi_pad, vi_fsid);
+    same_shape!(vnode_info_path, libc::vnode_info_path);
+    same_offsets!(vnode_info_path, libc::vnode_info_path, vip_vi, vip_path);
+}
+
+/// The libproc descriptor calls exist (the test links and calls each) and read this process's
+/// own answers: a listening loopback TCP socket at its port in `LISTEN`, and `/bin/sh` (a
+/// regular file under SIP on every macOS, at that path) as a regular vnode at its path. A
+/// descriptor that is not open answers `EBADF`, a pid that is no process `ESRCH`.
+#[cfg(target_os = "macos")]
+#[test]
+fn this_process_lists_its_own_socket_and_file() {
+    use crate::posix::io::{CWD, OpenFlags, OwnedFd, openat};
+    use crate::posix::net::{AF_INET, SOCK_STREAM, bind, getsockname, in_addr, listen, sockaddr_in, sockaddr_storage, socket};
+    use crate::posix::proc::{PROX_FDTYPE_SOCKET, PROX_FDTYPE_VNODE, VREG};
+    use crate::{Errno, Path};
+
+    let raw = socket(AF_INET, SOCK_STREAM, 0).unwrap();
+    // SAFETY: `socket` just returned this descriptor to this test alone.
+    let listener = unsafe { OwnedFd::from_raw(raw.raw()) };
+    let loopback = sockaddr_in {
+        sin_len: 16,
+        sin_family: 2,
+        sin_port: 0,
+        sin_addr: in_addr { s_addr: u32::from_ne_bytes([127, 0, 0, 1]) },
+        sin_zero: [0; 8],
+    };
+    let mut at = sockaddr_storage::ZERO;
+    // SAFETY: a `sockaddr_storage` is larger than and as aligned as a `sockaddr_in`.
+    unsafe { core::ptr::from_mut(&mut at).cast::<sockaddr_in>().write(loopback) };
+    bind(listener.fd(), &at, 16).unwrap();
+    listen(listener.fd(), 1).unwrap();
+    let (bound, _) = getsockname(listener.fd()).unwrap();
+    // SAFETY: as above; `getsockname` of an `AF_INET` socket wrote a `sockaddr_in`.
+    let port = u16::from_be(unsafe { core::ptr::from_ref(&bound).cast::<sockaddr_in>().read() }.sin_port);
+    let file = openat(CWD, Path::new(c"/bin/sh"), OpenFlags::READ, 0).unwrap();
+    let pid = getpid();
+
+    let capacity = proc_fd_list_capacity(pid).unwrap();
+    let mut fds = [proc_fdinfo::default(); 4096];
+    assert!(capacity <= fds.len(), "{capacity} descriptors");
+    let listed = proc_list_fds(pid, &mut fds).unwrap();
+    let fds = &fds[..listed];
+    let socket = fds.iter().find(|fd| fd.proc_fd == listener.fd().raw()).expect("the listener is listed");
+    assert_eq!(socket.proc_fdtype, PROX_FDTYPE_SOCKET);
+    let held = fds.iter().find(|fd| fd.proc_fd == file.fd().raw()).expect("the file is listed");
+    assert_eq!(held.proc_fdtype, PROX_FDTYPE_VNODE);
+
+    let info = proc_fd_socket_info(pid, listener.fd().raw()).unwrap();
+    let tcp = info.psi.tcp().expect("a TCP socket");
+    assert_eq!(tcp.tcpsi_state, 1, "TCPS_LISTEN");
+    assert_eq!(u16::from_be(tcp.tcpsi_ini.insi_lport as u16), port);
+    assert_ne!(tcp.tcpsi_ini.insi_vflag & crate::posix::proc::INI_IPV4, 0);
+    assert_eq!(tcp.tcpsi_ini.insi_laddr[12..], [127, 0, 0, 1]);
+    assert_eq!(info.psi.soi_protocol, 6, "IPPROTO_TCP");
+    assert_eq!(info.psi.soi_family, AF_INET);
+
+    let vnode = proc_fd_vnode_path(pid, file.fd().raw()).unwrap();
+    assert_eq!(vnode.pvip.vip_vi.vi_type, VREG);
+    assert_eq!(vnode.pvip.path(), b"/bin/sh");
+
+    drop(file);
+    drop(listener);
+    // A descriptor past every table (a closed one could be reopened by a parallel test).
+    assert_eq!(proc_fd_vnode_path(pid, i32::MAX).map(|_| ()), Err(Errno::BadF));
+    assert_eq!(proc_fd_socket_info(pid, i32::MAX).map(|_| ()), Err(Errno::BadF));
+    // `i32::MAX` is above every pid macOS hands out (`PID_MAX` is 99999).
+    assert_eq!(proc_fd_list_capacity(i32::MAX), Err(Errno::Srch));
 }
 
 #[cfg(target_os = "macos")]

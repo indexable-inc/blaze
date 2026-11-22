@@ -27,13 +27,13 @@ use blaze_core::{
 };
 use blaze_ids::ContentId;
 use blaze_keyed::{
-    kind::{Namespace, Tag},
+    kind::{Namespace, ReservedTag, Tag},
     store::{ENTRY, FOOTER, HEADER},
 };
 use blaze_mem::Frame;
 
 use super::{
-    core::{GRACE_NS, INDEX_TAG, INDEXED_ROOT_TAG, LEASE_NS, Liveness, Plain, PlainConfig, Plant, ROOT_LIFE_NS, TAGS},
+    core::{GRACE_NS, LEASE_NS, Liveness, Plain, PlainConfig, Plant, ROOT_LIFE_NS, TAGS},
     format::aligned,
     test_root,
 };
@@ -73,6 +73,7 @@ fn cfg(n: u64, root: &Frame) -> PlainConfig<&Frame> {
         writes,
         reads,
         liveness: Liveness::Reached,
+        lock_step: crate::plain::LockStep::Backoff,
     }
 }
 
@@ -240,10 +241,10 @@ fn history(plant: Plant, root: &Frame) -> Result<Vec<String>, String> {
     {
         let r = w.open(Plant::None)?;
         match r.get(&index) {
-            Some(got) if got.tag == INDEX_TAG && got.bytes.len() == PROGRAM as usize * 32 => {}
+            Some(got) if ReservedTag::Index.is(got.tag) && got.bytes.len() == PROGRAM as usize * 32 => {}
             other => problems.push(format!("the index does not read as an index of {PROGRAM} keys: {:?}", other.map(|it| (it.tag, it.bytes.len())))),
         }
-        let indexed = r.roots().into_iter().filter(|(name, _)| name == "program" || name == "toolchain").filter(|(_, root)| r.get(root).is_some_and(|it| it.tag == INDEXED_ROOT_TAG)).count();
+        let indexed = r.roots().into_iter().filter(|(name, _)| name == "program" || name == "toolchain").filter(|(_, root)| r.get(root).is_some_and(|it| ReservedTag::IndexedRoot.is(it.tag))).count();
         if indexed != 2 {
             problems.push(format!("{indexed} of the two indexed roots are filed as indexed roots"));
         }

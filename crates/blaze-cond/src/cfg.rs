@@ -214,6 +214,48 @@ pub fn parse_prefix<'s, 'a>(text: &'s str, alloc: Alloc<'a>) -> Result<(Expr<'s,
     }
 }
 
+impl<'s> Expr<'s, '_> {
+    /// Whether the predicate holds where `has` says which atoms are set: the one evaluation of
+    /// a predicate over a plain list of atoms (a target's `--print cfg`, a config's
+    /// `target.'cfg(..)'` table matched against it), where [`lower`] is the one over a space.
+    pub fn holds(&self, has: impl Fn(Atom<'s>) -> bool, alloc: Alloc<'_>) -> bool {
+        let mut stack: AVec<'_, bool> = blaze_own::Vec::new_in(alloc);
+        for op in self.ops.iter() {
+            let value = match *op {
+                Op::True => true,
+                Op::False => false,
+                Op::Atom(atom) => has(atom),
+                Op::Not => !stack.pop().unwrap_or(false),
+                Op::All(n) => {
+                    let mut all = true;
+                    for _ in 0..n {
+                        all &= stack.pop().unwrap_or(true);
+                    }
+                    all
+                }
+                Op::Any(n) => {
+                    let mut any = false;
+                    for _ in 0..n {
+                        any |= stack.pop().unwrap_or(false);
+                    }
+                    any
+                }
+            };
+            stack.push(value);
+        }
+        stack.pop().unwrap_or(false)
+    }
+
+    /// The one atom this predicate is, when it is a lone `name` or `name = "value"` (a rustc
+    /// `--cfg` spec); `None` for `true`, `false` or any `all`/`any`/`not`.
+    pub fn lone_atom(&self) -> Option<Atom<'s>> {
+        match self.ops.as_slice() {
+            [Op::Atom(atom)] => Some(*atom),
+            _ => None,
+        }
+    }
+}
+
 /// Parses a whole predicate: nothing but space may follow it.
 pub fn parse<'s, 'a>(text: &'s str, alloc: Alloc<'a>) -> Result<Expr<'s, 'a>, ParseError> {
     let (expr, end) = parse_prefix(text, alloc)?;

@@ -45,11 +45,11 @@ use crate::{
 
 /// The descriptor's `root`, in 8-byte units for `ldr`'s scaled offset (the forms' one home is
 /// blaze-code's `tls`; blaze-build's `tls::index_tests` runs this sequence against its getter).
-const DESC_ROOT_WORDS: u32 = blaze_code::tls::DESC_ROOT as u32 / 8;
+pub(crate) const DESC_ROOT_WORDS: u32 = blaze_code::tls::DESC_ROOT as u32 / 8;
 /// The table's `len`, in 8-byte units.
-const TABLE_LEN_WORDS: u32 = blaze_code::tls::TABLE_LEN as u32 / 8;
+pub(crate) const TABLE_LEN_WORDS: u32 = blaze_code::tls::TABLE_LEN as u32 / 8;
 /// The table's first slot, in bytes.
-const TABLE_SLOTS: u32 = blaze_code::tls::TABLE_SLOTS as u32;
+pub(crate) const TABLE_SLOTS: u32 = blaze_code::tls::TABLE_SLOTS as u32;
 
 impl<A: Allocator> Pass<'_, '_, A> {
     pub(super) fn tls_addr_indexed(&mut self, inst: usize, op: Op) -> Result<(), EmitError> {

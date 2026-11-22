@@ -292,6 +292,23 @@ fn runs_to_three(label: &str, items: &str, ret: &str) {
     println!("local static {label}: {counts}; run status {status}");
 }
 
+/// [`runs_to_three`] without the whole-program run: walked over the records with no refusal
+/// and nothing filed. For a program whose fact the whole-program walk cannot reach by design:
+/// that walk (`run_with` over `Front2Program::new`, run.rs `build_from`) checks only what it
+/// foresees from `main`'s bodies, and no binary runs it (`blaze run` and `blaze test` make
+/// each fn on demand, run/make_one.rs); D159 and D197 (8) delete it (audit F12), and D197
+/// refuses a fix that adds a planner's scan to it. The record walk builds the same fns, so a
+/// layout that needs a fact it does not have is refused there by name.
+fn walks_clean(label: &str, items: &str, ret: &str) {
+    let text = program(items, ret);
+    let f = fixture(&text);
+    let counts = try_walk(&f).unwrap_or_else(|e| {
+        println!("local static {label}: {e}");
+        panic!("local static {label}: {e}")
+    });
+    println!("local static {label}: {counts}");
+}
+
 /// A static with an initializer in a fn body, read and returned.
 /// Prints "local static fn body: {counts}; run status 3".
 #[test]
@@ -481,11 +498,14 @@ fn a_bodiless_fn_in_a_body_is_refused_by_name() {
 // defining uses give, whether or not the program calls them.
 
 /// A type holding the alias whose defining fn `make` nothing calls, laid out by `absent`'s
-/// build: walked with no refusal, and run whole to 3 (`Maybe::None`).
-/// Prints "local static opaque unreached: {counts}; run status 3".
+/// build: walked with no refusal. Not run whole: the whole-program walk checks only the fns
+/// `main`'s bodies call, so `make` is not in its program ("needs its defining fn .. checked,
+/// which is not in the program"); that walk is deleted by D159 and D197 (8) and no binary runs
+/// it ([`walks_clean`]). The record walk makes `make` when the layout names it (run/make_one.rs,
+/// `BuildError::OpaqueOwnerUnchecked`). Prints "local static opaque unreached: {counts}".
 #[test]
 fn an_alias_opaque_whose_defining_fn_is_not_called_is_laid_out() {
-    runs_to_three(
+    walks_clean(
         "opaque unreached",
         "type Hidden = impl Sized;
 
@@ -496,6 +516,45 @@ fn make() -> Hidden {
 
 enum Maybe {
     Some(Hidden),
+    None,
+}
+
+#[inline(never)]
+fn absent() -> Maybe {
+    Maybe::None
+}",
+        "match absent() {
+        Maybe::None => 3,
+        Maybe::Some(_) => 4,
+    }",
+    );
+}
+
+/// The twin of std's own shape (backtrace.rs:431 `mod helper`): the alias in a module, its
+/// defining fn in ANOTHER module naming it by a path (`#[define_opaque(super::a::Hidden)]`),
+/// never called. The hidden type is the defining fn's, found by its attribute over the crate
+/// (front2 tait.rs `defining_fn`): before, the alias itself was checked as the fn ("NotAHead
+/// .. a type alias", tempo t1935d, eyre's `default_with`). Walked over the records only, for
+/// the reason [`walks_clean`] and the test above give: `make` is never called.
+/// Prints "local static opaque by path: {counts}".
+#[test]
+fn an_alias_opaque_defined_in_another_module_by_path_is_laid_out() {
+    walks_clean(
+        "opaque by path",
+        "mod a {
+    // `super::`: a `no_core` crate has no prelude, and `Sized` is declared at its root.
+    pub type Hidden = impl super::Sized;
+}
+
+mod b {
+    #[define_opaque(super::a::Hidden)]
+    pub fn make() -> super::a::Hidden {
+        7u8
+    }
+}
+
+enum Maybe {
+    Some(a::Hidden),
     None,
 }
 
@@ -560,4 +619,90 @@ fn absent() -> Maybe {
         Maybe::Some(_) => 4,
     }",
     );
+}
+
+/// The builtins tracing's callsite static uses, as core declares them, and its
+/// `$crate::__macro_support` re-export. The programs below write `"handle_tip"` where tracing
+/// writes `file!()`: a program of given files has no package, so no body sources (front2
+/// program.rs `make`), and `file!()` in a body is refused by name (body_host.rs
+/// `BodyHost::place`, D96 (4): no package to show), as the item host refuses it
+/// ([`a_callsite_static_with_file_in_a_program_of_given_files_is_refused_by_name`]). `file!()`
+/// with a package is blaze-cli's `engine_check_checks_a_callsite_static_with_line_in_eager_input`.
+const CALLSITE_SUPPORT: &str = "#[rustc_builtin_macro]
+#[macro_export]
+macro_rules! concat {
+    ($($t:tt)*) => {{ /* compiler built-in */ }};
+}
+
+#[rustc_builtin_macro]
+#[macro_export]
+macro_rules! file {
+    () => {{ /* compiler built-in */ }};
+}
+
+#[rustc_builtin_macro]
+#[macro_export]
+macro_rules! line {
+    () => {{ /* compiler built-in */ }};
+}
+
+pub mod __macro_support {
+    pub use crate::concat;
+}
+";
+
+/// tempo rt-loop a2000 on the RUN path: tracing's `event!` writes its callsite static in the
+/// user's fn, its initializer `concat!(file!(), ":", line!())` through `$crate::__macro_support`
+/// (here `"handle_tip"` for `file!()`: [`CALLSITE_SUPPORT`]).
+/// The static, a copy of the expansion's words, is placed at the `event!` call in `handle_tip`
+/// (front2 body.rs `body_at`, `fixed`); before, at its local key, which the names do not place:
+/// `line!()` refused, the static not lowered. 3 (the tuple's second field).
+/// Prints "local static callsite by a macro: {counts}; run status 3".
+#[test]
+fn a_callsite_static_a_macro_writes_with_line_in_eager_input_runs() {
+    let items = format!(
+        "{CALLSITE_SUPPORT}
+macro_rules! event {{
+    () => {{{{
+        static META: (&str, i32) = ($crate::__macro_support::concat!(\"handle_tip\", \":\", line!()), 3);
+        META.1
+    }}}};
+}}
+
+fn handle_tip() -> i32 {{
+    event!()
+}}"
+    );
+    runs_to_three("callsite by a macro", &items, "handle_tip()");
+}
+
+/// The twin: the same static written by hand in the fn (a written local, placed at its own
+/// call's byte): 3. Prints "local static callsite by hand: {counts}; run status 3".
+#[test]
+fn a_callsite_static_written_by_hand_with_line_in_eager_input_runs() {
+    let items = format!(
+        "{CALLSITE_SUPPORT}
+fn handle_tip() -> i32 {{
+    static META: (&str, i32) = (crate::__macro_support::concat!(\"handle_tip\", \":\", line!()), 3);
+    META.1
+}}"
+    );
+    runs_to_three("callsite by hand", &items, "handle_tip()");
+}
+
+/// The control: the by-hand static with `file!()` as tracing writes it, in a program of given
+/// files (no package: [`CALLSITE_SUPPORT`]): the walk is refused, by name, at the host's place
+/// question, never answered with a made-up path (rule 3). Remove `file!()` and the refusal goes
+/// ([`a_callsite_static_written_by_hand_with_line_in_eager_input_runs`]).
+#[test]
+fn a_callsite_static_with_file_in_a_program_of_given_files_is_refused_by_name() {
+    let items = format!(
+        "{CALLSITE_SUPPORT}
+fn handle_tip() -> i32 {{
+    static META: (&str, i32) = (crate::__macro_support::concat!(file!(), \":\", line!()), 3);
+    META.1
+}}"
+    );
+    let refusal = try_walk(&fixture(&program(&items, "handle_tip()"))).expect_err("`file!()` in a body of a program with no package");
+    assert!(refusal.contains("HostError { ask: Place, why: Refused }"), "refused at the place question: {refusal}");
 }

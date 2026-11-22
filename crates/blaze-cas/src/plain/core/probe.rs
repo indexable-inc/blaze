@@ -42,7 +42,7 @@ use std::alloc::Allocator;
 
 use blaze_core::{Effect, Extent};
 use blaze_keyed::{
-    kind::{Namespace, Tag},
+    kind::{Namespace, ReservedTag, Tag},
     store::StoreError,
 };
 
@@ -261,7 +261,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// The NEWEST record under `key` in `space`: what this process holds uncommitted, then the
     /// rows of `space` newest first ([`Plain::newest_rows`]), the first that holds it answering;
     /// a row is mapped at its first probe, as [`Plain::find`] maps. What a pointer is read by
-    /// ([`super::POINTER_TAG`]): its newer value lies in a later row. At most one probe a row,
+    /// ([`ReservedTag::Pointer`]): its newer value lies in a later row. At most one probe a row,
     /// so at most [`super::SEGMENTS_MOST`] (the tiered merge's bound: `Tiers`; and the
     /// rows committed since the last cleanup) a read.
     pub fn find_newest(&mut self, space: Namespace, key: &Key, now_ns: u64, effects: &mut Vec<Effect>) -> Result<Probe, StoreError> {
@@ -302,7 +302,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 // Committed since it was found: a commit maps what it wrote (a commit needs a
                 // whole store, and a whole store maps every generation it adopts).
                 // A pointer's value is its newest row's.
-                let committed = if found.tag == super::POINTER_TAG { self.newest_mapped(found.namespace, &found.key) } else { self.find_in(std::slice::from_ref(&found.namespace), &found.key) };
+                let committed = if ReservedTag::Pointer.is(found.tag) { self.newest_mapped(found.namespace, &found.key) } else { self.find_in(std::slice::from_ref(&found.namespace), &found.key) };
                 committed.expect("a record found held is still held, or committed into a segment this process mapped after its flip")
             }
         };

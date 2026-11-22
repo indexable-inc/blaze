@@ -578,7 +578,7 @@ mod tests {
         let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
         let mut phases = Phases::new(io.need_clock().expect("the simulated clock"));
         let start = StartTally { placed: 0, answered: 0, data: 0, positioned: 0, resolved: 0, built: Built::Head, held: ListHeld::None };
-        let lowerings = LoweringCounts { bodies_lowered: 7, lower_again: 2, forks: 1 };
+        let lowerings = LoweringCounts { bodies_lowered: 7, lower_again: 2, forks: 1, typing: None };
         phases.code_records = Some(RunTally { codes: Tally::default(), start, lowerings, walk: None });
         let profile = std::format!("{phases}");
         assert!(profile.lines().any(|line| line == "run          bodies lowered 7, lower_again calls 2, forks 1"), "{profile}");

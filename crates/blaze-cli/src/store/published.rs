@@ -19,7 +19,8 @@
 use core::fmt;
 
 use blaze_cas::Key as CasKey;
-use blaze_cas::plain::{INDEX_TAG, INDEXED_ROOT_TAG, Lent, LentError, Namespace, Tag};
+use blaze_cas::plain::{Lent, LentError, Namespace, Tag};
+use blaze_keyed::kind::{ReservedTag, TagReach, reach_of};
 use blaze_core::Driver;
 use blaze_ids::ContentId;
 use blaze_toolchain::ToolchainId;
@@ -27,8 +28,7 @@ use blaze_toolchain::ToolchainId;
 use super::plain_place::{PlaceError, PlainPlace, StoreAlloc};
 use super::roots::{RootName, TOOLCHAIN_LIFE_NS};
 
-/// The tag of a floor record: reserved after blaze-cas's `INDEXED_ROOT_TAG` (`u16::MAX - 7`).
-pub(crate) const FLOOR_TAG: Tag = Tag(u16::MAX - 8);
+// A floor record is filed under [`ReservedTag::Floor`] (blaze-keyed's registry).
 const FLOOR_DOMAIN: &str = "blaze-cli published floor 1";
 const FLOOR_MAGIC: [u8; 4] = *b"BLPF";
 /// A floor record: the magic, the set's id, the generation, the wall time its head was last
@@ -83,7 +83,7 @@ impl fmt::Display for PublishedError {
             PublishedError::Store { root, why } => write!(f, "the published set's root `{}`: {why}", root.as_str()),
             PublishedError::Place(error) => write!(f, "the published set's floor: {error}"),
             PublishedError::Gone { root, key } => write!(f, "the root `{}` names {:?}, which the store does not hold: nothing is published from a root with a hole", root.as_str(), key.0),
-            PublishedError::NotIndexed { root, key } => write!(f, "the root `{}` names {:?} where an index belongs (blaze-cas `INDEX_TAG`, `INDEXED_ROOT_TAG`)", root.as_str(), key.0),
+            PublishedError::NotIndexed { root, key } => write!(f, "the root `{}` names {:?} where an index belongs (blaze-keyed `ReservedTag::Index`, `ReservedTag::IndexedRoot`)", root.as_str(), key.0),
             PublishedError::Floor { root, len } => write!(f, "the floor root `{}` names a record of {len} bytes that is not this set's floor ({FLOOR_LEN} bytes, `BLPF`)", root.as_str()),
             PublishedError::Path(error) => write!(f, "a published set's path: {error}"),
             PublishedError::Folder { what, error } => write!(f, "the folder origin, {what}: {error}"),
@@ -128,12 +128,12 @@ pub(crate) fn walk_toolchain<'l, D: Driver>(lent: &'l Lent<D, StoreAlloc>, toolc
     let store = |why| PublishedError::Store { root, why };
     let Some(at) = lent.root_named(root.as_str()) else { return Ok(()) };
     let Some(indexes) = lent.get(&at).map_err(store)? else { return Err(PublishedError::Gone { root, key: at }) };
-    if indexes.tag != INDEXED_ROOT_TAG {
+    if reach_of(indexes.tag) != TagReach::Indexes {
         return Err(PublishedError::NotIndexed { root, key: at });
     }
     for index in indexes.bytes.chunks_exact(32).map(key_of) {
         let Some(keys) = lent.get(&index).map_err(store)? else { return Err(PublishedError::Gone { root, key: index }) };
-        if keys.tag != INDEX_TAG {
+        if reach_of(keys.tag) != TagReach::IndexKeys {
             return Err(PublishedError::NotIndexed { root, key: index });
         }
         for key in keys.bytes.chunks_exact(32).map(key_of) {
@@ -172,7 +172,7 @@ pub(crate) fn seen<D: Driver>(lent: &Lent<D, StoreAlloc>, set: &ContentId) -> Re
     let key = key_of(named.bytes);
     let Some(record) = lent.get(&key).map_err(store)? else { return Err(PublishedError::Gone { root, key }) };
     let bytes = record.bytes;
-    if record.tag != FLOOR_TAG || bytes.len() != FLOOR_LEN || bytes[..4] != FLOOR_MAGIC || bytes[4..36] != set.0 {
+    if !ReservedTag::Floor.is(record.tag) ||bytes.len() != FLOOR_LEN || bytes[..4] != FLOOR_MAGIC || bytes[4..36] != set.0 {
         return Err(PublishedError::Floor { root, len: bytes.len() });
     }
     let word = |at: usize| {
@@ -193,7 +193,7 @@ pub(crate) fn keep_floor<D: Driver>(place: &mut PlainPlace<'_, D>, set: &Content
     bytes[36..44].copy_from_slice(&generation.to_le_bytes());
     bytes[44..].copy_from_slice(&asked_wall_ns.to_le_bytes());
     let key = ContentId::of(FLOOR_DOMAIN, &bytes);
-    place.put_record(blaze_drive::Key(key), false, FLOOR_TAG, &bytes).map_err(PublishedError::Place)?;
+    place.put_record(blaze_drive::Key(key), false, ReservedTag::Floor.tag(), &bytes).map_err(PublishedError::Place)?;
     let root = RootName::published_floor(set);
     place.lent().root_for(root.as_str(), &[CasKey(key)], TOOLCHAIN_LIFE_NS).map_err(|why| PublishedError::Store { root, why })?;
     Ok(())

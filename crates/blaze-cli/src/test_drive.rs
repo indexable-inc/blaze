@@ -74,7 +74,16 @@ use crate::code_store::HomeCodeStore;
 use crate::run_names::{Found, TestRows, TestUnit};
 use crate::run_ids::RunIds;
 use crate::run_loop::LoopError as RunLoopError;
-use crate::run_parent::{self, CodeRefusal, Codes, Front, Gate, Lazy, Needs, ParentError, RECORDS, RecordsDir, Resolve, Resolved, RunMaker, Start as _, WRITE_BOUND};
+use crate::run_bytes::{Chosen, Delivery};
+use crate::run_parent::{self, CodeRefusal, Codes, Front, Gate, Lazy, Needs, ParentError, RECORDS, RecordsDir, Resolve, Resolved, Start as _, WRITE_BOUND};
+
+/// THE TEST'S MAKER: every body checked by the run, as before D197 root 1, for now. `run`
+/// reads bodies from the check's records by kind (run_parent.rs `RunMaker`); a test's code
+/// workers cannot yet: the command's store handle (`CommandLent`) is a `RefCell`, not `Sync`,
+/// and the shared snapshot does not hold this command's own puts. What a worker needs: a `Sync`
+/// view that sees this command's puts, or the relay serving the record reads. The serial
+/// step's maker and the workers' are one type, so they flip together.
+pub(crate) type TestMaker<'h> = Maker<'h, crate::run_ids::Runnable, SecondCheck>;
 use blaze_engine::SVec;
 use blaze_engine::code_pool::relay::{self as code_relay, Relay as PoolRelay, RelayError, Reply};
 use blaze_engine::code_pool::{Child, Time, Worker};
@@ -104,8 +113,8 @@ const STEPS_FIXED: usize = 256;
 const ADDRESS_DOMAIN: &str = "blaze test address of an untraced run 1";
 /// The domain of a test output's digest.
 const OUTPUT_DOMAIN: &str = "blaze test output 1";
-/// Beneath `<HOME>`: the parent of each command's suite and row folders.
-const TEMPS: &str = ".blaze/v2/test/tmp";
+/// Beneath `<HOME>`: the parent of each command's suite and row folders (layout.rs's row).
+pub(crate) const TEMPS: &str = ".blaze/v2/test/tmp";
 
 /// Why the driver stopped the command: each names the step and the thing (rule 19).
 #[derive(Debug)]
@@ -271,9 +280,6 @@ pub(crate) struct InstanceRefusal {
 enum RefusalCause {
     Build(ParentError),
     Unresolved,
-    /// Its make was refused while another test asked it too (D194: one make a key in flight);
-    /// the refusal's cause went whole to that test, the relay's child `first` ([`Launched::child_base`]).
-    Elsewhere { first: usize },
 }
 
 #[derive(Debug)]
@@ -309,16 +315,25 @@ impl fmt::Display for InstanceName<'_> {
 
 impl fmt::Display for InstanceRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", InstanceName(&self.instance, self.symbol))?;
-        match &self.site {
-            Some(InstanceSite::Source(site)) => write!(f, " at {}:{}:{}", site.file, site.line, site.column)?,
-            Some(InstanceSite::Item { item, byte }) => write!(f, " at byte {byte} of item {:#x}", item.0)?,
-            None => {}
+        // A refusal made on a code worker is named and placed by that worker's maker (D194): the
+        // command thread's walk has no program of its own to show or place it by.
+        let crossed = match &self.cause {
+            RefusalCause::Build(ParentError::CodeRefused { why, .. }) => Some(why),
+            _ => None,
+        };
+        match crossed.and_then(|why| why.instance.as_ref()) {
+            Some(shown) => f.write_str(shown.as_str())?,
+            None => write!(f, "{}", InstanceName(&self.instance, self.symbol))?,
+        }
+        match (crossed.and_then(|why| why.site.as_ref()), &self.site) {
+            (Some(site), _) => write!(f, " at {}:{}:{}", site.file.as_str(), site.line, site.column)?,
+            (None, Some(InstanceSite::Source(site))) => write!(f, " at {}:{}:{}", site.file, site.line, site.column)?,
+            (None, Some(InstanceSite::Item { item, byte })) => write!(f, " at byte {byte} of item {:#x}", item.0)?,
+            (None, None) => {}
         }
         let cause = match &self.cause {
             RefusalCause::Build(cause) => cause,
             RefusalCause::Unresolved => return f.write_str(": the first-call stub requested this symbol, but the program has no callable record for it"),
-            RefusalCause::Elsewhere { first } => return write!(f, ": its make was refused, and the cause is said with the test that asked it first (the relay's child {first}, D194)"),
         };
         match cause {
             ParentError::Walk {
@@ -329,7 +344,7 @@ impl fmt::Display for InstanceRefusal {
             ParentError::CodeRefused { why: CodeRefusal { cause: Some(cause), whole, .. }, .. } => {
                 write!(f, ": {cause}")?;
                 if !whole {
-                    f.write_str(" (its words were cut: the command's heap refused the rest, run_parent.rs `CodeRefusal`)")?;
+                    f.write_str(run_parent::WORDS_CUT)?;
                 }
                 Ok(())
             }
@@ -343,7 +358,7 @@ impl fmt::Display for InstanceRefusal {
 /// wire error, or an invariant of the parent stops the command; a names-record read that did
 /// not answer while one instance was made (`LazyRefusal::RecordsVoid`) is that test's. Keep the walk alive until the instance and item-relative site have been named.
 fn test_parent_error<F: Front, D: run_parent::Folder>(lazy: &mut Lazy<'_, '_, F, D>, cause: ParentError) -> OneError {
-    let Some((symbol, location)) = refused_instance(&cause) else { return OneError::Parent(cause) };
+    let Some((symbol, location)) = instance_site(&cause) else { return OneError::Parent(cause) };
     let site = location.map(|(item, byte)| match lazy.site_of(item, byte) {
         Some(shown) => InstanceSite::Source(shown),
         None => InstanceSite::Item { item, byte },
@@ -351,130 +366,58 @@ fn test_parent_error<F: Front, D: run_parent::Folder>(lazy: &mut Lazy<'_, '_, F,
     OneError::CannotBuild(InstanceRefusal { instance: lazy.name_of(symbol), symbol, site, cause: RefusalCause::Build(cause) })
 }
 
-/// The test whose instance could not be made, and where (`refused_at`), or `None` for a fault
-/// that is the suite's own. INVERTED (wave-1119, handoff c8): every failure of making ONE
-/// instance is that test's NOT RUN (rule 20), and only the classes named here and in
-/// [`stops_suite`] stop the suite (rule 19). Before, the test's classes were listed and every
-/// class not on the list stopped the suite: three new front-end classes stopped whole suites in
-/// one day that way (`LazyRefusal::RecordsVoid` at tempo a1425; `LazyRefusal::NotFound` at
-/// tempo-primitives 15:06, "the suite stopped" with 165 tests passing at 14:41).
-fn refused_instance(cause: &ParentError) -> Option<([u8; 32], Option<(ItemKey, u32)>)> {
+/// The test whose instance could not be made, and where (its tabled fn and [`refused_byte`]),
+/// or `None` for a fault that is the suite's own: whose it is is [`ParentError::scope`]'s
+/// answer alone (blaze-ladder scope.rs, the one home of that sorting); this says only where.
+/// INVERTED (wave-1119, handoff c8): every failure of making ONE instance is that test's NOT RUN
+/// (rule 20), and only the classes scope.rs names stop the suite (rule 19). Before, the test's
+/// classes were listed and every class not on the list stopped the suite: three new front-end
+/// classes stopped whole suites in one day that way (`LazyRefusal::RecordsVoid` at tempo a1425;
+/// `LazyRefusal::NotFound` at tempo-primitives 15:06, "the suite stopped" with 165 tests passing
+/// at 14:41).
+fn instance_site(cause: &ParentError) -> Option<([u8; 32], Option<(ItemKey, u32)>)> {
     use blaze_ladder::body_ids::WalkError;
+    use blaze_ladder::scope::Scope;
 
+    if cause.scope() == Scope::Suite {
+        return None;
+    }
     Some(match cause {
-        // Every variant, no `_`: a new step of the walk is sorted when it is added (rule 73).
-        ParentError::Walk { symbol, why } => match why {
-            // The suite's: the store refused a read or a write, a stored entry does not read,
-            // one symbol is tabled under two fns (an entry's declaration), or the walk's own
-            // bound on its instances (rule 18).
-            WalkError::Store(_) | WalkError::Entry { .. } | WalkError::TwoTabled { .. } | WalkError::Cap { .. } => return None,
-            // The relay's own protocol (D194: a row stepped while it is being made, a made entry
-            // handed back to a row not begun for it): a fault of blaze's driver, which no test's
-            // code can cause, so the suite's; as one test's NOT RUN it would hide the driver's bug.
-            WalkError::Making { .. } | WalkError::NotBegun { .. } => return None,
-            WalkError::Make { tabled, why } => (*symbol, Some((*tabled, refused_at(why)?))),
-            // That instance's: a bound the test's code passes (an instance name past its cap,
-            // the walk's names past their arena, an item instantiating itself past
-            // `#![recursion_limit]`, rustc's "reached the recursion limit while
-            // instantiating"), a fn or crate fact the command lacks, a name that does not list.
-            // The error names the declarer, the depth or the size.
-            WalkError::NoBody { tabled }
-            | WalkError::NoCrateFact { tabled, .. }
-            | WalkError::Name { tabled, .. }
-            | WalkError::NameTooLarge { tabled, .. }
-            | WalkError::ArenaFull { tabled, .. }
-            | WalkError::RecursionLimit { tabled, .. } => (*symbol, Some((*tabled, 0))),
-        },
-        // Sorted on its worker by the arm above (test_drive.rs `crossing`).
-        ParentError::CodeRefused { symbol, why } => (*symbol, Some(why.at?)),
-        ParentError::Special { symbol, why } if !record_stops_suite(why) => (*symbol, None),
+        ParentError::Walk { symbol, why: WalkError::Make { tabled, why } } => (*symbol, Some((*tabled, refused_byte(why)))),
+        ParentError::Walk {
+            symbol,
+            why:
+                WalkError::NoBody { tabled }
+                | WalkError::NoCrateFact { tabled, .. }
+                | WalkError::Name { tabled, .. }
+                | WalkError::NameTooLarge { tabled, .. }
+                | WalkError::ArenaFull { tabled, .. }
+                | WalkError::RecursionLimit { tabled, .. },
+        } => (*symbol, Some((*tabled, 0))),
+        // Sorted on its worker by this function (test_drive.rs `crossing`).
+        ParentError::CodeRefused { symbol, why } => (*symbol, why.at),
+        ParentError::Special { symbol, .. } => (*symbol, None),
         ParentError::NotChecked { function, symbol, .. } => (*symbol, Some((*function, 0))),
         ParentError::NoPersonality { function, symbol, .. } => (*symbol, function.map(|item| (item, 0))),
-        // The wire and the protocol of the run, its roots, the names records it opened, a
-        // special record's store fault: the suite's. Never a failure inside one make.
+        // `ParentError::scope` gives every other variant (and the walk's other steps) to the
+        // suite, so none is here; were one given to a test with no site written above, the
+        // suite stops naming it (rule 3: said, never one test's quietly).
         _ => return None,
     })
 }
 
-/// The byte of the body where making one instance refused (`Some(0)`: the body, no place), or
-/// `None` for one of the faults [`stops_suite`] names. A refusal a later instance carried
-/// (`NotBuilt`) is judged by the refusal it holds.
-fn refused_at(why: &blaze_ladder::run::RunError) -> Option<u32> {
+/// The byte of the body where making one instance refused (`0`: the body, no place). A refusal
+/// a later instance carried (`NotBuilt`) is placed by the refusal it holds. Whose it is is
+/// `RunError::scope`'s.
+fn refused_byte(why: &blaze_ladder::run::RunError) -> u32 {
     use blaze_ladder::front2::program::Front2Refusal;
     use blaze_ladder::run::RunError;
-    if stops_suite(why) {
-        return None;
-    }
-    Some(match why {
+    match why {
         RunError::Build { range, .. } => range.map_or(0, |range| range.start),
-        RunError::NotBuilt { refusal, .. } => return refused_at(refusal),
+        RunError::NotBuilt { refusal, .. } => refused_byte(refusal),
         RunError::Front2(Front2Refusal::Literal { range, .. }) => range.start,
+        // A place is written only for the classes above; every other is the body's.
         _ => 0,
-    })
-}
-
-/// The few failures of making an instance that are the suite's own, never one test's: the
-/// store (a code record that would not be stored, sealed or entered), a bound of the run
-/// itself (its instance cap), and the run's setup and start (its crates, edition, manifest,
-/// names, roots, the start's shape and process; the program's start rule, queue cap and crate
-/// set, [`front_stops_suite`]). Anything else is that test's NOT RUN. A refusal `NotBuilt`
-/// carries is judged by what it carries.
-fn stops_suite(why: &blaze_ladder::run::RunError) -> bool {
-    use blaze_ladder::run::RunError;
-    match why {
-        RunError::NotBuilt { refusal, .. } => stops_suite(refusal),
-        RunError::CodeRecord { error, .. } => record_stops_suite(error),
-        RunError::Front2(front) => front_stops_suite(front),
-        RunError::TooManyInstances
-        | RunError::OverflowDisagrees { .. }
-        | RunError::Crates(_)
-        | RunError::Edition { .. }
-        | RunError::Names { .. }
-        | RunError::Manifest { .. }
-        | RunError::Roots(_)
-        | RunError::NoMain
-        | RunError::MainShape { .. }
-        | RunError::NoHost { .. }
-        | RunError::NoArgs { .. }
-        | RunError::Args(_)
-        | RunError::OwnProcess { .. } => true,
-        _ => false,
-    }
-}
-
-/// A code record's fault that is the store's: it would not be stored, sealed or entered. An
-/// emit, a symbol, a routine, a shim or a datum that did not make is the instance's.
-fn record_stops_suite(error: &blaze_ladder::code_records::CodeRecordError) -> bool {
-    use blaze_ladder::code_records::CodeRecordError;
-    matches!(error, CodeRecordError::Store(_) | CodeRecordError::Seal(_) | CodeRecordError::Entry(_))
-}
-
-/// The front end's refusals that are the suite's: the engine's own check state (the tables did
-/// not fork, a record's reads differ from the list it was checked against), the program's queue
-/// cap, its start (the start rule, the crate list) and its crate set (`Front2Refusal::Front`: a
-/// program file no `mod` reaches, two values under one key (rule 21), a lang item defined twice,
-/// roots that name no crate set; none is one instance's). A row's refusal is judged by what it
-/// carries. Every other refusal, `LazyRefusal::NotFound`, `Unanswered` and `RecordsVoid` among
-/// them, is the instance's.
-fn front_stops_suite(why: &blaze_ladder::front2::program::Front2Refusal) -> bool {
-    use blaze_ladder::front2::check::CheckFail;
-    use blaze_ladder::front2::program::{Front2Refusal as Front, lazy::LazyRefusal};
-    match why {
-        Front::Lazy(LazyRefusal::Row { refusal, .. }) => front_stops_suite(refusal),
-        Front::Lazy(LazyRefusal::Check { error, .. }) | Front::Asked { error, .. } | Front::Check(error) =>
-            matches!(error, CheckFail::Tables { .. } | CheckFail::ReadsDiffer { .. }),
-        Front::Front(_)
-        | Front::Capped { .. }
-        | Front::Unlisted { .. }
-        | Front::NoMain
-        | Front::MainTakenBy { .. }
-        | Front::MainNotWritten { .. }
-        | Front::NoLangStart { .. }
-        | Front::Start { .. }
-        | Front::NoHostedStart
-        | Front::StartFact { .. }
-        | Front::TwoEntries { .. } => true,
-        _ => false,
     }
 }
 
@@ -502,12 +445,12 @@ pub(crate) mod refusal_tests {
         let named = || Named { path: "lib::callee".into(), at: blaze_ladder::front::At { file: 0, place: 80 } };
         let make = |why| ParentError::Walk { symbol, why: WalkError::Make { tabled: item, why } };
         let store = || StoreError::TwoValues { key: CodeKey(ContentId([7; 32])) };
-        assert_eq!(refused_instance(&ParentError::Walk { symbol, why: WalkError::Store(store()) }), None);
-        assert_eq!(refused_instance(&make(RunError::CodeRecord { function: named(), error: CodeRecordError::Store(store()) })), None);
-        assert_eq!(refused_instance(&ParentError::UndeclaredSlot { slot: 4 }), None);
+        assert_eq!(instance_site(&ParentError::Walk { symbol, why: WalkError::Store(store()) }), None);
+        assert_eq!(instance_site(&make(RunError::CodeRecord { function: named(), error: CodeRecordError::Store(store()) })), None);
+        assert_eq!(instance_site(&ParentError::UndeclaredSlot { slot: 4 }), None);
         let range = blaze_typeck::Range { start: 15, end: 22 };
         let why = RunError::Front2(blaze_ladder::front2::program::Front2Refusal::Literal { function: "lib::callee".into(), what: "an unsupported literal", range });
-        assert_eq!(refused_instance(&make(why)), Some((symbol, Some((item, range.start)))));
+        assert_eq!(instance_site(&make(why)), Some((symbol, Some((item, range.start)))));
     }
 
     /// A test's code blaze refuses (a static's data, a thread local, a lowering, an unwinding
@@ -521,14 +464,14 @@ pub(crate) mod refusal_tests {
         let named = || Named { path: "lib::callee".into(), at: blaze_ladder::front::At { file: 0, place: 80 } };
         let make = |why| ParentError::Walk { symbol, why: WalkError::Make { tabled: item, why } };
         let range = blaze_typeck::Range { start: 15, end: 22 };
-        assert_eq!(refused_instance(&make(RunError::UnwindRaised { function: named() })), Some((symbol, Some((item, 0)))));
-        assert_eq!(refused_instance(&make(RunError::Lower { refusals: std::vec::Vec::new(), shown: "a lowering".into() })), Some((symbol, Some((item, 0)))));
+        assert_eq!(instance_site(&make(RunError::UnwindRaised { function: named() })), Some((symbol, Some((item, 0)))));
+        assert_eq!(instance_site(&make(RunError::Lower { refusals: std::vec::Vec::new(), shown: "a lowering".into() })), Some((symbol, Some((item, 0)))));
         let literal = RunError::Front2(blaze_ladder::front2::program::Front2Refusal::Literal { function: "lib::callee".into(), what: "an unsupported literal", range });
         let carried = RunError::NotBuilt { refusal: std::boxed::Box::new(literal), not_built: 1, reached: 2 };
-        assert_eq!(refused_instance(&make(carried)), Some((symbol, Some((item, range.start)))), "a carried refusal is judged by what it carries");
+        assert_eq!(instance_site(&make(carried)), Some((symbol, Some((item, range.start)))), "a carried refusal is judged by what it carries");
         let store = RunError::CodeRecord { function: named(), error: CodeRecordError::Store(StoreError::TwoValues { key: CodeKey(ContentId([7; 32])) }) };
         let carried = RunError::NotBuilt { refusal: std::boxed::Box::new(store), not_built: 1, reached: 2 };
-        assert_eq!(refused_instance(&make(carried)), None, "planted: a carried store fault stops the suite");
+        assert_eq!(instance_site(&make(carried)), None, "planted: a carried store fault stops the suite");
     }
 
     /// Before (tempo a1425, 2026-11-21): a make the names records voided fell to `_` and stopped
@@ -542,11 +485,11 @@ pub(crate) mod refusal_tests {
         let item = ItemKey(3);
         let make = |why| ParentError::Walk { symbol, why: WalkError::Make { tabled: item, why } };
         let void = || RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled: item, first: "no record answers yet".into(), kept: 1, dropped: 0 }));
-        assert_eq!(refused_instance(&make(void())), Some((symbol, Some((item, 0)))));
+        assert_eq!(instance_site(&make(void())), Some((symbol, Some((item, 0)))));
         let carried = RunError::NotBuilt { refusal: std::boxed::Box::new(void()), not_built: 1, reached: 2 };
-        assert_eq!(refused_instance(&make(carried)), Some((symbol, Some((item, 0)))), "twin: a carried void is the test's too");
+        assert_eq!(instance_site(&make(carried)), Some((symbol, Some((item, 0)))), "twin: a carried void is the test's too");
         let store = StoreError::TwoValues { key: CodeKey(ContentId([7; 32])) };
-        assert_eq!(refused_instance(&ParentError::Walk { symbol, why: WalkError::Store(store) }), None, "control: a store fault stops the suite");
+        assert_eq!(instance_site(&ParentError::Walk { symbol, why: WalkError::Store(store) }), None, "control: a store fault stops the suite");
     }
 
     /// A walk bound the test's code passes (a name past its cap, the names' arena full, an item
@@ -558,12 +501,12 @@ pub(crate) mod refusal_tests {
         let (item, declarer) = (ItemKey(3), ItemKey(4));
         let walk = |why| ParentError::Walk { symbol, why };
         let recursion = WalkError::RecursionLimit { tabled: item, item, declarer: Some(declarer), depth: 129, limit: 128 };
-        assert_eq!(refused_instance(&walk(recursion)), Some((symbol, Some((item, 0)))));
+        assert_eq!(instance_site(&walk(recursion)), Some((symbol, Some((item, 0)))));
         let large = WalkError::NameTooLarge { tabled: item, declarer: Some(declarer), bytes: 1 << 30, most: 1 << 29, heads: [Some(item), None, None] };
-        assert_eq!(refused_instance(&walk(large)), Some((symbol, Some((item, 0)))));
+        assert_eq!(instance_site(&walk(large)), Some((symbol, Some((item, 0)))));
         let arena = WalkError::ArenaFull { tabled: item, bytes: 1 << 32, adding: 20 };
-        assert_eq!(refused_instance(&walk(arena)), Some((symbol, Some((item, 0)))));
-        assert_eq!(refused_instance(&walk(WalkError::Cap { most: 4 })), None, "control: the walk's own cap stops the suite");
+        assert_eq!(instance_site(&walk(arena)), Some((symbol, Some((item, 0)))));
+        assert_eq!(instance_site(&walk(WalkError::Cap { most: 4 })), None, "control: the walk's own cap stops the suite");
     }
 
     /// INVERTED (wave-1119, handoff c8): a failure of making an instance that no stopping class
@@ -581,19 +524,19 @@ pub(crate) mod refusal_tests {
         let named = || Named { path: "lib::callee".into(), at: blaze_ladder::front::At { file: 0, place: 80 } };
         let make = |why| ParentError::Walk { symbol, why: WalkError::Make { tabled: item, why } };
         let not_found = || LazyRefusal::NotFound { key: item, krate: "crate 91".into(), searched: "its item, module and variant rows".into() };
-        assert_eq!(refused_instance(&make(RunError::Front2(Front2Refusal::Lazy(not_found())))), Some((symbol, Some((item, 0)))));
+        assert_eq!(instance_site(&make(RunError::Front2(Front2Refusal::Lazy(not_found())))), Some((symbol, Some((item, 0)))));
         let carried = RunError::NotBuilt { refusal: std::boxed::Box::new(RunError::Front2(Front2Refusal::Lazy(not_found()))), not_built: 1, reached: 2 };
-        assert_eq!(refused_instance(&make(carried)), Some((symbol, Some((item, 0)))), "twin: carried by `NotBuilt`");
+        assert_eq!(instance_site(&make(carried)), Some((symbol, Some((item, 0)))), "twin: carried by `NotBuilt`");
         let row = Front2Refusal::Lazy(LazyRefusal::Row { function: "lib::callee".into(), refusal: std::boxed::Box::new(Front2Refusal::Lazy(not_found())) });
-        assert_eq!(refused_instance(&make(RunError::Front2(row))), Some((symbol, Some((item, 0)))), "twin: through a row's refusal");
+        assert_eq!(instance_site(&make(RunError::Front2(row))), Some((symbol, Some((item, 0)))), "twin: through a row's refusal");
         let unanswered = Front2Refusal::Lazy(LazyRefusal::Unanswered { question: "each_item", item: "crate 91".into() });
-        assert_eq!(refused_instance(&make(RunError::Front2(unanswered))), Some((symbol, Some((item, 0)))), "twin: a class no list names is the test's");
+        assert_eq!(instance_site(&make(RunError::Front2(unanswered))), Some((symbol, Some((item, 0)))), "twin: a class no list names is the test's");
         let store = RunError::CodeRecord { function: named(), error: CodeRecordError::Store(StoreError::TwoValues { key: CodeKey(ContentId([7; 32])) }) };
         let carried = RunError::NotBuilt { refusal: std::boxed::Box::new(store), not_built: 1, reached: 2 };
-        assert_eq!(refused_instance(&make(carried)), None, "planted: a carried store fault stops the suite");
+        assert_eq!(instance_site(&make(carried)), None, "planted: a carried store fault stops the suite");
         let capped = Front2Refusal::Capped { entry: "lib::main".into(), queued: 9, cap: 8, items: 9, forced: false, report: "".into() };
-        assert_eq!(refused_instance(&make(RunError::Front2(capped))), None, "control: the program's queue cap stops the suite");
-        assert_eq!(refused_instance(&make(RunError::TooManyInstances)), None, "control: the run's instance bound stops the suite");
+        assert_eq!(instance_site(&make(RunError::Front2(capped))), None, "control: the program's queue cap stops the suite");
+        assert_eq!(instance_site(&make(RunError::TooManyInstances)), None, "control: the run's instance bound stops the suite");
     }
 }
 
@@ -1480,6 +1423,12 @@ pub(crate) trait KeptMakers {
     fn make(&mut self, job: &Job<'static>, entry: &mut AVec<'_, u8>) -> Result<(), Unmade>;
     /// Everything kept for `suite` forgotten (after one of its makes panicked).
     fn forget(&mut self, suite: SuiteId);
+    /// `job`'s refused instance named, and `refusal.at` placed in its file, by the kept maker
+    /// that refused it, into `refusal` (in the command's heap): what the asking test's NOT RUN
+    /// prints, as the serial step's names and places it (run_parent.rs `Lazy::name_of`,
+    /// `Lazy::site_of`). A maker never made (the make refused before it) names nothing. Read
+    /// only on a refusal's path.
+    fn shown(&mut self, job: &Job<'static>, refusal: &mut CodeRefusal);
 }
 
 /// The one make of a worker (sans-IO, rule 14): `job` made into `scratch` by `makers`, copied
@@ -1495,7 +1444,12 @@ pub(crate) fn make_one(makers: &mut dyn KeptMakers, job: &Job<'static>, scratch:
             made.extend_from_slice(scratch.as_slice());
             Ok(made)
         }
-        Ok(Err(why)) => Err(crossing(why, alloc)),
+        Ok(Err(why)) => {
+            let mut refusal = crossing(why, alloc);
+            makers.shown(job, &mut refusal);
+            Err(refusal)
+        }
+        // The suite's makers are forgotten (half made): nothing names the instance but its fn.
         Err(_panicked) => {
             makers.forget(job.suite);
             Err(crossing(refused(job, PANICKED), alloc))
@@ -1504,30 +1458,71 @@ pub(crate) fn make_one(makers: &mut dyn KeptMakers, job: &Job<'static>, scratch:
 }
 
 /// `why` as it crosses to the command thread (run_parent.rs [`CodeRefusal`]): whose and where by
-/// [`refused_instance`], the serial path's own sorting, and its words as [`InstanceRefusal`] and
+/// [`instance_site`] over [`ParentError::scope`], the serial path's own sorting, and its words as [`InstanceRefusal`] and
 /// `ParentError::Walk` print them, in `alloc` (the command's heap).
 pub(crate) fn crossing(why: Unmade, alloc: SharedAlloc<'static>) -> CodeRefusal {
     use blaze_ladder::body_ids::WalkError;
 
-    let mut walk = String::new_in(alloc);
-    let mut whole = write!(walk, "{why}").is_ok();
+    let mut whole = true;
+    let walk = words(&why, alloc, &mut whole);
     let cause = match &why {
         WalkError::Make { why: blaze_ladder::run::RunError::Build { error, .. }, .. } => Some(words(error, alloc, &mut whole)),
         WalkError::Make { why, .. } => Some(words(why, alloc, &mut whole)),
         _ => None,
     };
     // The symbol is the command thread's (its asking row's), and the sorting does not read it.
-    let at = refused_instance(&ParentError::Walk { symbol: [0; 32], why }).and_then(|(_, at)| at);
-    CodeRefusal { at, cause, walk, whole }
+    let at = instance_site(&ParentError::Walk { symbol: [0; 32], why }).and_then(|(_, at)| at);
+    // Named and placed by the maker that refused it ([`KeptMakers::shown`]).
+    CodeRefusal { at, cause, walk, instance: None, site: None, whole }
 }
 
-/// `shown`'s words in `alloc`; `whole` cleared when the heap refused part of them.
+/// `shown`'s words in `alloc`, at most [`run_parent::MOST_REFUSAL_WORDS`] bytes (cut at a char's
+/// edge); `whole` cleared when they were cut there or the heap refused part of them.
 fn words(shown: &dyn fmt::Display, alloc: SharedAlloc<'static>, whole: &mut bool) -> String<SharedAlloc<'static>> {
-    let mut words = String::new_in(alloc);
+    let mut words = Capped { into: String::new_in(alloc) };
     if write!(words, "{shown}").is_err() {
         *whole = false;
     }
-    words
+    words.into
+}
+
+/// Words written up to [`run_parent::MOST_REFUSAL_WORDS`] bytes: past it the write fails, as
+/// the heap's refusal does, so [`words`] says the cut.
+struct Capped {
+    into: String<SharedAlloc<'static>>,
+}
+
+impl fmt::Write for Capped {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let room = run_parent::MOST_REFUSAL_WORDS.saturating_sub(self.into.len());
+        if text.len() <= room {
+            return self.into.try_push_str(text).map_err(|_| fmt::Error);
+        }
+        let mut end = room;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.into.try_push_str(&text[..end]).map_err(|_| fmt::Error)?;
+        Err(fmt::Error)
+    }
+}
+
+/// `job`'s instance and the place `refusal.at`, as `maker` shows them, into `refusal` (in its
+/// words' heap): the serial NOT RUN's printers ([`InstanceName`], lazy fill.rs `site_shown`).
+fn shown_by(maker: &TestMaker<'_>, job: &Job<'static>, refusal: &mut CodeRefusal) {
+    let alloc = *refusal.walk.allocator();
+    let mut whole = refusal.whole;
+    if let Some(shown) = maker.instance_shown(job.order.tabled, job.name.as_slice()) {
+        let named = crate::run_fault::Named::Shown { item: shown.item, args: shown.args };
+        // The symbol is printed only for a row-less name, which `Shown` is not.
+        refusal.instance = Some(words(&InstanceName(&named, [0; 32]), alloc, &mut whole));
+    }
+    if let Some((item, byte)) = refusal.at
+        && let Some((file, line, column)) = maker.site_shown(item, byte)
+    {
+        refusal.site = Some(run_parent::CrossedSite { file: words(&file, alloc, &mut whole), line, column });
+    }
+    refusal.whole = whole;
 }
 
 /// `job`'s refusal for `why`, as a make's (`Order::make`'s `WalkError::Make`).
@@ -1644,7 +1639,7 @@ pub(crate) trait MadeFor {
     fn made_for(&self) -> (Option<ItemKey>, MakerStart);
 }
 
-impl MadeFor for RunMaker<'_> {
+impl MadeFor for TestMaker<'_> {
     fn made_for(&self) -> (Option<ItemKey>, MakerStart) {
         Maker::made_for(self)
     }
@@ -1699,6 +1694,12 @@ impl<M: MadeFor> Makers<M> {
     pub(crate) fn forget(&mut self, suite: SuiteId) {
         self.kept.retain(|(kept, ..)| *kept != suite);
     }
+
+    /// The kept maker of `job`'s suite, entry and start, never made here: `None` when none is kept.
+    pub(crate) fn kept(&self, job: &Job<'_>) -> Option<&M> {
+        let (_, _, _, maker) = self.kept.iter().find(|(suite, entry, start, _)| *suite == job.suite && *entry == job.entry && *start == job.start)?;
+        Some(maker)
+    }
 }
 
 /// What one suite's makes read, shared read only by every worker (run_names.rs `RunCrates`):
@@ -1707,6 +1708,8 @@ impl<M: MadeFor> Makers<M> {
 pub(crate) struct SuiteSide<'s> {
     pub crates: crate::run_names::RunCrates<'s>,
     pub builder: Builder,
+    /// The command's make watch ([`Launched::make_watch`]): every worker's makers are handed it.
+    pub make_watch: blaze_ladder::run::make_one::MakeWatch<'static>,
 }
 
 /// The words of a make whose suite's names records could not be made on its worker.
@@ -1727,7 +1730,7 @@ pub(crate) struct SuiteMakers<'w> {
     frame: &'w Frame,
     tables: Alloc<'static>,
     names: AVec<'static, Option<NamesRecords<'w>>>,
-    makers: Makers<RunMaker<'w>>,
+    makers: Makers<TestMaker<'w>>,
 }
 
 impl<'w> SuiteMakers<'w> {
@@ -1757,7 +1760,11 @@ impl KeptMakers for SuiteMakers<'_> {
             }
         };
         let tables = self.tables;
-        let maker = self.makers.of(job, || Ok(Maker::of_start(names, job.entry, job.start, SecondCheck, &side.builder, tables)))?;
+        let maker = self.makers.of(job, || {
+            let mut maker = Maker::of_start(names, job.entry, job.start, SecondCheck, &side.builder, tables);
+            maker.watch(side.make_watch);
+            Ok(maker)
+        })?;
         job.order.make(maker, &job.proof, job.name.as_slice(), entry)
     }
 
@@ -1765,6 +1772,12 @@ impl KeptMakers for SuiteMakers<'_> {
         self.makers.forget(suite);
         if let Some(slot) = self.names.get_mut(suite.0 as usize) {
             *slot = None;
+        }
+    }
+
+    fn shown(&mut self, job: &Job<'static>, refusal: &mut CodeRefusal) {
+        if let Some(maker) = self.makers.kept(job) {
+            shown_by(maker, job, refusal);
         }
     }
 }
@@ -1864,7 +1877,6 @@ struct Parked {
 enum Came {
     Made,
     Failed(ParentError),
-    Elsewhere { first: Child },
     Late { waited: u64 },
 }
 
@@ -1899,6 +1911,9 @@ pub(crate) struct Launched<'c, 'h> {
     pub lent: &'c CommandLent,
     pub tables: Alloc<'static>,
     pub watch: &'c dyn Watch,
+    /// What its makers report their large or slow makes with: the command's one clock
+    /// (run_parent.rs `command_make_watch`, made in [`run_suites`]).
+    pub make_watch: blaze_ladder::run::make_one::MakeWatch<'static>,
     /// Its suite's native library ([`Suite::native`]), as `blaze run` starts its program
     /// (own_process.rs `run_own`): named in the start (`BLAZE_LAUNCH_NATIVE`), told as the first
     /// frame (`Down::Native`, before the personality and any `Declare`), and the one file the
@@ -2063,9 +2078,11 @@ impl<'c> Launched<'c, '_> {
         let temp = bstd::mem::format_in!(frame, "{}/{row}", self.temp);
         // 2. The lazy parent with the test's roots; nothing built yet.
         let exports = self.native.map_or(&[][..], |send| send.items);
-        let front = TestFront { names: self.names, ids: self.ids, builder: self.builder, tables: self.tables, alloc, test, exports, harness: self.tests.harnessed(), watch: self.watch };
+        let front = TestFront { names: self.names, ids: self.ids, builder: self.builder, tables: self.tables, alloc, test, exports, harness: self.tests.harnessed(), watch: self.watch, make_watch: self.make_watch };
         let mut codes = HomeCodeStore::new(self.lent);
-        let mut lazy = Lazy::new(cx, front, RecordsDir { cx, dir: self.records }, &mut codes, self.builder, alloc);
+        // THE SEAM LINE: how the records reach the program (run_bytes.rs `Delivery`; `Inline`
+        // sends them over descriptor 3 and files none).
+        let mut lazy = Lazy::new(cx, front, Chosen::of(Delivery::Files, RecordsDir { cx, dir: self.records }, alloc), &mut codes, self.builder, alloc);
         // Its place in the relay, told its end however the run ends (D194).
         let child = Child(self.child_base + row as usize);
         let _asking = self.codes.map(|code| Asking { code, child });
@@ -2147,8 +2164,8 @@ impl<'c> Launched<'c, '_> {
                         Ok(()) => Came::Made,
                         Err(cause) => Came::Failed(cause),
                     },
-                    Reply::Refused(why) => Came::Failed(lazy.refused(why)),
-                    Reply::RefusedElsewhere { first, .. } => Came::Elsewhere { first },
+                    // Every asker of the key is handed the same refusal (rule 19).
+                    Reply::Refused(why) => Came::Failed(lazy.refused(why.for_asker())),
                     Reply::Late { waited, .. } => Came::Late { waited },
                 })?;
                 if let Some(came) = came {
@@ -2157,10 +2174,6 @@ impl<'c> Launched<'c, '_> {
                     let stop = match came {
                         Came::Made => None,
                         Came::Failed(cause) => Some(test_parent_error(&mut lazy, cause)),
-                        Came::Elsewhere { first } => Some(match lazy.withdraw() {
-                            Ok(()) => OneError::CannotBuild(InstanceRefusal { instance: lazy.name_of(park.symbol), symbol: park.symbol, site: None, cause: RefusalCause::Elsewhere { first: first.0 } }),
-                            Err(cause) => OneError::Parent(cause),
-                        }),
                         Came::Late { waited } => Some(match lazy.withdraw() {
                             Ok(()) => OneError::CodeLate { instance: lazy.name_of(park.symbol), symbol: park.symbol, waited },
                             Err(cause) => OneError::Parent(cause),
@@ -2387,7 +2400,7 @@ impl<'c> Launched<'c, '_> {
             if let Some(fault) = fault {
                 let mut bytes = bstd::mem::Bytes::new_in(frame, "the code record a test struck in");
                 let record = match fault.at {
-                    Some(spot) if spot.placed == blaze_launch::wire::fault::Placed::Code => Some(lazy.folder().read(&spot.record, &mut bytes).map(|()| bytes.as_slice())),
+                    Some(spot) if spot.placed == blaze_launch::wire::fault::Placed::Code => Some(lazy.read_record(&spot.record, &mut bytes).map(|()| bytes.as_slice())),
                     _ => None,
                 };
                 err.line(cx, format_args!("{}", crate::run_fault::report(fault, &mut lazy, record))).map_err(diagnostic)?;
@@ -2450,12 +2463,14 @@ pub(crate) struct TestFront<'s, 'h, 'r> {
     /// The Rust fns the test binary's C calls (its image's words, `NativeSend::items`): roots.
     pub exports: &'s [LibKey],
     pub watch: &'s dyn Watch,
+    /// The command's make watch ([`Launched::make_watch`]), handed to each maker made.
+    pub make_watch: blaze_ladder::run::make_one::MakeWatch<'static>,
 }
 
 impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
     type Start = Roots<'r>;
     type Ids = &'s RunIds<'h>;
-    type Maker = RunMaker<'h>;
+    type Maker = TestMaker<'h>;
 
     fn start(&mut self) -> Result<Roots<'r>, ParentError> {
         entry_roots(self.harness, self.names, self.test, self.exports, self.builder, self.tables, self.alloc).map_err(ParentError::Roots)
@@ -2465,10 +2480,12 @@ impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
         Ok(self.ids)
     }
 
-    fn maker(&mut self, start: &Roots<'r>) -> Result<RunMaker<'h>, ParentError> {
+    fn maker(&mut self, start: &Roots<'r>, _ids: &&'s RunIds<'h>) -> Result<TestMaker<'h>, ParentError> {
         // The test's roots start its program at the test fn (`MakerStart::Direct`), not at `main`.
-        // The typing is the run's (run_parent.rs `RunMaker`: the flip changes both).
-        Ok(Maker::of_roots(self.names, start.maker_entry(), start, SecondCheck, &self.builder, self.tables))
+        // The typing is the test's ([`TestMaker`]: the workers' too).
+        let mut maker = Maker::of_roots(self.names, start.maker_entry(), start, SecondCheck, &self.builder, self.tables);
+        maker.watch(self.make_watch);
+        Ok(maker)
     }
 
     /// As run_parent.rs `CommandFront::path_of`: the one printer over the names records.
@@ -2478,7 +2495,7 @@ impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
         blaze_ladder::front2::item_shown::ItemShown::of_lib(self.names.records, lib).path().map(Box::from)
     }
 
-    fn named(&mut self, maker: Option<&RunMaker<'h>>, tabled: ItemKey, name: &[u8]) -> crate::run_fault::Named {
+    fn named(&mut self, maker: Option<&TestMaker<'h>>, tabled: ItemKey, name: &[u8]) -> crate::run_fault::Named {
         use crate::run_fault::Named;
         if let Some(shown) = maker.and_then(|maker| maker.instance_shown(tabled, name)) {
             return Named::Shown { item: shown.item, args: shown.args };
@@ -2489,7 +2506,7 @@ impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
         }
     }
 
-    fn site_shown(&mut self, maker: Option<&RunMaker<'h>>, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
+    fn site_shown(&mut self, maker: Option<&TestMaker<'h>>, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
         let (file, line, column) = maker?.site_shown(item, site)?;
         Some(crate::run_fault::SiteShown { file: Box::from(file), line, column })
     }
@@ -2729,9 +2746,12 @@ pub(crate) fn run_suites<'h>(
     args: &[&str], lent: &CommandLent, root: &Dir<ReadWrite>, procs: crate::job_texts::Procs<'_>, heap: &'static blaze_own::Heap, watch: &dyn Watch, frame: &Frame,
 ) -> Result<Status, DriveError> {
     let tables = heap.alloc();
+    // The command's one make watch (rule 75: its clock started here, at the edge), handed to
+    // every maker, the serial turns' and each code worker's (rule 16: a large or slow make's line).
+    let make_watch = crate::run_parent::command_make_watch();
     match CODES {
-        Codes::Serial => run_selected(cx, io, suites, ids, config, args, lent, tables, watch, frame, None),
-        Codes::Pooled => pooled(cx, io, suites, root, procs, heap, |relay| run_selected(cx, io, suites, ids, config, args, lent, tables, watch, frame, Some(relay))),
+        Codes::Serial => run_selected(cx, io, suites, ids, config, args, lent, tables, watch, make_watch, frame, None),
+        Codes::Pooled => pooled(cx, io, suites, root, procs, heap, make_watch, |relay| run_selected(cx, io, suites, ids, config, args, lent, tables, watch, make_watch, frame, Some(relay))),
     }
 }
 
@@ -2744,8 +2764,10 @@ pub(crate) fn run_suites<'h>(
 /// What is shared and what is not (the doc of run_names.rs `RunCrates`): each worker reads the
 /// suites' crates in place and makes its own names records, trees, environments and makers; the
 /// proc-macro runner, made by need on this thread, is relayed ([`CodePool::finished`]).
+#[expect(clippy::too_many_arguments, reason = "the command supplies the suites, the workers' inputs and the run")]
 fn pooled<'h>(
     cx: &Cx, io: &Io, suites: &[Suite<'_, 'h>], root: &Dir<ReadWrite>, procs: crate::job_texts::Procs<'_>, heap: &'static blaze_own::Heap,
+    make_watch: blaze_ladder::run::make_one::MakeWatch<'static>,
     run: impl FnOnce(&CodeRelay<'_>) -> Result<Status, DriveError>,
 ) -> Result<Status, DriveError> {
     let cx = cx.span("blaze test: the command's code workers");
@@ -2757,7 +2779,7 @@ fn pooled<'h>(
     };
     let lanes = Lanes::new(most, heap);
     let mut sides: AVec<'static, SuiteSide<'_>> = Vec::with_capacity_in(suites.len(), heap.alloc());
-    sides.extend(suites.iter().map(|suite| SuiteSide { crates: suite.crates, builder: suite.builder }));
+    sides.extend(suites.iter().map(|suite| SuiteSide { crates: suite.crates, builder: suite.builder, make_watch }));
     let sides = sides.as_slice();
     let side = ProcsSide::of(procs);
     let children = suites.iter().map(|suite| suite.unit.tests.len()).sum::<usize>();
@@ -2807,7 +2829,7 @@ fn pooled<'h>(
 #[expect(clippy::too_many_arguments, reason = "the command supplies the selected records and runtime capabilities")]
 fn run_selected<'h>(
     cx: &Cx, io: &Io, suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, config: LoopConfig<'_>,
-    args: &[&str], lent: &CommandLent, tables: Alloc<'static>, watch: &dyn Watch, frame: &Frame,
+    args: &[&str], lent: &CommandLent, tables: Alloc<'static>, watch: &dyn Watch, make_watch: blaze_ladder::run::make_one::MakeWatch<'static>, frame: &Frame,
     relay: Option<&CodeRelay<'_>>,
 ) -> Result<Status, DriveError> {
     let cx = cx.span("blaze test: selected suites");
@@ -2878,7 +2900,7 @@ fn run_selected<'h>(
             err: &err, package: unit.package, target: unit.target,
             cx: &cx, spawner: &spawner, launcher: launcher.as_str(), records: &records, store: store.as_str(),
             temps: dir, temp: temp.as_str(), env: vars.as_slice(), place: suite.place, tests, names: suite.names, ids,
-            builder: suite.builder, lent, tables, watch,
+            builder: suite.builder, lent, tables, watch, make_watch,
             args: if tests.harnessed() { &[] } else { args },
             native: suite.native.ok().flatten(),
             codes: relay,

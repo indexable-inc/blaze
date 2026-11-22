@@ -437,6 +437,7 @@ pub(crate) fn compile<'d>(def: &'d MacroDefinition<'d>) -> Result<Program<'d>, E
         };
         let result = match (def.kind(), c.params) {
             (MacroKind::Macro2, Some(params)) => c.macro2_simple(params),
+            // astlog-ignore: expand-hand-extent (the macro language: a `macro` item's rule separators)
             (MacroKind::Macro2, None) => c.rules(&[';', ',']),
             _ => c.rules(&[';']),
         };
@@ -666,6 +667,7 @@ impl<'d, 'f> Compiler<'_, 'd, 'f> {
         if !self.expect_char(c, &['=']) {
             return Err(DefError::Message("expected `=`").into());
         }
+        // astlog-ignore: expand-hand-extent (the macro language: a rule's `=>`)
         if !self.expect_char(c, &['>']) {
             return Err(DefError::Message("expected `>`").into());
         }
@@ -1125,6 +1127,7 @@ impl<'d, 'f> Compiler<'_, 'd, 'f> {
             "count" => {
                 self.expect_dollar(&mut args)?;
                 let name = self.expect_ident(&mut args, false)?;
+                // astlog-ignore: expand-hand-extent (the macro language: `${count($x, depth)}`)
                 let comma = matches!(self.kind(args), Some(TokenKind::Punct { char: ',', .. }));
                 let depth = match comma {
                     true => {
@@ -1157,6 +1160,7 @@ impl<'d, 'f> Compiler<'_, 'd, 'f> {
                         }
                     };
                     self.program.concat.push(elem);
+                    // astlog-ignore: expand-hand-extent (the macro language: `${concat(a, $b)}`)
                     if !args.is_empty() && !self.expect_char(&mut args, &[',']) {
                         self.program.concat.truncate(start as usize);
                         return None;
@@ -1241,17 +1245,21 @@ pub(crate) fn glued_len(kind_at: impl Fn(u32) -> Option<TokenKind>, at: u32) -> 
 pub(crate) fn glue(left: &str, right: char) -> Option<&'static str> {
     Some(match (left, right) {
         ("=", '=') => "==",
+        // astlog-ignore: expand-hand-extent (rustc's operator glue table)
         ("=", '>') => "=>",
         ("<", '=') => "<=",
+        // astlog-ignore: expand-hand-extent (the glue table)
         ("<", '<') => "<<",
         ("<", '-') => "<-",
         ("<<", '=') => "<<=",
         (">", '=') => ">=",
+        // astlog-ignore: expand-hand-extent (the glue table)
         (">", '>') => ">>",
         (">>", '=') => ">>=",
         ("!", '=') => "!=",
         ("+", '=') => "+=",
         ("-", '=') => "-=",
+        // astlog-ignore: expand-hand-extent (the glue table)
         ("-", '>') => "->",
         ("*", '=') => "*=",
         ("/", '=') => "/=",

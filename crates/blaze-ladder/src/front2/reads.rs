@@ -124,6 +124,11 @@ pub enum FactKind {
     /// member's visibility, kept in its impl's head, against the body's module). `key`: the
     /// impl; `detail`: the member's name and the body's module.
     MemberVisible = 27,
+    /// Whether an inherent impl's member is unstable under a feature the body's crate does not
+    /// turn on (`Question::MemberUnstable`: the member's `#[unstable]`, kept in its impl's head,
+    /// against the crate root's `#![feature]` list). `key`: the impl; `detail`: the member's
+    /// name and the body's module.
+    MemberUnstable = 28,
 }
 
 /// One fact a body's check asked for (module docs). Ordered as its bytes are
@@ -371,6 +376,8 @@ pub fn fact_of(q: Question, module: tc::ItemKey, paths: &[BodyPath], segments: &
         Question::FieldDefaults(adt) => about(FactKind::FieldDefaults, adt, 0),
         // The answer is the body's module's: two bodies of one module that ask it are one fact.
         Question::MemberVisible(container, name) => about(FactKind::MemberVisible, container, part(&(name, module))),
+        // The answer is of the body's crate (its `#![feature]` list); the module names it.
+        Question::MemberUnstable(container, name) => about(FactKind::MemberUnstable, container, part(&(name, module))),
     })
 }
 

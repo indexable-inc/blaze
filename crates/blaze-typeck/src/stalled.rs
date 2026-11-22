@@ -83,7 +83,11 @@ pub enum StalledError {
     /// The solver left the goal open on the exact interior. `site` is the
     /// obligation's range. `storage` identifies a block and stored type when
     /// probing that type separately reproduced the ambiguity.
-    Ambiguous { trait_: ItemKey, site: crate::ids::Range, storage: Option<(ExprId, PTy)> },
+    /// `undecided` is the goal under it that is undecided by itself and why
+    /// ([`crate::UndecidedLeaf`], the solver's undecided walk on the same goal). It is `None`
+    /// when the walk found no undecided goal, or for the structural No on a local future that
+    /// names no stored value.
+    Ambiguous { trait_: ItemKey, site: crate::ids::Range, storage: Option<(ExprId, PTy)>, undecided: Option<crate::error::UndecidedLeaf> },
     /// The world had no answer to `Question` (a closure's facts, the owner's predicates).
     Need(Question),
     /// The check's own error while importing or solving.
@@ -273,7 +277,16 @@ fn decide<'a, W: World>(
                     if let Some(why) = unavailable_witness(source, row.diag.at, types, exact, reads, alloc)? {
                         return Err(why);
                     }
-                    return Err(StalledError::Ambiguous { trait_: row.trait_, site: row.diag.at, storage });
+                    // What it rests on (rule 19): the solver's undecided walk on the same goal,
+                    // in a probe (nothing is bound). It is bounded by the solver's
+                    // `MAX_WHY_ROWS` and `MAX_WHY_DEPTH`.
+                    let mut steps: Vec<PendingWhyStep, Alloc<'_>> = Vec::new_in(alloc);
+                    let undecided = cx.why_maybe_chain(goal, &mut steps, reads)?.map(|leaf| crate::error::UndecidedLeaf {
+                        trait_: steps.iter().rev().find_map(|s| s.goal.map(|(t, _)| t)),
+                        depth: u32::try_from(steps.len().saturating_sub(1)).unwrap_or(u32::MAX),
+                        leaf,
+                    });
+                    return Err(StalledError::Ambiguous { trait_: row.trait_, site: row.diag.at, storage, undecided });
                 }
             }
         }
@@ -297,7 +310,7 @@ fn decide<'a, W: World>(
                     {
                         // A structural No for a local future must have a non-Send/non-Sync
                         // capture or saved value. The root failure alone cannot identify one.
-                        return Err(StalledError::Ambiguous { trait_: row.trait_, site: row.diag.at, storage: None });
+                        return Err(StalledError::Ambiguous { trait_: row.trait_, site: row.diag.at, storage: None, undecided: None });
                     }
                     unsize_storage(row, goal, body, types, exact, &mut cx, reads, alloc)?
                 }

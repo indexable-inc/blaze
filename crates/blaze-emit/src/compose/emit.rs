@@ -59,11 +59,22 @@
 //!
 //! # What this tier refuses by name (the Reference tier serves them)
 //!
-//! Values that are not an integer of at most 64 bits, a pointer, an `f32` or an `f64` (compounds,
-//! `i128`, vectors); `sret`/`byval` parameters, more arguments than registers, calls returning two
-//! values; landing blocks, `invoke`, `resume`; atomics, fences, bulk memory, `asm`, intrinsics,
-//! thread-locals, the function's own data, tail calls, coroutines' `suspend`; a frame of 16 MiB
-//! or more, or a slot aligned past 16 bytes.
+//! Values that are not an integer of at most 64 bits, a pointer, an `f32` or an `f64` (compounds
+//! other than an overflow operation's or a `cmpxchg`'s pair, which lives in its cell:
+//! `Composer::overflow`, `Composer::atomic`; `i128`, vectors); `sret`/`byval` parameters, more
+//! arguments than registers, calls returning two values; landing blocks, `invoke`, `resume`;
+//! atomics of an `i1` or a float, bulk memory, `asm`, target intrinsics, a thread-local's
+//! `data_addr` (its `tls_addr` is served: `Composer::tls_addr`), tail calls, coroutines'
+//! `suspend`; a frame of 16 MiB or more, or a slot aligned past 16 bytes; the function's own
+//! data aligned past a page (as the Reference tier).
+//!
+//! # The function's own data
+//!
+//! A `data_addr` of an own row is an own-data site (`adrp; add` with `Page21` and `PageOff12 {
+//! scale: 0 }` relocations to `OWN_CODE` or `OWN_RELRO` plus the row's offset), the rows placed
+//! after the code as the Reference tier's record form places them (pass/sites.rs): a row
+//! holding no address in the code part, one holding addresses in the relro part with a relro
+//! word per address (`Composer::place_rows`).
 //!
 //! # Scratch registers (end-state.md D193 point 6)
 //!
@@ -74,11 +85,11 @@
 //! past one page under the saved registers is probed by the `glue::PROBE` template (the
 //! Reference tier's sequence, pass/probe.rs, with its count in a lent temporary).
 
-use blaze_code::record::{SiteKind, Space, Symbol, Target};
+use blaze_code::record::{OWN_CODE, OWN_RELRO, PositionField, PositionPart, PositionRow, SiteKind, Space, Symbol, Target, Word as RelroWord};
 use blaze_code::unwind::{Action, Frame, INST, Row};
-use blaze_lir::func::{BlockKind, Ext, ParamKind, RefKind, SigId};
+use blaze_lir::func::{BlockKind, DataId, Ext, ParamKind, RefId, RefKind, SigId};
 use blaze_lir::op::{Field as LirField, Layout, Target as Edge, Word, walk};
-use blaze_lir::{Block, IntCond, Op, Ty, Value, View};
+use blaze_lir::{Block, Flags, IntCond, Op, Ordering, Ty, Value, View};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_tier::table::{RESULT, TEMP0, TEMP1};
 use blaze_tier::{
@@ -88,7 +99,7 @@ use blaze_tier::{
 
 use super::analysis::{Analysis, Home};
 use super::loop_map::slot_of;
-use super::scratch::{Pool, Scratch, ScratchError, Use};
+use crate::scratch::{Pool, Scratch, ScratchError, Use};
 use crate::pass::probe::PROBE_STEP;
 
 /// The C name of the runtime's poll page: the launcher maps it readable, and makes it unreadable
@@ -142,6 +153,25 @@ pub(crate) mod glue {
     /// The variant of a cell access or slot address past the near form's reach: `add TEMP0 (or
     /// the result), sp, #hi, lsl #12`, then the access at `#lo` from it.
     pub(crate) const FAR: u8 = 1;
+
+    /// A `fence` that orders loads only (`dmb ishld`: an acquire fence).
+    pub(crate) const FENCE_LOADS: u8 = 0;
+    /// A `fence` that orders every access (`dmb ish`: release, acq_rel, seq_cst).
+    pub(crate) const FENCE_ALL: u8 = 1;
+
+    /// An atomic's variant: bit 0 when it releases, bit 1 when it acquires (pass/atomic.rs
+    /// `sides`), bits 2.. an `atomic_rmw`'s kind (`AtomicRmw as u8`; 0 for the other atomics).
+    pub(crate) const fn atomic(rmw: u8, acq: bool, rel: bool) -> u8 {
+        (rmw << 2) | ((acq as u8) << 1) | rel as u8
+    }
+
+    /// A `tls_addr`'s first template: the thread's root address on `os` (`Os as u8`).
+    pub(crate) const fn tls_root(os: blaze_tier::Os) -> u8 {
+        os as u8
+    }
+
+    /// A `tls_addr`'s second template: the table lookup and, failing it, the getter's call.
+    pub(crate) const TLS_LOOKUP: u8 = 2;
 
     const fn p(op: Op, width: u8, variant: u8, result: Form, operands: [Form; 4]) -> Pattern {
         Pattern { op, width, variant, result, operands, inner: None }
@@ -267,6 +297,14 @@ pub(crate) mod glue {
     /// the import word's value, for `func_addr` and `data_addr`.
     pub(crate) const fn address(op: Op) -> Pattern {
         p(op, 64, 0, Form::Reg(RegClass::Gpr), [Form::Site(SiteKind::Load), N, N, N])
+    }
+
+    /// `adrp RESULT, row@PAGE; add RESULT, RESULT, row@PAGEOFF` (a `Site(Relro)` field): the
+    /// address of a row of the function's own data, in the record's code or relro part (T1's
+    /// row "a byte of the record's relro part"; the composer's `Page21` and `PageOff12 { scale:
+    /// 0 }` relocations name `OWN_CODE` or `OWN_RELRO` and the row's offset there).
+    pub(crate) const fn own_address() -> Pattern {
+        p(Op::DataAddr, 64, 0, Form::Reg(RegClass::Gpr), [Form::Site(SiteKind::Relro), N, N, N])
     }
 
     /// `add RESULT, sp, #off` (a `Frame { scale: 0 }` field).
@@ -466,6 +504,18 @@ struct Composer<'v, 'r, 'a> {
     poll_target: u32,
     /// The saved pairs, in the prologue's order.
     pairs: AVec<'a, (Reg, Reg)>,
+    /// Per row of the function's own data: its index among the placed rows, or `NONE`.
+    row_index: AVec<'a, u32>,
+    /// The rows to place after the code, in the order first reached (a `data_addr`, or a word
+    /// of a placed row).
+    rows: AVec<'a, u32>,
+    /// Per placed row, once placed: in the relro part (else the code), and its offset there.
+    row_at: AVec<'a, (bool, u32)>,
+    /// Each own-data site: its `Page21` relocation's index (the `PageOff12` follows) and the
+    /// placed row it reaches, resolved when the rows are placed.
+    own_sites: AVec<'a, (u32, u32)>,
+    /// Each relro word naming another own row: (the word's offset, the placed row, the addend).
+    inner: AVec<'a, (u32, u32, i64)>,
 }
 
 /// The emission pass: `view` as `an` says, every instruction from `table` (piece K2).
@@ -546,6 +596,11 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
             moves: Vec::new_in(alloc),
             poll_target: NONE,
             pairs: Vec::new_in(alloc),
+            row_index: Vec::from_elem_in(NONE, view.datas.len(), alloc),
+            rows: Vec::new_in(alloc),
+            row_at: Vec::new_in(alloc),
+            own_sites: Vec::new_in(alloc),
+            inner: Vec::new_in(alloc),
         };
         c.positions()?;
         c.occurrences(alloc)?;
@@ -904,7 +959,13 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
                     }
                     site_at = at;
                     if kind == SiteKind::Relro {
-                        return Err(bad_field(k as u32, "a relro site (the function's own data is the Reference tier's)"));
+                        // An own-data site: `target` is the placed row's index; the part and the
+                        // row's offset there are filled when the rows are placed (`place_rows`).
+                        self.own_sites.push((self.out.relocs.len() as u32, target));
+                        self.out.relocs.push(Reloc { at, in_relro: false, kind: RelocKind::Page21, target: OWN_CODE, addend: 0 });
+                        let off = RelocKind::PageOff12 { scale: 0 };
+                        self.out.relocs.push(Reloc { at: at + INST, in_relro: false, kind: off, target: OWN_CODE, addend: 0 });
+                        continue;
                     }
                     self.out.relocs.push(Reloc { at, in_relro: false, kind: RelocKind::GotPage21, target, addend: 0 });
                     self.out.relocs.push(Reloc { at: at + INST, in_relro: false, kind: RelocKind::GotPageOff12, target, addend: 0 });
@@ -1155,6 +1216,15 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
         self.temps = self.temps.with(r);
         self.pinned = self.pinned.with(r);
         Ok(r)
+    }
+
+    /// A loaded or stored value's register class and width: [`Composer::class_of`]'s, an `i1`
+    /// refused (memory holds whole bytes: the Reference tier's rule, pass.rs, and the evaluator's).
+    fn access_width(&self, v: Value) -> Result<(RegClass, u8), TierError> {
+        match self.class_of(v)? {
+            (RegClass::Gpr, 1) => Err(refused(self.inst, "an access of an `i1` (memory holds whole bytes)")),
+            it => Ok(it),
+        }
     }
 
     /// A value's register class, or the refusal of its type.
@@ -1534,7 +1604,9 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
                 let mut i = view.operands(inst);
                 let _ = i.value();
                 let index = i.value();
-                ptr.index() == inst && off == 0 && self.const_bits(index.index()).is_none()
+                // A 64-bit index only: the fused `[rn, rm]` adds the register as it is, where a
+                // narrower `ptr_add` offset is sign-extended first (its own template's).
+                ptr.index() == inst && off == 0 && view.ty(index).bits(64) == 64 && self.const_bits(index.index()).is_none()
             }
             _ => false,
         }
@@ -1578,13 +1650,10 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
                 let forms = [Form::Imm(ImmClass::Mov16), Form::None, Form::None, Form::None];
                 self.put(Pattern { op, width: 0, variant: 0, result: Form::None, operands: forms, inner: None }, &args)?;
             }
+            Op::Fence | Op::AtomicLoad | Op::AtomicStore | Op::AtomicRmw | Op::Cmpxchg => self.atomic(inst, op)?,
+            Op::TlsAddr => self.tls_addr(inst)?,
             Op::Param
             | Op::Vconst
-            | Op::Fence
-            | Op::AtomicLoad
-            | Op::AtomicStore
-            | Op::AtomicRmw
-            | Op::Cmpxchg
             | Op::Memcpy
             | Op::Memmove
             | Op::Memset
@@ -1593,11 +1662,13 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
             | Op::MaskedStore
             | Op::Gather
             | Op::Scatter
-            | Op::TlsAddr
             | Op::FrameAddress
             | Op::ReturnAddress
-            | Op::StackPointer
-            | Op::Project => return Err(refused(inst, op.name())),
+            | Op::StackPointer => return Err(refused(inst, op.name())),
+            Op::UaddOverflow | Op::SaddOverflow | Op::UsubOverflow | Op::SsubOverflow | Op::UmulOverflow | Op::SmulOverflow => {
+                self.overflow(inst, op)?
+            }
+            Op::Project => self.project(inst)?,
             _ => self.generic(inst, op)?,
         }
         self.after(inst);
@@ -1752,6 +1823,206 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
         Ok(())
     }
 
+    /// An overflow operation's pair, in its cell as the Reference tier lays it out (pass/int.rs
+    /// `overflow`): the wrapped result at +0 (the plain `add`/`sub`/`mul` template), whether it
+    /// overflowed at +8 (the flag template, table_gen arm64.rs `overflows`). A pair has no
+    /// register class, so it lives in its cell only and each `project` loads its member.
+    fn overflow(&mut self, inst: usize, op: Op) -> Result<(), TierError> {
+        let mut o = self.view.operands(inst);
+        let (a, b) = (o.value(), o.value());
+        let (class, width) = self.class_of(a)?;
+        if class != RegClass::Gpr {
+            return Err(refused(inst, "an overflow operation on a value that is not an integer"));
+        }
+        let cell = self.cell[inst];
+        if cell == NONE {
+            return Err(refused(inst, "an overflow operation's pair with no cell"));
+        }
+        let wrapped = match op {
+            Op::UaddOverflow | Op::SaddOverflow => Op::Add,
+            Op::UsubOverflow | Op::SsubOverflow => Op::Sub,
+            _ => Op::Mul,
+        };
+        let mut args = [Arg::None; 7];
+        args[0] = Arg::Reg(self.operand(a)?);
+        args[1] = Arg::Reg(self.operand(b)?);
+        let t = self.temp(RegClass::Gpr)?;
+        args[RESULT as usize] = Arg::Reg(t);
+        let gpr = Form::Reg(RegClass::Gpr);
+        let of = |op| Pattern { op, width, variant: 0, result: gpr, operands: [gpr, gpr, Form::None, Form::None], inner: None };
+        self.emit_op(of(wrapped), &args, false)?;
+        self.store_cell(t, cell)?;
+        self.emit_op(of(op), &args, false)?;
+        self.store_cell(t, cell + 8)?;
+        self.in_cell[inst] = true;
+        self.loc[inst] = Loc::Cell;
+        Ok(())
+    }
+
+    /// `fence`, `atomic_load`, `atomic_store`, `atomic_rmw` and `cmpxchg` of 8 to 64 bits, by
+    /// the Reference tier's Armv8.0 mapping (pass/atomic.rs; the templates are table_gen/arm64.rs
+    /// `atomics`, their variants `glue::atomic`). An exclusive loop's status register is a
+    /// temporary handed as an operand. `cmpxchg`'s pair lives in its cell like an overflow pair:
+    /// the old value at +0, and at +8 whether it was `expected` (an `icmp eq` of the two, both
+    /// zero-extended). A single-thread fence emits nothing: this tier keeps every access in
+    /// program order. An `i1`, float or wider atomic is the Reference tier's.
+    fn atomic(&mut self, inst: usize, op: Op) -> Result<(), TierError> {
+        let view = self.view;
+        let flags = view.flags(inst);
+        let ordering = flags.ordering().ok_or(refused(inst, "an atomic ordering that is none of the five"))?;
+        let (acq, rel) = crate::pass::atomic::sides(ordering);
+        let gpr = Form::Reg(RegClass::Gpr);
+        let n = Form::None;
+        let mut o = view.operands(inst);
+        let mut args = [Arg::None; 7];
+        let pattern = |width, variant, result, operands| Pattern { op, width, variant, result, operands, inner: None };
+        match op {
+            Op::Fence => {
+                if flags.contains(Flags::SINGLE_THREAD) {
+                    return Ok(());
+                }
+                let variant = match ordering {
+                    Ordering::Acquire => glue::FENCE_LOADS,
+                    _ => glue::FENCE_ALL,
+                };
+                self.emit_op(pattern(0, variant, n, [n; 4]), &args, false).map(drop)
+            }
+            Op::AtomicLoad => {
+                let ptr = o.value();
+                let width = self.atomic_width(inst, Value(inst as u32))?;
+                args[0] = Arg::Reg(self.operand(ptr)?);
+                let dest = self.dest(RegClass::Gpr)?;
+                args[RESULT as usize] = Arg::Reg(dest.reg());
+                self.emit_op(pattern(width, glue::atomic(0, acq, false), gpr, [gpr, n, n, n]), &args, false)?;
+                self.finish_dest(dest)
+            }
+            Op::AtomicStore => {
+                let (value, ptr) = (o.value(), o.value());
+                let width = self.atomic_width(inst, value)?;
+                args[0] = Arg::Reg(self.operand(value)?);
+                args[1] = Arg::Reg(self.operand(ptr)?);
+                self.emit_op(pattern(width, glue::atomic(0, false, rel), n, [gpr, gpr, n, n]), &args, false).map(drop)
+            }
+            Op::AtomicRmw => {
+                let (rmw, ptr, value) = (o.rmw(), o.value(), o.value());
+                let width = self.atomic_width(inst, value)?;
+                args[0] = Arg::Reg(self.operand(ptr)?);
+                args[1] = Arg::Reg(self.operand(value)?);
+                args[2] = Arg::Reg(self.temp(RegClass::Gpr)?);
+                let dest = self.dest(RegClass::Gpr)?;
+                args[RESULT as usize] = Arg::Reg(dest.reg());
+                self.emit_op(pattern(width, glue::atomic(rmw as u8, acq, rel), gpr, [gpr, gpr, gpr, n]), &args, false)?;
+                self.finish_dest(dest)
+            }
+            _ => {
+                let (ptr, expected, new) = (o.value(), o.value(), o.value());
+                let width = self.atomic_width(inst, expected)?;
+                let failure = flags.failure().ok_or(refused(inst, "a `cmpxchg` failure ordering that is none of the five"))?;
+                // The acquire part from the stronger of success and failure.
+                let acq = acq || crate::pass::atomic::sides(failure).0;
+                let cell = self.cell[inst];
+                if cell == NONE {
+                    return Err(refused(inst, "a `cmpxchg` pair with no cell"));
+                }
+                let e = self.operand(expected)?;
+                args[0] = Arg::Reg(self.operand(ptr)?);
+                args[1] = Arg::Reg(e);
+                args[2] = Arg::Reg(self.operand(new)?);
+                args[3] = Arg::Reg(self.temp(RegClass::Gpr)?);
+                let t = self.temp(RegClass::Gpr)?;
+                args[RESULT as usize] = Arg::Reg(t);
+                self.emit_op(pattern(width, glue::atomic(0, acq, rel), gpr, [gpr; 4]), &args, false)?;
+                self.store_cell(t, cell)?;
+                let mut same = [Arg::None; 7];
+                same[0] = Arg::Reg(t);
+                same[1] = Arg::Reg(e);
+                same[RESULT as usize] = Arg::Reg(t);
+                let eq = Pattern { op: Op::Icmp, width, variant: IntCond::Eq as u8, result: gpr, operands: [gpr, gpr, n, n], inner: None };
+                self.emit_op(eq, &same, false)?;
+                self.store_cell(t, cell + 8)?;
+                self.in_cell[inst] = true;
+                self.loc[inst] = Loc::Cell;
+                Ok(())
+            }
+        }
+    }
+
+    /// `tls_addr` of a thread-local: the Reference tier's indexed access (pass/tls_index.rs) in
+    /// the two templates of table_gen/arm64.rs `thread_locals`. The descriptor's, the index's and
+    /// the getter's import words are loaded first ([`Composer::import_word`]), then the root's
+    /// address on the table's OS, then the lookup, emitted as a call (the getter's) so what lives
+    /// in a caller-saved register is kept across it; the thread's copy is moved from x0 last.
+    fn tls_addr(&mut self, inst: usize) -> Result<(), TierError> {
+        let rec = self.view.reference(self.view.operands(inst).reference());
+        if RefKind::from_word(rec.kind) != Some(RefKind::Tls) {
+            return Err(refused(inst, "`tls_addr` of other than a thread-local"));
+        }
+        let desc = self.import_word(Outside::TlsDesc, Space::Static)?;
+        let index = self.import_word(Outside::Tls(rec.place), Space::Tls)?;
+        let getter = self.import_word(Outside::TlsGetter, Space::Func)?;
+        let os = self.table.head().machine.os;
+        let gpr = Form::Reg(RegClass::Gpr);
+        let n = Form::None;
+        let at = self.temp(RegClass::Gpr)?;
+        let mut args = [Arg::None; 7];
+        args[0] = Arg::Reg(desc);
+        args[RESULT as usize] = Arg::Reg(at);
+        let root = Pattern { op: Op::TlsAddr, width: 64, variant: glue::tls_root(os), result: gpr, operands: [gpr, n, n, n], inner: None };
+        self.emit_op(root, &args, false)?;
+        let mut args = [Arg::None; 7];
+        for (k, r) in [at, index, getter, desc].into_iter().enumerate() {
+            args[k] = Arg::Reg(r);
+        }
+        let lookup = Pattern { op: Op::TlsAddr, width: 64, variant: glue::TLS_LOOKUP, result: n, operands: [gpr; 4], inner: None };
+        self.emit_op(lookup, &args, true)?;
+        // The template leaves the copy in x0, the getter's return register.
+        let x0 = self.regs.rets_gpr.first().copied().ok_or(refused(inst, "a description with no return register"))?;
+        let dest = self.dest(RegClass::Gpr)?;
+        self.mov(dest.reg(), x0)?;
+        self.finish_dest(dest)
+    }
+
+    /// The value of `of`'s import word (`adrp; ldr`: [`glue::address`]) in a temporary.
+    fn import_word(&mut self, of: Outside, space: Space) -> Result<Reg, TierError> {
+        let target = self.target_of(of, space)?;
+        let r = self.temp(RegClass::Gpr)?;
+        let mut args = [Arg::None; 7];
+        args[0] = Arg::Site(target);
+        args[RESULT as usize] = Arg::Reg(r);
+        self.emit_op(glue::address(Op::DataAddr), &args, false)?;
+        Ok(r)
+    }
+
+    /// The width of an atomic's value: 8, 16, 32 or 64 bits of an integer or pointer.
+    fn atomic_width(&self, inst: usize, v: Value) -> Result<u8, TierError> {
+        match self.class_of(v)? {
+            (RegClass::Gpr, w @ (8 | 16 | 32 | 64)) => Ok(w),
+            _ => Err(refused(inst, "an atomic of an `i1` or a float (the Reference tier's)")),
+        }
+    }
+
+    /// `project(pair, k)`: member `k` of an overflow operation's or a `cmpxchg`'s pair, loaded
+    /// from the pair's cell ([`Composer::overflow`], [`Composer::atomic`]). Any other compound
+    /// is the Reference tier's.
+    fn project(&mut self, inst: usize) -> Result<(), TierError> {
+        let mut o = self.view.operands(inst);
+        let (pair, k) = (o.value(), o.imm());
+        let from = pair.index();
+        let pairs =
+            [Op::UaddOverflow, Op::SaddOverflow, Op::UsubOverflow, Op::SsubOverflow, Op::UmulOverflow, Op::SmulOverflow, Op::Cmpxchg];
+        if from >= self.view.len() || !pairs.contains(&self.view.op(from)) || k > 1 {
+            return Err(refused(inst, "a member of a compound that is not an overflow operation's or a `cmpxchg`'s pair (the Reference tier's)"));
+        }
+        let cell = self.cell[from];
+        if cell == NONE {
+            return Err(refused(inst, "a member of a pair with no cell"));
+        }
+        let (class, _) = self.class_of(Value(inst as u32))?;
+        let dest = self.dest(class)?;
+        self.load_cell(dest.reg(), cell + 8 * k)?;
+        self.finish_dest(dest)
+    }
+
     /// The right side of an integer comparison of `width` bits: an `U12` immediate when the
     /// constant, extended as the condition reads it, is in 0..4096.
     fn cmp_rhs(&mut self, cond: IntCond, width: u32, b: Value) -> Result<(Form, Arg), TierError> {
@@ -1832,7 +2103,7 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
     fn load(&mut self, inst: usize) -> Result<(), TierError> {
         let mut o = self.view.operands(inst);
         let (ptr, off) = (o.value(), o.offset());
-        let (class, width) = self.class_of(Value(inst as u32))?;
+        let (class, width) = self.access_width(Value(inst as u32))?;
         let mut args = [Arg::None; 7];
         let (forms, inner) = match self.fused[ptr.index()] {
             true => {
@@ -1859,7 +2130,7 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
     fn store(&mut self, inst: usize) -> Result<(), TierError> {
         let mut o = self.view.operands(inst);
         let (value, ptr, off) = (o.value(), o.value(), o.offset());
-        let (class, width) = self.class_of(value)?;
+        let (class, width) = self.access_width(value)?;
         let mut args = [Arg::None; 7];
         args[0] = Arg::Reg(self.operand(value)?);
         let (forms, inner) = match self.fused[ptr.index()] {
@@ -1916,9 +2187,10 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
         let at = self.out.targets.len() as u32;
         self.out.targets.push(target);
         if let Some(name) = name {
+            // A name row is its text's start and LENGTH (record/form.rs `seal`, record/v1.rs).
             let from = self.out.text.len() as u32;
             self.out.text.extend_from_slice(name.as_bytes());
-            self.out.names.push((target.symbol, from, self.out.text.len() as u32));
+            self.out.names.push((target.symbol, from, name.len() as u32));
         }
         at
     }
@@ -1930,7 +2202,8 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
             Some(RefKind::Func) => (Outside::Func(rec.place), Space::Func),
             Some(RefKind::Static) => (Outside::Static(rec.place), Space::Static),
             Some(RefKind::Vtable) => (Outside::Vtable(rec.place), Space::Vtable),
-            _ => return Err(refused(inst, "the address of the function's own data or a thread-local (the Reference tier's)")),
+            Some(RefKind::Data) => return self.own_address(rec.place),
+            Some(RefKind::Tls) | None => return Err(refused(inst, "the address of a thread-local (the Reference tier's)")),
         };
         let target = self.target_of(of, space)?;
         let dest = self.dest(RegClass::Gpr)?;
@@ -1939,6 +2212,149 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
         args[RESULT as usize] = Arg::Reg(dest.reg());
         self.emit_op(glue::address(op), &args, false)?;
         self.finish_dest(dest)
+    }
+
+    /// `data_addr` of the function's own data row `row`: an own-data site ([`glue::own_address`])
+    /// reaching the row, which is placed after the code ([`Composer::place_rows`]).
+    fn own_address(&mut self, row: u32) -> Result<(), TierError> {
+        let index = self.place_row(row)?;
+        let dest = self.dest(RegClass::Gpr)?;
+        let mut args = [Arg::None; 7];
+        // For a `Site(Relro)` field, the placed row's index (`place`), not a target's.
+        args[0] = Arg::Site(index);
+        args[RESULT as usize] = Arg::Reg(dest.reg());
+        self.emit_op(glue::own_address(), &args, false)?;
+        self.finish_dest(dest)
+    }
+
+    /// Row `row`'s index among the rows placed after the code, added once.
+    fn place_row(&mut self, row: u32) -> Result<u32, TierError> {
+        let Some(&index) = self.row_index.get(row as usize) else {
+            return Err(refused(self.inst, "a reference to own data naming no row of the function's"));
+        };
+        if index != NONE {
+            return Ok(index);
+        }
+        let index = self.rows.len() as u32;
+        self.rows.push(row);
+        self.row_index[row as usize] = index;
+        Ok(index)
+    }
+
+    /// The rows of the function's own data, after the code: a row holding no address and
+    /// aligned to at most 4 bytes follows the instructions in the code part; any other row goes
+    /// to the relro part, at least 8-aligned, its addresses relro words, a row aligned past 8
+    /// raising the part's alignment (the record's `relro_align`, which the placer honours: up
+    /// to a page, as the Reference tier's). Each source position in a row is a slot of the
+    /// record (`position_slots`) the placer fills. Then each own-data site and each word naming
+    /// an own row gets the row's part and offset.
+    fn place_rows(&mut self) -> Result<(), TierError> {
+        const CODE_PART_ALIGN: u32 = 2;
+        const RELRO_PART_ALIGN: u32 = 3;
+        let view = self.view;
+        let mut k = 0;
+        // The list grows as it is walked: a row reached only from another row's address.
+        while k < self.rows.len() {
+            let row = self.rows[k];
+            let id = DataId(row);
+            let rec = view.datas[row as usize];
+            let relocs = view.data_relocs_of(id);
+            let bytes = view.data_bytes_of(id);
+            let in_relro = !relocs.is_empty() || rec.align > CODE_PART_ALIGN;
+            if rec.align > crate::pass::MOST_DATA_ALIGN {
+                return Err(refused_fn(crate::pass::DATA_ALIGN_PAST));
+            }
+            // A relro row past 8 bytes' alignment raises the part's (the record's `relro_align`,
+            // which the placer honours); a code row is at most 4-aligned, under the code's 16.
+            if in_relro {
+                self.out.relro_align = self.out.relro_align.max(rec.align as u8);
+            }
+            let part = match in_relro {
+                true => &mut self.out.relro,
+                false => &mut self.out.code,
+            };
+            let align = match in_relro {
+                true => 1usize << rec.align.max(RELRO_PART_ALIGN),
+                false => 1usize << rec.align,
+            };
+            while part.len() % align != 0 {
+                part.push(0);
+            }
+            let start = part.len();
+            if start + bytes.len() >= (u32::MAX / 2) as usize {
+                return Err(too_large("the function's own data (2 GiB)"));
+            }
+            part.extend_from_slice(bytes);
+            let start = start as u32;
+            // Each source position of the row: its four bytes zero, a slot of the record the
+            // placer fills with the run's line or column (as the Reference tier's, pass/sites.rs).
+            for p in view.data_positions_of(id) {
+                let field = match blaze_lir::PositionField::from_word(p.field) {
+                    Some(blaze_lir::PositionField::Line) => PositionField::Line,
+                    Some(blaze_lir::PositionField::Col) => PositionField::Col,
+                    None => return Err(refused_fn("a source position of no known field")),
+                };
+                if u64::from(p.offset) + 4 > u64::from(rec.bytes_len) {
+                    return Err(refused_fn("a source position past its row's end"));
+                }
+                let at = start + p.offset;
+                let (part, slot_part) = match in_relro {
+                    true => (&mut self.out.relro, PositionPart::Relro),
+                    false => (&mut self.out.code, PositionPart::Code),
+                };
+                part[at as usize..at as usize + 4].fill(0);
+                self.out.position_slots.push(PositionRow { part: slot_part, at, item: p.item_key(), site: p.site, field });
+            }
+            self.row_at.push((in_relro, start));
+            for r in relocs {
+                if u64::from(r.offset) + 8 > u64::from(rec.bytes_len) {
+                    return Err(refused_fn("an address past its data row's end"));
+                }
+                if r.offset % 8 != 0 {
+                    return Err(refused_fn(crate::pass::sites::UNALIGNED_ADDRESS));
+                }
+                let word = start + r.offset;
+                // The placer writes the whole word: the record's bytes there are zero.
+                self.out.relro[word as usize..word as usize + 8].fill(0);
+                let target = view.reference(RefId(r.target));
+                let (of, space) = match RefKind::from_word(target.kind) {
+                    Some(RefKind::Static) => (Outside::Static(target.place), Space::Static),
+                    Some(RefKind::Vtable) => (Outside::Vtable(target.place), Space::Vtable),
+                    Some(RefKind::Func) => (Outside::Func(target.place), Space::Func),
+                    Some(RefKind::Data) => {
+                        let index = self.place_row(target.place)?;
+                        self.inner.push((word, index, r.addend));
+                        continue;
+                    }
+                    Some(RefKind::Tls) | None => return Err(refused_fn("the address of a thread-local in data (it differs per thread)")),
+                };
+                let t = self.target_of(of, space)?;
+                if self.out.targets[t as usize].space == Space::Outside && r.addend != 0 {
+                    return Err(refused_fn("data holding a C name's address plus an addend"));
+                }
+                self.out.words.push(RelroWord { at: word, target: t, addend: r.addend });
+            }
+            k += 1;
+        }
+        for i in 0..self.inner.len() {
+            let (word, index, addend) = self.inner[i];
+            let (in_relro, start) = self.row_at[index as usize];
+            let addend = i64::from(start).checked_add(addend).ok_or(too_large("an own-data word's addend"))?;
+            let target = if in_relro { OWN_RELRO } else { OWN_CODE };
+            self.out.words.push(RelroWord { at: word, target, addend });
+        }
+        // Offsets are distinct (each address its own word), so the unstable sort is exact.
+        self.out.words.sort_unstable_by_key(|w| w.at);
+        for i in 0..self.own_sites.len() {
+            let (reloc, index) = self.own_sites[i];
+            let (in_relro, start) = self.row_at[index as usize];
+            let target = if in_relro { OWN_RELRO } else { OWN_CODE };
+            for r in [reloc as usize, reloc as usize + 1] {
+                self.out.relocs[r].target = target;
+                self.out.relocs[r].addend = i64::from(start);
+            }
+        }
+        Ok(())
     }
 
     /// A call in the C convention (AAPCS64; Apple's `signext` rule): scalar arguments in their
@@ -2389,7 +2805,8 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
             }
             self.set_bits(patch.start, patch.len as usize, &patch.field, units as u64)?;
         }
-        Ok(())
+        // The function's own data after the instructions: nothing patched above reaches it.
+        self.place_rows()
     }
 }
 

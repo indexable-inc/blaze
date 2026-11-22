@@ -38,8 +38,8 @@
 //! symbol once).
 //! The thin driver over the command's one store ([`held`], [`write`]): the ONE mechanism the
 //! command has for a mutable name, blaze-cas's POINTER (`Lent::point` / `Lent::pointed`,
-//! `POINTER_TAG`: the newest commit's value wins), as code_store.rs points a code key at its
-//! entry. The list's bytes are a record under their content key ([`START_LIST_TAG`],
+//! `ReservedTag::Pointer`: the newest commit's value wins), as code_store.rs points a code key at its
+//! entry. The list's bytes are a record under their content key ([`ReservedTag::StartList`],
 //! `Namespace::LOCAL`), and the list's name ([`ListName`]) points at it; both ride the
 //! command's one commit after the answer (store.rs `after_answer_printed`).
 //!
@@ -78,7 +78,8 @@ use core::fmt;
 use std::alloc::Allocator;
 
 use blaze_cas::Key as CasKey;
-use blaze_cas::plain::{Lent, LentError, Namespace, Tag};
+use blaze_cas::plain::{Lent, LentError, Namespace};
+use blaze_keyed::kind::ReservedTag;
 use blaze_core::Driver;
 use blaze_hash::ByHashSet;
 use blaze_ids::ContentId;
@@ -198,12 +199,9 @@ impl Values {
 /// The longest list: a longer input is refused before any of it is read.
 pub(crate) const LONGEST: usize = HEAD + MOST_ROWS * ROW;
 
-/// The tag the list's record is filed under in the plain store's index: its own number, apart
-/// from the roots' (`u16::MAX`), the startup image's (`u16::MAX - 1`), the drive's records
-/// (`DRIVE_TAG`, `u16::MAX - 2`), code entries (`CODE_TAG`, `u16::MAX - 3`) and pointers
-/// (`POINTER_TAG`, `u16::MAX - 4`). A pointer of the list's name naming a record of another tag
-/// is refused by the store (`LentError::TargetTag`), never read as a list.
-pub(crate) const START_LIST_TAG: Tag = Tag(u16::MAX - 5);
+// The list's record is filed under [`ReservedTag::StartList`] in the plain store's index
+// (blaze-keyed's registry of reserved tags). A pointer of the list's name naming a record of
+// another tag is refused by the store (`LentError::TargetTag`), never read as a list.
 
 /// The domain of a list name's key.
 const NAME_DOMAIN: &str = "blaze-cli start list name 1";
@@ -1015,12 +1013,12 @@ impl core::error::Error for ListError {}
 /// newest value, not its target): a hint lost costs a start, and the list is written again at
 /// exit.
 pub(crate) fn held<'m, D: Driver, A: Allocator + Clone>(lent: &'m Lent<D, A>, name: &ListName) -> Result<Option<&'m [u8]>, ListError> {
-    let target = match lent.pointed(START_LIST_TAG, &CasKey(name.0)) {
+    let target = match lent.pointed(ReservedTag::StartList.tag(),&CasKey(name.0)) {
         Ok(Some(target)) => target,
         Ok(None) | Err(LentError::TargetGone { .. }) => return Ok(None),
         Err(why) => return Err(ListError::Store(why)),
     };
-    // `pointed` checked the target is held under START_LIST_TAG.
+    // `pointed` checked the target is held under ReservedTag::StartList.
     Ok(lent.get(&target).map_err(ListError::Store)?.map(|lend| lend.bytes))
 }
 
@@ -1040,14 +1038,14 @@ pub(crate) fn write<D: Driver, A: Allocator + Clone>(lent: &Lent<D, A>, name: &L
         return Ok(Wrote::Nothing);
     }
     let content = CasKey(ContentId::of(RECORD_DOMAIN, bytes));
-    lent.put(&content, Namespace::LOCAL, START_LIST_TAG, bytes).map_err(ListError::Store)?;
-    lent.point(START_LIST_TAG, &CasKey(name.0), &content).map_err(ListError::Store)?;
+    lent.put(&content, Namespace::LOCAL, ReservedTag::StartList.tag(), bytes).map_err(ListError::Store)?;
+    lent.point(ReservedTag::StartList.tag(),&CasKey(name.0), &content).map_err(ListError::Store)?;
     Ok(Wrote::Written)
 }
 
 /// The keys that keep the list `name` and the code it names (store/roots.rs `keep_program`),
 /// pushed onto `out`: the list's pointer and record, and each code row's key and, when the key
-/// is a pointer, its target (reach does not follow a pointer: blaze-cas `POINTER_TAG`). `bytes`
+/// is a pointer, its target (reach does not follow a pointer: blaze-keyed `ReservedTag::Pointer`). `bytes`
 /// is the list just written ([`encode`]d by this run, so its form is known). Answers the rows
 /// whose key has no target the store holds: named by key alone and counted, never dropped
 /// quietly (rule 3); the next run builds them again. A row's record id is a file in the records
@@ -1064,7 +1062,7 @@ pub(crate) fn rooted_keys<D: Driver, A: Allocator + Clone, B: Allocator>(lent: &
         key.copy_from_slice(&row[33..65]);
         let key = CasKey(ContentId(key));
         out.push(key);
-        match lent.pointed(crate::code_store::CODE_TAG, &key) {
+        match lent.pointed(ReservedTag::Code.tag(), &key) {
             Ok(Some(target)) => out.push(target),
             // An entry under its code key (the getter's and ender's): the key is the record.
             Err(LentError::PointerTag { .. }) => {}

@@ -43,6 +43,10 @@ pub mod files;
 pub mod home;
 pub mod layout;
 pub mod lock;
+// cargo's `build.rustflags` rule: the `--cfg`s a unit's cfg takes (sans-IO, no serde).
+pub mod rustflags;
+#[cfg(test)]
+mod lock_ban_tests;
 #[cfg(feature = "cargo")]
 pub mod manifest;
 #[cfg(feature = "cargo")]

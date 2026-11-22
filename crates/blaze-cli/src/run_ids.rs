@@ -1618,6 +1618,11 @@ fn read_at(b: &[u8]) -> Read {
 /// in-place view of bytes. It holds NO read list: a workspace body's one read is its check's
 /// [`Proof`], read by need from [`ReadsFrom`] at the first call that steps it, once a check
 /// ([`Slot`]).
+///
+/// `Copy`: every field is a borrow of the rows (or a fixed word), so a copy is a second view of
+/// the same table, never a copy of a row (rule 11): the run's typing reads its own view
+/// (engine_body_record.rs `StoreTyped`) beside the parent's.
+#[derive(Clone, Copy)]
 pub(crate) struct RunIds<'a> {
     toolchain: ToolchainId,
     /// The toolchain fact with today's digest, the toolchain's id.

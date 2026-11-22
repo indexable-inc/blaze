@@ -64,8 +64,8 @@ fn usual() -> Io {
 
 /// This blaze's store files in the fixtures: under plain_place.rs `STORE_DIR` (a test below
 /// holds them there).
-const OWN_SEG: &str = "h/.blaze/v2/store/f5s2/seg-0000000000000001";
-const OWN_HEAD: &str = "h/.blaze/v2/store/f5s2/head";
+const OWN_SEG: &str = "h/.blaze/v2/store/f5s3/seg-0000000000000001";
+const OWN_HEAD: &str = "h/.blaze/v2/store/f5s3/head";
 
 #[test]
 fn the_fixtures_name_this_blazes_store() {
@@ -295,4 +295,123 @@ fn nothing_there_is_nothing_to_remove() {
     let (result, said) = clean(&io, &["ws", "--store"]);
     assert!(matches!(result, Ok(bstd::entry::Status::OK)), "{result:?}");
     assert_eq!(said, format!("{NOTHING}\n"));
+}
+
+/// `--all`: removes the checkout state, the home store, AND all derived caches listed in
+/// `layout.rs` (`Scope::All`: `run/records`, `proc-macro/expansions`, `sdk-answers`, `native-work`,
+/// `test/tmp`) while keeping `toolchain`, `sources`, and `roster`.
+#[test]
+fn clean_all_removes_store_and_derived_caches_and_keeps_toolchain_and_sources() {
+    let io = world(&[
+        ("ws/src/lib.rs", "fn f() {}\n"),
+        ("ws/.blaze/v2/profile.txt", "p"),
+        ("h/.blaze/v2/store/CACHEDIR.TAG", TAG),
+        (OWN_HEAD, "head"),
+        ("h/.blaze/v2/run/records/abc", "jit"),
+        ("h/.blaze/v2/proc-macro/expansions/e1", "exp"),
+        ("h/.blaze/v2/sdk-answers/s1", "sdk"),
+        ("h/.blaze/v2/roster/r1", "ros"),
+        ("h/.blaze/v2/native-work/n1", "nat"),
+        ("h/.blaze/v2/test/tmp/t1", "tmp"),
+        ("h/.blaze/v2/toolchain/abc/lib.rlib", "toolchain"),
+        ("h/.blaze/v2/sources/x.crate", "source"),
+    ]);
+    let (result, said) = clean(&io, &["ws", "--all"]);
+    assert!(result.is_ok(), "{result:?}");
+    assert!(said.contains("removed /h/.blaze/v2/store:"), "{said}");
+    assert!(said.contains("removed /h/.blaze/v2/run/records:"), "{said}");
+    assert!(said.contains("removed /h/.blaze/v2/proc-macro/expansions:"), "{said}");
+    for gone in [
+        "ws/.blaze/v2",
+        "h/.blaze/v2/store",
+        "h/.blaze/v2/run/records",
+        "h/.blaze/v2/proc-macro/expansions",
+        "h/.blaze/v2/sdk-answers",
+        "h/.blaze/v2/native-work",
+        "h/.blaze/v2/test/tmp",
+    ] {
+        assert!(!there(&io, gone), "{gone} was not removed by --all");
+    }
+    for kept in [
+        "h/.blaze/v2/toolchain/abc/lib.rlib",
+        "h/.blaze/v2/sources/x.crate",
+        "h/.blaze/v2/roster/r1",
+        "ws/src/lib.rs",
+    ] {
+        assert!(there(&io, kept), "{kept} was removed by --all");
+    }
+}
+
+/// A checkout a file watch ran in holds its cookies (blaze-core fsevents.rs `COOKIE_AREA`):
+/// `clean` removes them with the rest. Before `fsevents` was a `CheckoutEntry`, this clean was
+/// refused by that name and nothing went (remove the variant and this test fails so).
+#[test]
+fn clean_after_a_watch_removes_its_cookies() {
+    let io = world(&[("ws/src/lib.rs", "fn f() {}\n"), ("ws/.blaze/v2/profile.txt", "p"), ("ws/.blaze/v2/fsevents/4242-1", "")]);
+    assert_eq!(super::CheckoutEntry::Cookies.path(), ".blaze/v2/fsevents", "blaze-core fsevents.rs `COOKIE_AREA` (private there) moved");
+    let (result, said) = clean(&io, &["ws"]);
+    println!("blaze clean ws, after a watch:\n{said}");
+    assert!(result.is_ok(), "a watched checkout's clean was refused: {result:?}");
+    assert_eq!(said, "removed ws/.blaze/v2: 2 files, 1 bytes freed\n");
+    assert!(!there(&io, "ws/.blaze/v2"));
+    assert!(there(&io, "ws/src/lib.rs"));
+}
+
+/// `--all` on a home holding every row's folder AND folders no row names: beside a row (`mine`,
+/// `run/other` and `test/keep` in a row's parent, `sdk-answers-old` a row's name with more)
+/// and a file in `.blaze`. Each `All` row's folder goes, said with what it held; every planted
+/// folder, the kept rows (each said with why) and the sources stay. Removal is by each row's
+/// exact path, so nothing a listing shows is matched.
+#[test]
+fn clean_all_removes_only_the_tables_folders() {
+    use crate::layout::{LAYOUT, Scope, kept_at_home, of};
+    let planted = ["h/.blaze/v2/mine/notes", "h/.blaze/v2/run/other/x", "h/.blaze/v2/test/keep/x", "h/.blaze/v2/sdk-answers-old/x", "h/.blaze/notes.txt"];
+    let mut files: std::vec::Vec<(std::string::String, &str)> = std::vec![("ws/src/lib.rs".into(), "fn f() {}\n"), ("h/.blaze/v2/store/CACHEDIR.TAG".into(), TAG), (OWN_HEAD.into(), "head")];
+    for row in LAYOUT.iter().filter(|row| row.place == super::Place::Home && row.scope != Scope::Store) {
+        files.push((format!("h/{}/f", row.path), "x"));
+    }
+    files.extend(planted.iter().map(|path| (std::string::String::from(*path), "mine")));
+    let io = world(&files.iter().map(|(path, text)| (path.as_str(), *text)).collect::<std::vec::Vec<_>>());
+    let (result, said) = clean(&io, &["ws", "--all"]);
+    println!("blaze clean ws --all, with planted folders:\n{said}");
+    assert!(result.is_ok(), "{result:?}");
+    for row in of(Scope::All) {
+        assert!(!there(&io, &format!("h/{}", row.path)), "{} was not removed by --all", row.path);
+        assert!(said.contains(&format!("removed /h/{}: 1 file, 1 bytes freed ({})\n", row.path, row.holds)), "{} not said with what it held:\n{said}", row.path);
+    }
+    for (row, why) in kept_at_home() {
+        assert!(there(&io, &format!("h/{}/f", row.path)), "{} (kept: {why}) was removed", row.path);
+        assert!(said.contains(&format!("kept: {}: {why}\n", row.short())), "{} kept without saying why:\n{said}", row.path);
+    }
+    assert!(said.contains("kept: proc-macro/modules: made by the bootstrap builder, no command rebuilds it\n"), "{said}");
+    for path in planted {
+        assert!(there(&io, path), "{path}, which no row names, was removed");
+    }
+    assert!(!there(&io, "h/.blaze/v2/store"));
+}
+
+/// A row's folder that is a link (here `test/tmp`, pointing out of the home): `--all` refuses it
+/// by name before removing anything, so the checkout's state, the store and every other row's
+/// folder stay, and the link's target is never reached.
+#[test]
+fn clean_all_refuses_a_linked_folder_and_removes_nothing() {
+    let io = world(&[
+        ("ws/.blaze/v2/profile.txt", "p"),
+        ("h/.blaze/v2/store/CACHEDIR.TAG", TAG),
+        (OWN_HEAD, "head"),
+        ("h/.blaze/v2/sdk-answers/s1", "sdk"),
+        ("h/.blaze/v2/run/records/abc", "jit"),
+        ("elsewhere/precious", "mine"),
+    ]);
+    let link = blaze_core::FileName::new(&format!("h/{}", crate::test_drive::TEMPS)).expect("a name");
+    io.with_sim(|sim| sim.symlink(&link, "/elsewhere")).expect("a simulated world");
+    let (result, said) = clean(&io, &["ws", "--all"]);
+    let Err(CliError::Clean(refusal @ CleanError::Link { .. })) = &result else { panic!("a linked folder was not refused by name: {result:?}\n{said}") };
+    let words = refusal.to_string();
+    println!("blaze clean ws --all, test/tmp a link: {words}");
+    assert!(words.contains(&format!("the home's {} is a link", crate::test_drive::TEMPS)), "{words}");
+    assert_eq!(said, "", "something was said removed before the refusal");
+    for kept in ["ws/.blaze/v2/profile.txt", "h/.blaze/v2/store/CACHEDIR.TAG", OWN_HEAD, "h/.blaze/v2/sdk-answers/s1", "h/.blaze/v2/run/records/abc", "elsewhere/precious"] {
+        assert!(there(&io, kept), "{kept} was removed although the clean was refused");
+    }
 }

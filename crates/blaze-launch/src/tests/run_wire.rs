@@ -19,6 +19,7 @@ enum Owned {
     Positioned { slot: u32, optimized: bool, record: [u8; 32], values: Vec<u8> },
     Hooks { slot: u32, kind: HookKind },
     Promote { slot: u32, record: [u8; 32], inlined: Vec<Slot>, values: Vec<u8> },
+    Bytes { record: [u8; 32], at: u64, total: u64, part: Vec<u8> },
     Failed { need: Needed, why: OwnedFailure },
 }
 
@@ -59,6 +60,7 @@ impl Owned {
                 inlined: List::of(inlined),
                 values,
             }),
+            Owned::Bytes { record, at, total, part } => Message::Down(Down::Bytes { record: RecordId(*record), at: *at, total: *total, part }),
             Owned::Failed { need, why } => {
                 let why = match why {
                     OwnedFailure::Unresolved => Failure::Unresolved,
@@ -103,7 +105,7 @@ fn need(tape: &Tape) -> Needed {
 }
 
 fn owned(tape: &Tape) -> Owned {
-    match tape.below(7, "message") {
+    match tape.below(8, "message") {
         0 => Owned::Need { need: need(tape), thread: number(tape) },
         1 => {
             let count = tape.below(5, "pairs") as usize;
@@ -131,6 +133,14 @@ fn owned(tape: &Tape) -> Owned {
                 inlined,
                 values: (0..tape.below(4, "values")).flat_map(|_| small(tape).to_le_bytes()).collect(),
             }
+        }
+        6 => {
+            // A part of shape the decode takes: not empty, within its total, a total within
+            // BYTES_RECORD_MOST (wire/bytes.rs).
+            let part: Vec<u8> = (0..tape.range(1..40, "part")).map(|_| tape.below(256, "byte") as u8).collect();
+            let at = tape.below(1 << 20, "at");
+            let total = at + part.len() as u64 + tape.below(1 << 20, "after");
+            Owned::Bytes { record: bytes32(tape), at, total, part }
         }
         _ => {
             let why = match tape.below(5, "failure") {
@@ -200,7 +210,7 @@ const NEED: [u8; 46] = [
     0, 0, 0, 42, // the frame's length
     0xa3, // a map of 3
     0x62, b'i', b'd', 0x01, //
-    0x63, b'r', b'u', b'n', 0x05, // the run schema
+    0x63, b'r', b'u', b'n', 0x06, // the run schema
     0x64, b'b', b'o', b'd', b'y', //
     0xa1, 0x64, b'N', b'e', b'e', b'd', //
     0xa2, //
@@ -213,7 +223,7 @@ const NEED: [u8; 46] = [
 /// Expected: passes with no output.
 #[test]
 fn a_need_by_slot_is_these_bytes() {
-    assert_eq!(RUN_SCHEMA, 5, "a schema step changes the pinned bytes: update NEED");
+    assert_eq!(RUN_SCHEMA, 6, "a schema step changes the pinned bytes: update NEED");
     let need = Up::Need { need: Needed::Slot(Slot(3)), thread: Thread(7) };
     assert_eq!(encoded(&Message::Up(need), 1), NEED);
     assert_eq!(cbor::check(&NEED[4..]).map_err(|it| it.to_string()), Ok(()));

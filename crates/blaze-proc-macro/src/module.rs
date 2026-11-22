@@ -5,7 +5,7 @@
 //!
 //! The key is the SHA-256 of [`identity`]: the name, version and [`Source`] of the crate (the
 //! lock's checksum, a git commit and path, or a path package's [`files_digest`]), the
-//! dependencies the lock pins under it ([`lock_closure`]: two locks pinning another syn under
+//! dependencies the lock pins under it ([`LockedPackages::closure`]: two locks pinning another syn under
 //! one serde_derive are two modules),
 //! its features (the host side's unified set, sorted), the toolchain, the digests of the target
 //! JSON and of the shim, and the builder. The builder computes the same text; the example
@@ -20,7 +20,9 @@
 
 use std::path::{Path, PathBuf};
 
+use blaze_build_script::served::{InPackage, in_package};
 use blaze_expand::ProcKind;
+use blaze_manifest::lock::{Checksum, Lock, LockSource};
 
 /// The target a module is built for.
 pub const TARGET_JSON: &[u8] = include_bytes!("../guest/wasm32-wasip1-macro.json");
@@ -34,7 +36,7 @@ pub struct CrateId<'s> {
     pub version: &'s str,
     /// Where its sources are, as what pins their bytes.
     pub source: Source<'s>,
-    /// [`lock_closure`] of it: the dependencies the lock pins under it.
+    /// [`LockedPackages::closure`] of it: the dependencies the lock pins under it.
     pub deps: &'s str,
     /// The features the host side of the graph unifies to.
     pub features: &'s [&'s str],
@@ -53,13 +55,13 @@ pub enum Source<'s> {
     Path { files_sha256: &'s str },
 }
 
-/// Why a macro crate's dependency closure could not be read from a lock.
+/// Why a macro crate's dependency closure could not be read from a lock. A malformed lock never
+/// reaches here: blaze-manifest's one reader ([`Lock::read`]) refuses it first, naming the line
+/// of the entry (rule 30: one lock reader; rule 3: never a package named "").
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ClosureError {
     /// The lock has no package of this name and version.
     NotLocked { name: String, version: String },
-    /// A dependency names no package of the lock, or more than one.
-    Unresolved { of: String, dependency: String },
     /// A path package in the closure: its sources are pinned by nothing in the lock.
     Unpinned { name: String, version: String },
 }
@@ -68,7 +70,6 @@ impl std::fmt::Display for ClosureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClosureError::NotLocked { name, version } => write!(f, "the lock has no package {name} {version}"),
-            ClosureError::Unresolved { of, dependency } => write!(f, "{of}: its dependency {dependency:?} names no one package of the lock"),
             ClosureError::Unpinned { name, version } => {
                 write!(f, "{name} {version} is a path package under a proc-macro crate: the lock pins nothing of its sources")
             }
@@ -76,110 +77,81 @@ impl std::fmt::Display for ClosureError {
     }
 }
 
-/// The digest of a macro crate's dependency closure as the lock pins it (the `deps` line of
-/// [`identity`]): every package reachable from `name` `version` through the lock's
-/// `dependencies` lists, the crate itself left out, each as `name version pin` (the checksum,
-/// else the source), sorted, one a line, SHA-256. The lock lists every kind of dependency of
-/// every feature, so the closure is a superset of what a build links, keyed from the lock's
-/// text alone. The builder computes the same (`scripts/src/bin/proc_macro_modules.rs`).
-pub fn lock_closure(lock: &str, name: &str, version: &str) -> Result<String, ClosureError> {
-    LockedPackages::read(lock).closure(name, version)
-}
-
-struct Locked<'l> {
-    name: &'l str,
-    version: &'l str,
-    source: Option<&'l str>,
-    checksum: Option<&'l str>,
-    deps: Vec<&'l str>,
-}
-
-/// A lock's packages, read once: [`lock_closure`] for many crates of one lock reads its text
-/// once, not once a crate.
-pub struct LockedPackages<'l> {
-    packages: Vec<Locked<'l>>,
+/// A lock's packages as blaze-manifest read them ([`Lock::read`], read once a command), under
+/// the source corrections: what [`LockedPackages::closure`] walks for every macro crate of the
+/// lock.
+pub struct LockedPackages<'l, 'a> {
+    lock: &'l Lock<'a>,
     /// The source corrections (D58): a package a row corrects is pinned by its checksum and
     /// the row's digest.
     corrections: blaze_fetch::correct::Table<std::alloc::Global>,
 }
 
-
-impl<'l> LockedPackages<'l> {
-    /// The packages of the lock's text `lock`, under the checked-in source corrections.
-    pub fn read(lock: &'l str) -> LockedPackages<'l> {
-        LockedPackages::read_with(lock, blaze_fetch::correct::Table::checked_in(std::alloc::Global))
+impl<'l, 'a> LockedPackages<'l, 'a> {
+    /// The packages of `lock`, under the checked-in source corrections.
+    pub fn of(lock: &'l Lock<'a>) -> LockedPackages<'l, 'a> {
+        LockedPackages::of_with(lock, blaze_fetch::correct::Table::checked_in(std::alloc::Global))
     }
 
-    /// [`LockedPackages::read`] under another table of corrections (a test's edited row).
-    pub fn read_with(lock: &'l str, corrections: blaze_fetch::correct::Table<std::alloc::Global>) -> LockedPackages<'l> {
-        let mut packages = Vec::new();
-    for entry in lock.split("[[package]]").skip(1) {
-        let field = |key: &str| entry.lines().find_map(|line| line.trim().strip_prefix(key)).map(|it| it.trim().trim_matches('"'));
-        let mut deps = Vec::new();
-        if let Some(at) = entry.find("dependencies = [") {
-            let list = &entry[at + "dependencies = [".len()..];
-            let list = &list[..list.find(']').unwrap_or(list.len())];
-            deps.extend(list.split(',').map(|it| it.trim().trim_matches('"')).filter(|it| !it.is_empty()));
-        }
-        packages.push(Locked {
-            name: field("name = ").unwrap_or(""),
-            version: field("version = ").unwrap_or(""),
-            source: field("source = "),
-            checksum: field("checksum = "),
-            deps,
-        });
-    }
-        LockedPackages { packages, corrections }
+    /// [`LockedPackages::of`] under another table of corrections (a test's edited row).
+    pub fn of_with(lock: &'l Lock<'a>, corrections: blaze_fetch::correct::Table<std::alloc::Global>) -> LockedPackages<'l, 'a> {
+        LockedPackages { lock, corrections }
     }
 
-    /// [`lock_closure`] of the crate `name` `version` of this lock.
+    /// The digest of the macro crate `name` `version`'s dependency closure as the lock pins it
+    /// (the `deps` line of [`identity`]): every package reachable from it through the lock's
+    /// `dependencies` lists, the crate itself left out, each as `name version pin` (the
+    /// checksum, else the source as written), sorted, one a line, SHA-256. The lock lists every
+    /// kind of dependency of every feature, so the closure is a superset of what a build links,
+    /// keyed from the lock's text alone. The builder computes the same
+    /// (`scripts/src/bin/proc_macro_modules.rs`). Two packages of one name and version (two
+    /// sources): the first in the file's order is the root, as it was before (`Lock::named`
+    /// keeps the file's order within a name).
     pub fn closure(&self, name: &str, version: &str) -> Result<String, ClosureError> {
-    let packages = &self.packages;
-    let root = packages
-        .iter()
-        .position(|it| it.name == name && it.version == version)
-        .ok_or_else(|| ClosureError::NotLocked { name: name.to_owned(), version: version.to_owned() })?;
-    let mut seen = vec![false; packages.len()];
-    seen[root] = true;
-    let mut stack = vec![root];
-    while let Some(at) = stack.pop() {
-        for dep in &packages[at].deps {
-            let mut parts = dep.splitn(3, ' ');
-            let (dep_name, dep_version, dep_source) = (parts.next().unwrap_or(""), parts.next(), parts.next().map(|it| it.trim_matches(|c| c == '(' || c == ')')));
-            let mut found = packages.iter().enumerate().filter(|(_, it)| {
-                it.name == dep_name && dep_version.is_none_or(|v| it.version == v) && dep_source.is_none_or(|s| it.source == Some(s))
-            });
-            let (Some((index, _)), None) = (found.next(), found.next()) else {
-                return Err(ClosureError::Unresolved { of: format!("{} {}", packages[at].name, packages[at].version), dependency: (*dep).to_owned() });
-            };
-            if !seen[index] {
-                seen[index] = true;
-                stack.push(index);
+        let lock = self.lock;
+        let root = lock
+            .named(name)
+            .find(|id| lock.package(*id).version.to_string() == version)
+            .ok_or_else(|| ClosureError::NotLocked { name: name.to_owned(), version: version.to_owned() })?;
+        let mut seen = vec![false; lock.packages.len()];
+        seen[root.index()] = true;
+        let mut stack = vec![root];
+        while let Some(at) = stack.pop() {
+            for dep in lock.package(at).deps.iter() {
+                if !seen[dep.index()] {
+                    seen[dep.index()] = true;
+                    stack.push(*dep);
+                }
             }
         }
-    }
-    let mut lines = Vec::new();
-    for (at, package) in packages.iter().enumerate() {
-        if !seen[at] || at == root {
-            continue;
+        let mut lines = Vec::new();
+        for (at, package) in lock.packages.iter().enumerate() {
+            if !seen[at] || at == root.index() {
+                continue;
+            }
+            // The version as the lock writes it: a parsed semver prints as its text (no
+            // leading zero, nothing dropped), so the line is the text the old reader cut out.
+            let version = package.version.to_string();
+            let pin = match (&package.checksum, &package.source) {
+                (Checksum::Sha256(sum), _) => sum.as_str(),
+                (Checksum::Absent, LockSource::Path) => {
+                    return Err(ClosureError::Unpinned { name: package.name.as_str().to_owned(), version });
+                }
+                (Checksum::Absent, LockSource::Registry { .. } | LockSource::Git { .. }) => package.source_text.as_str(),
+            };
+            let pin = self.corrections.pin(package.name.as_str(), &version, pin);
+            lines.push(format!("{} {version} {pin}", package.name));
         }
-        let pin = package
-            .checksum
-            .or(package.source)
-            .ok_or_else(|| ClosureError::Unpinned { name: package.name.to_owned(), version: package.version.to_owned() })?;
-        let pin = self.corrections.pin(package.name, package.version, pin);
-        lines.push(format!("{} {} {pin}", package.name, package.version));
-    }
-    lines.sort();
-    Ok(sha256_hex(lines.join("\n").as_bytes()))
+        lines.sort();
+        Ok(sha256_hex(lines.join("\n").as_bytes()))
     }
 }
 
 /// The digest a path package's sources are pinned by: SHA-256 over its files, in the byte
 /// order of their paths relative to the package's folder, each as the path, a zero byte, its
-/// length as 8 little-endian bytes and its bytes. `files` holds every regular file under the
-/// folder but those under a folder named `target` or starting with `.`; the builder and blaze
-/// walk it alike (`examples/tempo_derives.rs` computes it from the checkout and finds the
+/// length as 8 little-endian bytes and its bytes. `files` holds every regular file of the
+/// package by the one package rule (blaze-build-script `served::in_package`); the builder and
+/// blaze walk it alike (`examples/tempo_derives.rs` computes it from the checkout and finds the
 /// builder's module by it).
 pub fn files_digest(files: &mut [(String, Vec<u8>)]) -> String {
     files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
@@ -194,7 +166,7 @@ pub fn files_digest(files: &mut [(String, Vec<u8>)]) -> String {
 }
 
 /// The files of the package at `dir` that [`files_digest`] covers, by their paths relative to
-/// it (`/`-separated). Walked with a stack of folders.
+/// it (`/`-separated): each entry `served::in_package` takes. Walked with a stack of folders.
 pub fn package_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, ModuleError> {
     let io = |path: &Path, error: std::io::Error| ModuleError::Io { path: path.to_owned(), error };
     let mut out = Vec::new();
@@ -205,11 +177,13 @@ pub fn package_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, ModuleError> 
             let name = entry.file_name().to_string_lossy().into_owned();
             let path = entry.path();
             let kind = entry.file_type().map_err(|e| io(&path, e))?;
+            let place = if relative.is_empty() { InPackage::Root } else { InPackage::Beneath };
+            if !in_package(entry.file_name().as_encoded_bytes(), kind.is_dir(), place) {
+                continue;
+            }
             let at = if relative.is_empty() { name.clone() } else { format!("{relative}/{name}") };
             if kind.is_dir() {
-                if name != "target" && !name.starts_with('.') {
-                    folders.push((path, at));
-                }
+                folders.push((path, at));
             } else if kind.is_file() {
                 out.push((at, std::fs::read(&path).map_err(|e| io(&path, e))?));
             }
@@ -410,3 +384,7 @@ pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, Modul
     let decls = text("decls")?.trim().to_owned();
     Ok(ModuleRecord { key, name: id.name.to_owned(), version: id.version.to_owned(), wasm_sha256: held, macros, decls, dir, compiled: store.join(COMPILED_DIR) })
 }
+
+#[cfg(test)]
+#[path = "module_lock_tests.rs"]
+mod lock_tests;

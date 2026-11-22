@@ -232,7 +232,8 @@ pub fn write<'a>(laid: &Laid<'_, '_>, eh: &EhSections<'_>, seed: &[u8; 32], out:
     out.extend_from_slice(&eh.eh_frame_hdr);
     out.resize(laid.const_at as usize, 0);
     out.extend_from_slice(&laid.konst);
-    let entries = [
+    // Exactly `DYN_COUNT` entries by type: the plan's `const_head` and `PT_DYNAMIC` name that many.
+    let entries: [(u64, u64); DYN_COUNT as usize] = [
         (DT_NEEDED, u64::from(needed)),
         (DT_HASH, meta_at + hash_at),
         (DT_STRTAB, meta_at + dynstr_at),
@@ -248,7 +249,6 @@ pub fn write<'a>(laid: &Laid<'_, '_>, eh: &EhSections<'_>, seed: &[u8; 32], out:
         (DT_DEBUG, 0),
         (DT_NULL, 0),
     ];
-    debug_assert_eq!(entries.len() as u64, DYN_COUNT);
     for (k, (tag, value)) in entries.iter().enumerate() {
         let at = laid.const_at as usize + 16 * k;
         bytes::set64(out, at, *tag);

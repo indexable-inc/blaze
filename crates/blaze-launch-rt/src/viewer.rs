@@ -4,28 +4,50 @@
 //! WebSocket with zero third-party dependencies:
 //! - `GET /api/info` -> `{"version":1,"active_viewers":<n>}` (lets `blaze run` skip opening a
 //!   duplicate browser tab whenever an Explore tab is already connected).
-//! - `GET /api/runs` -> current run summaries snapshot.
-//! - `GET /ws` -> live stream of `runs`, `run_started`, `events`, and `run_ended` messages drained
-//!   from every shared-memory `*.telem` ring under `<runs_dir>`.
+//! - `GET /api/runs`, `GET /api/builds` -> the runs and builds now.
+//! - `GET /api/resources?pid=<pid>` -> a process's descriptors, IP sockets and open files, asked
+//!   of the kernel in this process (`viewer/procfd.rs`: libproc on macOS, `/proc` on Linux; no
+//!   `lsof`), or a typed refusal naming the call and its errno.
+//! - `GET /ws` -> live stream of `runs`, `builds`, `run_started`, `run_ended` text frames and the
+//!   packed binary batches of every shared-memory `*.telem` ring under `<runs_dir>`.
 //! - `GET /explore` -> self-contained local fallback UI when offline.
+//!
+//! One thread, one wait. The thread sleeps in a single `poll` (`blaze_core::wait::readable`,
+//! named, with a deadline) over the listener, every connection (its reads, and its writes while
+//! bytes are queued for it), and the kernel's word on the runs directory and on each run's
+//! process (`viewer/watch.rs`: kqueue `EVFILT_VNODE` and `EVFILT_PROC` on macOS, inotify and
+//! pidfds on Linux). What each wake does is the sans-IO core's (`viewer/pump.rs`). Its one
+//! timer, the 16 ms drain tick, is armed only while a viewer is connected and a ring may have
+//! events; with nobody watching and nothing running the thread does not wake before the idle
+//! expiry, when it stops (rule 70).
 //!
 //! Upheld invariants:
 //! - Loopback-only (`127.0.0.1`), CORS + Private Network Access headers restricted to `https://ix.dev`
 //!   and loopback origins.
-//! - Every loop, frame read, header size, client count, and ring drain per tick has a hard bound.
+//! - Every header, frame, queue, connection count, listing and ring drain per tick has a bound.
 //! - Idle expiry (rule 70): exits cleanly once both `active_viewers == 0` and `active_runs == 0`
 //!   continuously for `idle_expiry`.
 
+#![blaze::driver]
+
+mod procfd;
+mod pump;
+mod resources;
+mod watch;
+
+use core::ffi::CStr;
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use core::time::Duration;
+use std::{ffi::OsStr, fs, io::{self, Read, Write}, net::{Shutdown, SocketAddr, TcpListener, TcpStream}, os::{fd::AsRawFd, unix::ffi::OsStrExt}, path::{Path, PathBuf}, thread::{self, JoinHandle}, time::{SystemTime, UNIX_EPOCH}};
 
-use crate::telemetry::MappedRing;
+use blaze_core::wait::{self, Clock, Deadline, Monotonic, WaitError, Waited};
+use blaze_own::{AString, AVec, Alloc, Arc, Share, SharedAlloc};
+
+use crate::telemetry::{Event, MappedRing};
+
+use self::pump::{Action, ConnId, Listed, Pump, Ring, RingStats, RunMeta};
+use self::watch::{Exit, Seen, Watch, WatchError};
 
 /// Default loopback port matching `site/explore/protocol.ts` and `blaze_run::viewer::DEFAULT_VIEWER_PORT`.
 pub const DEFAULT_PORT: u16 = 41937;
@@ -38,21 +60,45 @@ pub const DEFAULT_IDLE_EXPIRY: Duration = Duration::from_secs(120);
 
 const MAX_HTTP_HEADER_BYTES: usize = 8192;
 const MAX_CLIENTS: usize = 32;
-const MAX_DRAIN_PER_RUN_PER_TICK: usize = 256;
-const MAX_RUNS_TRACKED: usize = 64;
-const ACTIVE_TICK: Duration = Duration::from_millis(15);
-const MAX_IDLE_TICK: Duration = Duration::from_millis(200);
-const DIR_SCAN_INTERVAL: Duration = Duration::from_millis(200);
-const BIN_EVENT_MAGIC: u8 = b'B';
-const BIN_EVENT_VERSION: u8 = 1;
+/// The most connections open at once (viewers and requests); one past it is closed unanswered.
+const MOST_CONNS: usize = 64;
+/// A request's headers arrive within this of its connection, and a closing connection's peer
+/// closes within this of its answer; past it the connection is closed.
+const REQUEST_WAIT: Duration = Duration::from_secs(2);
+/// The most bytes queued for one viewer: one further behind is closed, and reported.
+const MOST_QUEUED: usize = 8 << 20;
+/// The longest frame a viewer may send (it sends close, ping and pong).
+const MOST_CLIENT_FRAME: usize = 64 << 10;
+/// A frame's header and mask at most: 2 + 8 + 4 bytes.
+const MOST_FRAME_HEADER: usize = 14;
+/// The reads of one connection at one wake; the descriptor stays readable for the next.
+const READS_A_WAKE: usize = 16;
+/// The most runs-directory entries one listing reads (rings and builds).
+const MOST_LISTED: usize = 1024;
+const MOST_META_BYTES: usize = 64 << 10;
+const MOST_BUILD_BYTES: usize = 1 << 20;
+/// The rounds of actions one wake takes; what is left is taken at once on the next.
+const ROUNDS: usize = 64;
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+/// The viewer's one wait.
+const WAITING_FOR: &str = "the viewer: its listener, its viewers, the runs directory and the runs' processes";
 
 /// Typed error for viewer startup and loopback operations.
 #[derive(Debug)]
 pub enum ViewerError {
-    Bind { addr: SocketAddr, io: std::io::Error },
-    RunsDir { path: PathBuf, io: std::io::Error },
-    Spawn { thread: &'static str, io: std::io::Error },
+    Bind { addr: SocketAddr, io: io::Error },
+    RunsDir { path: PathBuf, io: io::Error },
+    Spawn { thread: &'static str, io: io::Error },
+    /// The listener refused `call`.
+    Listener { call: &'static str, io: io::Error },
+    /// The runs directory could not be watched, or its watch refused a read.
+    Watch { path: PathBuf, error: WatchError },
+    /// The runs directory was deleted or moved while it was watched.
+    RunsDirGone { path: PathBuf },
+    /// The one wait refused.
+    Wait(WaitError),
+    /// The viewer's thread panicked.
+    Panicked,
 }
 
 impl core::fmt::Display for ViewerError {
@@ -61,13 +107,20 @@ impl core::fmt::Display for ViewerError {
             ViewerError::Bind { addr, io } => write!(f, "blaze viewer: cannot bind {addr}: {io}"),
             ViewerError::RunsDir { path, io } => write!(f, "blaze viewer: runs dir {}: {io}", path.display()),
             ViewerError::Spawn { thread, io } => write!(f, "blaze viewer: spawn {thread}: {io}"),
+            ViewerError::Listener { call, io } => write!(f, "blaze viewer: {call}: {io}"),
+            ViewerError::Watch { path, error } => write!(f, "blaze viewer: runs dir {}: {error}", path.display()),
+            ViewerError::RunsDirGone { path } => {
+                write!(f, "blaze viewer: runs dir {} was deleted or moved while watched", path.display())
+            }
+            ViewerError::Wait(error) => write!(f, "blaze viewer: {error}"),
+            ViewerError::Panicked => write!(f, "blaze viewer: its thread panicked"),
         }
     }
 }
 
 impl core::error::Error for ViewerError {}
 
-/// Configuration for running [`ViewerServer`].
+/// Configuration for running the viewer.
 #[derive(Clone, Debug)]
 pub struct ViewerConfig {
     pub runs_dir: PathBuf,
@@ -85,38 +138,17 @@ impl ViewerConfig {
     }
 }
 
-/// Metadata written by `blaze run` beside `<run_id>.telem` as `<run_id>.meta`.
-#[derive(Clone, Debug)]
-struct RunMeta {
-    pid: u32,
-    package: String,
-    started_ms: u64,
-    slots: BTreeMap<u32, String>,
-}
-
-struct TrackedRun {
-    id: String,
-    meta: RunMeta,
-    ring: MappedRing,
-    alive: bool,
-    ended_notified: bool,
-    dead_since: Option<Instant>,
-}
-
-struct SharedState {
+/// What the handle and the viewer's thread share.
+struct Shared {
     active_viewers: AtomicU32,
     stop: AtomicBool,
-    clients: Mutex<Vec<TcpStream>>,
-    runs_snapshot: Mutex<String>,
-    builds_snapshot: Mutex<String>,
 }
 
 /// Running local viewer server handle (for both CLI `--viewer` and tests).
 pub struct ViewerHandle {
     addr: SocketAddr,
-    shared: Arc<SharedState>,
-    accept_thread: Option<std::thread::JoinHandle<()>>,
-    pump_thread: Option<std::thread::JoinHandle<()>>,
+    shared: Arc<Shared, SharedAlloc<'static>>,
+    thread: Option<JoinHandle<Result<(), ViewerError>>>,
 }
 
 impl ViewerHandle {
@@ -128,129 +160,576 @@ impl ViewerHandle {
         self.shared.active_viewers.load(Ordering::Acquire)
     }
 
-    pub fn stop(&mut self) {
+    /// Stops the viewer and waits for its thread: the error it stopped on, if it did.
+    pub fn stop(&mut self) -> Result<(), ViewerError> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
         self.shared.stop.store(true, Ordering::Release);
-        // Wake blocking accept() with a quick loopback connect.
+        // A connection wakes the wait, which then sees the flag. It is refused only when the
+        // thread has ended already, which the join reports.
         let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(50));
-        if let Some(t) = self.accept_thread.take() {
-            let _ = t.join();
-        }
-        if let Some(t) = self.pump_thread.take() {
-            let _ = t.join();
+        joined(thread)
+    }
+
+    /// Blocks until the viewer stops by itself (its idle expiry, or an error, returned).
+    pub fn finish(mut self) -> Result<(), ViewerError> {
+        match self.thread.take() {
+            Some(thread) => joined(thread),
+            None => Ok(()),
         }
     }
 
-    /// Blocks until the viewer stops (e.g. idle expiry).
-    pub fn wait(mut self) {
-        if let Some(t) = self.pump_thread.take() {
-            let _ = t.join();
-        }
-        self.shared.stop.store(true, Ordering::Release);
-        let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(50));
-        if let Some(t) = self.accept_thread.take() {
-            let _ = t.join();
+    /// Blocks until the viewer stops (e.g. idle expiry); an error it stopped on is written to
+    /// standard error.
+    pub fn wait(self) {
+        if let Err(error) = self.finish() {
+            report(format_args!("{error}"));
         }
     }
 }
 
 impl Drop for ViewerHandle {
     fn drop(&mut self) {
-        self.stop();
+        if let Err(error) = self.stop() {
+            report(format_args!("{error}"));
+        }
     }
 }
 
-/// Starts the loopback viewer server on `127.0.0.1:<config.port>`.
+fn joined(thread: JoinHandle<Result<(), ViewerError>>) -> Result<(), ViewerError> {
+    thread.join().unwrap_or(Err(ViewerError::Panicked))
+}
+
+/// [`start_in`] on the process's heap and the monotonic clock, for blaze-launcher's entry until
+/// it hands its own (`start_in(cfg, shared, Monotonic::new())` with the `SharedAlloc` its
+/// `main` holds); then this goes.
 pub fn start(config: ViewerConfig) -> Result<ViewerHandle, ViewerError> {
-    std::fs::create_dir_all(&config.runs_dir).map_err(|io| ViewerError::RunsDir {
-        path: config.runs_dir.clone(),
-        io,
-    })?;
+    start_in(config, SharedAlloc::global(), Monotonic::new())
+}
+
+/// Starts the loopback viewer server on `127.0.0.1:<config.port>`, its memory from `alloc` and
+/// its time from `clock`.
+pub fn start_in<C: Clock + Send + 'static>(
+    config: ViewerConfig,
+    alloc: SharedAlloc<'static>,
+    clock: C,
+) -> Result<ViewerHandle, ViewerError> {
+    if let Err(io) = fs::create_dir_all(&config.runs_dir) {
+        return Err(ViewerError::RunsDir { path: config.runs_dir, io });
+    }
     let bind_addr = SocketAddr::from(([127, 0, 0, 1], config.port));
     let listener = TcpListener::bind(bind_addr).map_err(|io| ViewerError::Bind { addr: bind_addr, io })?;
     let addr = listener.local_addr().map_err(|io| ViewerError::Bind { addr: bind_addr, io })?;
-    let _ = listener.set_nonblocking(false);
-
-    let shared = Arc::new(SharedState {
-        active_viewers: AtomicU32::new(0),
-        stop: AtomicBool::new(false),
-        clients: Mutex::new(Vec::new()),
-        runs_snapshot: Mutex::new(String::from(r#"{"type":"runs","runs":[]}"#)),
-        builds_snapshot: Mutex::new(String::from(r#"{"type":"builds","builds":[]}"#)),
-    });
-
-    let accept_shared = Arc::clone(&shared);
-    let accept_thread = std::thread::Builder::new()
-        .name(String::from("blaze-viewer-accept"))
-        .spawn(move || accept_loop(listener, accept_shared))
-        .map_err(|io| ViewerError::Spawn { thread: "blaze-viewer-accept", io })?;
-
-    let pump_shared = Arc::clone(&shared);
-    let pump_thread = std::thread::Builder::new()
-        .name(String::from("blaze-viewer-pump"))
-        .spawn(move || pump_loop(config, pump_shared))
-        .map_err(|io| ViewerError::Spawn { thread: "blaze-viewer-pump", io })?;
-
-    Ok(ViewerHandle {
-        addr,
-        shared,
-        accept_thread: Some(accept_thread),
-        pump_thread: Some(pump_thread),
-    })
+    listener
+        .set_nonblocking(true)
+        .map_err(|io| ViewerError::Listener { call: "fcntl(O_NONBLOCK) on the listener", io })?;
+    // Made here, so a directory that cannot be watched is this call's error.
+    let mut dir = AVec::from_slice_in(config.runs_dir.as_os_str().as_bytes(), alloc.local());
+    dir.push(0);
+    let watched = match CStr::from_bytes_with_nul(&dir) {
+        Ok(dir) => Watch::new(dir),
+        Err(_) => return Err(ViewerError::RunsDir { path: config.runs_dir, io: io::Error::from(io::ErrorKind::InvalidInput) }),
+    };
+    drop(dir);
+    let watch = match watched {
+        Ok(watch) => watch,
+        Err(error) => return Err(ViewerError::Watch { path: config.runs_dir, error }),
+    };
+    let shared = Arc::new_in(Shared { active_viewers: AtomicU32::new(0), stop: AtomicBool::new(false) }, alloc);
+    let theirs = shared.share();
+    let thread = thread::Builder::new()
+        .name(String::from("blaze-viewer"))
+        .spawn(move || {
+            let mut served = Loop::new(&config, listener, watch, alloc.local(), clock.now());
+            let ended = served.run(&theirs, &clock);
+            drop(served);
+            theirs.active_viewers.store(0, Ordering::Release);
+            match ended {
+                Ended::Stopped | Ended::Expired => Ok(()),
+                Ended::DirGone => Err(ViewerError::RunsDirGone { path: config.runs_dir }),
+                Ended::Listing(io) => Err(ViewerError::RunsDir { path: config.runs_dir, io }),
+                Ended::Watch(error) => Err(ViewerError::Watch { path: config.runs_dir, error }),
+                Ended::Wait(error) => Err(ViewerError::Wait(error)),
+                Ended::Accept(io) => Err(ViewerError::Listener { call: "accept() on the listener", io }),
+            }
+        })
+        .map_err(|io| ViewerError::Spawn { thread: "blaze-viewer", io })?;
+    Ok(ViewerHandle { addr, shared, thread: Some(thread) })
 }
 
-fn accept_loop(listener: TcpListener, shared: Arc<SharedState>) {
-    for incoming in listener.incoming() {
-        if shared.stop.load(Ordering::Acquire) {
-            break;
-        }
-        let Ok(stream) = incoming else {
-            continue;
-        };
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
-        handle_connection(stream, &shared);
+/// Why the loop ended.
+enum Ended {
+    /// The handle asked.
+    Stopped,
+    /// The idle expiry passed.
+    Expired,
+    /// The runs directory was deleted or moved.
+    DirGone,
+    /// Listing the runs directory refused.
+    Listing(io::Error),
+    Watch(WatchError),
+    Wait(WaitError),
+    Accept(io::Error),
+}
+
+/// A mapped `.telem` file, as the core reads it.
+struct Mapped(MappedRing);
+
+const _: () = assert!(core::mem::size_of::<Event>() == pump::EVENT_BYTES);
+
+/// `event`'s bytes as it lies in memory (`#[repr(C)]`, no padding: the page reads them so),
+/// appended to `into`.
+fn push_event(into: &mut AVec<'_, u8>, event: &Event) {
+    into.push(event.kind);
+    into.push(event.flags);
+    into.extend_from_slice(&event.cpu.to_ne_bytes());
+    for word in [event.thread, event.slot_or_op, event._pad2] {
+        into.extend_from_slice(&word.to_ne_bytes());
+    }
+    for word in [event.ts_ns, event.a, event.b, event.c, event.d, event.e] {
+        into.extend_from_slice(&word.to_ne_bytes());
     }
 }
 
-fn handle_connection(mut stream: TcpStream, shared: &Arc<SharedState>) {
-    let mut buf = [0u8; MAX_HTTP_HEADER_BYTES];
-    let mut len = 0usize;
-    let mut header_end = None;
-    for _ in 0..32 {
-        match stream.read(&mut buf[len..]) {
-            Ok(0) => return,
-            Ok(n) => {
-                len += n;
-                if let Some(pos) = find_header_end(&buf[..len]) {
-                    header_end = Some(pos);
-                    break;
-                }
-                if len == buf.len() {
-                    return;
+impl Ring for Mapped {
+    fn drain_into(&mut self, most: usize, into: &mut AVec<'_, u8>) -> usize {
+        self.0.ring().drain(most, |event| push_event(into, &event))
+    }
+
+    fn stats(&self) -> RingStats {
+        let stats = self.0.ring().stats();
+        RingStats {
+            cap: stats.cap,
+            pushed: stats.pushed,
+            popped: stats.popped,
+            dropped: stats.dropped,
+            shadow_overflows: stats.shadow_overflows,
+            unwound_spans: stats.unwound_spans,
+        }
+    }
+}
+
+/// Where a connection is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    /// Its request's headers are being read.
+    Reading,
+    /// A viewer: frames go out, close, ping and pong come in.
+    Ws,
+    /// Its answer goes out; then (`shut`) our side is closed, and it ends at the peer's close.
+    Closing { shut: bool },
+}
+
+struct Conn<'a> {
+    id: ConnId,
+    stream: TcpStream,
+    phase: Phase,
+    inbox: AVec<'a, u8>,
+    outbox: AVec<'a, u8>,
+    /// What of `outbox` is written.
+    sent: usize,
+    /// Closed past this unless it moves on ([`REQUEST_WAIT`]); none for a viewer.
+    deadline: Option<Duration>,
+    /// Over: removed, and its viewer left, at the next sweep.
+    gone: bool,
+}
+
+/// The viewer's thread: the core, and what it waits on.
+struct Loop<'a> {
+    alloc: Alloc<'a>,
+    idle_expiry: Duration,
+    /// The runs directory's path, as bytes.
+    runs_dir: AVec<'a, u8>,
+    listener: TcpListener,
+    watch: Watch,
+    pump: Pump<'a, Mapped>,
+    conns: AVec<'a, Conn<'a>>,
+    next_conn: u64,
+    fds: AVec<'a, libc::pollfd>,
+    seen: AVec<'a, Seen>,
+}
+
+impl<'a> Loop<'a> {
+    fn new(config: &ViewerConfig, listener: TcpListener, watch: Watch, alloc: Alloc<'a>, now: Duration) -> Loop<'a> {
+        Loop {
+            alloc,
+            idle_expiry: config.idle_expiry,
+            runs_dir: AVec::from_slice_in(config.runs_dir.as_os_str().as_bytes(), alloc),
+            listener,
+            watch,
+            pump: Pump::new(pump::Config::new(config.idle_expiry), now, alloc),
+            conns: AVec::new_in(alloc),
+            next_conn: 0,
+            fds: AVec::new_in(alloc),
+            seen: AVec::new_in(alloc),
+        }
+    }
+
+    fn run(&mut self, shared: &Shared, clock: &impl Clock) -> Ended {
+        loop {
+            if shared.stop.load(Ordering::Acquire) {
+                return Ended::Stopped;
+            }
+            let now = clock.now();
+            self.pump.advance(now);
+            for conn in self.conns.iter_mut() {
+                if conn.deadline.is_some_and(|at| at <= now) {
+                    conn.gone = true;
                 }
             }
-            Err(_) => return,
+            if let Some(ended) = self.settle() {
+                return ended;
+            }
+            shared.active_viewers.store(u32::try_from(self.pump.viewers()).unwrap_or(u32::MAX), Ordering::Release);
+            if self.pump.stopped() {
+                return Ended::Expired;
+            }
+            self.fds.clear();
+            self.fds.push(watch::pollin(self.listener.as_raw_fd()));
+            self.watch.poll_fds(&mut self.fds);
+            let watched = self.fds.len();
+            for conn in self.conns.iter() {
+                let mut events = libc::POLLIN;
+                if conn.sent < conn.outbox.len() {
+                    events |= libc::POLLOUT;
+                }
+                self.fds.push(libc::pollfd { fd: conn.stream.as_raw_fd(), events, revents: 0 });
+            }
+            let deadline = if self.pump.has_actions() { Deadline::PASSED } else { Deadline::at(self.next_wake(now)) };
+            match wait::readable(WAITING_FOR, &mut self.fds, Some(deadline), clock) {
+                Ok(Waited::Ready(_)) => {}
+                Ok(Waited::Deadline) => continue,
+                Err(error) => return Ended::Wait(error),
+            }
+            if let Some(ended) = self.take_ready(watched, clock.now()) {
+                return ended;
+            }
         }
     }
-    let Some(end) = header_end else {
+
+    /// The wait's end: the core's next deadline, a connection's, and at the latest one idle
+    /// expiry from now (rule 18's bound: with a viewer and no live ring nothing else is due).
+    fn next_wake(&self, now: Duration) -> Duration {
+        let mut at = now.saturating_add(self.idle_expiry);
+        if let Some(due) = self.pump.next_deadline() {
+            at = at.min(due);
+        }
+        for conn in self.conns.iter() {
+            if let Some(due) = conn.deadline {
+                at = at.min(due);
+            }
+        }
+        at
+    }
+
+    /// The core's actions taken, queued bytes written, and closed connections swept, until
+    /// nothing is left (at most [`ROUNDS`] rounds).
+    fn settle(&mut self) -> Option<Ended> {
+        for _ in 0..ROUNDS {
+            for action in self.pump.take_actions() {
+                if let Some(ended) = self.act(action) {
+                    return Some(ended);
+                }
+            }
+            for conn in self.conns.iter_mut() {
+                if conn.sent < conn.outbox.len() || conn.phase == (Phase::Closing { shut: false }) {
+                    flush(conn);
+                }
+            }
+            let pump = &mut self.pump;
+            self.conns.retain(|conn| {
+                if conn.gone && conn.phase == Phase::Ws {
+                    pump.viewer_left(conn.id);
+                }
+                !conn.gone
+            });
+            if !self.pump.has_actions() {
+                break;
+            }
+        }
+        None
+    }
+
+    fn act(&mut self, action: Action<'a>) -> Option<Ended> {
+        match action {
+            Action::ListDir => {
+                if let Err(error) = self.list() {
+                    return Some(if error.kind() == io::ErrorKind::NotFound { Ended::DirGone } else { Ended::Listing(error) });
+                }
+            }
+            Action::Attach { stem } => self.attach(stem.as_str()),
+            Action::ReadBuild { name, modified } => self.read_build(name.as_str(), modified),
+            Action::WatchExit { pid } => match self.watch.watch_exit(pid) {
+                Ok(Exit::Watched) => {}
+                Ok(Exit::Gone) => self.pump.exited(pid),
+                Err(errno) => self.pump.watch_failed(pid, errno.raw(), errno.name()),
+            },
+            Action::Remove { stem } => self.remove(stem.as_str()),
+            Action::SendText { to, text } => {
+                if let Some(conn) = self.conns.iter_mut().find(|conn| conn.id == to) {
+                    queue_frame(conn, 0x81, text.as_bytes());
+                }
+            }
+            Action::BroadcastText { text } => {
+                for conn in self.conns.iter_mut() {
+                    queue_frame(conn, 0x81, text.as_bytes());
+                }
+            }
+            Action::BroadcastBinary { bytes } => {
+                for conn in self.conns.iter_mut() {
+                    queue_frame(conn, 0x82, &bytes);
+                }
+            }
+            Action::Report { error } => report(format_args!("{error}")),
+            // The core says it is stopped; the loop ends after this round.
+            Action::Stop => {}
+        }
+        None
+    }
+
+    /// The runs directory's rings and builds, to the core.
+    fn list(&mut self) -> io::Result<()> {
+        let entries = fs::read_dir(Path::new(OsStr::from_bytes(&self.runs_dir)))?;
+        let mut names: AVec<'a, (AString<'a>, u64)> = AVec::new_in(self.alloc);
+        let mut over = 0usize;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            // A name that is not UTF-8 is no run's or build's: blaze names them.
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let build = name.ends_with(".build.json");
+            if !build && !name.ends_with(".telem") {
+                continue;
+            }
+            if names.len() >= MOST_LISTED {
+                over += 1;
+                continue;
+            }
+            let modified = if build {
+                match entry.metadata() {
+                    Ok(meta) => nanos_since_epoch(meta.modified()?),
+                    // Deleted since the listing: not there.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                0
+            };
+            names.push((AString::from_str_in(name, self.alloc), modified));
+        }
+        if over > 0 {
+            report(format_args!("blaze viewer: {over} entries of the runs directory past the bound of {MOST_LISTED}: not read"));
+        }
+        let mut listed = AVec::with_capacity_in(names.len(), self.alloc);
+        for (name, modified) in names.iter() {
+            listed.push(Listed { name: name.as_str(), modified: *modified });
+        }
+        self.pump.listed(&listed);
+        Ok(())
+    }
+
+    fn attach(&mut self, stem: &str) {
+        let telem = file_path(&self.runs_dir, stem, ".telem", self.alloc);
+        let Ok(path) = CStr::from_bytes_with_nul(&telem) else {
+            self.pump.attach_failed(stem, "its path holds a NUL byte");
+            return;
+        };
+        let ring = match MappedRing::attach_file(path) {
+            Ok(ring) => ring,
+            Err(error) => {
+                let mut why = AString::new_in(self.alloc);
+                let _ = write!(why, "{error}");
+                self.pump.attach_failed(stem, why.as_str());
+                return;
+            }
+        };
+        // The run's start where its meta says none: the ring file's modification time (it is
+        // made as the run starts), 0 when that cannot be read; never this process's clock.
+        let started_ms = fs::metadata(path_of(&telem))
+            .and_then(|meta| meta.modified())
+            .map_or(0, |at| nanos_since_epoch(at) / 1_000_000);
+        let meta = file_path(&self.runs_dir, stem, ".meta", self.alloc);
+        let bytes = match read_bounded(path_of(&meta), MOST_META_BYTES, self.alloc) {
+            Ok(bytes) => Some(bytes),
+            // No meta: the run is listed by its stem, with no process to watch.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                report(format_args!("blaze viewer: run {stem}: {stem}.meta: {error}"));
+                None
+            }
+        };
+        let text = match bytes.as_deref().map(core::str::from_utf8) {
+            Some(Ok(text)) => Some(text),
+            Some(Err(_)) => {
+                report(format_args!("blaze viewer: run {stem}: {stem}.meta is not UTF-8"));
+                None
+            }
+            None => None,
+        };
+        let meta = RunMeta::parse(text, stem, started_ms, self.alloc);
+        self.pump.attached(stem, Mapped(ring), meta);
+    }
+
+    fn read_build(&mut self, name: &str, modified: u64) {
+        let path = file_path(&self.runs_dir, name, "", self.alloc);
+        match read_bounded(path_of(&path), MOST_BUILD_BYTES, self.alloc) {
+            Ok(bytes) => self.pump.build_read(name, modified, &bytes),
+            // Deleted since the listing: not there.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => report(format_args!("blaze viewer: build {name}: {error}")),
+        }
+    }
+
+    fn remove(&mut self, stem: &str) {
+        for suffix in [".telem", ".meta"] {
+            let path = file_path(&self.runs_dir, stem, suffix, self.alloc);
+            match fs::remove_file(path_of(&path)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => report(format_args!("blaze viewer: run {stem}: cannot delete {stem}{suffix}: {error}")),
+            }
+        }
+    }
+
+    /// What the wait said is ready: the watch's events to the core, then each connection's
+    /// reads and writes, then new connections. `watched` is where the connections' pollfds
+    /// start.
+    fn take_ready(&mut self, watched: usize, now: Duration) -> Option<Ended> {
+        let listener_ready = self.fds.first().is_some_and(|fd| fd.revents != 0);
+        if let Some(polled) = self.fds.get(1..watched) {
+            self.seen.clear();
+            if let Err(error) = self.watch.take(polled, &mut self.seen) {
+                return Some(Ended::Watch(error));
+            }
+            for &seen in self.seen.iter() {
+                match seen {
+                    Seen::DirChanged => self.pump.dir_changed(),
+                    Seen::DirGone => return Some(Ended::DirGone),
+                    Seen::Exited(pid) => self.pump.exited(pid),
+                }
+            }
+        }
+        let polled = self.fds.get(watched..).unwrap_or(&[]);
+        for (conn, fd) in self.conns.iter_mut().zip(polled) {
+            if fd.revents == 0 {
+                continue;
+            }
+            if fd.revents & libc::POLLNVAL != 0 {
+                conn.gone = true;
+                continue;
+            }
+            if fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                read_conn(conn, &mut self.pump, self.alloc, now);
+            }
+            if fd.revents & libc::POLLOUT != 0 && !conn.gone {
+                flush(conn);
+            }
+        }
+        if listener_ready {
+            return self.accept(now);
+        }
+        None
+    }
+
+    /// The listener's waiting connections taken, at most [`MOST_CONNS`] a wake.
+    fn accept(&mut self, now: Duration) -> Option<Ended> {
+        for _ in 0..MOST_CONNS {
+            let stream = match self.listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return None,
+                // The peer gave up before it was taken, or a signal came: the next one.
+                Err(error) if matches!(error.kind(), io::ErrorKind::ConnectionAborted | io::ErrorKind::Interrupted) => continue,
+                Err(error) => return Some(Ended::Accept(error)),
+            };
+            if self.conns.len() >= MOST_CONNS {
+                report(format_args!("blaze viewer: {MOST_CONNS} connections open: one more closed unanswered"));
+                continue;
+            }
+            if let Err(error) = stream.set_nonblocking(true).and_then(|()| stream.set_nodelay(true)) {
+                report(format_args!("blaze viewer: a connection refused its options, closed: {error}"));
+                continue;
+            }
+            let id = ConnId(self.next_conn);
+            self.next_conn = self.next_conn.wrapping_add(1);
+            self.conns.push(Conn {
+                id,
+                stream,
+                phase: Phase::Reading,
+                inbox: AVec::new_in(self.alloc),
+                outbox: AVec::new_in(self.alloc),
+                sent: 0,
+                deadline: Some(now.saturating_add(REQUEST_WAIT)),
+                gone: false,
+            });
+        }
+        None
+    }
+}
+
+/// What `conn` sent, read without waiting, then taken: a request answered, a viewer's frames.
+fn read_conn<'a>(conn: &mut Conn<'a>, pump: &mut Pump<'a, Mapped>, alloc: Alloc<'a>, now: Duration) {
+    let room = match conn.phase {
+        Phase::Reading => MAX_HTTP_HEADER_BYTES,
+        Phase::Ws => MOST_CLIENT_FRAME + MOST_FRAME_HEADER,
+        Phase::Closing { .. } => usize::MAX,
+    };
+    let mut chunk = [0u8; 4096];
+    for _ in 0..READS_A_WAKE {
+        if conn.inbox.len() >= room {
+            break;
+        }
+        match conn.stream.read(&mut chunk) {
+            Ok(0) => {
+                conn.gone = true;
+                return;
+            }
+            Ok(got) => {
+                // A closing connection's bytes are read only to see its close.
+                if !matches!(conn.phase, Phase::Closing { .. }) {
+                    conn.inbox.extend_from_slice(chunk.get(..got).unwrap_or(&[]));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            // Reset by the peer: the connection is over.
+            Err(_) => {
+                conn.gone = true;
+                return;
+            }
+        }
+    }
+    match conn.phase {
+        Phase::Reading => answer(conn, pump, alloc, now),
+        Phase::Ws => take_frames(conn, pump, now),
+        Phase::Closing { .. } => {}
+    }
+}
+
+/// `conn`'s request answered once its headers are in: a viewer's upgrade, or one answer and
+/// the close.
+fn answer<'a>(conn: &mut Conn<'a>, pump: &mut Pump<'a, Mapped>, alloc: Alloc<'a>, now: Duration) {
+    let Some(end) = find_header_end(&conn.inbox) else {
+        if conn.inbox.len() >= MAX_HTTP_HEADER_BYTES {
+            conn.gone = true;
+        }
         return;
     };
-    let Ok(head) = core::str::from_utf8(&buf[..end]) else {
+    let Some(Ok(head)) = conn.inbox.get(..end).map(core::str::from_utf8) else {
+        conn.gone = true;
         return;
     };
     let mut lines = head.split("\r\n");
-    let Some(request_line) = lines.next() else {
-        return;
-    };
-    let mut parts = request_line.split_whitespace();
+    let mut parts = lines.next().unwrap_or("").split_whitespace();
     let method = parts.next().unwrap_or("");
-    let raw_path = parts.next().unwrap_or("/");
-    let path = raw_path.split('?').next().unwrap_or(raw_path);
+    let target = parts.next().unwrap_or("/");
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
 
     let mut origin: Option<&str> = None;
     let mut ws_key: Option<&str> = None;
     let mut upgrade_ws = false;
-
     for line in lines {
         let Some((name, val)) = line.split_once(':') else {
             continue;
@@ -264,108 +743,316 @@ fn handle_connection(mut stream: TcpStream, shared: &Arc<SharedState>) {
             upgrade_ws = true;
         }
     }
-
-    let cors_origin = allowed_cors_origin(origin);
-
-    if method == "OPTIONS" {
-        let resp = format!(
-            "HTTP/1.1 204 No Content\r\n\
-             Access-Control-Allow-Origin: {cors_origin}\r\n\
-             Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-             Access-Control-Allow-Headers: content-type\r\n\
-             Access-Control-Allow-Private-Network: true\r\n\
-             Content-Length: 0\r\n\
-             Connection: close\r\n\r\n"
-        );
-        let _ = stream.write_all(resp.as_bytes());
-        return;
-    }
+    let cors = allowed_cors_origin(origin);
 
     if method == "GET" && path == "/ws" && upgrade_ws {
-        let Some(key) = ws_key else {
-            write_http(&mut stream, "400 Bad Request", "text/plain", cors_origin, "missing Sec-WebSocket-Key");
-            return;
+        match ws_key {
+            Some(key) if pump.viewers() < MAX_CLIENTS => {
+                let accept = ws_accept_key(key);
+                let mut reply = AString::new_in(alloc);
+                let _ = write!(
+                    reply,
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                );
+                conn.outbox.extend_from_slice(reply.as_bytes());
+                // What follows the request is the viewer's first frames.
+                let rest = AVec::from_slice_in(conn.inbox.get(end..).unwrap_or(&[]), alloc);
+                conn.inbox = rest;
+                conn.phase = Phase::Ws;
+                conn.deadline = None;
+                // Its runs and builds are queued after the handshake.
+                pump.viewer_joined(conn.id);
+                return;
+            }
+            Some(_) => push_http(&mut conn.outbox, "503 Service Unavailable", "text/plain", cors, b"viewer client cap reached", alloc),
+            None => push_http(&mut conn.outbox, "400 Bad Request", "text/plain", cors, b"missing Sec-WebSocket-Key", alloc),
+        }
+    } else {
+        route(method, path, query, cors, &mut conn.outbox, pump, alloc);
+    }
+    close(conn, now);
+}
+
+/// The answer to `method path?query`, queued in `out`.
+fn route<'a>(
+    method: &str,
+    path: &str,
+    query: &str,
+    cors: &str,
+    out: &mut AVec<'a, u8>,
+    pump: &Pump<'a, Mapped>,
+    alloc: Alloc<'a>,
+) {
+    match (method, path) {
+        ("OPTIONS", _) => {
+            let mut head = AString::new_in(alloc);
+            let _ = write!(
+                head,
+                "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: {cors}\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Allow-Private-Network: true\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            out.extend_from_slice(head.as_bytes());
+        }
+        ("GET", "/api/info") => {
+            let mut body = AString::new_in(alloc);
+            let _ = write!(body, r#"{{"version":1,"active_viewers":{}}}"#, pump.viewers());
+            push_http(out, "200 OK", "application/json", cors, body.as_bytes(), alloc);
+        }
+        ("GET", "/api/runs") => push_http(out, "200 OK", "application/json", cors, pump.runs_json().as_bytes(), alloc),
+        ("GET", "/api/builds") => push_http(out, "200 OK", "application/json", cors, pump.builds_json().as_bytes(), alloc),
+        ("GET", "/api/topology") => push_http(out, "200 OK", "application/json", cors, host_topology_json().as_bytes(), alloc),
+        ("GET", "/api/source") => match read_source_snippet_json(query) {
+            Some(body) => push_http(out, "200 OK", "application/json", cors, body.as_bytes(), alloc),
+            None => push_http(out, "404 Not Found", "application/json", cors, br#"{"error":"source unavailable"}"#, alloc),
+        },
+        ("GET", "/api/resources") => {
+            let mut body = AString::new_in(alloc);
+            let status = match resources::query_pid(query).and_then(|pid| procfd::gather(pid, alloc)) {
+                Ok(facts) => {
+                    facts.write_json(&mut body);
+                    "200 OK"
+                }
+                Err(error) => {
+                    error.write_json(&mut body);
+                    error.status()
+                }
+            };
+            push_http(out, status, "application/json", cors, body.as_bytes(), alloc);
+        }
+        ("POST", "/api/toggle") => push_http(out, "200 OK", "application/json", cors, br#"{"ok":true}"#, alloc),
+        ("GET", "/" | "/explore") => {
+            push_http(out, "200 OK", "text/html; charset=utf-8", cors, LOCAL_EXPLORE_HTML.as_bytes(), alloc);
+        }
+        _ => push_http(out, "404 Not Found", "text/plain", cors, b"not found", alloc),
+    }
+}
+
+/// One HTTP answer, closing its connection, queued in `out`.
+fn push_http(out: &mut AVec<'_, u8>, status: &str, content_type: &str, cors_origin: &str, body: &[u8], alloc: Alloc<'_>) {
+    let mut head = AString::new_in(alloc);
+    let _ = write!(
+        head,
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: {cors_origin}\r\nAccess-Control-Allow-Private-Network: true\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    out.extend_from_slice(head.as_bytes());
+    out.extend_from_slice(body);
+}
+
+/// `conn` answered: what is queued goes out, then it closes.
+fn close(conn: &mut Conn<'_>, now: Duration) {
+    conn.phase = Phase::Closing { shut: false };
+    conn.deadline = Some(now.saturating_add(REQUEST_WAIT));
+    conn.inbox.clear();
+}
+
+/// A viewer's whole frames taken from the front of its inbox: a close answered and the
+/// connection closed, a ping answered with its pong, the rest passed over.
+fn take_frames<'a>(conn: &mut Conn<'a>, pump: &mut Pump<'a, Mapped>, now: Duration) {
+    let mut at = 0;
+    while let Some(rest) = conn.inbox.get(at..) {
+        let (opcode, size, start, len, mask) = match client_frame(rest) {
+            ClientFrame::Partial => break,
+            ClientFrame::Refused => {
+                conn.gone = true;
+                return;
+            }
+            ClientFrame::Whole { opcode, size, start, len, mask } => (opcode, size, start, len, mask),
         };
-        if let Ok(clients) = shared.clients.lock() {
-            if clients.len() >= MAX_CLIENTS {
-                write_http(&mut stream, "503 Service Unavailable", "text/plain", cors_origin, "viewer client cap reached");
+        match opcode {
+            0x8 => {
+                push_ws_frame(&mut conn.outbox, 0x88, &[]);
+                pump.viewer_left(conn.id);
+                close(conn, now);
+                return;
+            }
+            0x9 => {
+                let mut pong = [0u8; 125];
+                let wrote = unmask(rest.get(start..start.saturating_add(len)).unwrap_or(&[]), mask, &mut pong);
+                push_ws_frame(&mut conn.outbox, 0x8a, pong.get(..wrote).unwrap_or(&[]));
+            }
+            _ => {}
+        }
+        at += size;
+    }
+    // `at` is at most the inbox's length: each frame taken was whole in it.
+    let left = conn.inbox.len().saturating_sub(at);
+    if at > 0 && left > 0 {
+        conn.inbox.copy_within(at.., 0);
+    }
+    conn.inbox.truncate(left);
+}
+
+/// A client's frame at the front of what it sent (RFC 6455 section 5.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClientFrame {
+    /// More bytes are needed.
+    Partial,
+    /// Unmasked (a client masks every frame), longer than [`MOST_CLIENT_FRAME`], or a control
+    /// frame longer than 125 bytes: the connection is closed.
+    Refused,
+    /// `size` bytes in all; the payload is `len` bytes from `start`, masked with `mask`.
+    Whole { opcode: u8, size: usize, start: usize, len: usize, mask: [u8; 4] },
+}
+
+fn client_frame(bytes: &[u8]) -> ClientFrame {
+    let (Some(&first), Some(&second)) = (bytes.first(), bytes.get(1)) else {
+        return ClientFrame::Partial;
+    };
+    if second & 0x80 == 0 {
+        return ClientFrame::Refused;
+    }
+    let (len, at) = match second & 0x7f {
+        126 => match bytes.get(2..4) {
+            Some(&[high, low]) => (u64::from(u16::from_be_bytes([high, low])), 4),
+            _ => return ClientFrame::Partial,
+        },
+        127 => match bytes.get(2..10).and_then(|word| <[u8; 8]>::try_from(word).ok()) {
+            Some(word) => (u64::from_be_bytes(word), 10),
+            None => return ClientFrame::Partial,
+        },
+        short => (u64::from(short), 2),
+    };
+    let opcode = first & 0x0f;
+    let Ok(len) = usize::try_from(len) else {
+        return ClientFrame::Refused;
+    };
+    if len > MOST_CLIENT_FRAME || (opcode & 0x8 != 0 && len > 125) {
+        return ClientFrame::Refused;
+    }
+    let Some(mask) = bytes.get(at..at + 4).and_then(|mask| <[u8; 4]>::try_from(mask).ok()) else {
+        return ClientFrame::Partial;
+    };
+    let start = at + 4;
+    if bytes.len() < start + len {
+        return ClientFrame::Partial;
+    }
+    ClientFrame::Whole { opcode, size: start + len, start, len, mask }
+}
+
+/// `masked` unmasked with `mask` into `into`, as much as fits: how many bytes.
+fn unmask(masked: &[u8], mask: [u8; 4], into: &mut [u8]) -> usize {
+    let wrote = into.len().min(masked.len());
+    for ((out, byte), key) in into.iter_mut().zip(masked).zip(mask.iter().cycle()) {
+        *out = byte ^ key;
+    }
+    wrote
+}
+
+/// A server-to-client (unmasked) RFC 6455 frame (`0x81` text, `0x82` binary), appended to `out`.
+fn push_ws_frame(out: &mut AVec<'_, u8>, fin_opcode: u8, payload: &[u8]) {
+    out.push(fin_opcode);
+    let len = payload.len();
+    if let Ok(short) = u8::try_from(len)
+        && short <= 125
+    {
+        out.push(short);
+    } else if let Ok(medium) = u16::try_from(len) {
+        out.push(126);
+        out.extend_from_slice(&medium.to_be_bytes());
+    } else {
+        out.push(127);
+        out.extend_from_slice(&u64::try_from(len).unwrap_or(u64::MAX).to_be_bytes());
+    }
+    out.extend_from_slice(payload);
+}
+
+/// A frame queued for viewer `conn`; one that would put it [`MOST_QUEUED`] behind closes it.
+fn queue_frame(conn: &mut Conn<'_>, fin_opcode: u8, payload: &[u8]) {
+    if conn.phase != Phase::Ws || conn.gone {
+        return;
+    }
+    let queued = conn.outbox.len().saturating_sub(conn.sent);
+    if queued.saturating_add(payload.len()) > MOST_QUEUED {
+        report(format_args!("blaze viewer: viewer {} is {queued} bytes behind: closed", conn.id.0));
+        conn.gone = true;
+        return;
+    }
+    push_ws_frame(&mut conn.outbox, fin_opcode, payload);
+}
+
+/// What is queued for `conn` written without waiting; an answered connection's side closed.
+fn flush(conn: &mut Conn<'_>) {
+    // Bounded by what is queued: each write takes some of it, or the loop ends.
+    while let Some(left) = conn.outbox.get(conn.sent..)
+        && !left.is_empty()
+    {
+        match conn.stream.write(left) {
+            Ok(0) => {
+                conn.gone = true;
+                return;
+            }
+            Ok(wrote) => conn.sent += wrote,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            // Reset by the peer: the connection is over.
+            Err(_) => {
+                conn.gone = true;
                 return;
             }
         }
-        let accept = ws_accept_key(key);
-        let handshake = format!(
-            "HTTP/1.1 101 Switching Protocols\r\n\
-             Upgrade: websocket\r\n\
-             Connection: Upgrade\r\n\
-             Sec-WebSocket-Accept: {accept}\r\n\r\n"
-        );
-        if stream.write_all(handshake.as_bytes()).is_err() {
-            return;
-        }
-        let _ = stream.set_nonblocking(true);
-        // Send initial runs and builds snapshots immediately.
-        if let Ok(snap) = shared.runs_snapshot.lock() {
-            let frame = ws_text_frame(&snap);
-            let _ = stream.write_all(&frame);
-        }
-        if let Ok(bsnap) = shared.builds_snapshot.lock() {
-            let frame = ws_text_frame(&bsnap);
-            let _ = stream.write_all(&frame);
-        }
-        if let Ok(mut clients) = shared.clients.lock() {
-            clients.push(stream);
-            shared.active_viewers.store(u32::try_from(clients.len()).unwrap_or(u32::MAX), Ordering::Release);
-        }
-        return;
     }
+    if conn.sent >= conn.outbox.len() {
+        conn.outbox.clear();
+        conn.sent = 0;
+    } else if conn.sent > conn.outbox.len() / 2 {
+        let left = conn.outbox.len() - conn.sent;
+        conn.outbox.copy_within(conn.sent.., 0);
+        conn.outbox.truncate(left);
+        conn.sent = 0;
+    }
+    if conn.phase == (Phase::Closing { shut: false }) && conn.outbox.is_empty() {
+        // All of the answer is out: our side is closed, and the peer's close ends it (closing
+        // with its bytes unread could reset the answer away).
+        match conn.stream.shutdown(Shutdown::Write) {
+            Ok(()) => conn.phase = Phase::Closing { shut: true },
+            Err(_) => conn.gone = true,
+        }
+    }
+}
 
-    match (method, path) {
-        ("GET", "/api/info") => {
-            let active = shared.active_viewers.load(Ordering::Acquire);
-            let body = format!(r#"{{"version":1,"active_viewers":{active}}}"#);
-            write_http(&mut stream, "200 OK", "application/json", cors_origin, &body);
+/// A line on standard error: what refused, for whoever reads the viewer's log.
+fn report(what: core::fmt::Arguments<'_>) {
+    // Standard error is the last place a report can go: a failed write of it has none.
+    let _ = writeln!(io::stderr().lock(), "{what}");
+}
+
+/// `<dir>/<name><suffix>` and a NUL: a `CStr`, or (without the NUL, [`path_of`]) a `Path`.
+fn file_path<'a>(dir: &[u8], name: &str, suffix: &str, alloc: Alloc<'a>) -> AVec<'a, u8> {
+    let mut path = AVec::with_capacity_in(dir.len() + name.len() + suffix.len() + 2, alloc);
+    path.extend_from_slice(dir);
+    path.push(b'/');
+    path.extend_from_slice(name.as_bytes());
+    path.extend_from_slice(suffix.as_bytes());
+    path.push(0);
+    path
+}
+
+fn path_of(bytes: &[u8]) -> &Path {
+    Path::new(OsStr::from_bytes(bytes.strip_suffix(&[0u8]).unwrap_or(bytes)))
+}
+
+fn nanos_since_epoch(at: SystemTime) -> u64 {
+    // A time before the epoch is 0.
+    at.duration_since(UNIX_EPOCH).map_or(0, |since| u64::try_from(since.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// The file at `path`, refused (`FileTooLarge`) past `most` bytes.
+fn read_bounded<'a, P: AsRef<Path> + ?Sized>(path: &P, most: usize, alloc: Alloc<'a>) -> io::Result<AVec<'a, u8>> {
+    let mut file = fs::File::open(path)?;
+    let mut bytes = AVec::new_in(alloc);
+    let mut chunk = [0u8; 8192];
+    // Bounded by `most`: each read adds to `bytes` or ends the loop.
+    loop {
+        let got = match file.read(&mut chunk) {
+            Ok(0) => return Ok(bytes),
+            Ok(got) => got,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if bytes.len().saturating_add(got) > most {
+            return Err(io::Error::from(io::ErrorKind::FileTooLarge));
         }
-        ("GET", "/api/runs") => {
-            let body = shared
-                .runs_snapshot
-                .lock()
-                .map(|s| s.clone())
-                .unwrap_or_else(|_| String::from(r#"{"type":"runs","runs":[]}"#));
-            write_http(&mut stream, "200 OK", "application/json", cors_origin, &body);
-        }
-        ("GET", "/api/builds") => {
-            let body = shared
-                .builds_snapshot
-                .lock()
-                .map(|s| s.clone())
-                .unwrap_or_else(|_| String::from(r#"{"type":"builds","builds":[]}"#));
-            write_http(&mut stream, "200 OK", "application/json", cors_origin, &body);
-        }
-        ("GET", "/api/topology") => {
-            let body = host_topology_json();
-            write_http(&mut stream, "200 OK", "application/json", cors_origin, &body);
-        }
-        ("GET", "/api/source") => {
-            let query = raw_path.split_once('?').map(|(_, q)| q).unwrap_or("");
-            match read_source_snippet_json(query) {
-                Some(body) => write_http(&mut stream, "200 OK", "application/json", cors_origin, &body),
-                None => write_http(&mut stream, "404 Not Found", "application/json", cors_origin, r#"{"error":"source unavailable"}"#),
-            }
-        }
-        ("GET", "/api/resources") => {
-            let query = raw_path.split_once('?').map(|(_, q)| q).unwrap_or("");
-            let body = read_process_resources_json(query);
-            write_http(&mut stream, "200 OK", "application/json", cors_origin, &body);
-        }
-        ("POST", "/api/toggle") => {
-            write_http(&mut stream, "200 OK", "application/json", cors_origin, r#"{"ok":true}"#);
-        }
-        ("GET", "/" | "/explore") => {
-            write_http(&mut stream, "200 OK", "text/html; charset=utf-8", cors_origin, LOCAL_EXPLORE_HTML);
-        }
-        _ => {
-            write_http(&mut stream, "404 Not Found", "text/plain", cors_origin, "not found");
-        }
+        bytes.extend_from_slice(chunk.get(..got).unwrap_or(&[]));
     }
 }
 
@@ -376,359 +1063,8 @@ fn allowed_cors_origin(origin: Option<&str>) -> &str {
     }
 }
 
-fn write_http(stream: &mut TcpStream, status: &str, content_type: &str, cors_origin: &str, body: &str) {
-    let resp = format!(
-        "HTTP/1.1 {status}\r\n\
-         Content-Type: {content_type}\r\n\
-         Access-Control-Allow-Origin: {cors_origin}\r\n\
-         Access-Control-Allow-Private-Network: true\r\n\
-         Cache-Control: no-store\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(resp.as_bytes());
-}
-
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
-fn pump_loop(config: ViewerConfig, shared: Arc<SharedState>) {
-    let mut tracked: BTreeMap<String, TrackedRun> = BTreeMap::new();
-    let mut builds: BTreeMap<String, (SystemTime, String)> = BTreeMap::new();
-    let mut idle_since: Option<Instant> = None;
-    let mut last_dir_scan = Instant::now() - DIR_SCAN_INTERVAL;
-    let mut sleep_dur = ACTIVE_TICK;
-    let mut tick: u64 = 0;
-    let mut bin_scratch: Vec<u8> = Vec::with_capacity(4096);
-
-    while !shared.stop.load(Ordering::Acquire) {
-        tick = tick.wrapping_add(1);
-        let now = Instant::now();
-        let mut runs_changed = false;
-        let mut builds_changed = false;
-        let mut any_events = false;
-
-        // 1. Poll existing clients for disconnect / ping / close frames so `active_viewers` stays exact.
-        poll_clients(&shared);
-
-        // 2. Discover new `*.telem` rings and `*.build.json` snapshots under `config.runs_dir` (~5 Hz).
-        if now.duration_since(last_dir_scan) >= DIR_SCAN_INTERVAL {
-            last_dir_scan = now;
-            if let Ok(entries) = std::fs::read_dir(&config.runs_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                    if name.ends_with(".build.json") && builds.len() < MAX_RUNS_TRACKED {
-                        let mtime = entry
-                            .metadata()
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .unwrap_or(UNIX_EPOCH);
-                        let changed = match builds.get(name) {
-                            Some((prev, _)) => *prev != mtime,
-                            None => true,
-                        };
-                        if changed {
-                            if let Ok(raw) = std::fs::read_to_string(&path) {
-                                let trimmed = raw.trim();
-                                if trimmed.starts_with('{') && trimmed.ends_with('}') {
-                                    builds.insert(String::from(name), (mtime, String::from(trimmed)));
-                                    builds_changed = true;
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    if tracked.len() >= MAX_RUNS_TRACKED {
-                        continue;
-                    }
-                    if path.extension().and_then(|s| s.to_str()) != Some("telem") {
-                        continue;
-                    }
-                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                        continue;
-                    };
-                    if tracked.contains_key(stem) {
-                        continue;
-                    }
-                    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
-                        continue;
-                    };
-                    let Ok(ring) = MappedRing::attach_file(&cpath) else {
-                        continue;
-                    };
-                    let meta = read_meta(&config.runs_dir.join(format!("{stem}.meta")), stem);
-                    let alive = meta.pid == 0 || pid_alive(meta.pid);
-                    let run = TrackedRun {
-                        id: String::from(stem),
-                        meta,
-                        ring,
-                        alive,
-                        ended_notified: false,
-                        dead_since: if alive { None } else { Some(now) },
-                    };
-                    let started_msg = format!(r#"{{"type":"run_started","run":{}}}"#, format_run_json(&run));
-                    tracked.insert(String::from(stem), run);
-                    broadcast_text(&shared, &started_msg);
-                    runs_changed = true;
-                }
-            }
-        }
-
-        // 3. Drain events from all tracked runs as packed 64-byte binary WebSocket frames (zero JSON!).
-        let mut to_remove: Vec<String> = Vec::new();
-
-        for (id, run) in tracked.iter_mut() {
-            bin_scratch.clear();
-            let id_bytes = id.as_bytes();
-            let id_len = u16::try_from(id_bytes.len()).unwrap_or(u16::MAX);
-            let hdr_len = (4 + usize::from(id_len) + 7) & !7;
-            bin_scratch.push(BIN_EVENT_MAGIC);
-            bin_scratch.push(BIN_EVENT_VERSION);
-            bin_scratch.extend_from_slice(&id_len.to_le_bytes());
-            bin_scratch.extend_from_slice(&id_bytes[..usize::from(id_len)]);
-            bin_scratch.resize(hdr_len, 0);
-
-            let mut drained = 0usize;
-            while drained < MAX_DRAIN_PER_RUN_PER_TICK {
-                let Some(ev) = run.ring.ring().pop() else {
-                    break;
-                };
-                // SAFETY: `Event` is `#[repr(C, align(8))]`, 64 bytes, all plain integer fields.
-                let raw: [u8; 64] = unsafe { core::mem::transmute(ev) };
-                bin_scratch.extend_from_slice(&raw);
-                drained += 1;
-            }
-            if drained > 0 {
-                any_events = true;
-                broadcast_binary(&shared, &bin_scratch);
-            }
-
-            if run.alive && run.meta.pid != 0 && !pid_alive(run.meta.pid) {
-                run.alive = false;
-                run.dead_since = Some(now);
-                runs_changed = true;
-            }
-            if !run.alive && !run.ended_notified && drained == 0 {
-                run.ended_notified = true;
-                let ended = format!(r#"{{"type":"run_ended","id":"{}","status":0}}"#, escape_json(id));
-                broadcast_text(&shared, &ended);
-                runs_changed = true;
-            }
-            // Garbage-collect exited run files after 15s so the runs directory stays clean.
-            if let Some(dead_at) = run.dead_since {
-                if now.duration_since(dead_at) > Duration::from_secs(15) {
-                    to_remove.push(id.clone());
-                }
-            }
-        }
-
-        for id in to_remove {
-            tracked.remove(&id);
-            let _ = std::fs::remove_file(config.runs_dir.join(format!("{id}.telem")));
-            let _ = std::fs::remove_file(config.runs_dir.join(format!("{id}.meta")));
-            runs_changed = true;
-        }
-
-        // 4. Refresh runs and builds snapshots periodically or on changes.
-        if builds_changed {
-            let mut bmsg = String::from(r#"{"type":"builds","builds":["#);
-            for (idx, (_, raw)) in builds.values().enumerate() {
-                if idx > 0 {
-                    bmsg.push(',');
-                }
-                bmsg.push_str(raw);
-            }
-            bmsg.push_str("]}");
-            if let Ok(mut guard) = shared.builds_snapshot.lock() {
-                *guard = bmsg.clone();
-            }
-            broadcast_text(&shared, &bmsg);
-        }
-        if runs_changed || tick % 20 == 0 {
-            let snap = format_runs_message(&tracked);
-            if let Ok(mut guard) = shared.runs_snapshot.lock() {
-                *guard = snap.clone();
-            }
-            if runs_changed || (tick % 40 == 0 && !tracked.is_empty()) {
-                broadcast_text(&shared, &snap);
-            }
-        }
-
-        // 5. Idle expiry check (rule 70: never linger forever with 0 runs and 0 viewers).
-        let active_viewers = shared.active_viewers.load(Ordering::Acquire);
-        let active_runs = tracked.values().filter(|r| r.alive).count();
-        if active_viewers > 0 || active_runs > 0 {
-            idle_since = None;
-        } else {
-            let since = *idle_since.get_or_insert(now);
-            if now.duration_since(since) >= config.idle_expiry {
-                shared.stop.store(true, Ordering::Release);
-                break;
-            }
-        }
-
-        // Adaptive backoff: 15ms while streaming, smoothly backing off to 200ms when quiet.
-        if any_events || runs_changed {
-            sleep_dur = ACTIVE_TICK;
-        } else {
-            sleep_dur = (sleep_dur * 2).min(MAX_IDLE_TICK);
-        }
-        std::thread::sleep(sleep_dur);
-    }
-}
-
-fn poll_clients(shared: &Arc<SharedState>) {
-    let Ok(mut clients) = shared.clients.lock() else {
-        return;
-    };
-    let mut i = 0;
-    let mut scratch = [0u8; 512];
-    while i < clients.len() {
-        let mut keep = true;
-        match clients[i].read(&mut scratch) {
-            Ok(0) => keep = false,
-            Ok(n) => {
-                // RFC 6455 close opcode = 0x8, ping = 0x9.
-                let opcode = scratch[0] & 0x0f;
-                if opcode == 0x8 {
-                    let _ = clients[i].write_all(&[0x88, 0x00]);
-                    keep = false;
-                } else if opcode == 0x9 && n >= 2 {
-                    let _ = clients[i].write_all(&[0x8a, 0x00]);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => keep = false,
-        }
-        if keep {
-            i += 1;
-        } else {
-            clients.swap_remove(i);
-        }
-    }
-    shared.active_viewers.store(u32::try_from(clients.len()).unwrap_or(u32::MAX), Ordering::Release);
-}
-
-fn broadcast_frame(shared: &Arc<SharedState>, frame: &[u8]) {
-    let Ok(mut clients) = shared.clients.lock() else {
-        return;
-    };
-    let mut i = 0;
-    while i < clients.len() {
-        let ok = match clients[i].write_all(frame) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
-            Err(_) => false,
-        };
-        if ok {
-            i += 1;
-        } else {
-            clients.swap_remove(i);
-        }
-    }
-    shared.active_viewers.store(u32::try_from(clients.len()).unwrap_or(u32::MAX), Ordering::Release);
-}
-
-fn broadcast_text(shared: &Arc<SharedState>, text: &str) {
-    let frame = ws_frame(0x81, text.as_bytes());
-    broadcast_frame(shared, &frame);
-}
-
-fn broadcast_binary(shared: &Arc<SharedState>, payload: &[u8]) {
-    let frame = ws_frame(0x82, payload);
-    broadcast_frame(shared, &frame);
-}
-
-fn read_meta(path: &Path, fallback_id: &str) -> RunMeta {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    let mut meta = RunMeta {
-        pid: 0,
-        package: String::from(fallback_id),
-        started_ms: now_ms,
-        slots: BTreeMap::new(),
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return meta;
-    };
-    for line in text.lines() {
-        if let Some(v) = line.strip_prefix("pid=") {
-            if let Ok(p) = v.trim().parse::<u32>() {
-                meta.pid = p;
-            }
-        } else if let Some(v) = line.strip_prefix("package=") {
-            meta.package = String::from(v.trim());
-        } else if let Some(v) = line.strip_prefix("started_ms=") {
-            if let Ok(t) = v.trim().parse::<u64>() {
-                meta.started_ms = t;
-            }
-        } else if let Some(v) = line.strip_prefix("slot=") {
-            if let Some((k, name)) = v.split_once(':') {
-                if let Ok(slot_id) = k.trim().parse::<u32>() {
-                    meta.slots.insert(slot_id, String::from(name.trim()));
-                }
-            }
-        }
-    }
-    meta
-}
-
-fn pid_alive(pid: u32) -> bool {
-    let Ok(p) = i32::try_from(pid) else {
-        return false;
-    };
-    if p <= 0 {
-        return false;
-    }
-    // SAFETY: `kill(pid, 0)` checks existence without delivering a signal.
-    let rc = unsafe { libc::kill(p, 0) };
-    if rc == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-fn format_runs_message(tracked: &BTreeMap<String, TrackedRun>) -> String {
-    let mut out = String::from(r#"{"type":"runs","runs":["#);
-    for (idx, run) in tracked.values().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        out.push_str(&format_run_json(run));
-    }
-    out.push_str("]}");
-    out
-}
-
-fn format_run_json(run: &TrackedRun) -> String {
-    let stats = run.ring.ring().stats();
-    let mut slots_json = String::from("{");
-    for (idx, (k, v)) in run.meta.slots.iter().enumerate() {
-        if idx > 0 {
-            slots_json.push(',');
-        }
-        let _ = write!(slots_json, r#""{}":"{}""#, k, escape_json(v));
-    }
-    slots_json.push('}');
-    format!(
-        r#"{{"id":"{}","pid":{},"package":"{}","alive":{},"started_ms":{},"stats":{{"cap":{},"pushed":{},"popped":{},"dropped":{},"shadow_overflows":{},"unwound_spans":{}}},"slots":{slots_json}}}"#,
-        escape_json(&run.id),
-        run.meta.pid,
-        escape_json(&run.meta.package),
-        run.alive,
-        run.meta.started_ms,
-        stats.cap,
-        stats.pushed,
-        stats.popped,
-        stats.dropped,
-        stats.shadow_overflows,
-        stats.unwound_spans,
-    )
 }
 
 fn escape_json(s: &str) -> String {
@@ -888,136 +1224,6 @@ fn read_source_snippet_json(query: &str) -> Option<String> {
     Some(out)
 }
 
-/// Inspects a live process's open listening ports, established TCP/UDP sockets, and FD count.
-fn read_process_resources_json(query: &str) -> String {
-    let mut pid: u32 = 0;
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == "pid" {
-                pid = v.parse::<u32>().unwrap_or(0);
-            }
-        }
-    }
-    if pid == 0 {
-        return String::from(r#"{"pid":0,"fd_count":0,"sockets":[],"files":[]}"#);
-    }
-
-    let mut fd_count: u32 = 0;
-    let mut sockets: Vec<(String, String, String, String, u16)> = Vec::new();
-    let mut files: Vec<String> = Vec::new();
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(output) = std::process::Command::new("lsof")
-            .args(["-nP", "-a", "-p", &pid.to_string(), "-F", "ftPnT"])
-            .output()
-        {
-            let text = String::from_utf8_lossy(&output.stdout);
-            let mut cur_type = String::new();
-            let mut cur_proto = String::new();
-            let mut cur_name = String::new();
-            let mut cur_state = String::new();
-            let flush = |ty: &str,
-                         proto: &str,
-                         name: &str,
-                         state: &str,
-                         sockets: &mut Vec<(String, String, String, String, u16)>,
-                         files: &mut Vec<String>| {
-                if ty == "IPv4" || ty == "IPv6" {
-                    let (local, remote) = name.split_once("->").unwrap_or((name, ""));
-                    let port = local.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(0);
-                    let st = if state.is_empty() {
-                        if remote.is_empty() { "LISTEN" } else { "ESTABLISHED" }
-                    } else {
-                        state
-                    };
-                    if sockets.len() < 48 {
-                        sockets.push((
-                            if proto.is_empty() { "TCP".into() } else { proto.to_string() },
-                            local.to_string(),
-                            remote.to_string(),
-                            st.to_string(),
-                            port,
-                        ));
-                    }
-                } else if (ty == "REG" || ty == "VREG") && !name.is_empty() && files.len() < 24 {
-                    files.push(name.to_string());
-                }
-            };
-            for line in text.lines() {
-                let mut chars = line.chars();
-                let Some(tag) = chars.next() else { continue };
-                let rest = chars.as_str();
-                match tag {
-                    'f' => {
-                        if !cur_type.is_empty() {
-                            flush(&cur_type, &cur_proto, &cur_name, &cur_state, &mut sockets, &mut files);
-                        }
-                        cur_type.clear();
-                        cur_proto.clear();
-                        cur_name.clear();
-                        cur_state.clear();
-                        if rest.bytes().all(|b| b.is_ascii_digit()) {
-                            fd_count = fd_count.saturating_add(1);
-                        }
-                    }
-                    't' => cur_type = rest.to_string(),
-                    'P' => cur_proto = rest.to_string(),
-                    'n' => cur_name = rest.to_string(),
-                    'T' => {
-                        if let Some(st) = rest.strip_prefix("ST=") {
-                            cur_state = st.to_string();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if !cur_type.is_empty() {
-                flush(&cur_type, &cur_proto, &cur_name, &cur_state, &mut sockets, &mut files);
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
-            for ent in entries.flatten() {
-                fd_count = fd_count.saturating_add(1);
-                if let Ok(target) = std::fs::read_link(ent.path()) {
-                    let s = target.to_string_lossy().to_string();
-                    if s.starts_with('/') && files.len() < 24 {
-                        files.push(s);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut out = format!(r#"{{"pid":{pid},"fd_count":{fd_count},"sockets":["#);
-    for (i, (proto, local, remote, state, port)) in sockets.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        let _ = write!(
-            out,
-            r#"{{"proto":"{}","local":"{}","remote":"{}","state":"{}","port":{port}}}"#,
-            escape_json(proto),
-            escape_json(local),
-            escape_json(remote),
-            escape_json(state),
-        );
-    }
-    out.push_str(r#"],"files":["#);
-    for (i, f) in files.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        let _ = write!(out, r#""{}""#, escape_json(f));
-    }
-    out.push_str("]}");
-    out
-}
-
 /// Probes `http://127.0.0.1:<port>/api/info` with a tight loopback timeout.
 /// Returns `Some(active_viewers)` when a live viewer responded.
 pub fn probe_active_viewers(port: u16) -> Option<u32> {
@@ -1050,31 +1256,6 @@ pub fn open_browser_url(url: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .spawn()
         .is_ok()
-}
-
-/// Encodes a server-to-client (unmasked) RFC 6455 frame (`0x81` text, `0x82` binary).
-pub fn ws_frame(fin_opcode: u8, bytes: &[u8]) -> Vec<u8> {
-    let len = bytes.len();
-    let mut out = Vec::with_capacity(len + 10);
-    out.push(fin_opcode);
-    if len <= 125 {
-        out.push(u8::try_from(len).unwrap_or(0));
-    } else if len <= 65535 {
-        out.push(126);
-        let l16 = u16::try_from(len).unwrap_or(u16::MAX);
-        out.extend_from_slice(&l16.to_be_bytes());
-    } else {
-        out.push(127);
-        let l64 = u64::try_from(len).unwrap_or(u64::MAX);
-        out.extend_from_slice(&l64.to_be_bytes());
-    }
-    out.extend_from_slice(bytes);
-    out
-}
-
-/// Encodes a server-to-client (unmasked) RFC 6455 text frame.
-pub fn ws_text_frame(text: &str) -> Vec<u8> {
-    ws_frame(0x81, text.as_bytes())
 }
 
 /// RFC 6455 `Sec-WebSocket-Accept = base64(SHA-1(key || GUID))`.
@@ -1188,7 +1369,8 @@ ws.onmessage=(e)=>{log.textContent=e.data+'\n'+log.textContent.slice(0,24000);};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blaze_launch::telemetry::{AllocOp, Event, EventKind};
+    use blaze_launch::telemetry::{AllocOp, EventKind};
+    use std::{env, ffi::CString, process};
 
     #[test]
     fn rfc6455_accept_key_matches_spec_vector() {
@@ -1197,17 +1379,38 @@ mod tests {
     }
 
     #[test]
-    fn viewer_tracks_active_viewers_streams_live_ring_events_and_expires_idle() {
-        let dir = std::env::temp_dir().join(format!("blaze-viewer-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create runs dir");
+    fn a_client_frame_is_taken_whole_and_unmasked() {
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        let ping = [0x89, 0x82, 0x11, 0x22, 0x33, 0x44, b'h' ^ 0x11, b'i' ^ 0x22];
+        assert_eq!(client_frame(&ping), ClientFrame::Whole { opcode: 0x9, size: 8, start: 6, len: 2, mask });
+        for cut in 0..ping.len() {
+            assert_eq!(client_frame(&ping[..cut]), ClientFrame::Partial, "{cut} bytes of a ping");
+        }
+        let mut payload = [0u8; 125];
+        let wrote = unmask(&ping[6..], mask, &mut payload);
+        assert_eq!(&payload[..wrote], b"hi");
+        // A client's frame is masked; a control frame is at most 125 bytes; a frame at most
+        // MOST_CLIENT_FRAME.
+        assert_eq!(client_frame(&[0x81, 0x02, b'h', b'i']), ClientFrame::Refused);
+        assert_eq!(client_frame(&[0x89, 0x80 | 126, 0x00, 126]), ClientFrame::Refused);
+        assert_eq!(client_frame(&[0x82, 0x80 | 127, 0, 0, 0, 0, 0, 0x10, 0, 0]), ClientFrame::Refused);
+        // Each length form of a server's frame.
+        let alloc = blaze_own::testing::heap().alloc();
+        for (len, header) in [(0usize, 2usize), (125, 2), (126, 4), (65535, 4), (65536, 10)] {
+            let mut out = AVec::new_in(alloc);
+            push_ws_frame(&mut out, 0x82, &AVec::from_elem_in(7u8, len, alloc));
+            assert_eq!(out.len(), header + len, "a frame of {len} bytes");
+        }
+    }
 
-        let mut handle = start(ViewerConfig {
-            runs_dir: dir.clone(),
-            port: 0,
-            idle_expiry: Duration::from_secs(30),
-        })
-        .expect("start viewer");
+    #[test]
+    fn viewer_tracks_active_viewers_streams_live_ring_events_and_expires_idle() {
+        let dir = env::temp_dir().join(format!("blaze-viewer-test-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create runs dir");
+
+        let config = ViewerConfig { runs_dir: dir.to_path_buf(), port: 0, idle_expiry: Duration::from_secs(30) };
+        let mut handle = start_in(config, blaze_own::testing::heap().shared(), Monotonic::new()).expect("start viewer");
         let port = handle.addr().port();
 
         // 1. Before any tab connects: active_viewers == 0 -> blaze run would open browser.
@@ -1235,14 +1438,13 @@ mod tests {
         let telem_path = dir.join("run-live-test.telem");
         let meta_path = dir.join("run-live-test.meta");
         let build_path = dir.join("run-live-test.build.json");
-        std::fs::write(&meta_path, format!("pid={}\npackage=demo-app\nstarted_ms=12345\n", std::process::id()))
-            .expect("write meta");
-        std::fs::write(
+        fs::write(&meta_path, format!("pid={}\npackage=demo-app\nstarted_ms=12345\n", process::id())).expect("write meta");
+        fs::write(
             &build_path,
             r#"{"id":"run-live-test","package":"demo-app","command":"blaze run","status":"running","exit_code":null,"errors":0,"warnings":1,"reached":40,"found":36,"made":4,"placed":36,"resolved":4,"frontend_built":"no","recompile_reason":"Certificate changed","phases":[]}"#,
         )
         .expect("write build json");
-        let telem_cpath = std::ffi::CString::new(telem_path.as_os_str().as_encoded_bytes()).expect("cpath");
+        let telem_cpath = CString::new(telem_path.as_os_str().as_encoded_bytes()).expect("cpath");
         let ring = MappedRing::create(&telem_cpath, 64).expect("create ring");
         assert!(ring.ring().try_push(Event::span_enter(
             1,
@@ -1261,56 +1463,59 @@ mod tests {
             [0x1000, 0x2000, 0x3000],
         )));
 
-        // 5. Read WebSocket frames until we see both our `run_started` text frame and the
-        //    packed binary event batch frame (`0x82`, magic `'B'`, version `1`, 2 x 64B Events).
-        let mut raw_stream: Vec<u8> = Vec::new();
+        // 5. Read WebSocket frames until we see both the live build snapshot and the packed
+        //    binary event batch frame (`0x82`, magic `'B'`, version `1`, 2 x 64B Events). Each
+        //    read waits at most the stream's 3 s timeout, and at most 256 are made.
+        let mut raw_stream = AVec::new_in(blaze_own::testing::heap().alloc());
         let mut buf = [0u8; 4096];
-        let deadline = Instant::now() + Duration::from_secs(3);
         let mut saw_binary_events = false;
         let mut saw_builds = false;
-        while Instant::now() < deadline {
-            match ws.read(&mut buf) {
-                Ok(0) => break,
-                Ok(k) => {
-                    raw_stream.extend_from_slice(&buf[..k]);
-                    if !saw_builds && raw_stream.windows(19).any(|w| w == br#"Certificate changed"#) {
-                        saw_builds = true;
-                    }
-                    // Locate binary batch header: [b'B', 1, 13, 0, b"run-live-test"...]
-                    if !saw_binary_events {
-                        if let Some(pos) = raw_stream.windows(17).position(|w| {
-                            w[0] == BIN_EVENT_MAGIC && w[1] == BIN_EVENT_VERSION && &w[4..17] == b"run-live-test"
-                        }) {
-                            let hdr_len = (4 + 13 + 7) & !7; // 24 bytes
-                            if raw_stream.len() >= pos + hdr_len + 128 {
-                                let ev_bytes = &raw_stream[pos + hdr_len..pos + hdr_len + 128];
-                                assert_eq!(ev_bytes[0], EventKind::SpanEnter as u8, "first binary event must be SpanEnter");
-                                assert_eq!(ev_bytes[64], EventKind::Alloc as u8, "second binary event must be Alloc");
-                                let alloc_size = u64::from_le_bytes(ev_bytes[64 + 32..64 + 40].try_into().expect("8 bytes"));
-                                assert_eq!(alloc_size, 512, "binary Alloc event size must match 512");
-                                saw_binary_events = true;
-                            }
-                        }
-                    }
-                    if saw_binary_events && saw_builds {
-                        break;
-                    }
+        for _ in 0..256 {
+            if saw_binary_events && saw_builds {
+                break;
+            }
+            let k = match ws.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(k) => k,
+            };
+            raw_stream.extend_from_slice(&buf[..k]);
+            if !saw_builds && raw_stream.windows(19).any(|w| w == br#"Certificate changed"#) {
+                saw_builds = true;
+            }
+            // Locate binary batch header: [b'B', 1, 13, 0, b"run-live-test"...]
+            if !saw_binary_events
+                && let Some(pos) = raw_stream.windows(17).position(|w| {
+                    w[0] == pump::BIN_EVENT_MAGIC && w[1] == pump::BIN_EVENT_VERSION && &w[4..17] == b"run-live-test"
+                })
+            {
+                let hdr_len = (4 + 13 + 7) & !7; // 24 bytes
+                if raw_stream.len() >= pos + hdr_len + 128 {
+                    let ev_bytes = &raw_stream[pos + hdr_len..pos + hdr_len + 128];
+                    assert_eq!(ev_bytes[0], EventKind::SpanEnter as u8, "first binary event must be SpanEnter");
+                    assert_eq!(ev_bytes[64], EventKind::Alloc as u8, "second binary event must be Alloc");
+                    let alloc_size = u64::from_le_bytes(ev_bytes[64 + 32..64 + 40].try_into().expect("8 bytes"));
+                    assert_eq!(alloc_size, 512, "binary Alloc event size must match 512");
+                    saw_binary_events = true;
                 }
-                Err(_) => break,
             }
         }
         assert!(saw_binary_events, "did not receive packed binary event batch in ws stream");
         assert!(saw_builds, "did not receive live build.json snapshot in ws stream");
 
-        // 6. Close client -> active_viewers drops back to 0.
+        // 6. Close client -> active_viewers drops back to 0. Each probe is one round trip
+        //    through the viewer's loop, which takes the close before or with it.
         drop(ws);
-        let wait_zero = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < wait_zero && handle.active_viewers() != 0 {
-            std::thread::sleep(Duration::from_millis(20));
+        let mut active = probe_active_viewers(port);
+        for _ in 0..64 {
+            if active == Some(0) {
+                break;
+            }
+            active = probe_active_viewers(port);
         }
+        assert_eq!(active, Some(0));
         assert_eq!(handle.active_viewers(), 0);
 
-        handle.stop();
-        let _ = std::fs::remove_dir_all(&dir);
+        handle.stop().expect("the viewer stops on its handle's word");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

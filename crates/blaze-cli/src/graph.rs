@@ -196,11 +196,24 @@ pub struct Graph<'f> {
     /// Each member's lock entry and its directory, anchor-relative (`""` for the root's own
     /// package): where the names world reads that member's files ([`Graph::member_dirs`]).
     dirs: Vec<(LockId, blaze_unit_graph::Text<'static>), Alloc<'static>>,
+    /// The rustflags blaze does not apply, said on the graph's record ([`RUSTFLAGS_NOT_APPLIED`]).
+    told: Option<&'f str>,
 }
 
 impl<'f> Graph<'f> {
+    /// [`Graph::new`] for the targets [`target_of`] made: what of their rustflags blaze does not
+    /// apply is said on the graph's record, never dropped (rule 3). Under no `--target` the host
+    /// takes the target's flags, so the target's are said.
+    pub fn of(parts: Parts, lockfile: &Lockfile<'f>, workspace_read: ContentId, target: Targeted, host: Targeted, tests: bool, heap: &'static blaze_own::Heap, frame: &'f Frame) -> Graph<'f> {
+        let told = RustflagsTold(&target.flags);
+        let told = told.any().then(|| held_str(bstd::mem::format_in!(frame, "{told}").as_str(), frame));
+        let mut graph = Graph::new(parts, lockfile, workspace_read, target.desc, host.desc, tests, heap, frame);
+        graph.told = told;
+        graph
+    }
+
     /// The job of `parts` over `lockfile`, for `target` and, for the host's units (build
-    /// scripts), `host` (both from [`target`], each asked for its unit's kind); `workspace_read`
+    /// scripts), `host` (both from [`target_of`], each asked for its unit's kind); `workspace_read`
     /// is the units' source.
     pub fn new(parts: Parts, lockfile: &Lockfile<'f>, workspace_read: ContentId, target: TargetDesc<'static>, host: TargetDesc<'static>, tests: bool, heap: &'static blaze_own::Heap, frame: &'f Frame) -> Graph<'f> {
         let mut roots = Vec::with_capacity_in(parts.members.len(), heap.alloc());
@@ -211,7 +224,7 @@ impl<'f> Graph<'f> {
         let host: &'f TargetDesc<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(host, frame));
         let ask: &'f Ask<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(ask, frame));
         let inputs = UnitGraphInputs { lock: lockfile.text, workspace_read, members, resolver: parts.resolver, target, host, ask };
-        Graph { source: unit_graph_task::source(&inputs), inputs, mapped: Vec::new_in(frame), dirs: parts.dirs }
+        Graph { source: unit_graph_task::source(&inputs), inputs, mapped: Vec::new_in(frame), dirs: parts.dirs, told: None }
     }
 
     /// Each member's lock entry and its directory, anchor-relative, in the layout's order.
@@ -226,13 +239,80 @@ impl<'f> Graph<'f> {
     }
 }
 
-/// This build's target as the pinned toolchain states it: its cfg atoms, read from the
-/// toolchain's manifest on the shelf under `home`, reached from the start folder `start`.
-/// For a target-side unit of `kind`: its `cfg(panic)` is derived from the program's profile
-/// fact `program` by blaze-world `panic::unit_panic` (the one home of a unit's strategy: the
-/// profile's for a library or binary, `unwind` for a test or bench, the run target's cut for a
-/// build script), in place of the toolchain list's atom.
-pub fn target(cx: &Cx, env: &crate::fetch::FetchEnv<'_>, program: blaze_manifest::layout::panic::ProfilePanic, kind: &blaze_unit_graph::UnitKind<'_>, frame: &Frame) -> Result<TargetDesc<'static>, CliError> {
+/// The finding number of the rustflags blaze does not apply (blaze-manifest rustflags.rs
+/// `Chosen::not_applied`): a note on the graph's record, counted as nothing (`Told`). Its one
+/// argument is the whole sentence: the flags and the source they came from.
+pub(crate) const RUSTFLAGS_NOT_APPLIED: u16 = 47;
+
+/// The checkout's cargo config, as cargo names it: `.cargo/config` is read over
+/// `.cargo/config.toml` when both are there.
+const CARGO_CONFIG: [&str; 2] = [".cargo/config", ".cargo/config.toml"];
+
+/// A unit's target with the rustflags cargo gives it ([`target_of`]): its description, whose cfg
+/// holds the flags' `--cfg`s (so its key moves with them, rule 21), and what was chosen.
+pub struct Targeted {
+    pub desc: TargetDesc<'static>,
+    pub flags: blaze_manifest::rustflags::Chosen<'static>,
+}
+
+/// The `rustflags` of the checkout's cargo config (blaze-manifest rustflags.rs), each file read
+/// a row of the layout (`rows`: the units' source, so an edit to one, or one made or removed,
+/// lays the graph again): the config file cargo reads ([`CARGO_CONFIG`]), and its `include`s
+/// (relative to `.cargo/`, merged under it in order; an absent one that is not `optional` is
+/// refused). Not read yet, and so not applied: the config files of the folders above the
+/// checkout and `$CARGO_HOME/config.toml`.
+pub fn rustflags_config(
+    cx: &Cx, root: &bstd::fs::Dir<bstd::fs::ReadWrite>, stamps: &impl crate::sweep::Stamps, rows: &mut crate::sweep::Rows<'_>, heap: &'static blaze_own::Heap, frame: &Frame,
+) -> Result<blaze_manifest::rustflags::RustflagsConfig<'static>, CliError> {
+    use blaze_manifest::rustflags::{RustflagsConfig, RustflagsError};
+    // Kept for the command (the graph's inputs are made from it): on the process's heap.
+    let alloc = heap.alloc();
+    let refused = |why: &dyn core::fmt::Display| CliError::Program(crate::ManifestRefused::of(why, frame));
+    let mut config = RustflagsConfig::new(alloc);
+    let mut file = None;
+    let mut text = bstd::mem::Bytes::new_in(frame, "a cargo config file");
+    for path in CARGO_CONFIG {
+        if crate::sweep::read_manifest(cx, root, stamps, path, rows, &mut text)? {
+            file = Some(path);
+            break;
+        }
+    }
+    let Some(file) = file else { return Ok(config) };
+    let text = core::str::from_utf8(text.as_slice()).map_err(|_| refused(&format_args!("{file}: not UTF-8")))?;
+    for include in RustflagsConfig::includes(file, text, alloc).map_err(|error| refused(&error))?.iter() {
+        let path = include.path.as_str();
+        if path.starts_with('/') || path.split('/').any(|part| part == "..") {
+            return Err(refused(&format_args!("{file}: its `include` of `{path}` leaves `.cargo/`, which blaze does not read")));
+        }
+        let joined = bstd::mem::format_in!(frame, ".cargo/{path}");
+        let mut included = bstd::mem::Bytes::new_in(frame, "an included cargo config file");
+        if !crate::sweep::read_manifest(cx, root, stamps, joined.as_str(), rows, &mut included)? {
+            match include.optional {
+                true => continue,
+                false => return Err(refused(&RustflagsError::IncludeMissing { file: blaze_own::String::from_str_in(file, alloc), path: blaze_own::String::from_str_in(path, alloc) })),
+            }
+        }
+        let included = core::str::from_utf8(included.as_slice()).map_err(|_| refused(&format_args!("{}: not UTF-8", joined.as_str())))?;
+        if !RustflagsConfig::includes(joined.as_str(), included, alloc).map_err(|error| refused(&error))?.is_empty() {
+            return Err(refused(&RustflagsError::NestedInclude { file: blaze_own::String::from_str_in(joined.as_str(), alloc) }));
+        }
+        config.read(joined.as_str(), included).map_err(|error| refused(&error))?;
+    }
+    config.read(file, text).map_err(|error| refused(&error))?;
+    Ok(config)
+}
+
+/// This build's target as the pinned toolchain states it, for a unit of `kind`, with the
+/// rustflags cargo gives that unit. The toolchain's cfg atoms are read from its manifest on the
+/// shelf under `env.home`; the unit's `cfg(panic)` is derived from the program's profile fact
+/// `program` by blaze-world `panic::unit_panic` in place of the toolchain list's atom; and each
+/// `--cfg` of the rustflags (blaze-manifest rustflags.rs `choose`, over the checkout's `config`
+/// and the command's variables, `env.rustflags`) is an atom of the unit's cfg. blaze takes no
+/// `--target`, so a build script's unit takes the flags as a library's does (cargo's rule
+/// without `--target`; the rule's twin is tested in blaze-manifest rustflags_tests.rs).
+pub fn target_of(
+    cx: &Cx, env: &crate::fetch::FetchEnv<'_>, config: &blaze_manifest::rustflags::RustflagsConfig<'_>, program: blaze_manifest::layout::panic::ProfilePanic, kind: &blaze_unit_graph::UnitKind<'_>, frame: &Frame,
+) -> Result<Targeted, CliError> {
     if TRIPLE.is_empty() {
         return Err(CliError::Text { what: "this build's machine has no target triple the toolchain is cut for" });
     }
@@ -249,10 +329,15 @@ pub fn target(cx: &Cx, env: &crate::fetch::FetchEnv<'_>, program: blaze_manifest
     let cuts = blaze_world::panic::Cuts::read(view, TRIPLE).map_err(|e| refused(&e))?;
     let panic = blaze_world::panic::unit_panic(program, blaze_world::Side::Target, kind, &cuts).map_err(|e| refused(&e))?;
     let atoms = view.cfg(TRIPLE).ok_or(CliError::Text { what: "the pinned toolchain was not cut for this machine's target" })?;
+    let mut listed = Vec::new_in(frame);
+    listed.extend(atoms);
+    // What `rustc --print cfg` says for the target, which cargo matches `target.'cfg(..)'` against.
+    let unit = blaze_manifest::rustflags::Unit { target_given: false, host_unit: matches!(kind, blaze_unit_graph::UnitKind::BuildScript | blaze_unit_graph::UnitKind::ProcMacro) };
     // Kept for the command (the graph's inputs): on the process's heap.
     let heap = env.heap.alloc();
+    let flags = blaze_manifest::rustflags::choose(config, env.rustflags, TRIPLE, &listed, unit, heap).map_err(|error| refused(&error))?;
     let mut cfg = Vec::new_in(heap);
-    for (name, value) in atoms {
+    for &(name, value) in listed.iter() {
         if name == blaze_world::panic::CFG_KEY {
             continue;
         }
@@ -262,7 +347,42 @@ pub fn target(cx: &Cx, env: &crate::fetch::FetchEnv<'_>, program: blaze_manifest
         });
     }
     cfg.push(CfgAtom::pair(blaze_world::panic::CFG_KEY, blaze_world::panic::cfg_value(panic), heap));
-    Ok(TargetDesc::new(TRIPLE, cfg, heap))
+    for (name, value) in flags.cfg.iter() {
+        cfg.push(match value {
+            Some(value) => CfgAtom::pair(name.as_str(), value.as_str(), heap),
+            None => CfgAtom::flag(name.as_str(), heap),
+        });
+    }
+    Ok(Targeted { desc: TargetDesc::new(TRIPLE, cfg, heap), flags })
+}
+
+/// The note of the rustflags a unit takes that blaze does not apply ([`RUSTFLAGS_NOT_APPLIED`]),
+/// and of `target.'cfg(..)'` tables that did not settle in cargo's two turns.
+struct RustflagsTold<'c, 'a>(&'c blaze_manifest::rustflags::Chosen<'a>);
+
+impl RustflagsTold<'_, '_> {
+    /// Whether there is anything to say.
+    fn any(&self) -> bool {
+        !self.0.not_applied.is_empty() || !self.0.settled
+    }
+}
+
+impl core::fmt::Display for RustflagsTold<'_, '_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let flags = self.0;
+        if !flags.not_applied.is_empty() {
+            write!(f, "the rustflags of {} hold {} flag(s) blaze does not apply:", flags.from, flags.not_applied.len())?;
+            for flag in flags.not_applied.iter() {
+                write!(f, " `{}`", flag.as_str())?;
+            }
+            write!(f, "; their {} `--cfg`(s) are in every unit's cfg", flags.cfg.len())?;
+        }
+        if !flags.settled {
+            let after = if flags.not_applied.is_empty() { "" } else { "; " };
+            write!(f, "{after}the `target.'cfg(..)'` rustflags tables did not settle in cargo's two turns (cargo warns the same): the second turn's flags are taken")?;
+        }
+        Ok(())
+    }
 }
 
 /// The records of the `Fetch` jobs the task was handed, mapped from `<home>/.blaze/v2/sources/` once a
@@ -374,6 +494,10 @@ pub(crate) fn run<'f, 'b>(cx: &Cx, lockfile: &mut Lockfile<'f>, graph: &mut Grap
             for left in made.left_out.iter() {
                 let words = bstd::mem::format_in!(held, "{left}");
                 record.find(TARGET_SKIPPED, (0, 0), &[words.as_str()]);
+            }
+            // The rustflags blaze does not apply, said (rule 3): graph.rs `Graph::of`.
+            if let Some(told) = graph.told {
+                record.find(RUSTFLAGS_NOT_APPLIED, (0, 0), &[told]);
             }
             Ok(Did::Done(record))
         }

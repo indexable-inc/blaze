@@ -415,16 +415,17 @@ pub struct BodyReads<'w> {
     /// The defining texts of the constants the body's evaluator read (project.rs
     /// `record_const_texts`): each is a read the engine places beside `reads`.
     pub const_texts: AVec<'static, TableRead>,
-    /// The library key of each fn declared in a body the check reached (`each_from` past the
+    /// The library key of each fn, const and static declared in a body the check reached (`each_from` past the
     /// root, at any depth), in the order reached: bodies this check checked that are no outline
     /// entry of their own, so the caller lists them in its covers (blaze-cli engine_bodies.rs,
     /// work.rs `covered`) and a call of one finds its row. Empty for `Coverage::RootOnly`.
     pub locals: AVec<'w, ItemKey>,
     /// The ROOT body's checked record (blaze-typeck checked_record.rs, D163 R1), in `work`:
-    /// `Some` only for a clean verdict, types and borrows (front2 borrows.rs `check_borrows_in`
-    /// encodes it): the caller puts it as it is, under the body's check name.
+    /// `Some` for a root whose types are clean, whatever its borrows say (`keeps_typed`; front2
+    /// borrows.rs `check_borrows_in` encodes it): the caller puts it as it is, under the body's
+    /// check name.
     pub typed: Option<AVec<'w, u8>>,
-    /// The root's verdict is clean but it has no checked record because its check left stalled
+    /// The root's types are clean but it has no checked record because its check left stalled
     /// goals, decided after the record (front2 stalled_goals.rs): the run meets a `TypedGap`
     /// for it. The run's census sums this flag over its bodies (the engine's Bodies stage, which
     /// reads `BodyReads`), so a tempo run says how many such gaps it has.
@@ -545,19 +546,74 @@ impl core::fmt::Debug for AsksDiffer<'_> {
     }
 }
 
+/// Whether the two sides of D161's seam agree on one body (the relation [`compare_asks`] holds):
+/// - the same failure, and for a body that checked (clean or with findings) the same verdict
+///   digest, findings, verdict bytes (which carry the final round's read-list digest), constant
+///   texts, locals and typed record bytes;
+/// - the `Once` side's read list a SUBSET of the `Again` side's (both sorted): under `Once`
+///   over frozen heads the run stops at its first hole (asks.rs `Store::stops_at_holes`), so
+///   every fill it makes is a question its final round asks; `Again` also keeps the reads of
+///   the fills it made past a stand-in that its final round never asked (the superset the
+///   module doc's INTERIM paragraph names);
+/// - a body whose TYPES both sides checked clean (`typed` kept: [`keeps_typed`]) is held to all of
+///   the above whatever its borrows say (a refused borrow check fails the task, both sides
+///   alike, and its verdict bytes say so equally);
+/// - for a body whose types a side did not check clean, the verdict bytes may differ only by
+///   the gaps named: `Again` lists every gap of every round, speculative ones included; `Once`
+///   the gaps met before its run stopped. Both must fail.
+fn asks_agree(a: &BodyReads<'_>, o: &BodyReads<'_>) -> bool {
+    let subset = o.reads.as_slice().iter().all(|read| a.reads.as_slice().binary_search(read).is_ok());
+    let types_clean = a.typed.is_some() && o.typed.is_some();
+    if (a.failed || o.failed) && !types_clean {
+        return a.failed == o.failed && subset;
+    }
+    a.out == o.out
+        && a.failed == o.failed
+        && a.findings == o.findings
+        && a.bytes.as_slice() == o.bytes.as_slice()
+        && subset
+        && a.const_texts.as_slice() == o.const_texts.as_slice()
+        && a.locals.as_slice() == o.locals.as_slice()
+        && a.typed.as_ref().map(|b| b.as_slice()) == o.typed.as_ref().map(|b| b.as_slice())
+}
+
 /// D161 step 3's ORACLE (rule 78: each instantiation of the seam tested equal): `task`'s body
 /// checked under `AsksMet::Again` and under `AsksMet::Once(plant)`, each with a fresh recorder,
 /// no keyer, no meter and no shared goal table (a shared table filled by the first run would
-/// give the second hits the first never had), its read list sorted; equal verdict digests,
-/// failure, findings, verdict bytes, read lists, constant texts and locals, or both runs refused
-/// alike. `plant` is the control's (`AsksPlant::RefuseMade` must differ on a seeded body that
-/// imports a head).
+/// give the second hits the first never had), its read list sorted, over the frame's heads or,
+/// for a frame with none, a fresh frozen seed a side ([`oracle_seed`]); the two agree as
+/// [`asks_agree`] says, or both runs refused alike. A seed refusal of the oracle's own seed is
+/// said on its own `asks-oracle SEED REFUSED` line and passes (counted apart, not a
+/// difference). `plant` is the control's (`AsksPlant::RefuseMade` must differ on a seeded body
+/// that imports a head).
 pub fn compare_asks<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, plant: super::super::asks::AsksPlant) -> Result<(), AsksDiffer<'w>> {
     use super::super::asks::AsksMet;
-    let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads: frame.heads, sources: frame.sources, goals: None, census: None };
-    let run = |met: AsksMet| {
+    let run = |met: AsksMet, heads: Option<&'n dyn HeadSeed<'n>>| {
+        let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads, sources: frame.sources, goals: None, census: None };
         let mut recorder = Recorder::new(RecorderOpts { alloc: work });
         record_body_as(tables, task, &shadow, work, &mut recorder, None, Coverage::WithLocals, ReadReport::Sorted, met)
+    };
+    // An unseeded body (a lowering store, where `Once` would meet its heads as `Again` does)
+    // gets frozen heads of its own, one fresh seed a side ([`oracle_seed`]), so the oracle
+    // exercises the one ask on EVERY body. A head the seed cannot freeze (no constant
+    // evaluator, receiver pointers not looked up: the record form's known limits) is a seed
+    // refusal, said on its own line and counted apart, never a difference.
+    let (again, once) = match frame.heads {
+        Some(heads) => (run(AsksMet::Again, Some(heads)), run(AsksMet::Once(plant), Some(heads))),
+        None => {
+            let side = |met: AsksMet| {
+                let seed = oracle_seed(tables, frame);
+                let got = run(met, Some(seed as &'n dyn HeadSeed<'n>));
+                release_oracle_seed(tables, frame, seed);
+                got
+            };
+            let (again, once) = (side(AsksMet::Again), side(AsksMet::Once(plant)));
+            if let Some(error) = [&again, &once].into_iter().find_map(|got| got.as_ref().err().filter(|e| matches!(e, TaskError::Seed { .. }))) {
+                std::eprintln!("asks-oracle SEED REFUSED (counted apart, not a difference): {error}");
+                return Ok(());
+            }
+            (again, once)
+        }
     };
     let empty = || BodyReads {
         out: ContentId([0; 32]),
@@ -576,13 +632,10 @@ pub fn compare_asks<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFra
         goal_hits: AVec::new_in(work),
         asked: blaze_ask::Counts::default(),
     };
-    let (again, once) = (run(AsksMet::Again), run(AsksMet::Once(plant)));
     let body = task.planned.name;
     match (again, once) {
         (Ok(a), Ok(o)) => {
-            let equal = a.out == o.out && a.failed == o.failed && a.findings == o.findings && a.bytes.as_slice() == o.bytes.as_slice() && a.reads.as_slice() == o.reads.as_slice() && a.const_texts.as_slice() == o.const_texts.as_slice() && a.locals.as_slice() == o.locals.as_slice()
-                && a.typed.as_ref().map(|b| b.as_slice()) == o.typed.as_ref().map(|b| b.as_slice());
-            if equal { Ok(()) } else { Err(AsksDiffer { body, again: a, once: o, errors: (None, None) }) }
+            if asks_agree(&a, &o) { Ok(()) } else { Err(AsksDiffer { body, again: a, once: o, errors: (None, None) }) }
         }
         // Both refused: equal when they refuse with one text (`TaskError` has no `Eq`).
         (Err(a), Err(o)) => {
@@ -593,6 +646,112 @@ pub fn compare_asks<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFra
         }
         (Ok(a), Err(o)) => Err(AsksDiffer { body, again: a, once: empty(), errors: (None, Some(o)) }),
         (Err(a), Ok(o)) => Err(AsksDiffer { body, again: empty(), once: o, errors: (Some(a), None) }),
+    }
+}
+
+/// Fresh frozen heads for one side of [`compare_asks`] over a body its frame gives none: the
+/// tests' seed (front2_tables_cost.rs's `Freezing`) over the tables' records, with `sized`
+/// from the lang crates, no constant evaluator and receiver pointers not looked up (a head
+/// that needs either is a seed refusal, counted apart). Placed in the body's frame (`'n`),
+/// whose bump never runs its destructor: [`release_oracle_seed`] drops what it froze.
+fn oracle_seed<'n>(tables: Tables<'_, 'n>, frame: &BodyFrame<'n>) -> &'n super::seeds::Freezing<'n, 'n, &'n Records<'n>> {
+    let names = tables.records();
+    frame.frame.alloc(super::seeds::Freezing::new(names, oracle_heads(tables, frame)))
+}
+
+/// The empty frozen heads [`oracle_seed`] starts from.
+fn oracle_heads<'n>(tables: Tables<'_, 'n>, frame: &BodyFrame<'n>) -> super::head::SeededHeads<'n, 'n, &'n Records<'n>> {
+    let names = tables.records();
+    let mut sized = None;
+    for &at in tables.lang_crates() {
+        NamesSource::each_lang(names, at, &mut |name, key| {
+            if name == "sized" {
+                sized = Some(key);
+            }
+        });
+    }
+    super::head::SeededHeads::new(super::head::SeededHeadsOpts { names, sized, pointers: super::super::receiver::Pointers::NOT_LOOKED_UP, frame: frame.frame, scratch: frame.alloc, alloc: frame.alloc, consts: None, known: None, owners: None })
+}
+
+/// Drops what an [`oracle_seed`] froze (its cells are in `frame.alloc`, which the frame's bump
+/// would never free): its heads are swapped for empty ones, which hold nothing.
+fn release_oracle_seed<'n>(tables: Tables<'_, 'n>, frame: &BodyFrame<'n>, seed: &super::seeds::Freezing<'n, 'n, &'n Records<'n>>) {
+    drop(seed.heads.replace(oracle_heads(tables, frame)));
+}
+
+/// The enter-once cost test's entry (front2 tables/enter_once_tests.rs): `task`'s body on one
+/// side of D161's seam, `met`, with the frame as given (its meter included, which
+/// [`compare_asks`] drops), a fresh recorder and its read list sorted.
+#[cfg(test)]
+pub(crate) fn record_body_met<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, met: super::super::asks::AsksMet) -> Result<BodyReads<'w>, TaskError> {
+    let mut recorder = Recorder::new(RecorderOpts { alloc: work });
+    record_body_as(tables, task, frame, work, &mut recorder, None, Coverage::WithLocals, ReadReport::Sorted, met)
+}
+
+#[cfg(test)]
+impl<'w> BodyReads<'w> {
+    /// The verdict's bytes (what `out` digests).
+    pub(crate) fn verdict_bytes(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+
+    /// What the one ask counted in the body's store (zero under `Again`).
+    pub(crate) fn asked_counts(&self) -> blaze_ask::Counts {
+        self.asked
+    }
+
+    /// The head read of each head the body's store held after the check, with its key.
+    pub(crate) fn held_heads(&self) -> &[(TableRead, u128)] {
+        self.held.as_slice()
+    }
+
+    /// Whether the two sides of D161's seam agree on this body ([`asks_agree`]): `self` the
+    /// `Again` side's, `once` the `Once` side's, both with sorted read lists.
+    pub(crate) fn agrees_with_once(&self, once: &BodyReads<'_>) -> bool {
+        asks_agree(self, once)
+    }
+
+    /// What of [`asks_agree`]'s relation fails between `self` (the `Again` side) and `once`, by
+    /// field: each a line naming the field and how it differs (the first byte apart, the
+    /// lengths, the `Once` reads missing from the `Again` list). Empty when they agree.
+    pub(crate) fn once_differs(&self, once: &BodyReads<'_>) -> std::string::String {
+        let mut s = std::string::String::new();
+        let first_apart = |a: &[u8], b: &[u8]| a.iter().zip(b.iter()).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
+        if self.out != once.out {
+            let _ = writeln!(s, "out: {:?} against {:?}", self.out, once.out);
+        }
+        if self.failed != once.failed {
+            let _ = writeln!(s, "failed: {} against {}", self.failed, once.failed);
+        }
+        if self.findings != once.findings {
+            let _ = writeln!(s, "findings: {} against {}", self.findings, once.findings);
+        }
+        let (ab, ob) = (self.bytes.as_slice(), once.bytes.as_slice());
+        if ab != ob {
+            let at = first_apart(ab, ob);
+            let near = |b: &[u8]| std::string::String::from_utf8_lossy(&b[at.saturating_sub(40).min(b.len())..(at + 80).min(b.len())]).into_owned();
+            let _ = writeln!(s, "verdict bytes: {} against {} bytes, first apart at {at}: again `{}` once `{}`", ab.len(), ob.len(), near(ab), near(ob));
+        }
+        let missing: std::vec::Vec<&TableRead> = once.reads.as_slice().iter().filter(|r| self.reads.as_slice().binary_search(r).is_err()).collect();
+        if !missing.is_empty() {
+            let _ = writeln!(s, "reads: {} of the one ask's {} are not in the restart path's {} (the first: {:?})", missing.len(), once.reads.len(), self.reads.len(), missing.first());
+        }
+        if self.const_texts.as_slice() != once.const_texts.as_slice() {
+            let _ = writeln!(s, "const texts: {} against {}", self.const_texts.len(), once.const_texts.len());
+        }
+        if self.locals.as_slice() != once.locals.as_slice() {
+            let _ = writeln!(s, "locals: {} against {}", self.locals.len(), once.locals.len());
+        }
+        match (self.typed.as_ref().map(|b| b.as_slice()), once.typed.as_ref().map(|b| b.as_slice())) {
+            (Some(a), Some(o)) if a != o => {
+                let _ = writeln!(s, "typed record: {} against {} bytes, first apart at {}", a.len(), o.len(), first_apart(a, o));
+            }
+            (a, o) if a.is_some() != o.is_some() => {
+                let _ = writeln!(s, "typed record: kept {} against {}", a.is_some(), o.is_some());
+            }
+            _ => {}
+        }
+        s
     }
 }
 
@@ -888,19 +1047,20 @@ fn record_body_as<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     };
     drop(held_keys);
     drop(reading);
-    // The root's checked record (D163 R1), copied into `work` beside the rest of the answer,
-    // only of a clean verdict (types and borrows); a clean check the record refused fails the
-    // task by name (rule 3).
+    // The root's checked record (D163 R1), copied into `work` beside the rest of the answer, of
+    // every root whose TYPES are clean ([`keeps_typed`]); a clean check the record refused
+    // fails the task by name (rule 3).
     let root_reached = reached.iter().find(|one| one.within.is_none());
-    let clean = root_reached.filter(|one| one.got.0.is_clean() && one.got.1.findings.is_empty() && one.got.1.refused.is_none());
+    let clean = root_reached.filter(|one| keeps_typed(&one.got.0));
     let typed = match clean.and_then(|one| one.got.0.typed.as_ref()) {
         Some(Ok(record)) => {
             let mut kept = AVec::with_capacity_in(record.len(), alloc);
             kept.extend_from_slice(record);
             Some(kept)
         }
-        // Its stalled goals are decided after the record is written (front2 stalled_goals.rs):
-        // a `TypedGap` for the run, counted (`typed_stalled`), never a failed task (D163).
+        // Its stalled goals were not all proved on their exact interiors (front2 stalled_goals.rs;
+        // proved ones keep the record, borrows.rs `check_borrows_in`, F18): a `TypedGap` for
+        // the run, counted (`typed_stalled`), never a failed task (D163).
         Some(Err(blaze_typeck::checked_record::CheckedRecordError::NotClean { what: "stalled", .. })) => None,
         Some(Err(why)) => return Err(TaskError::Typed { body: name, why: *why }),
         None => None,
@@ -908,6 +1068,17 @@ fn record_body_as<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     let typed_stalled = matches!(clean.and_then(|one| one.got.0.typed.as_ref()), Some(Err(blaze_typeck::checked_record::CheckedRecordError::NotClean { what: "stalled", .. })));
     // `findings` summed over the root and its local fns (u32, saturating), as the row's.
     Ok(BodyReads { out: digest, failed, findings, bytes, reads, const_texts, locals, typed, typed_stalled, held, said, goal_hits, read_tally, work: work_bytes, asked })
+}
+
+/// Whether a root's checked record is kept (D163 R1, D197 root 1): when its TYPES are clean (no
+/// diagnostic, no gap, no refusal), whatever its borrows say. The record holds the type
+/// checker's columns, which a borrow verdict never changes. A body whose borrows were refused
+/// (D151 `Typed`: types whole, borrows not checked) runs (blaze-cli run_ids.rs
+/// `Checked::runs`), so it needs its record; that kind was checked a second time by every run
+/// before (the borrow filter here). A body with a borrow finding or a lint finding keeps its
+/// record too: whether it runs is the run gate's question, asked by its class, not this one.
+fn keeps_typed(types: &BodyVerdict<'_>) -> bool {
+    types.is_clean()
 }
 
 /// A local fn's path below the task root. The work list puts every parent before its children.
@@ -1077,7 +1248,7 @@ fn body_of<'n>(view: Tables<'_, 'n>, name: Name) -> Result<BodyRef<'n>, TaskErro
 fn fact_read<'n>(names: &'n Records<'n>, keys: &Keys, kind: FactKind, key: u128, owner: Option<(blaze_typeck::ItemKey, u32)>, alloc: Alloc<'_>) -> Result<Option<TableRead>, TaskError> {
     use FactKind as K;
     match kind {
-        K::Head | K::Predicates | K::Adt | K::ImplHeader | K::AssocItem | K::Const | K::Opaque | K::Attrs | K::TraitDef | K::AssocParent | K::ConstHolds | K::ConstParams | K::AssocGenerics | K::BorrowAdt | K::BorrowHead | K::TypeAlias | K::FieldDefaults | K::MemberVisible
+        K::Head | K::Predicates | K::Adt | K::ImplHeader | K::AssocItem | K::Const | K::Opaque | K::Attrs | K::TraitDef | K::AssocParent | K::ConstHolds | K::ConstParams | K::AssocGenerics | K::BorrowAdt | K::BorrowHead | K::TypeAlias | K::FieldDefaults | K::MemberVisible | K::MemberUnstable
             if key != 0 =>
         {
             let key = blaze_typeck::ItemKey(key);
@@ -1543,5 +1714,97 @@ mod read_id_tests {
         assert_eq!(memo.id(read).unwrap(), Some(expected));
         assert_eq!(memo.counts(), (ReadIds::LIMIT as u64 + 2, 1));
         std::println!("read ID unchanged after 65,536 entries and a reset");
+    }
+}
+
+/// D197 root 1, the `Typed` kind: a body whose types are clean and whose borrows were refused
+/// (D151 `Typed`, which runs) keeps its checked record, so a run reads it instead of checking
+/// it again. The fixture is borrows.rs `region_record_tests`'s shape: `calls_soft_refused`
+/// calls `m`, whose parameter is a type macro, so its borrows are refused `RegionsUnread`
+/// while its types are whole.
+#[cfg(test)]
+mod keeps_typed_tests {
+    use super::keeps_typed;
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::borrows::BorrowRefused;
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+macro_rules! byte {
+    () => {
+        u8
+    };
+}
+
+fn m(x: &u8, _y: byte!()) -> &u8 {
+    x
+}
+
+fn calls_soft_refused() {
+    let a = 1u8;
+    let r = m(&a, 2);
+    let _ = *r;
+}
+
+fn plain() -> u8 {
+    let a = 1u8;
+    a
+}
+
+fn mistyped() -> u8 {
+    true
+}
+
+fn main() {}
+"#;
+
+    /// The cause (rule 23): the old filter, which kept a record only when the borrows were
+    /// checked clean too. CONTROL: under it the `Typed` body keeps none, which is what sent
+    /// every such body to the run's second check. TWIN: a body with a type error keeps none
+    /// under either (its columns are not clean, so there is no record to keep).
+    ///
+    /// Prints: `keeps_typed: calls_soft_refused kept (borrows refused), plain kept, mistyped none`
+    #[test]
+    fn a_body_whose_borrows_were_refused_keeps_its_typed_record() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/kt/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "kt", dir: "/kt/", root: "/kt/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, alloc).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let body = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+        let old = |types: &crate::front2::project::BodyVerdict<'_>, borrows: &crate::front2::borrows::BorrowVerdict<'_>| types.is_clean() && borrows.findings.is_empty() && borrows.refused.is_none();
+
+        let (types, borrows) = world.check_borrows(body("calls_soft_refused"), alloc);
+        assert!(types.is_clean(), "calls_soft_refused: types whole: {types:?}");
+        assert!(matches!(borrows.refused, Some(ref r) if !matches!(r, BorrowRefused::Untyped(_))), "calls_soft_refused: borrows refused by name (D151 `Typed`): {borrows:?}");
+        assert!(matches!(types.typed, Some(Ok(_))), "calls_soft_refused: the check encoded its record");
+        assert!(keeps_typed(&types), "calls_soft_refused: a `Typed` body keeps its record");
+        assert!(!old(&types, &borrows), "CONTROL: the old filter kept none for it");
+
+        let (types, borrows) = world.check_borrows(body("plain"), alloc);
+        assert!(matches!(types.typed, Some(Ok(_))) && keeps_typed(&types) && old(&types, &borrows), "plain: a clean body keeps its record under both: {types:?} {borrows:?}");
+
+        let (types, borrows) = world.check_borrows(body("mistyped"), alloc);
+        assert!(!keeps_typed(&types) && !old(&types, &borrows), "TWIN: a type error keeps no record: {types:?}");
+        assert!(types.typed.is_none(), "TWIN: no record was encoded for a type error");
+        std::println!("keeps_typed: calls_soft_refused kept (borrows refused), plain kept, mistyped none");
     }
 }

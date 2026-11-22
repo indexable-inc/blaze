@@ -44,6 +44,7 @@ use blaze_format::FormatError;
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_own::{AString, AVec, Alloc, Box};
+pub use blaze_own::found::{Found, Unread};
 use blaze_surface::{
     Binding, BindingState, BuildError, BuiltinFn, CallShape, CrateRootBuilder, CrateRootView,
     DeclsBuilder, Def, DefKind, Edition, ExternCrateDecl, ExternTarget, ItemIndex, MacroShapes, ModuleDeclsView,
@@ -76,19 +77,44 @@ use crate::prepares::{Kept, Prepares};
 /// Where a crate's texts come from: the caller reads them (from disk, the store, a test's
 /// table). Called from the fill's threads at once, for the files a macro's `mod x;` names.
 pub trait SourceTexts<'a> {
-    /// The text of the file at `path` (absolute, `/`-separated, without `.` or `..`) of the
-    /// crate at `krate` (its index in the inputs), or `None` when it has no such file.
-    fn read(&self, krate: usize, path: &str) -> Option<&'a str>;
+    /// A TABLE's text of the file at `path` (absolute, `/`-separated, without `.` or `..`) of
+    /// the crate at `krate` (its index in the inputs), or `None` when the table has no such
+    /// file: the form for a source that cannot fail to read (a test's table, the toolchain's
+    /// records), reached through [`SourceTexts::source`]'s default, as [`Found::of_table`]; a
+    /// source that reads a disk or a store gives [`SourceTexts::source`] itself, with its
+    /// failures as [`Found::Unknown`]. PORT IN PROGRESS (2026-11-21): the walk's reads
+    /// (`walked_files`, `from_tree_record`) ask `source`; the include read (`Host::include`),
+    /// `file_at`, lib_features.rs and the front2 wrappers still ask this, and it goes once they
+    /// and the table implementors are moved to `source`.
+    fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+        let _ = (krate, path);
+        None
+    }
 
-    /// The bytes of the file at `path` (as [`SourceTexts::read`]'s) that the file `from` (the
-    /// calling file, absolute) reads as DATA by `include_str!` or `include_bytes!`, or `None`
-    /// when there is no such file. Data is no module: a source that records what a crate read
-    /// records it as a read of the bytes, never as a module file wanting its surface
-    /// (blaze-cli names.rs). By default the file is read as [`SourceTexts::read`] reads it,
-    /// for a source that keeps no read list; a file that is not UTF-8 is then `None`.
+    /// The text of the file at `path` of the crate at `krate`: [`Found::Known`],
+    /// [`Found::Absent`] when there is no such file, or [`Found::Unknown`] when it could not
+    /// be read (a permission, a read that moved, the driver): the asker fails, naming the file
+    /// and the cause, and never reads it as absent (D193 point 5). By default the table's
+    /// [`SourceTexts::read`].
+    fn source(&self, krate: usize, path: &str) -> Found<&'a str, Unread<'a>> {
+        Found::of_table(self.read(krate, path))
+    }
+
+    /// A TABLE's bytes of the file `from` reads as data ([`SourceTexts::source_data`]), as
+    /// [`SourceTexts::read`] is a table's text.
     fn read_data(&self, krate: usize, from: &str, path: &str) -> Option<&'a [u8]> {
         let _ = from;
         self.read(krate, path).map(str::as_bytes)
+    }
+
+    /// The bytes of the file at `path` (as [`SourceTexts::source`]'s) that the file `from` (the
+    /// calling file, absolute) reads as DATA by `include_str!` or `include_bytes!`, as
+    /// [`SourceTexts::source`] answers. Data is no module: a source that records what a crate
+    /// read records it as a read of the bytes, never as a module file wanting its surface
+    /// (blaze-cli names.rs). By default the table's [`SourceTexts::read_data`]; a file that
+    /// is not UTF-8 is then absent.
+    fn source_data(&self, krate: usize, from: &str, path: &str) -> Found<&'a [u8], Unread<'a>> {
+        Found::of_table(self.read_data(krate, from, path))
     }
 
     /// A read of a call in the crate at `krate` that left its own package and stayed inside
@@ -598,6 +624,9 @@ pub enum NamesError<'a> {
     /// A dependency index past the inputs.
     NoSuchDep { krate: &'a str, name: &'a str, index: usize },
     RootNotRead { krate: &'a str, path: &'a str },
+    /// A file of `krate` (its root, or one a `mod` names) could not be read: neither its text
+    /// nor its absence is known ([`Found::Unknown`]), so no names are made from a guess.
+    SourceUnread { krate: &'a str, error: Unread<'a> },
     /// The walk kept finding files past [`MOST_WALKS`] passes.
     WalkUnbounded { krate: &'a str },
     OutlineWorker { krate: &'a str, path: &'a str, why: &'a str },
@@ -630,6 +659,7 @@ impl fmt::Display for NamesError<'_> {
                 write!(f, "crate `{krate}`: dependency `{name}` is crate {index}, past the inputs")
             }
             NamesError::RootNotRead { krate, path } => write!(f, "crate `{krate}`: its root file {path} is not read"),
+            NamesError::SourceUnread { krate, error } => write!(f, "crate `{krate}`: {error} (D193 point 5: an unread file is no absent one)"),
             NamesError::WalkUnbounded { krate } => {
                 write!(f, "crate `{krate}`: the module walk found new files past {MOST_WALKS} passes")
             }
@@ -1196,7 +1226,7 @@ impl<'r, 'a> Built<'r, 'a> {
             fn node(&mut self, source: Def) -> Result<Node<'a>, ()> {
                 let Some(other) = self.built.of(source.key) else { return Ok(Node::Value(None)) };
                 let Some(scope) = other.scope(source.key) else {
-                    let found = other.enum_of(source.key).and_then(|v| match variant_answer(v, self.ns, self.name) {
+                    let found = other.enum_of(source.key).and_then(|v| match variant_answer(v.iter(), self.ns, self.name) {
                         NameAnswer::Found { def, vis, state, .. } => Some(Passed { def, vis, state }),
                         NameAnswer::Absent => None,
                     });
@@ -1206,11 +1236,11 @@ impl<'r, 'a> Built<'r, 'a> {
                     return Ok(Node::Value(Some(Passed { def: b.def, vis: b.vis, state: b.state })));
                 }
                 let Some(chain) = other.chain(source.key) else { return Err(()) };
-                Ok(Node::Edges { edges: blaze_surface::Globs::of(&scope.globs), krate: other.key(), chain })
+                Ok(Node::Edges { edges: scope.globs(), krate: other.key(), chain })
             }
         }
         let other = self.of(module)?;
-        if let Some(b) = other.scope(module).and_then(|s| s.get(ns, name).copied()) {
+        if let Some(b) = other.scope(module).and_then(|s| s.get(ns, name)) {
             return Some(b);
         }
         let mut sources = Records { built: self, ns, name };
@@ -1220,8 +1250,8 @@ impl<'r, 'a> Built<'r, 'a> {
 }
 
 /// A `Name` read of an enum: its variant of the name (a record variant has no value).
-fn variant_answer(variants: &[Variant<&str>], ns: Namespace, name: &str) -> NameAnswer {
-    let hit = variants.iter().find(|v| v.name == name && (ns == Namespace::Types || (ns == Namespace::Values && !v.record)));
+fn variant_answer<'v>(variants: impl IntoIterator<Item = Variant<&'v str>>, ns: Namespace, name: &str) -> NameAnswer {
+    let hit = variants.into_iter().find(|v| v.name == name && (ns == Namespace::Types || (ns == Namespace::Values && !v.record)));
     match hit {
         Some(v) => NameAnswer::Found {
             def: Def { key: v.key, kind: DefKind::Other },
@@ -1971,7 +2001,8 @@ fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
     alloc: Alloc<'a>,
 ) -> Result<Prepared<'a>, NamesError<'a>> {
     par.stage(crate::task::Stage::Files);
-    let root_text = sources.read(index, input.root).ok_or(NamesError::RootNotRead { krate: input.name, path: input.root })?;
+    let unread = |error| NamesError::SourceUnread { krate: input.name, error };
+    let root_text = sources.source(index, input.root).known().map_err(unread)?.ok_or(NamesError::RootNotRead { krate: input.name, path: input.root })?;
     let mut set = FileSet::new_in(alloc);
     let root_file = set.add(file_of(input.root, root_text, outline(root_text, edition, alloc), input.shown_from, alloc));
     let mut root_dir = AString::from_str_in(input.root, alloc);
@@ -1989,7 +2020,7 @@ fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
             }
             let path = keep(path, alloc);
             tried.insert(path, ());
-            if let Some(text) = sources.read(index, path) {
+            if let Some(text) = sources.source(index, path).known().map_err(unread)? {
                 read.push((path, text));
             }
         }
@@ -2117,8 +2148,9 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
         }
         if member || m.macros > 0 {
             if set.find(m.file).is_none() {
-                // A file gone: the file set moved under the record.
-                let Some(text) = sources.read(index, m.file) else { return Ok(None) };
+                // A file gone: the file set moved under the record. One not read is no gone one.
+                let found = sources.source(index, m.file).known().map_err(|error| NamesError::SourceUnread { krate: input.name, error })?;
+                let Some(text) = found else { return Ok(None) };
                 set.add(file_of(m.file, text, outline(text, edition, alloc), input.shown_from, alloc));
             }
         }
@@ -2642,7 +2674,7 @@ impl<'a, S> crate::cells::EnumNames<&'a str> for Facts<'_, 'a, S> {
     }
 
     fn variant(&self, of: ItemKey, ns: Namespace, name: &'a str) -> crate::cells::DepAnswer {
-        let answer = |variants: &[Variant<&str>]| match variant_answer(variants, ns, name) {
+        let answer = |variants: &[Variant<&str>]| match variant_answer(variants.iter().copied(), ns, name) {
             NameAnswer::Found { def, vis, .. } => crate::cells::DepAnswer::Found(def, vis),
             NameAnswer::Absent => crate::cells::DepAnswer::NotFound,
         };
@@ -2838,7 +2870,7 @@ impl<'r, 'a, S: SourceTexts<'a>> FillEnv<&'a str> for FillCx<'r, 'a, S> {
             return Held::Scope { scope, krate: other.key(), chain: other.chain(key) };
         }
         if let Some(v) = other.enum_of(key) {
-            return Held::Variants { variants: AVec::from_slice_in(v, alloc), krate: other.key() };
+            return Held::Variants { variants: AVec::from_iter_in(v.iter(), alloc), krate: other.key() };
         }
         Held::Failed { krate: other.key(), chain: None }
     }

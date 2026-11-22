@@ -251,7 +251,28 @@ pub(super) fn written<'n, S: super::source::NamesSource<'n>>(
     use super::types::Why;
 
     let Some(&first) = segments.first() else { return Ok(None) };
-    let Some(scope) = view.path(path)?.scope else { return Ok(None) };
+    // A path of no block scope is a signature's. A LOCAL item's signature (a fn, const or
+    // static declared in a body, its head or its body lowered) stands in the block it is
+    // declared in (the Reference, "Statements", "Item declarations": "Declaring an item within
+    // a statement block restricts its scope to the block containing the statement"): asked
+    // as the enclosing body's, at the declaring block's scope (`LocalHead::enclosing`,
+    // `LocalHead::scope`), one step out, as `Locals::find` steps out of a local's body. A
+    // block of only `use` items and fns is no module of the names library, so its import was
+    // read nowhere else (alloc's `custom_owner_from_box`: `use core::ptr::NonNull;` then
+    // `unsafe fn drop_box_raw<T: ?Sized>(ptr: NonNull<T>)`: E0412; ladder rungs f3-dyn,
+    // x0-ref-11-deref-unsized, x0-ref-12-wide-ptr-eq; tests/front2_block_use_types.rs). Any
+    // other body's signature path is its module's.
+    let declared;
+    let (body, scope) = match view.path(path)?.scope {
+        Some(s) => (body, s.0),
+        None => match body.locals.head(body.owner) {
+            Some(h) => {
+                declared = super::block_type_uses::BodyScope { owner: h.enclosing, ..*body };
+                (&declared, h.scope)
+            }
+            None => return Ok(None),
+        },
+    };
     // Body lowering already put the first token's mark in the path's view. An opaque
     // token names the definition module even if that module also encloses the invocation.
     if !invocation_name(absolute, first, view.mark_of_path(path)?) {
@@ -267,8 +288,8 @@ pub(super) fn written<'n, S: super::source::NamesSource<'n>>(
         crate::resolve::Ns::Type => LocalNs::Type,
         crate::resolve::Ns::Value => LocalNs::Value,
     };
-    let row = body.locals.find(body.owner, Some(scope.0), first, local_ns);
-    let hit = super::glob_uses::before(body.locals, resolver, body.module, body.owner, scope.0, first, first_ns, row.as_ref(), body.alloc)
+    let row = body.locals.find(body.owner, Some(scope), first, local_ns);
+    let hit = super::glob_uses::before(body.locals, resolver, body.module, body.owner, scope, first, first_ns, row.as_ref(), body.alloc)
         .map_err(|gap| Why::Unsupported(gap.form, gap.range))?;
     if let Some(hit) = hit {
         // A direct declaration keeps the original first segment. A glob prepends its path.
@@ -284,7 +305,7 @@ pub(super) fn written<'n, S: super::source::NamesSource<'n>>(
     }
     let Some(row) = row else { return Ok(None) };
     if row.kind == LocalKind::Use {
-        return super::block_type_uses::through_use(resolver, marks, body, view, path, absolute, segments, ns, at);
+        return super::block_type_uses::through_use(resolver, marks, body, scope, view, path, absolute, segments, ns, at);
     }
     let module = row.module.ok_or(Why::Unsupported(row.kind.unplaced(), at))?;
     super::item_site::resolve_written(resolver, marks, module, view, path, absolute, segments, ns, at).map(Some)

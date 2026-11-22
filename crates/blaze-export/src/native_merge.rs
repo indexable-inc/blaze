@@ -67,11 +67,24 @@ const MH_HAS_TLV_DESCRIPTORS: u32 = 0x80_0000;
 /// The segments' names (16 bytes at most, `segment_command_64::segname`).
 pub(crate) const NATIVE_TEXT: &str = "__NATIVE_TEXT";
 pub(crate) const NATIVE_DATA: &str = "__NATIVE_DATA";
-/// The sections the two segments may hold, at most: `__text`, `__const`; `__got`, `__data`,
-/// `__blaze_words`, `__mod_init_func`, `__thread_vars`, `__thread_data`, `__thread_bss`, `__bss`.
-const MOST_SECTIONS: u64 = 10;
-/// `dylib_command`'s name offset.
-const DYLIB_NAME_AT: u64 = 24;
+/// The sections the two segments may hold, in order, as (region, name, flags, zero fill); an
+/// empty region has none. The executable's header room counts every one (macho.rs
+/// `command_room`, from [`CODE_SECTIONS`] and [`DATA_SECTIONS`]), never a hand count.
+const CODE_PARTS: [(Region, &str, u32, bool); 2] = [(Region::Text, "__text", S_CODE, false), (Region::Const, "__const", S_REGULAR, false)];
+const DATA_PARTS: [(Region, &str, u32, bool); 8] = [
+    (Region::Got, "__got", S_REGULAR, false),
+    (Region::Data, "__data", S_REGULAR, false),
+    (Region::Words, "__blaze_words", S_REGULAR, false),
+    (Region::Inits, "__mod_init_func", S_MOD_INIT_FUNC_POINTERS, false),
+    (Region::ThreadVars, "__thread_vars", S_THREAD_LOCAL_VARIABLES, false),
+    (Region::ThreadData, "__thread_data", S_THREAD_LOCAL_REGULAR, false),
+    (Region::ThreadZero, "__thread_bss", S_THREAD_LOCAL_ZEROFILL, true),
+    (Region::Zero, "__bss", S_ZEROFILL, true),
+];
+/// `__NATIVE_TEXT`'s sections at most.
+pub(crate) const CODE_SECTIONS: usize = CODE_PARTS.len();
+/// `__NATIVE_DATA`'s sections at most.
+pub(crate) const DATA_SECTIONS: usize = DATA_PARTS.len();
 
 /// Why a native image could not be merged into an executable. Indices name the image's own
 /// tables (`Image::words`, `Image::libraries`), which the caller holds.
@@ -190,7 +203,7 @@ fn up(n: u64, to: u64) -> u64 {
 
 /// The install names of `image`'s libraries: distinct, in the image's order, libSystem (the
 /// executable's first library) left out. Computed once, before the layout: the header's room
-/// depends on them ([`command_room`]).
+/// depends on them (macho.rs `command_room`).
 pub fn libraries<'a>(image: &Image<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, AString<'a>>, MergeError> {
     let mut paths: AVec<'a, AString<'a>> = Vec::new_in(alloc);
     for (k, library) in image.libraries.iter().enumerate() {
@@ -206,17 +219,6 @@ pub fn libraries<'a>(image: &Image<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, ASt
         paths.push(path);
     }
     Ok(paths)
-}
-
-/// The load-command bytes the image adds at most: two segments with every section they may
-/// hold, one `LC_LOAD_DYLIB` per library. The executable's header room grows by it
-/// (macho.rs `plan_with`), so the code's place depends only on the image.
-pub fn command_room(libraries: &[AString<'_>]) -> u64 {
-    let mut room = 2 * macho::SEGMENT + MOST_SECTIONS * macho::SECTION;
-    for path in libraries {
-        room += DYLIB_NAME_AT + up(path.len() as u64 + 1, 8);
-    }
-    room
 }
 
 /// Places `image` after `laid` and turns its fixups, words, imports and regions into the
@@ -294,47 +296,39 @@ pub fn merge<'a, 'i>(
     // The fixups: the image's, moved; then each word's cell, a rebase to its function.
     let (words_at, _, _) = region(Region::Words)?;
     let mut fixups: AVec<'a, (u64, Chain)> = Vec::with_capacity_in(image.fixups.len() + image.words.len(), alloc);
+    // An executable image offset as a chained rebase's 36-bit target, refused where it is made.
+    let target36 = |offset: u64| macho::Target36::new(offset).ok_or(MergeError::TooLarge { what: macho::REBASE_TOO_FAR, len: offset });
     for f in image.fixups.iter() {
         let to = match f.to {
-            NativeFix::Rebase { target } => Chain::Rebase { target: target + shift },
+            // The tag stays; the image address moves by `shift`.
+            NativeFix::Rebase { address, high8 } => Chain::Rebase { target: target36(address.get() + shift)?, high8 },
             NativeFix::Import { index, addend } => {
                 let k = rows.binary_search(&(index, addend)).map_err(|_| MergeError::TooLarge { what: "an import row of the native image", len: u64::from(index) })?;
                 Chain::Bind { import: first_row + k as u32 }
             }
             NativeFix::Word { index } => {
                 let at = word_at.get(index as usize).ok_or(MergeError::RustWordMissing { word: index })?;
-                Chain::Rebase { target: *at }
+                Chain::Rebase { target: target36(*at)?, high8: 0 }
             }
         };
         fixups.push((f.at + shift, to));
     }
     for (k, &at) in word_at.iter().enumerate() {
-        fixups.push((words_at + 8 * k as u64 + shift, Chain::Rebase { target: at }));
+        fixups.push((words_at + 8 * k as u64 + shift, Chain::Rebase { target: target36(at)?, high8: 0 }));
     }
     fixups.sort_unstable_by_key(|&(at, _)| at);
 
     // The sections, at executable offsets; empty regions have none.
     let mut code: AVec<'a, Sect> = Vec::new_in(alloc);
     let mut data: AVec<'a, Sect> = Vec::new_in(alloc);
-    let code_parts: [(Region, &'static str, u32, bool); 2] = [(Region::Text, "__text", S_CODE, false), (Region::Const, "__const", S_REGULAR, false)];
-    let data_parts: [(Region, &'static str, u32, bool); 8] = [
-        (Region::Got, "__got", S_REGULAR, false),
-        (Region::Data, "__data", S_REGULAR, false),
-        (Region::Words, "__blaze_words", S_REGULAR, false),
-        (Region::Inits, "__mod_init_func", S_MOD_INIT_FUNC_POINTERS, false),
-        (Region::ThreadVars, "__thread_vars", S_THREAD_LOCAL_VARIABLES, false),
-        (Region::ThreadData, "__thread_data", S_THREAD_LOCAL_REGULAR, false),
-        (Region::ThreadZero, "__thread_bss", S_THREAD_LOCAL_ZEROFILL, true),
-        (Region::Zero, "__bss", S_ZEROFILL, true),
-    ];
-    for (r, name, flags, zero) in code_parts {
+    for (r, name, flags, zero) in CODE_PARTS {
         let (at, len, align_log2) = region(r)?;
         if len > 0 {
             code.push(Sect { name, at: at + shift, len, zero, align_log2, flags });
         }
     }
     let mut thread_vars = false;
-    for (r, name, flags, zero) in data_parts {
+    for (r, name, flags, zero) in DATA_PARTS {
         let (at, len, align_log2) = region(r)?;
         if len > 0 {
             thread_vars |= r == Region::ThreadVars;
@@ -432,10 +426,10 @@ mod tests {
         put32(&mut bytes, 0x4018, (0x4004i64 - 0x4018) as i32 as u32); // pc_begin, as lay wrote it
         let mut fixups: AVec<'static, Fixup> = Vec::new_in(a);
         fixups.push(Fixup { at: 0x8000, to: FixTo::Import { index: 0, addend: 0 } });
-        let first = if word_pointer { FixTo::Word { index: 0 } } else { FixTo::Rebase { target: 0x4000 } };
+        let first = if word_pointer { FixTo::Word { index: 0 } } else { FixTo::rebase(0x4000) };
         fixups.push(Fixup { at: 0xC020, to: first });
         fixups.push(Fixup { at: 0xC028, to: FixTo::Import { index: 1, addend: 8 } });
-        fixups.push(Fixup { at: 0xC038, to: FixTo::Rebase { target: 0x4004 } });
+        fixups.push(Fixup { at: 0xC038, to: FixTo::rebase(0x4004) });
         let mut imports: AVec<'static, Import<'static>> = Vec::new_in(a);
         imports.push(Import { name: b"_puts", weak: false });
         imports.push(Import { name: b"_weak_hook", weak: true });
@@ -500,6 +494,7 @@ mod tests {
             fixups: Vec::new_in(a),
             entry: START,
             placed: homes,
+            tables_room: 0x8000 - START,
         }
     }
 
@@ -516,8 +511,8 @@ mod tests {
         let m = merge(&program, &img, &exports(), libs, alloc()).unwrap();
         assert_eq!(m.shift, SHIFT);
         let find = |at: u64| m.fixups.iter().find(|f| f.0 == at).map(|f| f.1);
-        assert_eq!(find(0xC030 + SHIFT), Some(Chain::Rebase { target: 0x5000 }), "word 0's cell is the Rust function's address");
-        assert_eq!(find(0xC020 + SHIFT), Some(Chain::Rebase { target: 0x5000 }), "a C pointer to a Rust function is its address");
+        assert_eq!(find(0xC030 + SHIFT), Chain::untagged(0x5000), "word 0's cell is the Rust function's address");
+        assert_eq!(find(0xC020 + SHIFT), Chain::untagged(0x5000), "a C pointer to a Rust function is its address");
         assert!(m.fixups.windows(2).all(|w| w[0].0 < w[1].0), "fixups sorted by address");
         // Control: no export of that name, the word is refused by its index.
         let libs = super::libraries(&img, alloc()).unwrap();
@@ -538,7 +533,7 @@ mod tests {
         assert!(m.imports.iter().all(|i| i.ordinal == FLAT_LOOKUP), "every native import binds by flat lookup");
         assert_eq!((m.imports[1].name, m.imports[1].weak, m.imports[1].addend), (&b"_weak_hook"[..], true, 8));
         assert_eq!(m.fixups.iter().find(|f| f.0 == 0x8000 + SHIFT).map(|f| f.1), Some(Chain::Bind { import: 1 }), "rows count after the program's own");
-        assert_eq!(m.fixups.iter().find(|f| f.0 == 0xC038 + SHIFT).map(|f| f.1), Some(Chain::Rebase { target: 0x4004 + SHIFT }));
+        assert_eq!(m.fixups.iter().find(|f| f.0 == 0xC038 + SHIFT).map(|f| f.1), Chain::untagged(0x4004 + SHIFT));
         // libSystem (for `c`) is the executable's own first library: not repeated.
         assert_eq!(m.libraries.len(), 1);
         assert_eq!(m.libraries[0].as_str(), "/usr/lib/libc++.1.dylib");

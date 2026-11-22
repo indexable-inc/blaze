@@ -452,6 +452,12 @@ struct BuiltParts {
     ordinal: u32,
     args: Vec<PTy, Global>,
     parts: [Option<blaze_build::Built<Global>>; 3],
+    /// The state it was built into, its full lay digested (code_reads.rs `laid_answer`): each
+    /// part's `Laid` row.
+    laid: ContentId,
+    /// What its build asked (run/lay_states.rs `build_laid`), one log for the three parts:
+    /// each part's make takes these rows into its read list (run/make_one.rs `build_one`).
+    reads: crate::code_records::reads::ReadLog,
 }
 
 /// The most owner fns one instance's coroutine lay may have checked on demand (make_one.rs's
@@ -612,18 +618,20 @@ impl<P: FrontEnd> LayoutFacts for FrontConsts<'_, P> {
         self.program.adt(key)
     }
 
-    fn repr(&self, key: ItemKey) -> ReprAttrs {
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, Missing> {
         self.program.repr(key)
     }
 
-    /// The front end's answer (the seam's `discriminant`).
+    /// The front end's answer (the seam's `discriminant`). Its `Missing` is the enum's unmade
+    /// head; every reader asks `adt` or `repr` of the enum first, which refuse it as the head's
+    /// need, so it reaches no reader of a value record.
     fn discriminant(&self, adt: ItemKey, variant: u32) -> Result<Option<i128>, Missing> {
-        Ok(self.program.discriminant(adt, variant))
+        self.program.discriminant(adt, variant)
     }
 
     /// The front end's answer (the seam's `valid_range`): the same one the code builder's
     /// layout reads ([`FrontAdts`]), so a constant and the code agree on every niche.
-    fn valid_range(&self, key: ItemKey) -> ValidRange {
+    fn valid_range(&self, key: ItemKey) -> Result<ValidRange, Missing> {
         self.program.valid_range(key)
     }
 
@@ -887,18 +895,18 @@ impl<P: FrontEnd> LayoutFacts for FrontAdts<'_, P> {
     }
 
     /// As front.rs read the ADT's `#[repr(..)]`.
-    fn repr(&self, key: ItemKey) -> ReprAttrs {
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, Missing> {
         self.0.repr(key)
     }
 
-    /// The front end's answer (the seam's `discriminant`).
+    /// The front end's answer (the seam's `discriminant`; its `Missing` as [`FrontConsts`]'s).
     fn discriminant(&self, adt: ItemKey, variant: u32) -> Result<Option<i128>, Missing> {
-        Ok(self.0.discriminant(adt, variant))
+        self.0.discriminant(adt, variant)
     }
 
     /// The front end's `rustc_layout_scalar_valid_range_*` bounds (the seam's `valid_range`:
     /// front2's heads.rs `AdtRow::valid`).
-    fn valid_range(&self, key: ItemKey) -> ValidRange {
+    fn valid_range(&self, key: ItemKey) -> Result<ValidRange, Missing> {
         self.0.valid_range(key)
     }
 
@@ -928,6 +936,10 @@ impl<P: FrontEnd> LayoutFacts for FrontAdts<'_, P> {
 impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
         self.0.adt(key)
+    }
+
+    fn opaque_of(&self, opaque: ItemKey) -> Option<(ItemKey, u32)> {
+        self.0.opaque_of(opaque)
     }
 
     fn overflow_checks(&self) -> OverflowChecks {
@@ -1094,12 +1106,12 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     }
 
     /// From the front end (`FrontEnd::caller_site`): item-relative, never a line (rule 71).
-    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Option<blaze_build::CallerSite<'_>> {
+    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
         self.0.caller_site(owner, expr)
     }
 
     /// From the front end (`FrontEnd::def_site`): item-relative, as `caller_site`.
-    fn def_site(&self, item: ItemKey) -> Option<blaze_build::CallerSite<'_>> {
+    fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
         self.0.def_site(item)
     }
 
@@ -2411,7 +2423,9 @@ fn build_from<P: FrontEnd>(
                 let world = FrontAdts(program, i, &consts, &langs, &checked_bodies);
                 let mut resolve = |item: ItemKey, args: List, ground: &mut PortableTys<'_>| program.resolve(i, item, args, ground).ok();
                 match verify(&entry, &world, &mut resolve, &mut ground, alloc).map_err(|e| fail(CodeRecordError::Reads(e)))? {
-                    Verdict::Stale { .. } => run.stale += 1,
+                    // The whole program holds every head it has: a row whose record is not made
+                    // reads an item gone today, and the entry is built again.
+                    Verdict::Stale { .. } | Verdict::Needs { .. } => run.stale += 1,
                     Verdict::Holds => {
                         let mut declared: Vec<(ItemKey, Instance), Global> = Vec::new_in(Global);
                         entry
@@ -2963,12 +2977,31 @@ fn build_from<P: FrontEnd>(
             // The soft-float routines after the instance's own references, as run/make_one.rs
             // binds them: `make_entry` declares those the emitter says the record calls.
             let routines = bound.bind(&mut funcs).map_err(fail)?;
-            let names = InstanceNames { funcs: &funcs, statics: &built.statics, c_statics: &[], vtables: &vtables, tls: &built.thread_locals };
+            let mut c_statics: Vec<(ItemKey, &str), Global> = Vec::new_in(Global);
+            for &s in built.statics.iter() {
+                if let Some(c) = program.foreign_static(s) {
+                    c_statics.push((s, c));
+                }
+            }
+            let names = InstanceNames { funcs: &funcs, statics: &built.statics, c_statics: &c_statics, vtables: &vtables, tls: &built.thread_locals };
             // A census walk (`RecordRun::census`): the instance's LIR and names go to the census,
             // which emits them itself; no record is made. The walk goes on to the slots it filled.
             if let Some(seen) = run.seen.as_deref_mut() {
                 let function = format!("{}", name());
-                seen.seen(&function, parts.symbol, built.func.verified(), &names);
+                let mut reached = blaze_own::Vec::with_capacity_in(reaches.len(), alloc);
+                for (tabled, bytes) in reaches.iter() {
+                    reached.push(Declared { tabled: *tabled, name: &bytes[..] });
+                }
+                let declares = crate::code_records::instance_declares(&reached, &names, &built.vtables, ground.view(), &routines, alloc).map_err(fail)?;
+                let instance = crate::code_records::SeenInstance {
+                    function: &function,
+                    symbol: parts.symbol,
+                    func: built.func.verified(),
+                    names: &names,
+                    routines: *routines.places(),
+                    declares,
+                };
+                seen.seen(instance);
                 run.met.push(crate::code_records::Met { symbol: parts.symbol, key, parts, function: function.into_boxed_str(), found: false });
                 continue;
             }
@@ -3058,7 +3091,16 @@ fn build_from<P: FrontEnd>(
                 continue;
             }
         };
-        bodies.push(Body { code, targets, statics: built.statics, tls: tls_at, vtables: table_of, positions });
+        // A static an `extern` block declares is its C symbol's address (the seam's
+        // `foreign_static`), any other the static image's.
+        let mut statics_at = Vec::with_capacity_in(built.statics.len(), Global);
+        for &s in built.statics.iter() {
+            statics_at.push(match program_mut.foreign_static(s) {
+                Some(c) => crate::place::StaticAt::Symbol(Box::from(c)),
+                None => crate::place::StaticAt::Image(s),
+            });
+        }
+        bodies.push(Body { code, targets, statics: statics_at, tls: tls_at, vtables: table_of, positions });
     }
     let program = &*program_mut;
     // The record walk keeps no body: its answer is the store's entries and `met`. A program

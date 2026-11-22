@@ -160,6 +160,77 @@ pub(super) fn in_source<'n, S: PositionSource<'n>>(
     position_at(names, place, start.checked_add(site).ok_or(PositionGap::PastText)?, alloc)
 }
 
+/// The item or member whose body's blocks the text `fragment` (outlined as `outline`) is the
+/// module text of: the one key the scope solver gives that text, `(body, "blocks", "", 0)`
+/// (blaze-scope resolve.rs `make_blocks`), found among the crate's bodies that hold items.
+/// `Ok(None)`: the text is a macro call's expansion. A real macro can also declare a module
+/// with the block modules' spelling, so the spelling only rules a text out; the fragment key
+/// rules it in. Two bodies under one key: refused (`NoItem`).
+fn block_body_of<'n, S: PositionSource<'n>>(
+    names: S, krate: usize, outline: &blaze_file_items::Outline<'_>, text: &str, fragment: LibKey,
+) -> Result<Option<LibKey>, PositionGap> {
+    let is_block = outline.children(None).any(|(_, item)| item.kind() == ItemKind::Module
+        && item.name.is_some_and(|r| blaze_scope::blocks::is_block_module(item.text(text, r))));
+    if !is_block {
+        return Ok(None);
+    }
+    let crate_key = names.crate_key(krate).ok_or(PositionGap::NoItem)?;
+    let mut parent = None;
+    names.enclosing_keys(krate, |lib| {
+        if blaze_scope::task::key_of(crate_key, lib, "blocks", "", 0) == fragment {
+            if parent.replace(lib).is_some() {
+                return Err(PositionGap::NoItem);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(parent)
+}
+
+/// A macro call written in a block of a body, placed in that body's own text. The names
+/// library writes a body's blocks as module text, a text of its own that is no macro's
+/// expansion and keeps no call origins (resolve.rs `make_blocks`), so a call written there
+/// (tempo's `#[derive(serde::Serialize)] struct BlockRef` in `fn serialize`; rand's
+/// `const _: () = unsafe { impl_fill!(..) };`) has its site in the text the block's
+/// rendering copied it from. `text` is the fragment `fragment`'s text and `at` gives a byte of
+/// it (the call's site, `invoked_at`, read only for a body's blocks); the answer is the byte of
+/// the body's text it was copied from, the body's text rendered again today (`module_text`,
+/// the one renderer). `Ok(None)`: `fragment` is a macro call's expansion, not a body's blocks.
+/// Refused (`NoItem`): today's rendering is not the text the call was counted in, or the byte
+/// is in no copied slice.
+pub(super) fn block_call_site<'n, S: PositionSource<'n>>(
+    names: S, krate: usize, fragment: LibKey, text: &str, at: impl FnOnce() -> Result<u32, PositionGap>, alloc: Alloc<'_>,
+) -> Result<Option<(Anchor<'n>, u32)>, PositionGap> {
+    let edition = names.edition_of(krate).ok_or(PositionGap::NoFile)?;
+    let outline = blaze_file_items::outline(text, edition, alloc);
+    let Some(lib) = block_body_of(names, krate, &outline, text, fragment)? else { return Ok(None) };
+    let body = Anchor::from_lib(names, lib).ok_or(PositionGap::NoItem)?;
+    let written = body.text(names).ok_or(PositionGap::NoItem)?;
+    Ok(Some((body, copied_from(written, text, at()?, alloc)?)))
+}
+
+/// The byte of `body` that byte `at` of its blocks' module text `rendered` was copied from:
+/// `body` rendered again (`blaze_scope::blocks::module_text`) must be `rendered`, else the
+/// byte would be counted in another text (refused, `NoItem`, as a byte in no copied slice).
+fn copied_from(body: &str, rendered: &str, at: u32, alloc: Alloc<'_>) -> Result<u32, PositionGap> {
+    let nested = blaze_file_items::nested::scan(body, alloc);
+    if nested.end != NestedEnd::Whole {
+        return Err(PositionGap::NoItem);
+    }
+    let mut copies = AVec::new_in(alloc);
+    let today = blaze_scope::blocks::module_text(body, &nested, &mut |c| copies.push(c), alloc);
+    if today.as_str() != rendered {
+        return Err(PositionGap::NoItem);
+    }
+    for copy in copies {
+        let end = copy.to.checked_add(copy.len).ok_or(PositionGap::PastText)?;
+        if copy.to <= at && at < end {
+            return copy.from.checked_add(at - copy.to).ok_or(PositionGap::PastText);
+        }
+    }
+    Err(PositionGap::NoItem)
+}
+
 /// The scope solver renders item statements into block modules and keys that
 /// fragment from the enclosing body's library key (resolve.rs `make_blocks`).
 /// A copied method still denotes the method written in the function. Locate its
@@ -171,24 +242,7 @@ pub(super) fn copied_declaration<'n, S: PositionSource<'n>>(
     let original = names.expansion_text(krate, call).ok_or(PositionGap::NoFile)?;
     let edition = names.edition_of(krate).ok_or(PositionGap::NoFile)?;
     let outline = blaze_file_items::outline(original, edition, alloc);
-    let is_block = outline.children(None).any(|(_, item)| item.kind() == ItemKind::Module
-        && item.name.is_some_and(|r| blaze_scope::blocks::is_block_module(item.text(original, r))));
-    if !is_block {
-        return Ok(None);
-    }
-    let crate_key = names.crate_key(krate).ok_or(PositionGap::NoItem)?;
-    let mut parent = None;
-    names.enclosing_keys(krate, |lib| {
-        if blaze_scope::task::key_of(crate_key, lib, "blocks", "", 0) == call {
-            if parent.replace(lib).is_some() {
-                return Err(PositionGap::NoItem);
-            }
-        }
-        Ok(())
-    })?;
-    // A real macro can also declare a module with this spelling. Only the
-    // fragment key establishes that the scope solver made this expansion.
-    let Some(lib) = parent else { return Ok(None) };
+    let Some(lib) = block_body_of(names, krate, &outline, original, call)? else { return Ok(None) };
     let parent = Anchor::from_lib(names, lib).ok_or(PositionGap::NoItem)?;
     let index = match anchor {
         Anchor::Item(lib) => names.place_of(lib).ok_or(PositionGap::NoItem)?.item,
@@ -223,11 +277,23 @@ pub(super) fn written_range(body: &str, chain: ContentId, edition: Edition, allo
     let range = current.ok_or(PositionGap::NoItem)?;
     for copy in copies {
         let end = copy.to.checked_add(copy.len).ok_or(PositionGap::PastText)?;
-        if copy.to <= range.start && range.end <= end {
-            let start = copy.from.checked_add(range.start - copy.to).ok_or(PositionGap::PastText)?;
-            let end = start.checked_add(range.end - range.start).ok_or(PositionGap::PastText)?;
-            return Ok(Range::new(start, end));
+        if !(copy.to <= range.start && range.start < end) {
+            continue;
         }
+        // A `(..)` or `[..]` call is copied and then given the `;` an item-position call ends
+        // with (blaze-scope expanded_blocks.rs `render`, `Event::Call`): rand's tail call
+        // `const _: () = unsafe { impl_fill!(..) };` is written `impl_fill!(..);`. That `;` is
+        // the renderer's, no byte of the body: the call's written range ends with its copy.
+        // Before (tempo t1855d), the item's range was never inside one copy, and every
+        // expression call in a block had no place (`NoItem`).
+        let last = match rendered.get(end as usize..range.end as usize) {
+            _ if range.end <= end => range.end,
+            Some(";") => end,
+            _ => return Err(PositionGap::NoItem),
+        };
+        let start = copy.from.checked_add(range.start - copy.to).ok_or(PositionGap::PastText)?;
+        let end = start.checked_add(last - range.start).ok_or(PositionGap::PastText)?;
+        return Ok(Range::new(start, end));
     }
     Err(PositionGap::NoItem)
 }

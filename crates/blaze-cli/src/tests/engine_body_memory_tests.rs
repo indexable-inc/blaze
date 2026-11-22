@@ -461,42 +461,96 @@ fn the_oracle_catches_a_dropped_refusal_read() {
     assert_fresh_refusal(&io, &fact_world(FACT_EDIT), target, &stale, FACT_EDIT);
 }
 
-#[test]
-fn an_unlisted_data_read_stands_absent_until_a_file_plans_it() {
-    // The body expands its computed path. The literal include scanner cannot plan it
-    // from this source. Only b's later literal causes a FileItems task for the data.
-    const COMPUTED: &str = "#![no_core]\n\
+// A COMPUTED DATA INCLUDE. The rule, the pinned core `macros/mod.rs` `include_str!`: "Includes
+// a UTF-8 encoded file as a string. The file is located relative to the current file": the
+// expanded `concat!` names `../assets/g.json` as the literal of FACT_LIB does, so the body reads
+// the same file and is checked like it. The literal scanner (data_include.rs) cannot list a
+// computed path from the text, so no `FileItems` task defines it: the read is the file's
+// checkout-read `Given` cell (engine_script_reads.rs `file_read`), one leaf row the sweep follows
+// from the next request on, as a build script's `file:` read of the same path is.
+const COMPUTED: &str = "#![no_core]\n\
 #[rustc_builtin_macro]\nmacro_rules! include_str { () => {} }\n\
 #[rustc_builtin_macro]\nmacro_rules! concat { () => {} }\n\
 pub fn target() { let _value = include_str!(concat!(\"../assets/\", \"g.json\")); }\n";
-    const LISTED: &str = "#![no_core]\npub struct Before;\n\
-#[cfg(any())]\nconst UNUSED: &str = include_str!(\"../../a/assets/g.json\");\n";
+// The same body with no include: it reads the file no more.
+const DROPPED: &str = "#![no_core]\npub fn target() {}\n";
+
+fn bodies_entered(checked: &engine_check::Checked) -> u32 {
+    checked.stages[blaze_engine::Stage::Bodies.index()].entered
+}
+
+/// The file's `Given` cell and the answer a body handed `text` keeps (engine_script_reads.rs
+/// `file_read`).
+fn given_of(text: &str) -> (blaze_engine::CellId, blaze_ids::ContentId) {
+    let (given, answer) = crate::engine_script_reads::file_read(FACT_PATH, Some(text.as_bytes())).expect("a checkout-relative path");
+    (blaze_engine::CellId { of: given, cell: crate::engine_tasks::WHOLE }, answer)
+}
+
+#[test]
+fn a_computed_data_read_is_followed_as_a_checkout_read() {
     let io = fact_world(FACT_FIRST);
     write(&io, "a/src/lib.rs", COMPUTED);
     let target = target_name(b"a/src/lib.rs", COMPUTED);
-    let data = blaze_engine::CellId { of: blaze_drive::Name::file(FACT_PATH.as_bytes()), cell: crate::engine_tasks::WHOLE };
-    let (_, lines, _) = said(&io, false);
-    let note = lines.iter().find(|line| line.contains(FACT_PATH) && line.contains("without an available FileItems record")).expect("the body refused the unlisted data read");
-    let cold = stored(&io);
-    assert!(cold.answer.rows[&target].failed);
-    assert_eq!(cold.answer.rows[&target].read_of(&data).0, Some(blaze_drive::key::ABSENT));
-    let (_, replayed, unchanged) = said(&io, false);
-    assert_refusal_stands(&unchanged);
-    assert!(replayed.contains(note));
+    let (data, first) = given_of(FACT_FIRST);
+    let noted = |lines: &[std::string::String]| lines.iter().any(|line| line.contains("without an available FileItems record") || line.contains("`target`"));
 
-    write(&io, "b/src/lib.rs", LISTED);
-    let (ids, repaired, now) = said(&io, false);
-    let kept = stored(&io);
-    assert!(matches!(kept.causes[&target], (serial, blaze_engine::Cause::ReadMoved { read, was, .. })
-        if serial == kept.answer.serial && read == data && was == blaze_drive::key::ABSENT));
-    assert_eq!(kept.answer.rows[&target].read_of(&data).0, Some(crate::data_include::data_out(FACT_FIRST.as_bytes())));
-    assert!(!repaired.contains(note), "the file now has its record");
-    let fresh = fact_world(FACT_FIRST);
+    // 1. Discovery: checked, no note, not owed; the row holds what the body saw, and no task
+    //    defines the cell yet (the leaf is saved for the next request).
+    let (_, lines, _) = said(&io, false);
+    assert!(!noted(&lines), "the body is checked, with no note: {lines:?}");
+    let cold = stored(&io);
+    assert!(!cold.answer.rows[&target].failed, "the computed include is read as a literal one is");
+    assert_eq!(cold.answer.rows[&target].read_of(&data).0, Some(first), "the row holds what the body read");
+    assert!(!cold.answer.owed_tasks.contains_key(&target), "the leaf, not an owe, covers the read");
+    assert!(!cold.answer.rows.contains_key(&data.of), "no task defines the cell in the request that found it");
+
+    // 2. From the second request on, the file is a followed leaf whose answer is what the body
+    //    saw. Either nothing moved and the certificate stands, or the phase path plans the leaf's
+    //    `Given` task, which defines the cell to what the row saw. In both cases no body is
+    //    entered.
+    let (_, replayed, second) = said(&io, false);
+    assert_eq!(bodies_entered(&second), 0, "the second request after discovery enters no body");
+    assert!(!noted(&replayed), "{replayed:?}");
+    let (_, _, third) = said(&io, false);
+    assert_eq!(bodies_entered(&third), 0);
+
+    // 3. THE EFFECT the control removes: an edit of the data file moves its leaf, so its task's
+    //    key, so its cell, and the reader is entered (its 2 units' rows, D191), reading the new
+    //    bytes; the answer is a fresh world's.
+    write(&io, FACT_PATH, FACT_EDIT);
+    let (_, edited_lines, edited) = said(&io, false);
+    assert_eq!(bodies_entered(&edited), 2, "an edit of the included file must enter its reader");
+    assert_eq!(stored(&io).answer.rows[&target].read_of(&data).0, Some(given_of(FACT_EDIT).1));
+    let fresh = fact_world(FACT_EDIT);
     write(&fresh, "a/src/lib.rs", COMPUTED);
-    write(&fresh, "b/src/lib.rs", LISTED);
-    let (fresh_ids, fresh_lines, fresh_check) = said(&fresh, false);
-    assert_eq!((ids, repaired, now.status.0), (fresh_ids, fresh_lines, fresh_check.status.0));
-    println!("unlisted include: absent read replayed, target re-entered when its data record appeared");
+    let (_, fresh_lines, fresh_check) = said(&fresh, false);
+    assert_eq!((edited_lines, edited.status.0), (fresh_lines, fresh_check.status.0));
+
+    // 4. BOUNDED (rule 18): once no row reads the cell, the request does not keep its leaf
+    //    (engine_check.rs H2, `keep_rows`), and the sweep follows the file no more. An edit of
+    //    the file then moves no leaf, so the certificate stands. Twin: in step 3 the same edit,
+    //    with the leaf kept, entered its reader.
+    write(&io, "a/src/lib.rs", DROPPED);
+    let (_, _, dropped) = said(&io, false);
+    assert!(bodies_entered(&dropped) > 0, "the edited body is entered");
+    said(&io, false);
+    write(&io, FACT_PATH, FACT_FIRST);
+    let (_, _, unfollowed) = said(&io, false);
+    assert!(unfollowed.certified, "a file no row reads is followed no more: its edit moves no leaf");
+    println!("computed include: no note on discovery; 0 bodies from the second request on; 2 rows when the file is edited; unfollowed once no row reads it");
+}
+
+#[test]
+#[should_panic(expected = "an edit of the included file must enter its reader")]
+fn the_oracle_catches_a_computed_data_read_left_unfollowed() {
+    use crate::engine_bodies::BodyFault::DropDataLeaf;
+    let io = fact_world(FACT_FIRST);
+    write(&io, "a/src/lib.rs", COMPUTED);
+    with_fault(DropDataLeaf, || said(&io, false));
+    with_fault(DropDataLeaf, || said(&io, false));
+    write(&io, FACT_PATH, FACT_EDIT);
+    let (_, _, edited) = with_fault(DropDataLeaf, || said(&io, false));
+    assert_eq!(bodies_entered(&edited), 2, "an edit of the included file must enter its reader");
 }
 
 // ---- D168 (2): A WORLD IS OPENED BY NEED ----------------------------------------------------

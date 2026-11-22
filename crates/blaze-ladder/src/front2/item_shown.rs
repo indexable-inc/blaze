@@ -525,7 +525,7 @@ const MOST_CALLS: usize = 16;
 /// `None`: the source holds neither the item's module path nor its place.
 fn written<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Option<Box<str>> {
     use blaze_scope::resolve::At;
-    let module = names.home_of(lib).and_then(|m| names.module_path(m)).filter(|p| !p.is_empty());
+    let module = names.home_of(lib).and_then(|m| names.module_path(m)).map(|p| shown_segments(p).collect::<std::vec::Vec<_>>().join("::")).filter(|p| !p.is_empty());
     let mut k = lib;
     let mut by_macro = false;
     let mut at: Option<String> = None;
@@ -585,11 +585,12 @@ fn lib_path<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Option<String> {
     let mut out = String::new();
     match names.home_of(owner) {
         Some(m) => match names.module_path(m) {
-            Some(p) if !p.is_empty() => {
-                out.push_str(p);
-                out.push_str("::");
+            Some(p) => {
+                for segment in shown_segments(p) {
+                    out.push_str(segment);
+                    out.push_str("::");
+                }
             }
-            Some(_) => {}
             None => out.push_str("<a module the names source holds no path for>::"),
         },
         None => {}
@@ -604,6 +605,19 @@ fn lib_path<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Option<String> {
         out.push_str(l);
     }
     Some(out)
+}
+
+/// The segments of module path `path` a person is shown: every one but a block's module. The
+/// names library writes a body's blocks, and a statement call's blocks, as modules named
+/// `__blaze_block_N` and `__blaze_block_x<tag>_N` (blaze-scope blocks.rs, expanded_blocks.rs):
+/// names no text writes and no path can name (`blocks::is_block_module`, the one test), so a
+/// path holding one (tempo's `serde_sealed_or_recovered_block::__blaze_block_0::__blaze_block_0
+/// ::<impl ..>::serialize`, rand's four `__blaze_block_x..` around `<impl Fill for [u64]>`)
+/// names the item by a word that is in no file. rustc's path of an item in a block names the
+/// enclosing body instead (`a::f::<impl ..>`); the module does not say which body it is, so
+/// the block is left out and the key, shown beside the path, tells two such items apart.
+fn shown_segments(path: &str) -> impl Iterator<Item = &str> {
+    path.split("::").filter(|s| !s.is_empty() && !blaze_scope::blocks::is_block_module(s))
 }
 
 /// An impl as a path segment shows it (here and in row_path.rs, a row's path): `<` its header
@@ -880,7 +894,14 @@ fn check_error_class(path: &dyn Fn(ItemKey) -> String, e: &blaze_typeck::CheckEr
             "{gap}: the hidden type of {} (another fn's future) has no record here at item bytes {}..{}",
             path(*item), at.start, at.end
         ),
-        E::FutureWitnessGoal { trait_, .. } => path(*trait_) + ": " + &e.to_string(),
+        // Rule 19: the root trait and the undecided goal under it, each by its path.
+        E::FutureWitnessGoal { trait_, undecided, .. } => {
+            let mut text = path(*trait_) + ": " + &e.to_string();
+            if let Some(blaze_typeck::UndecidedLeaf { trait_: Some(under), .. }) = undecided {
+                text = text + " (the undecided goal's trait: " + &path(*under) + ")";
+            }
+            text
+        }
         E::DynUndecided { trait_, .. } => format!("the dyn compatibility of {} is not decided", path(*trait_)),
         E::UnknownInCleanBody { .. } => String::from("a body with no diagnostic recorded an unknown type (the checker's own invariant)"),
         E::DiagWithoutPlace { code, .. } => format!("diagnostic {} has an empty range (the checker's own invariant)", code.code()),
@@ -994,5 +1015,27 @@ mod tests {
         assert_eq!(impl_shown(boxed), "<unsafe impl<#[may_dangle] T> Drop for Box<T> where T: Sized,>");
         assert_eq!(impl_shown("# [doc = \"//\"] impl Default for Stat"), "<impl Default for Stat>");
         assert_eq!(impl_shown("impl Default for stat"), "<impl Default for stat>");
+    }
+
+    /// The module paths of tempo's t1855d refusals: a body's block module and the derive's
+    /// `const _` block module (`serde_sealed_or_recovered_block::__blaze_block_0::
+    /// __blaze_block_0`), and rand's four statement-call blocks under a body's block. Each is
+    /// shown without its block modules. TWIN: a module whose name only begins like one
+    /// (`__blaze_blocks`, no `_` after `block`) and an ordinary path are kept whole. CONTROL:
+    /// the names the library writes are block modules by the one test (`is_block_module`), so
+    /// the filter is what removed them.
+    #[test]
+    fn a_block_module_is_not_shown_in_a_path() {
+        use super::shown_segments;
+        let shown = |p: &str| shown_segments(p).collect::<std::vec::Vec<_>>().join("::");
+        let serde = "tempo_payload_types::serde_sealed_or_recovered_block::__blaze_block_0::__blaze_block_0";
+        assert_eq!(shown(serde), "tempo_payload_types::serde_sealed_or_recovered_block");
+        let rand = "rand::rng::__blaze_block_0::__blaze_block_x49b4c4837b78ffc5_0::__blaze_block_x49b4c4837b78ffc5_0::__blaze_block_x49b4c4837b78ffc5_0::__blaze_block_x49b4c4837b78ffc5_0";
+        assert_eq!(shown(rand), "rand::rng");
+        assert_eq!(shown("a::__blaze_blocks::b"), "a::__blaze_blocks::b");
+        assert_eq!(shown("tempo_primitives::transaction"), "tempo_primitives::transaction");
+        assert_eq!(shown(""), "");
+        assert!(blaze_scope::blocks::is_block_module("__blaze_block_0"));
+        assert!(blaze_scope::blocks::is_block_module("__blaze_block_x49b4c4837b78ffc5_0"));
     }
 }

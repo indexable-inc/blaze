@@ -237,6 +237,7 @@ fn follower(engine: &Engine<'_, '_, '_>, next: Option<Op>) -> Follower {
     let Some(Op::Puncts { at, len }) = next else { return Follower::Other };
     let def = engine.def;
     match (def.char(at), len) {
+        // astlog-ignore: expand-hand-extent (the token after a transcribed fragment, for its spacing)
         ('<', _) => Follower::Angle,
         ('.' | '?', 1) => Follower::Postfix,
         _ => Follower::Other,
@@ -678,6 +679,15 @@ fn var<B: Copying>(
         Value::Fragment(Fragment::Tokens { toks, origin: Origin::Raw | Origin::Ast }) => {
             push_view(scratch, out, view, toks, true, B::RANGES)?;
         }
+        // `&$t` of `A + B` is `&(A + B)`, `&$p` of `A | B` is `&(A | B)`: one operand, as an
+        // expression is below.
+        Value::Fragment(Fragment::Tokens { toks, origin: Origin::Parenthesized }) => {
+            invisible(scratch, out, true)?;
+            paren(scratch, out, true)?;
+            push_view(scratch, out, view, strip_invisible(view, toks), true, B::RANGES)?;
+            paren(scratch, out, false)?;
+            invisible(scratch, out, false)?;
+        }
         Value::Fragment(Fragment::Expr(toks)) => {
             let sub = strip_invisible(view, toks);
             let len = sub.end - sub.at;
@@ -708,6 +718,7 @@ fn var<B: Copying>(
             let mut prev_ident = false;
             for tree in trees(view, toks) {
                 let end = view.after_tree(tree);
+                // astlog-ignore: expand-hand-extent (a `::` the transcription writes before a `<`)
                 if prev_ident && end == tree + 1 && view.char(tree) == Some('<') {
                     push(scratch, out, TokenKind::Punct { char: ':', spacing: Spacing::Joint }, WholeText::of(""), SITE)?;
                     push(scratch, out, TokenKind::Punct { char: ':', spacing: Spacing::Alone }, WholeText::of(""), SITE)?;

@@ -1,5 +1,6 @@
-//! The one new code record's on-disk form, `bzcode03` (D100 point 11; D106 added the declared
-//! instances, declared.rs, and the closing digest): [`seal`] puts an
+//! The one new code record's on-disk form, `bzcode08` (D100 point 11; D106 added the declared
+//! instances, declared.rs, and the closing digest; `bzcode08` the trap rows, the parts'
+//! alignments and the source-position slots, record/mod.rs): [`seal`] puts an
 //! [`Emitted`] in its one canonical form and checks every rule of it once, [`encode`] writes a
 //! [`Sealed`] record's bytes, [`read`] reads them in place as a [`RecordView`], checking every tag
 //! and every rule again (bytes from a store or a fetch are checked once, here: rule 74), and
@@ -9,7 +10,8 @@
 //! write equal bytes: rule 25): the targets by (space, symbol), each kept once, every index into
 //! them renumbered; the relro words by offset; the landing pads by (start, len, landing,
 //! action); the unwind rows by (start, len, landing, action); the names by symbol, each once, the
-//! text rebuilt in that order and a name no target uses dropped.
+//! text rebuilt in that order and a name no target uses dropped; the trap rows by offset, each
+//! subject's discriminants past its count zeroed; the source-position slots by (part, offset).
 //!
 //! What [`seal`] REFUSES unsorted, each by its own [`FormError`] variant (piece 0's rows say the
 //! caller sorts them): the relocations by (offset, part), at most one a byte; the loop headers by
@@ -24,19 +26,25 @@
 //! (the rows also by blaze-code unwind.rs's rules); every loop header and poll in the code, every
 //! header's live range inside the live list, every poll's header a loop; every position in the
 //! code and naming a frame; every inline frame's parent before it; every name's text inside
-//! the text and UTF-8; every outside target named.
+//! the text and UTF-8; every outside target named; each part's alignment from its least
+//! (blaze-code's `LEAST_CODE_ALIGN`, `LEAST_RELRO_ALIGN`) to a page; every trap row a whole
+//! instruction of the code, one a `brk`, its held register at most `x30`; every subject row a
+//! trap row's, rising; every source-position slot 4-aligned, inside its part, four zero bytes
+//! there, once, and sharing no byte with a relocation's field or a relro word.
 //!
 //! Layout (little-endian; every section starts 8-aligned from the record's first byte): `MAGIC`;
 //! `frame: u32` (the frame's size below the frame record); the unwind frame word (blaze-code
-//! unwind.rs's `Frame::word`, 0 for none); sixteen `u32` counts (code bytes, relro bytes, targets,
-//! relocations, words, pads, unwind rows, loop headers, live values, polls, inline frames,
-//! positions, reads, names, declared instances, text bytes); `flags: u32` (0); a reserved `u32`
-//! (0); then the sections in that order, each padded to 8; then the DIGEST: 32 bytes of BLAKE3
+//! unwind.rs's `Frame::word`, 0 for none); nineteen `u32` counts (code bytes, relro bytes,
+//! targets, relocations, words, pads, unwind rows, loop headers, live values, polls, inline
+//! frames, positions, reads, names, declared instances, trap rows, subjects, source-position
+//! slots, text bytes); `flags: u32` (0); `code_align: u8`, `relro_align: u8` (log2), two zero
+//! bytes; a reserved `u32` (0); then the sections in that order, each padded to 8; then the
+//! DIGEST: 32 bytes of BLAKE3
 //! (domain [`DIGEST_DOMAIN`]) over every byte before it, so any changed byte of a shared record
 //! is refused ([`FormError::Digest`]). The names' text holds the C names, then the declared
-//! names, in row order, tiling it exactly. A record of another form number (`bzcode02`) is
-//! refused naming both numbers ([`FormError::OtherForm`]): an old record is reported and
-//! rebuilt, never migrated (rule 26).
+//! names, in row order, tiling it exactly. A record of another form number (`bzcode03`, or
+//! blaze-code's `bzcode07`) is refused naming both numbers ([`FormError::OtherForm`]): an old
+//! record is reported and rebuilt, never migrated (rule 26).
 //!
 //! | section | row |
 //! |---|---|
@@ -53,13 +61,19 @@
 //! | read (64) | fact 32, digest 32 |
 //! | name (40) | symbol 32, text `at: u32`, `len: u32` |
 //! | declared instance (64) | symbol 32, `item: u128`, kind `u8`, 3 zero, name `at: u32`, `len: u32`, 4 zero (declared.rs) |
+//! | trap row (32) | `at: u32`, kind `u8` (blaze-code `TrapKind`), held tag `u8` (0 unknown, 1 register, 2 stack), held register `u8` (tag 1; else 0), 0 `u8`, `site: u32` (`u32::MAX` none), held stack offset `u32` (tag 2; else 0), `item: u128` (0 with no site) |
+//! | subject (88) | its trap row's `at: u32`, `count: u32`, `item: u128`, eight `u64` discriminants (past `count` 0) |
+//! | source-position slot (32) | `item: u128`, `site: u32`, `at: u32`, part `u8` (0 code, 1 relro), field `u8` (0 line, 1 column), 6 zero |
 //!
 //! Relocation kinds by byte: Page21 0, PageOff12 1, Branch26 2, GotPage21 3, GotPageOff12 4, Abs64
 //! 5, Pc32 6, GotPc32 7 (piece 0's discriminants).
 
 use core::fmt;
 
-use blaze_code::record::{DecodeError, OWN_CODE, OWN_RELRO, Pad, RecordError, Space, Symbol, Target, Word};
+use blaze_code::record::{
+    DecodeError, Held, LEAST_CODE_ALIGN, LEAST_RELRO_ALIGN, MOST_PART_ALIGN, OWN_CODE, OWN_RELRO, Pad, PositionField, PositionPart,
+    PositionRow, RecordError, SUBJECT_SHOWN, Space, Subject, Symbol, Target, TrapKind, TrapRow, Word,
+};
 use blaze_code::unwind::{Action, Frame, INST, Row, UnwindError};
 use blaze_ids::Hasher;
 use blaze_own::{AVec, Alloc, Vec};
@@ -71,18 +85,23 @@ use super::{Emitted, InlineFrame, Live, LoopHeader, OUTERMOST, Place, Poll, Posi
 use crate::Reg;
 
 /// The first eight bytes of every encoded record of this form: the ONE place its number is.
-pub const MAGIC: [u8; 8] = *b"bzcode03";
+pub const MAGIC: [u8; 8] = *b"bzcode08";
 
 /// [`MAGIC`]'s number, for [`FormError::OtherForm`].
 const FORM_NUMBER: u8 = (MAGIC[6] - b'0') * 10 + (MAGIC[7] - b'0');
 
-/// The bytes before the sections: magic, frame, unwind word, sixteen counts, flags, reserved.
-const HEAD: usize = 88;
-const SECTIONS: usize = 16;
+/// The bytes before the sections: magic, frame, unwind word, nineteen counts, flags, the
+/// alignments' word, reserved (104: the first section starts 8-aligned).
+const HEAD: usize = 8 + 4 + 4 + 4 * SECTIONS + 4 + 4 + 4;
+const SECTIONS: usize = 19;
+/// The head's offsets of the flags, the alignments' word and the reserved word.
+const FLAGS_AT: usize = 16 + 4 * SECTIONS;
+const ALIGNS_AT: usize = FLAGS_AT + 4;
+const RESERVED_AT: usize = ALIGNS_AT + 4;
 
 /// The digest that ends every record: its bytes and its hash domain.
 const DIGEST: usize = 32;
-const DIGEST_DOMAIN: &str = "blaze-tier code record bzcode03 digest";
+const DIGEST_DOMAIN: &str = "blaze-tier code record bzcode08 digest";
 
 const CODE: usize = 0;
 const RELRO: usize = 1;
@@ -99,10 +118,24 @@ const POSITIONS: usize = 11;
 const READS: usize = 12;
 const NAMES: usize = 13;
 const DECLARED: usize = 14;
-const TEXT: usize = 15;
+const TRAPS: usize = 15;
+const SUBJECTS: usize = 16;
+const SLOTS: usize = 17;
+const TEXT: usize = 18;
+
+/// A trap row, a subject row and a source-position slot's row in bytes.
+const TRAP_ROW: usize = 32;
+const SUBJECT_ROW: usize = 24 + 8 * SUBJECT_SHOWN;
+const SLOT_ROW: usize = 32;
+
+/// A trap row's site field meaning none (its item is then 0).
+const NO_SITE: u32 = u32::MAX;
+/// The highest general register a [`Held::Reg`] names (`x30`).
+const MOST_HELD_REG: u8 = 30;
 
 /// Each section's row in bytes (1 for the byte sections).
-const ROW: [usize; SECTIONS] = [1, 1, 40, 24, 16, 16, 16, 12, 12, 8, 48, 16, 64, 40, declared::ROW_BYTES, 1];
+const ROW: [usize; SECTIONS] =
+    [1, 1, 40, 24, 16, 16, 16, 12, 12, 8, 48, 16, 64, 40, declared::ROW_BYTES, TRAP_ROW, SUBJECT_ROW, SLOT_ROW, 1];
 
 /// Each section's name, for [`FormError::Tag`] and [`FormError::TooLarge`].
 const SECTION_NAME: [&str; SECTIONS] = [
@@ -121,6 +154,9 @@ const SECTION_NAME: [&str; SECTIONS] = [
     "read list",
     "names",
     "declared instances",
+    "trap rows",
+    "trap subjects",
+    "source-position slots",
     "names' text",
 ];
 
@@ -237,6 +273,32 @@ pub enum FormError {
     DeclaredMissing { symbol: Symbol, space: Space },
     /// The target `symbol` is in `space` and its declared row is a `kind` of another space.
     DeclaredSpace { symbol: Symbol, space: Space, kind: DeclaredKind },
+    /// The `part`'s (`"code"` or `"relro part"`) alignment `align` (log2) is below its least
+    /// (blaze-code's `LEAST_CODE_ALIGN`, `LEAST_RELRO_ALIGN`) or past a page (`MOST_PART_ALIGN`).
+    Align { part: &'static str, align: u8 },
+    /// The trap row at `at` is not after the one before it (sorted by offset, one a `brk`).
+    TrapsUnsorted { at: u32 },
+    /// The trap row's `brk` at `at` is not a whole instruction of the code.
+    TrapOutside { at: u32 },
+    /// The trap row at `at` names site byte `u32::MAX`, the form's word for no site.
+    TrapSite { at: u32 },
+    /// The trap row at `at` says register `x{reg}` holds the switched value, past `x30`.
+    HeldReg { at: u32, reg: u8 },
+    /// The trap row at `at`'s subject keeps a nonzero discriminant past its count (one form:
+    /// rule 25).
+    SubjectRest { at: u32 },
+    /// Subject row `row` is not after the one before it, or no trap row is at its offset.
+    SubjectRow { row: u32 },
+    /// The `part`'s source-position slot at `at` is not 4-aligned.
+    SlotMisaligned { part: PositionPart, at: u32 },
+    /// The `part`'s four-byte source-position slot at `at` runs past the part.
+    SlotOutside { part: PositionPart, at: u32 },
+    /// The `part`'s source-position slot at `at` is not four zero bytes in the record.
+    SlotNonzero { part: PositionPart, at: u32 },
+    /// The source-position slot at (`part`, `at`) is not after the one before it (each slot once).
+    SlotsUnsorted { part: PositionPart, at: u32 },
+    /// The `part`'s source-position slot at `at` shares a byte with a relocation or relro word.
+    SlotOverlapsReference { part: PositionPart, at: u32 },
     /// [`super::from_v1`]: the `bzcode01` record did not seal.
     V1Record(RecordError),
     /// [`super::from_v1`]: the sealed `bzcode01` record did not read back.
@@ -327,8 +389,35 @@ impl fmt::Display for FormError {
             FormError::DeclaredSpace { symbol, space, kind } => {
                 write!(f, "a code record's target {symbol} is in {space:?} and is declared as a {kind} (blaze-tier record/declared.rs, D106)")
             }
-            FormError::V1Record(error) => write!(f, "{error} (turning a bzcode01 record into bzcode03)"),
-            FormError::V1Decode(error) => write!(f, "{error} (turning a bzcode01 record into bzcode03)"),
+            FormError::Align { part, align } => write!(
+                f,
+                "a code record's {part} asks an alignment of 2^{align}: below its least (code 2^{LEAST_CODE_ALIGN}, relro 2^{LEAST_RELRO_ALIGN}) or past a page (2^{MOST_PART_ALIGN}) {rule}"
+            ),
+            FormError::TrapsUnsorted { at } => write!(f, "a code record's trap row at {at} is not after the one before it {rule}"),
+            FormError::TrapOutside { at } => write!(f, "a code record's trap row at {at} is not an instruction of its code {rule}"),
+            FormError::TrapSite { at } => write!(f, "a code record's trap row at {at} names site {NO_SITE}, the form's word for no site {rule}"),
+            FormError::HeldReg { at, reg } => {
+                write!(f, "a code record's trap row at {at} says register x{reg} holds the switched value, past x{MOST_HELD_REG} {rule}")
+            }
+            FormError::SubjectRest { at } => {
+                write!(f, "a code record's trap row at {at} keeps a nonzero discriminant past its subject's count {rule}")
+            }
+            FormError::SubjectRow { row } => {
+                write!(f, "a code record's subject row {row} is not after the one before it or is no trap row's {rule}")
+            }
+            FormError::SlotMisaligned { part, at } => write!(f, "a code record's {part:?} source-position slot at {at} is not 4-aligned {rule}"),
+            FormError::SlotOutside { part, at } => write!(f, "a code record's {part:?} source-position slot at {at} runs past its part {rule}"),
+            FormError::SlotNonzero { part, at } => {
+                write!(f, "a code record's {part:?} source-position slot at {at} is not four zero bytes {rule}")
+            }
+            FormError::SlotsUnsorted { part, at } => {
+                write!(f, "a code record's {part:?} source-position slot at {at} is not after the one before it {rule}")
+            }
+            FormError::SlotOverlapsReference { part, at } => {
+                write!(f, "a code record's {part:?} source-position slot at {at} shares a byte with a relocation or relro word {rule}")
+            }
+            FormError::V1Record(error) => write!(f, "{error} (turning a bzcode07 record into this form)"),
+            FormError::V1Decode(error) => write!(f, "{error} (turning a bzcode07 record into this form)"),
         }
     }
 }
@@ -374,6 +463,9 @@ pub fn seal<'a>(e: Emitted<'a>) -> Result<Sealed<'a>, FormError> {
         e.reads.len(),
         e.names.len(),
         e.declared.len(),
+        e.traps.len(),
+        subjects_of(&e.traps),
+        e.position_slots.len(),
         e.text.len(),
     ];
     for (section, &len) in lens.iter().enumerate() {
@@ -420,6 +512,16 @@ pub fn seal<'a>(e: Emitted<'a>) -> Result<Sealed<'a>, FormError> {
     e.words.sort_unstable_by_key(|w| (w.at, w.target, w.addend));
     e.pads.sort_unstable_by_key(|p| (p.start, p.len, p.landing, p.action));
     e.unwind.sort_unstable_by_key(|r| (r.start, r.len, r.landing, r.action.code()));
+    // Trap rows by offset (two at one offset are refused below); a subject's discriminants past
+    // the ones it keeps are 0 (one form: rule 25). Slots by (part, offset).
+    e.traps.sort_unstable_by_key(|t| t.at);
+    for trap in e.traps.iter_mut() {
+        if let Some(subject) = trap.subject.as_mut() {
+            let kept = (subject.count as usize).min(SUBJECT_SHOWN);
+            subject.discriminants[kept..].fill(0);
+        }
+    }
+    e.position_slots.sort_unstable_by_key(|s| (s.part, s.at));
     // Names by symbol, each once, the text rebuilt in that order; a name no outside target uses
     // is dropped (the check below refuses an outside target with none).
     let mut names = core::mem::replace(&mut e.names, Vec::new_in(alloc));
@@ -477,13 +579,17 @@ pub fn encode(s: &Sealed<'_>, out: &mut AVec<'_, u8>) {
         r.reads.len(),
         r.names.len(),
         r.declared.len(),
+        r.traps.len(),
+        subjects_of(&r.traps),
+        r.position_slots.len(),
         r.text.len(),
     ];
     for count in counts {
         put32(out, count as u32);
     }
-    // The flags, then the reserved word.
+    // The flags, the alignments' word, the reserved word.
     put32(out, 0);
+    out.extend_from_slice(&[r.code_align, r.relro_align, 0, 0]);
     put32(out, 0);
     out.extend_from_slice(&r.code);
     pad8(out, start);
@@ -561,10 +667,138 @@ pub fn encode(s: &Sealed<'_>, out: &mut AVec<'_, u8>) {
     for row in r.declared.iter() {
         declared::put_row(out, row);
     }
+    for t in r.traps.iter() {
+        put_trap(out, t);
+    }
+    // The subjects, one per trap row that has one, in the rows' order (by offset).
+    for t in r.traps.iter() {
+        let Some(subject) = t.subject else { continue };
+        put32(out, t.at);
+        put32(out, subject.count);
+        out.extend_from_slice(&subject.item.to_le_bytes());
+        for d in subject.discriminants {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+    }
+    for s in r.position_slots.iter() {
+        out.extend_from_slice(&s.item.to_le_bytes());
+        put32(out, s.site);
+        put32(out, s.at);
+        out.push(s.part as u8);
+        out.push(s.field as u8);
+        out.extend_from_slice(&[0; 6]);
+    }
     out.extend_from_slice(&r.text);
     pad8(out, start);
     let sum = digest(&out[start..]);
     out.extend_from_slice(&sum);
+}
+
+/// How many trap rows have a subject: the subjects section's rows.
+fn subjects_of(traps: &[TrapRow]) -> usize {
+    traps.iter().filter(|t| t.subject.is_some()).count()
+}
+
+/// A trap row (32): `at: u32`, kind `u8`, held tag `u8` (0 unknown, 1 a register, 2 a stack
+/// slot), held register `u8`, 0 `u8`, `site: u32` ([`NO_SITE`] for none), held stack offset
+/// `u32`, `item: u128` (0 for none).
+fn put_trap(out: &mut AVec<'_, u8>, t: &TrapRow) {
+    let (tag, reg, offset) = match t.held {
+        Held::Unknown => (0u8, 0u8, 0u32),
+        Held::Reg(reg) => (1, reg, 0),
+        Held::Stack(offset) => (2, 0, offset),
+    };
+    put32(out, t.at);
+    out.extend_from_slice(&[t.kind as u8, tag, reg, 0]);
+    let (item, site) = t.site.unwrap_or((0, NO_SITE));
+    put32(out, site);
+    put32(out, offset);
+    out.extend_from_slice(&item.to_le_bytes());
+}
+
+/// The trap kind a row's byte names (the encoding is `TrapKind as u8`); `None` for a byte no
+/// kind has. This form's own reading of the leaf type's bytes: blaze-code's `bzcode07` reader
+/// has its own until that form is retired.
+fn trap_kind_of(byte: u8) -> Option<TrapKind> {
+    Some(match byte {
+        0 => TrapKind::MatchNoArm,
+        1 => TrapKind::LetElse,
+        2 => TrapKind::NeverValue,
+        3 => TrapKind::AfterDivergingCall,
+        4 => TrapKind::Intrinsic,
+        5 => TrapKind::Discriminant,
+        6 => TrapKind::SliceLength,
+        7 => TrapKind::NoreturnAsm,
+        8 => TrapKind::BodyEnd,
+        9 => TrapKind::AfterPanic,
+        _ => return None,
+    })
+}
+
+/// Whether a trap row's bytes are of the one form [`put_trap`] writes: a known kind and held
+/// tag, the zero byte, the register only under tag 1, the offset only under tag 2, the item 0
+/// where the site is none. `Err` is the first wrong byte, for [`FormError::Tag`].
+fn check_trap_bytes(b: &[u8]) -> Result<(), u8> {
+    if trap_kind_of(b[4]).is_none() {
+        return Err(b[4]);
+    }
+    let (tag, reg, zero) = (b[5], b[6], b[7]);
+    if tag > 2 {
+        return Err(tag);
+    }
+    if zero != 0 || (tag != 1 && reg != 0) {
+        return Err(if zero != 0 { zero } else { reg });
+    }
+    if tag != 2 && get32(b, 12) != 0 {
+        return Err(b[12..16].iter().copied().find(|&x| x != 0).unwrap_or(0));
+    }
+    if get32(b, 8) == NO_SITE && b[16..32].iter().any(|&x| x != 0) {
+        return Err(b[16..32].iter().copied().find(|&x| x != 0).unwrap_or(0));
+    }
+    Ok(())
+}
+
+/// A trap row's bytes as the row (its subject `None`: the view adds it).
+fn trap_of_bytes(b: &[u8]) -> TrapRow {
+    let Some(kind) = trap_kind_of(b[4]) else {
+        unreachable!("read checked every trap row's kind byte");
+    };
+    let held = match b[5] {
+        0 => Held::Unknown,
+        1 => Held::Reg(b[6]),
+        _ => Held::Stack(get32(b, 12)),
+    };
+    let site = match get32(b, 8) {
+        NO_SITE => None,
+        site => Some((u128::from_le_bytes(bytes16(b, 16)), site)),
+    };
+    TrapRow { at: get32(b, 0), kind, site, held, subject: None }
+}
+
+/// Whether a slot row's bytes are of the one form: a known part and field, six zero bytes.
+fn check_slot_bytes(b: &[u8]) -> Result<(), u8> {
+    if b[24] > 1 {
+        return Err(b[24]);
+    }
+    if b[25] > 1 {
+        return Err(b[25]);
+    }
+    match b[26..32].iter().copied().find(|&x| x != 0) {
+        Some(byte) => Err(byte),
+        None => Ok(()),
+    }
+}
+
+fn slot_of_bytes(b: &[u8]) -> PositionRow {
+    let part = match b[24] {
+        0 => PositionPart::Code,
+        _ => PositionPart::Relro,
+    };
+    let field = match b[25] {
+        0 => PositionField::Line,
+        _ => PositionField::Col,
+    };
+    PositionRow { part, at: get32(b, 20), item: u128::from_le_bytes(bytes16(b, 0)), site: get32(b, 16), field }
 }
 
 /// The closing digest of a record's bytes before it.
@@ -608,6 +842,12 @@ fn get64(b: &[u8], at: usize) -> u64 {
 fn bytes32(b: &[u8], at: usize) -> [u8; 32] {
     let mut s = [0u8; 32];
     s.copy_from_slice(&b[at..at + 32]);
+    s
+}
+
+fn bytes16(b: &[u8], at: usize) -> [u8; 16] {
+    let mut s = [0u8; 16];
+    s.copy_from_slice(&b[at..at + 16]);
     s
 }
 
@@ -673,6 +913,8 @@ pub struct RecordView<'b> {
     bytes: &'b [u8],
     frame: u32,
     unwind_frame: Option<Frame>,
+    code_align: u8,
+    relro_align: u8,
     /// Each section's used bytes (the byte sections without their padding).
     parts: [&'b [u8]; SECTIONS],
 }
@@ -699,11 +941,17 @@ pub fn read(bytes: &[u8]) -> Result<RecordView<'_>, FormError> {
     }
     let frame = get32(bytes, 8);
     let unwind_frame = Frame::of_word(get32(bytes, 12)).map_err(FormError::Unwind)?;
-    let flags = get32(bytes, 16 + 4 * SECTIONS);
+    let flags = get32(bytes, FLAGS_AT);
     if flags != 0 {
         return Err(FormError::Flags { flags });
     }
-    let reserved = get32(bytes, 20 + 4 * SECTIONS);
+    // The alignments' word: code, relro, two zero bytes (their range is `check`'s rule).
+    let (code_align, relro_align) = (bytes[ALIGNS_AT], bytes[ALIGNS_AT + 1]);
+    let after_aligns = get32(bytes, ALIGNS_AT) & 0xFFFF_0000;
+    if after_aligns != 0 {
+        return Err(FormError::Reserved { word: after_aligns });
+    }
+    let reserved = get32(bytes, RESERVED_AT);
     if reserved != 0 {
         return Err(FormError::Reserved { word: reserved });
     }
@@ -757,8 +1005,35 @@ pub fn read(bytes: &[u8]) -> Result<RecordView<'_>, FormError> {
             return Err(tag(DECLARED, row, byte));
         }
     }
-    let view = RecordView { bytes, frame, unwind_frame, parts };
+    for row in 0..counts[TRAPS] as usize {
+        let at = row * TRAP_ROW;
+        if let Err(byte) = check_trap_bytes(&parts[TRAPS][at..at + TRAP_ROW]) {
+            return Err(tag(TRAPS, row, byte));
+        }
+    }
+    for row in 0..counts[SLOTS] as usize {
+        let at = row * SLOT_ROW;
+        if let Err(byte) = check_slot_bytes(&parts[SLOTS][at..at + SLOT_ROW]) {
+            return Err(tag(SLOTS, row, byte));
+        }
+    }
+    // Each subject row after the one before it and at a trap row's offset, so the view's
+    // `trap` finds a row's subject by halving and none is left over. The trap rows' order is
+    // `check`'s; a subject row is searched among them only after it held.
+    let view = RecordView { bytes, frame, unwind_frame, code_align, relro_align, parts };
+    for row in 0..view.rows_of(SUBJECTS) {
+        let at = get32(view.row_of(SUBJECTS, row), 0);
+        if row > 0 && get32(view.row_of(SUBJECTS, row - 1), 0) >= at {
+            return Err(FormError::SubjectRow { row: row as u32 });
+        }
+    }
     check(&view)?;
+    for row in 0..view.rows_of(SUBJECTS) {
+        let at = get32(view.row_of(SUBJECTS, row), 0);
+        if search(view.traps(), |i| get32(view.row_of(TRAPS, i), 0), &at).is_none() {
+            return Err(FormError::SubjectRow { row: row as u32 });
+        }
+    }
     Ok(view)
 }
 
@@ -950,6 +1225,52 @@ impl<'b> RecordView<'b> {
         declared::row_of_bytes(self.row_of(DECLARED, i))
     }
 
+    /// log2 of the alignment the code's first byte must be placed at ([`Emitted::code_align`]).
+    pub fn code_align(&self) -> u8 {
+        self.code_align
+    }
+
+    /// log2 of the alignment the relro part's first byte must be placed at.
+    pub fn relro_align(&self) -> u8 {
+        self.relro_align
+    }
+
+    pub fn traps(&self) -> usize {
+        self.rows_of(TRAPS)
+    }
+
+    /// Trap row `i` (by offset), with its subject.
+    pub fn trap(&self, i: usize) -> TrapRow {
+        let mut row = trap_of_bytes(self.row_of(TRAPS, i));
+        let found = search(self.rows_of(SUBJECTS), |k| get32(self.row_of(SUBJECTS, k), 0), &row.at);
+        row.subject = found.map(|k| {
+            let b = self.row_of(SUBJECTS, k);
+            let mut discriminants = [0u64; SUBJECT_SHOWN];
+            for (n, d) in discriminants.iter_mut().enumerate() {
+                *d = get64(b, 24 + 8 * n);
+            }
+            Subject { item: u128::from_le_bytes(bytes16(b, 8)), count: get32(b, 4), discriminants }
+        });
+        row
+    }
+
+    /// The trap row of the `brk` at code offset `at`, by halving: what a fault at that
+    /// instruction ended (blaze-code trap.rs's question of a record).
+    pub fn trap_at(&self, at: u32) -> Option<TrapRow> {
+        let i = search(self.traps(), |i| get32(self.row_of(TRAPS, i), 0), &at)?;
+        Some(self.trap(i))
+    }
+
+    /// The count of source-position slots: the placer's `values` hold one `u32` for each.
+    pub fn position_slots(&self) -> usize {
+        self.rows_of(SLOTS)
+    }
+
+    /// Source-position slot `i`, in (part, offset) order: the order of the placer's `values`.
+    pub fn position_slot(&self, i: usize) -> PositionRow {
+        slot_of_bytes(self.row_of(SLOTS, i))
+    }
+
     /// The record back in memory, in `alloc`: what was sealed, so sealing it again encodes to
     /// these bytes.
     pub fn to_emitted<'a>(&self, alloc: Alloc<'a>) -> Emitted<'a> {
@@ -998,6 +1319,14 @@ impl<'b> RecordView<'b> {
             e.declared.push(self.declared_raw(i));
         }
         e.text.extend_from_slice(self.parts[TEXT]);
+        e.code_align = self.code_align;
+        e.relro_align = self.relro_align;
+        for i in 0..self.traps() {
+            e.traps.push(self.trap(i));
+        }
+        for i in 0..self.position_slots() {
+            e.position_slots.push(self.position_slot(i));
+        }
         e
     }
 }
@@ -1049,6 +1378,14 @@ trait Rows {
     fn declared_rows(&self) -> usize;
     fn declared_row(&self, i: usize) -> DeclaredRow;
     fn text(&self) -> &[u8];
+    /// (code, relro) alignments, log2.
+    fn aligns(&self) -> (u8, u8);
+    fn traps(&self) -> usize;
+    fn trap(&self, i: usize) -> TrapRow;
+    fn slots(&self) -> usize;
+    fn slot(&self, i: usize) -> PositionRow;
+    fn code_bytes(&self) -> &[u8];
+    fn relro_bytes(&self) -> &[u8];
 }
 
 /// A record in memory after the seal's sorting; every length fits a `u32` (checked first).
@@ -1145,6 +1482,27 @@ impl Rows for Mem<'_, '_> {
     fn text(&self) -> &[u8] {
         &self.0.text
     }
+    fn aligns(&self) -> (u8, u8) {
+        (self.0.code_align, self.0.relro_align)
+    }
+    fn traps(&self) -> usize {
+        self.0.traps.len()
+    }
+    fn trap(&self, i: usize) -> TrapRow {
+        self.0.traps[i]
+    }
+    fn slots(&self) -> usize {
+        self.0.position_slots.len()
+    }
+    fn slot(&self, i: usize) -> PositionRow {
+        self.0.position_slots[i]
+    }
+    fn code_bytes(&self) -> &[u8] {
+        &self.0.code
+    }
+    fn relro_bytes(&self) -> &[u8] {
+        &self.0.relro
+    }
 }
 
 impl Rows for RecordView<'_> {
@@ -1237,6 +1595,27 @@ impl Rows for RecordView<'_> {
     }
     fn text(&self) -> &[u8] {
         self.parts[TEXT]
+    }
+    fn aligns(&self) -> (u8, u8) {
+        (self.code_align, self.relro_align)
+    }
+    fn traps(&self) -> usize {
+        RecordView::traps(self)
+    }
+    fn trap(&self, i: usize) -> TrapRow {
+        RecordView::trap(self, i)
+    }
+    fn slots(&self) -> usize {
+        self.position_slots()
+    }
+    fn slot(&self, i: usize) -> PositionRow {
+        self.position_slot(i)
+    }
+    fn code_bytes(&self) -> &[u8] {
+        self.parts[CODE]
+    }
+    fn relro_bytes(&self) -> &[u8] {
+        self.parts[RELRO]
     }
 }
 
@@ -1420,6 +1799,15 @@ fn check(r: &impl Rows) -> Result<(), FormError> {
             return Err(FormError::ReadsUnsorted { row: i as u32 });
         }
     }
+    let (code_align, relro_align) = r.aligns();
+    if !(LEAST_CODE_ALIGN..=MOST_PART_ALIGN).contains(&code_align) {
+        return Err(FormError::Align { part: "code", align: code_align });
+    }
+    if !(LEAST_RELRO_ALIGN..=MOST_PART_ALIGN).contains(&relro_align) {
+        return Err(FormError::Align { part: "relro part", align: relro_align });
+    }
+    check_traps(r, code)?;
+    check_slots(r)?;
     check_names(r)?;
     declared::check(
         r.declared_rows(),
@@ -1466,6 +1854,97 @@ fn check_unwind(r: &impl Rows, code: u32) -> Result<(), FormError> {
         if !landing_ok {
             return Err(FormError::Unwind(UnwindError::PadLanding { start: row.start, landing: row.landing, action: row.action }));
         }
+    }
+    Ok(())
+}
+
+/// Trap rows: by offset, one a `brk`, each a whole instruction of the code, no site the form's
+/// word for none, no held register past `x30`, no subject discriminant kept past its count.
+fn check_traps(r: &impl Rows, code: u32) -> Result<(), FormError> {
+    for i in 0..r.traps() {
+        let t = r.trap(i);
+        if i > 0 && r.trap(i - 1).at >= t.at {
+            return Err(FormError::TrapsUnsorted { at: t.at });
+        }
+        if t.at % INST != 0 || u64::from(t.at) + u64::from(INST) > u64::from(code) {
+            return Err(FormError::TrapOutside { at: t.at });
+        }
+        if let Some((_, NO_SITE)) = t.site {
+            return Err(FormError::TrapSite { at: t.at });
+        }
+        if let Held::Reg(reg) = t.held
+            && reg > MOST_HELD_REG
+        {
+            return Err(FormError::HeldReg { at: t.at, reg });
+        }
+        if let Some(subject) = t.subject {
+            let kept = (subject.count as usize).min(SUBJECT_SHOWN);
+            if subject.discriminants[kept..].iter().any(|&d| d != 0) {
+                return Err(FormError::SubjectRest { at: t.at });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Source-position slots: by (part, offset), each once, 4-aligned, inside its part, four zero
+/// bytes there, and sharing no byte with a relocation's field or a relro word (the placer
+/// writes both; neither may overwrite the other).
+fn check_slots(r: &impl Rows) -> Result<(), FormError> {
+    let slots = r.slots();
+    for i in 0..slots {
+        let s = r.slot(i);
+        let (part, at) = (s.part, s.at);
+        if i > 0 {
+            let prev = r.slot(i - 1);
+            if (prev.part, prev.at) >= (part, at) {
+                return Err(FormError::SlotsUnsorted { part, at });
+            }
+        }
+        if at % 4 != 0 {
+            return Err(FormError::SlotMisaligned { part, at });
+        }
+        let bytes = match part {
+            PositionPart::Code => r.code_bytes(),
+            PositionPart::Relro => r.relro_bytes(),
+        };
+        match bytes.get(at as usize..).and_then(|tail| tail.get(..4)) {
+            None => return Err(FormError::SlotOutside { part, at }),
+            Some(slot) if slot != [0; 4] => return Err(FormError::SlotNonzero { part, at }),
+            Some(_) => {}
+        }
+    }
+    if slots == 0 {
+        return Ok(());
+    }
+    // The first slot at or after the 4-byte slot holding a reference's first byte is the only
+    // one it can share a byte with (the slots are sorted, 4 bytes, 4-aligned, apart).
+    let overlap = |part: PositionPart, at: u32, len: u32| -> Result<(), FormError> {
+        let key = (part, at & !3);
+        let (mut lo, mut hi) = (0usize, slots);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let s = r.slot(mid);
+            match (s.part, s.at) < key {
+                true => lo = mid + 1,
+                false => hi = mid,
+            }
+        }
+        if lo < slots {
+            let s = r.slot(lo);
+            if s.part == part && u64::from(s.at) < u64::from(at) + u64::from(len) {
+                return Err(FormError::SlotOverlapsReference { part, at: s.at });
+            }
+        }
+        Ok(())
+    };
+    for i in 0..r.relocs() {
+        let x = r.reloc(i);
+        let part = if x.in_relro { PositionPart::Relro } else { PositionPart::Code };
+        overlap(part, x.at, field_len(x.kind))?;
+    }
+    for i in 0..r.words() {
+        overlap(PositionPart::Relro, r.word(i).at, 8)?;
     }
     Ok(())
 }

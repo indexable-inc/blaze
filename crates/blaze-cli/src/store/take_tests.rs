@@ -25,7 +25,7 @@ use bstd::mem::TASK_FRAME;
 use bstd::test::BUDGET;
 use core::time::Duration;
 
-use super::super::plain_place::DRIVE_TAG;
+use blaze_keyed::kind::ReservedTag;
 use super::super::published::folder::{self, Order};
 use super::super::published;
 use super::super::published_e2e_tests::{N, Planted, SEED, TOOLCHAIN, contains, developer_home, path, plant, planted, set_name, set_path};
@@ -126,7 +126,7 @@ pub(super) fn named_by_root(lent: &CommandLent, records: &Planted) -> Result<Opt
         if record.bytes != want.as_slice() {
             return Err(Broke::Oracle("a record taken with other bytes than the set's".into()));
         }
-        if record.namespace != Namespace::LOCAL || record.tag != DRIVE_TAG {
+        if record.namespace != Namespace::LOCAL || !ReservedTag::Drive.is(record.tag) {
             return Err(Broke::Oracle("a record taken in another namespace or under another tag".into()));
         }
     }
@@ -234,8 +234,9 @@ fn the_oracle_catches_a_take_that_checks_no_digest() {
 }
 
 /// A take stopped after a drawn number of records, its home's syncs failing or not, then a
-/// crash; then the next command. The oracle: after the crash the root is absent or names the
-/// set whole; after the next command the set is whole, and a take counts every record once.
+/// crash; then the next command. The oracle: before the crash (a reader of the same boot) and
+/// after it the root is absent or names the set whole; after the next command the set is
+/// whole, and a take counts every record once.
 fn interrupted(tape: &Tape, root_each_segment: bool) -> Result<(), Broke> {
     let world = world(tape.below(1 << 32, "sim seed"));
     let stop = tape.below(u64::from(N) + 1, "records put before the crash") as u32;
@@ -250,6 +251,13 @@ fn interrupted(tape: &Tape, root_each_segment: bool) -> Result<(), Broke> {
         }
         // A failed sync stops the take where it is, as the crash does.
         let _stopped = world.take(&cx, &lent, TakePlant { root_each_segment, stop_after: Some(stop), ..TakePlant::NONE });
+        // Before the crash, as a reader of this boot sees the store: what the next boot's open
+        // drops (blaze-cas D200: a root reaching a record the power cut took) cannot hide a half
+        // root here, where nothing was lost.
+        match named_by_root(&lent, &world.records)? {
+            Some(n) if n != N as usize => return Err(Broke::Oracle(format!("half a root: before the crash the toolchain's root names {n} of the set's {N} records"))),
+            _ => {}
+        }
     }
     if !world.io.crash() {
         return Err(Broke::Harness("the world is not simulated: no crash".into()));

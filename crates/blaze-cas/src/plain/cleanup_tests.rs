@@ -78,6 +78,7 @@ fn cfg(n: u64, boot: u64, root: &Frame) -> PlainConfig<&Frame> {
         writes,
         reads,
         liveness: Liveness::Reached,
+        lock_step: crate::plain::LockStep::Backoff,
     }
 }
 
@@ -284,12 +285,19 @@ fn wave(w: &mut World<'_>, jobs: Vec<Job>, cut: Option<u64>) -> bool {
     }
     let mut done: Vec<Completion> = Vec::new_in(Global);
     for _ in 0..10_000_000u32 {
+        // A step may end with nothing asked (a commit with nothing left to write ends at once,
+        // as one does after a `SliceFlipsAlone` slice flipped its root and lease): the process
+        // is ready again, and the next round steps it. A stall is a round that stepped no one
+        // with nothing in flight.
+        let mut stepped = false;
         for p in procs.iter_mut() {
             if p.store.ready() && p.effects.is_empty() && !matches!(p.step, Step::Done) {
                 next_step(w, p);
+                stepped = true;
             }
             if p.store.broken().is_some() && !matches!(p.step, Step::Done) {
                 next_step(w, p);
+                stepped = true;
             }
             w.sim.submit(&mut p.effects);
         }
@@ -298,6 +306,9 @@ fn wave(w: &mut World<'_>, jobs: Vec<Job>, cut: Option<u64>) -> bool {
             return false;
         }
         if w.sim.in_flight() == 0 {
+            if stepped {
+                continue;
+            }
             panic!("a wave stalled: a process neither done nor asking anything");
         }
         w.sim.poll(&mut done, Deadline::after(w.sim.now(), Duration::from_secs(1)));

@@ -1009,19 +1009,27 @@ fn unit_cfgs() {
             })
             .collect()
     };
+    // The test unit unwinds whatever the profile says. This is Cargo's rule, quoted at resolve.rs
+    // `unit_cfg`: "Tests, benchmarks, build scripts, and proc macros ignore the `panic`
+    // setting"; `ignores_profile_panic` asks it. So it carries `panic = "unwind"` although
+    // `mac()` lists no panic atom.
     assert_eq!(
         text(1),
         vec![
             "debug_assertions",
             "feature=\"default\"",
             "feature=\"x\"",
+            "panic=\"unwind\"",
             "target_arch=\"aarch64\"",
             "target_os=\"macos\"",
             "test",
             "unix"
         ]
     );
+    // The library unit is not a test. It keeps what the profile's desc says: no `test`, and no
+    // panic atom, since `mac()` lists none.
     assert!(!text(0).contains(&"test".to_owned()));
+    assert!(!text(0).iter().any(|atom| atom.starts_with("panic")), "a non-test unit's panic is the profile's: {:?}", text(0));
 }
 
 /// A drawn workspace: packages `p0..pn`, each depending only on later ones, with features whose

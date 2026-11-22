@@ -73,13 +73,13 @@ impl LayoutFacts for Tw {
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
         self.w.adt(key)
     }
-    fn repr(&self, key: ItemKey) -> ReprAttrs {
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, Missing> {
         self.w.repr(key)
     }
     fn discriminant(&self, key: ItemKey, variant: u32) -> Result<Option<i128>, Missing> {
         self.w.discriminant(key, variant)
     }
-    fn valid_range(&self, key: ItemKey) -> ValidRange {
+    fn valid_range(&self, key: ItemKey) -> Result<ValidRange, Missing> {
         self.w.valid_range(key)
     }
 }

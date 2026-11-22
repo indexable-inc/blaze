@@ -866,13 +866,13 @@ impl LayoutFacts for World {
         })
     }
 
-    fn repr(&self, key: ItemKey) -> ReprAttrs {
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, blaze_build::layout::Missing> {
         let int = self.reprs.iter().find(|(k, _)| *k == key).map(|&(_, n)| match n {
             PNode::Int(i) => IntRepr::Signed(i),
             PNode::Uint(u) => IntRepr::Unsigned(u),
             _ => panic!("a repr that is not an integer"),
         });
-        ReprAttrs { int, hide_niche: self.cells.contains(&key), ..ReprAttrs::RUST }
+        Ok(ReprAttrs { int, hide_niche: self.cells.contains(&key), ..ReprAttrs::RUST })
     }
 
     /// From the explicit discriminant's record (the machine makes it a need before it asks).
@@ -884,12 +884,12 @@ impl LayoutFacts for World {
         let r = self.store.iter().find(|r| r.key == RecordKey::of(ik)).ok_or(missing)?;
         let bits = 8 * r.data.allocs[0].bytes.len() as u32;
         let v = int_of(r);
-        let signed = !matches!(self.repr(key).int, Some(IntRepr::Unsigned(_)));
+        let signed = !matches!(self.repr(key)?.int, Some(IntRepr::Unsigned(_)));
         Ok(Some(if signed && bits < 128 { ((v << (128 - bits)) as i128) >> (128 - bits) } else { v as i128 }))
     }
 
-    fn valid_range(&self, _: ItemKey) -> ValidRange {
-        ValidRange::default()
+    fn valid_range(&self, _: ItemKey) -> Result<ValidRange, blaze_build::layout::Missing> {
+        Ok(ValidRange::default())
     }
 }
 

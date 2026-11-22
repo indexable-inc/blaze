@@ -29,6 +29,9 @@ pub(crate) struct World {
     defs: Vec<Def>,
     /// An enum whose explicit discriminants' records are not made yet.
     missing: core::cell::Cell<Option<ItemKey>>,
+    /// An ADT whose head is not made yet: its `repr`, valid range and discriminants are
+    /// `Missing` (a lazy front end asked before the head, D194).
+    unmade: core::cell::Cell<Option<ItemKey>>,
 }
 
 impl LayoutFacts for World {
@@ -36,17 +39,48 @@ impl LayoutFacts for World {
         let d = self.defs.iter().find(|d| d.key == key)?;
         Some(Adt { kind: d.kind, generics: d.generics, variants: &d.variants, fields: &d.fields, types: d.types.view() })
     }
-    fn repr(&self, key: ItemKey) -> ReprAttrs {
-        self.defs.iter().find(|d| d.key == key).map_or(ReprAttrs::RUST, |d| d.repr)
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, super::Missing> {
+        if self.unmade.get() == Some(key) {
+            return Err(super::Missing { item: key });
+        }
+        Ok(self.defs.iter().find(|d| d.key == key).map_or(ReprAttrs::RUST, |d| d.repr))
     }
     fn discriminant(&self, key: ItemKey, variant: u32) -> Result<Option<i128>, super::Missing> {
-        if self.missing.get() == Some(key) {
+        if self.missing.get() == Some(key) || self.unmade.get() == Some(key) {
             return Err(super::Missing { item: key });
         }
         Ok(self.defs.iter().find(|d| d.key == key).and_then(|d| d.discrs.get(variant as usize).copied().flatten()))
     }
-    fn valid_range(&self, key: ItemKey) -> ValidRange {
-        self.defs.iter().find(|d| d.key == key).map_or(ValidRange::default(), |d| d.valid)
+    fn valid_range(&self, key: ItemKey) -> Result<ValidRange, super::Missing> {
+        if self.unmade.get() == Some(key) {
+            return Err(super::Missing { item: key });
+        }
+        Ok(self.defs.iter().find(|d| d.key == key).map_or(ValidRange::default(), |d| d.valid))
+    }
+}
+
+/// The planted control of `a_repr_asked_before_its_head_caches_nothing`: the old answer to a
+/// `repr` asked before the ADT's head, a default `repr(Rust)` where the head is unmade.
+struct DefaultsRepr<'w>(&'w World);
+
+impl LayoutFacts for DefaultsRepr<'_> {
+    fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
+        self.0.adt(key)
+    }
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, super::Missing> {
+        if self.0.unmade.get() == Some(key) {
+            return Ok(ReprAttrs::RUST);
+        }
+        self.0.repr(key)
+    }
+    fn discriminant(&self, key: ItemKey, variant: u32) -> Result<Option<i128>, super::Missing> {
+        self.0.discriminant(key, variant)
+    }
+    fn valid_range(&self, key: ItemKey) -> Result<ValidRange, super::Missing> {
+        if self.0.unmade.get() == Some(key) {
+            return Ok(ValidRange::default());
+        }
+        self.0.valid_range(key)
     }
 }
 
@@ -156,7 +190,7 @@ pub(crate) fn lay(w: &World, g: &mut G, ls: &mut Layouts<Global>, t: PTy) -> Res
     ls.of(t, &mut cx)
 }
 
-fn size_align(ls: &Layouts<Global>, id: LayoutId) -> (u64, u64) {
+fn size_align<A: core::alloc::Allocator + Clone>(ls: &Layouts<A>, id: LayoutId) -> (u64, u64) {
     let l = ls.get(id);
     (l.size, l.align_bytes())
 }
@@ -684,7 +718,7 @@ fn random_types(tape: &Tape) -> Result<(), Broke> {
                 for f in adt.fields {
                     ps.push(crate::ground(adt.types, f.ty, &args, &mut g.t, Alloc::global(), &w).unwrap());
                 }
-                (ps, w.repr(k).packed, Some(adt.kind))
+                (ps, w.repr(k).expect("every head of the random world is made").packed, Some(adt.kind))
             }
             _ => continue,
         };
@@ -799,6 +833,48 @@ fn a_missing_discriminant_caches_nothing() {
     assert_eq!(size_align(&ls, id), (2, 2), "300 and 301 need a 2-byte tag");
     let eid = lay(&w, &mut g, &mut ls, et).unwrap();
     assert_eq!(ls.discriminant(eid, 1), Some(301));
+}
+
+/// D194: a `repr` asked before the ADT's head is made (`Missing`) refuses as an unanswered head
+/// (`Refusal::NoAdt`, which every driver makes and asks again) and caches nothing, so the same `Layouts` asked again once the head exists lays the packed struct (and
+/// the struct holding it) out packed: the answer does not depend on which was asked first.
+/// The planted control answers the unmade head with a default `repr(Rust)` (the old reading):
+/// the holder is then laid out padded, and the order would change the layout.
+#[test]
+fn a_repr_asked_before_its_head_caches_nothing() {
+    let mut w = World::default();
+    let packed = w.strukt(0, &[F::Leaf(U8), F::Leaf(U32)], ReprAttrs { packed: Some(0), ..ReprAttrs::RUST });
+    let mut g = G::new();
+    let pt = g.adt(packed, &[]);
+    let holder = w.strukt(1, &[F::P(0)], ReprAttrs::RUST);
+    let ht = g.adt(holder, &[pt]);
+    let heap = blaze_own::testing::heap();
+
+    // Asked first, before the head: refused by name, nothing kept.
+    let mut ls = Layouts::new_in(heap.alloc());
+    w.unmade.set(Some(packed));
+    let mut cx = LayoutCx { ground: &mut g.t, facts: &w, scratch: heap.alloc() };
+    let err = ls.of(ht, &mut cx).unwrap_err();
+    assert!(matches!(err.why, Refusal::NoAdt(item) if item == packed), "{err}");
+    w.unmade.set(None);
+    let mut cx = LayoutCx { ground: &mut g.t, facts: &w, scratch: heap.alloc() };
+    let id = ls.of(ht, &mut cx).expect("laid out once the head exists");
+    let asked_first = size_align(&ls, id);
+    assert_eq!(asked_first, (5, 1), "repr(packed) u8, u32: no padding, held unpadded");
+
+    // Asked after the head: the same answer.
+    let mut fresh = Layouts::new_in(heap.alloc());
+    let mut cx = LayoutCx { ground: &mut g.t, facts: &w, scratch: heap.alloc() };
+    let id = fresh.of(ht, &mut cx).unwrap();
+    assert_eq!(size_align(&fresh, id), asked_first, "the order of asking changes nothing");
+
+    // Planted: the unmade head read as `repr(Rust)` lays the holder out padded.
+    w.unmade.set(Some(packed));
+    let planted = DefaultsRepr(&w);
+    let mut wrong = Layouts::new_in(heap.alloc());
+    let mut cx = LayoutCx { ground: &mut g.t, facts: &planted, scratch: heap.alloc() };
+    let id = wrong.of(ht, &mut cx).expect("the planted reading answers");
+    assert_eq!(size_align(&wrong, id), (8, 4), "the planted default is caught: a padded layout");
 }
 
 #[test]

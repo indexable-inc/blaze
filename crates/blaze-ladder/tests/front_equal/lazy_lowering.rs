@@ -146,9 +146,9 @@ fn compare_call_graph(shape: Shape, n: usize, entry: ItemKey, new: &mut Side<'_>
     let planted = old.program.lowering_counts();
     let bound = |c: LoweringCounts| c.bodies_lowered + c.lower_again <= bodies;
     assert!(bound(counts), "{shape:?}({n}): {counts}");
-    assert_eq!(counts, LoweringCounts { bodies_lowered: bodies, lower_again: 0, forks: 0 });
+    assert_eq!(counts, LoweringCounts { bodies_lowered: bodies, lower_again: 0, forks: 0, typing: None });
     assert_eq!(new.program.counts().live as u64, bodies);
-    assert_eq!(planted, LoweringCounts { bodies_lowered: bodies, lower_again: bodies * (bodies + 1) / 2, forks: bodies });
+    assert_eq!(planted, LoweringCounts { bodies_lowered: bodies, lower_again: bodies * (bodies + 1) / 2, forks: bodies, typing: None });
     assert!(!bound(planted), "the same bound must catch the actual re-lower-all loop");
     println!("{shape:?} N={n}: {bodies} equal records, {counts}, control caught {} re-lowerings", planted.lower_again);
 }

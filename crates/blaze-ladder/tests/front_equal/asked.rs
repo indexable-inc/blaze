@@ -262,6 +262,15 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         r
     }
 
+    fn object_table(&mut self, t: ItemKey) -> Result<bool, RunError> {
+        let r = self.inner.object_table(t);
+        self.note(format_args!("object_table {t:?}"), |o| match &r {
+            Ok(made) => write!(o, "{made}"),
+            Err(e) => write!(o, "refused: {e}"),
+        });
+        r
+    }
+
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
         let r = self.inner.adt(key);
         self.note(format_args!("adt {key:?}"), |o| shown::adt(o, r));
@@ -292,15 +301,26 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         r
     }
 
-    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Option<CallerSite<'_>> {
+    // The site only, not the gap: the two fronts give no place by different steps (the old
+    // front's `NotLive`, the lazy one's own), and the log compares what was answered.
+    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Result<CallerSite<'_>, blaze_build::SiteGap> {
         let r = self.inner.caller_site(owner, expr);
-        self.note(format_args!("caller_site {owner:?} {expr:?}"), |o| write!(o, "{r:?}"));
+        self.note(format_args!("caller_site {owner:?} {expr:?}"), |o| write!(o, "{:?}", r.as_ref().ok()));
         r
     }
 
-    fn def_site(&self, item: ItemKey) -> Option<CallerSite<'_>> {
+    fn def_site(&self, item: ItemKey) -> Result<CallerSite<'_>, blaze_build::SiteGap> {
         let r = self.inner.def_site(item);
-        self.note(format_args!("def_site {item:?}"), |o| write!(o, "{r:?}"));
+        self.note(format_args!("def_site {item:?}"), |o| write!(o, "{:?}", r.as_ref().ok()));
+        r
+    }
+
+    fn site_heads(&mut self, owner: ItemKey) -> Result<(), RunError> {
+        let r = self.inner.site_heads(owner);
+        self.note(format_args!("site_heads {owner:?}"), |o| match &r {
+            Ok(()) => write!(o, "asked"),
+            Err(e) => write!(o, "refused: {e}"),
+        });
         r
     }
 
@@ -347,6 +367,12 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
     fn opaque_of(&self, opaque: ItemKey) -> Option<(ItemKey, u32)> {
         let r = self.inner.opaque_of(opaque);
         self.note(format_args!("opaque_of {opaque:?}"), |o| write!(o, "{r:?}"));
+        r
+    }
+
+    fn alias_definer(&self, alias: ItemKey) -> Result<ItemKey, blaze_ladder::front2::tait::DefinerMiss> {
+        let r = self.inner.alias_definer(alias);
+        self.note(format_args!("alias_definer {alias:?}"), |o| write!(o, "{r:?}"));
         r
     }
 
@@ -474,13 +500,13 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         r
     }
 
-    fn repr(&self, key: ItemKey) -> ReprAttrs {
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, blaze_build::layout::Missing> {
         let r = self.inner.repr(key);
         self.note(format_args!("repr {key:?}"), |o| write!(o, "{r:?}"));
         r
     }
 
-    fn valid_range(&self, key: ItemKey) -> ValidRange {
+    fn valid_range(&self, key: ItemKey) -> Result<ValidRange, blaze_build::layout::Missing> {
         let r = self.inner.valid_range(key);
         self.note(format_args!("valid_range {key:?}"), |o| write!(o, "{r:?}"));
         r
@@ -503,7 +529,7 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         r
     }
 
-    fn discriminant(&self, adt: ItemKey, variant: u32) -> Option<i128> {
+    fn discriminant(&self, adt: ItemKey, variant: u32) -> Result<Option<i128>, blaze_build::layout::Missing> {
         let r = self.inner.discriminant(adt, variant);
         self.note(format_args!("discriminant {adt:?} {variant}"), |o| write!(o, "{r:?}"));
         r

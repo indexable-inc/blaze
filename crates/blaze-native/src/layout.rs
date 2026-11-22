@@ -22,11 +22,12 @@
 //! and input indices index them); a plan that breaks this is a bug of the caller's and panics
 //! at the index.
 
+use blaze_code::a64::{adrp_to, lo12};
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::Platform;
 use crate::descriptor::{Descriptor, MAGIC as DESCRIPTOR_MAGIC, NAME_ROW_LEN, POINTER_ROW_LEN};
-use crate::image::{DESCRIPTOR_LEN, EhPointer, FixTo, Fixup, Frame, Image, Import, Placed, Region, TlsReloc, descriptor_name};
+use crate::image::{Addr56, DESCRIPTOR_LEN, EhPointer, FixTo, Fixup, Frame, Image, Import, Placed, Region, TlsReloc, descriptor_name};
 use crate::object::{Bind, Def, Reloc, RelocKind, RelocTo, SectionKind};
 use crate::resolve::{Input, Origin, Plan, Resolution};
 use crate::unwind::{self, Row, UnwindInfoError};
@@ -76,6 +77,10 @@ pub enum LayoutError<'a> {
     /// word) and relocation made `found` `FixTo::Word` fixups: the count's test and `apply`'s
     /// disagree (BNL2, descriptor.rs).
     PointerRows { counted: u32, found: u32 },
+    /// The second pass wrote `what` at `written` bytes where the first pass measured `measured`
+    /// and placed what follows by it (the unwind index: `unwind_len` from stand-in rows, then
+    /// `unwind_info` from the real ones): a bug of this file's, refused in every build.
+    Remeasured { what: &'static str, measured: u64, written: u64 },
 }
 
 /// A relocation whose field cannot hold its target (rule 19): its kind, the member and section
@@ -131,10 +136,6 @@ pub enum Reach {
     /// past the image's end `end`, so the addend is unexplained, and refused (rule 3).
     Rebase { to: u64, addend: i64, end: u64 },
 }
-
-/// A rebase target's address part: everything below the top byte, which is the pointer's tag
-/// (`dyld_chained_ptr_64_rebase.high8`, [`Reach::Rebase`]).
-pub const REBASE_ADDRESS: u64 = (1 << 56) - 1;
 
 impl core::fmt::Display for Reach {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -351,7 +352,7 @@ const BR_X16: u32 = 0xD61F_0200; // br x16
 fn page_field(kind: RelocKind, insn: u32, place: u64, to: u64) -> Result<u32, Reach> {
     let scale_log2 = match kind {
         RelocKind::Page21 | RelocKind::GotPage21 | RelocKind::TlvPage21 | RelocKind::TlsDescPage21 | RelocKind::TlsIePage21 => {
-            return adrp(insn, place, to).ok_or(Reach::Distance { place, to });
+            return adrp_to(insn, place, to).map_err(|_| Reach::Distance { place, to });
         }
         RelocKind::PageOff12 { scale_log2 } => scale_log2,
         RelocKind::GotPageOff12 | RelocKind::TlvPageOff12 | RelocKind::TlsDescLo12 | RelocKind::TlsIeLo12 => 3,
@@ -384,25 +385,6 @@ fn unreached(t: Target) -> Reach {
     }
 }
 
-/// ADRP's page delta into `insn` (A64 "ADRP": `Xd = (PC & ~0xFFF) + (imm21 << 12)`).
-fn adrp(insn: u32, place: u64, to: u64) -> Option<u32> {
-    let pages = ((to & !0xfff) as i64).wrapping_sub((place & !0xfff) as i64) >> 12;
-    if !(-(1i64 << 20)..(1i64 << 20)).contains(&pages) {
-        return None;
-    }
-    let imm = pages as u32;
-    Some((insn & 0x9f00_001f) | ((imm & 3) << 29) | (((imm >> 2) & 0x7ffff) << 5))
-}
-
-/// The low 12 bits of `to`, scaled by the access size, into imm12 (bits 10..21) of an ADD or
-/// LDR/STR (unsigned offset); a misaligned offset cannot be encoded.
-fn lo12(insn: u32, to: u64, scale_log2: u8) -> Option<u32> {
-    let low = (to & 0xfff) as u32;
-    if low & ((1u32 << scale_log2) - 1) != 0 {
-        return None;
-    }
-    Some((insn & !(0xfff << 10)) | ((low >> scale_log2) << 10))
-}
 
 /// A branch's word offset into a field of `bits` at bit `shift`.
 fn branch(insn: u32, place: u64, to: u64, bits: u32, shift: u32) -> Option<u32> {
@@ -1207,7 +1189,7 @@ impl<'p, 'a> Lay<'p, 'a> {
 
     /// Writes one 12-byte `adrp x16; <second> x16; br x16` at `at` reaching `to`.
     fn write_x16(&mut self, at: u64, second: u32, to: u64, scale: u8) -> Option<()> {
-        let a = adrp(X16_ADRP, at, to)?;
+        let a = adrp_to(X16_ADRP, at, to).ok()?;
         let b = lo12(second, to, scale)?;
         self.put32(at, a);
         self.put32(at + 4, b);
@@ -1266,11 +1248,12 @@ impl<'p, 'a> Lay<'p, 'a> {
                         // unverified. The part below the tag must be an image place: anything
                         // else (bits 36..55, an addend that left the image) is refused here,
                         // where the relocation's input, section and name are known (rule 19).
-                        if v & REBASE_ADDRESS > self.end {
+                        let to = FixTo::rebase(v);
+                        if matches!(to, FixTo::Rebase { address, .. } if address.get() > self.end) {
                             return Err(far(self, Reach::Rebase { to: v, addend: r.addend, end: self.end }));
                         }
                         self.put64(place, v);
-                        push(&mut self.fixups, Fixup { at: place, to: FixTo::Rebase { target: v } })?;
+                        push(&mut self.fixups, Fixup { at: place, to })?;
                     }
                     Target::Absolute(v) => self.put64(place, v),
                     Target::Import { index, addend } => {
@@ -1404,19 +1387,20 @@ impl<'p, 'a> Lay<'p, 'a> {
                 Cell::Plain(t) => match t {
                     Target::Place { object, offset, .. } => {
                         let v = self.address(t, object, b"")?;
-                        if v > self.end {
+                        // A GOT entry is an address, untagged: an image place or refused.
+                        let Some(address) = Addr56::new(v).filter(|a| a.get() <= self.end) else {
                             return Err(self.far_own(RelocKind::GotPage21, b"(a GOT entry)", Reach::Rebase { to: v, addend: offset, end: self.end }));
-                        }
+                        };
                         self.put64(at, v);
-                        push(&mut self.fixups, Fixup { at, to: FixTo::Rebase { target: v } })?;
+                        push(&mut self.fixups, Fixup { at, to: FixTo::Rebase { address, high8: 0 } })?;
                     }
                     Target::Common { offset, .. } | Target::Linker { offset, .. } => {
                         let v = self.address(t, 0, b"")?;
-                        if v > self.end {
+                        let Some(address) = Addr56::new(v).filter(|a| a.get() <= self.end) else {
                             return Err(self.far_own(RelocKind::GotPage21, b"(a GOT entry)", Reach::Rebase { to: v, addend: offset, end: self.end }));
-                        }
+                        };
                         self.put64(at, v);
-                        push(&mut self.fixups, Fixup { at, to: FixTo::Rebase { target: v } })?;
+                        push(&mut self.fixups, Fixup { at, to: FixTo::Rebase { address, high8: 0 } })?;
                     }
                     Target::Absolute(v) => self.put64(at, v),
                     Target::Import { index, addend } => push(&mut self.fixups, Fixup { at, to: FixTo::Import { index, addend } })?,
@@ -1666,7 +1650,7 @@ pub fn lay<'a>(plan: &Plan<'a>, inputs: &[Input<'a>], layout: Layout, alloc: All
             }
         }
         if out.len() as u64 != unwind_len {
-            return Err(LayoutError::Unwind { from: me.origin(0), why: "the unwind index changed size between its measure and its write" });
+            return Err(LayoutError::Remeasured { what: "the unwind index", measured: unwind_len, written: out.len() as u64 });
         }
         let i = (unwind_at - layout.header_reserve) as usize;
         me.bytes[i..i + out.len()].copy_from_slice(&out);

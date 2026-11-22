@@ -105,7 +105,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             (PNode::Adt(k, _), Repr::Agg(_), Repr::Int { ty, .. }) => {
                 let at = self.place(v, from)?;
                 let d = self.enum_discriminant(operand, t, at)?;
-                let signed = !matches!(self.adts.facts().repr(k).int, Some(crate::layout::IntRepr::Unsigned(_)));
+                let repr = self.adts.facts().repr(k).map_err(|m| BuildError::NoAdt { adt: m.item })?;
+                let signed = !matches!(repr.int, Some(crate::layout::IntRepr::Unsigned(_)));
                 V::Scalar(self.resize(d, Ty::I64, ty, signed))
             }
             // An enum of one variant and no size: that variant's discriminant.

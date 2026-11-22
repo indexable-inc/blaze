@@ -72,6 +72,7 @@ fn env(io: &Io, checkout: &'static str) -> FetchEnv<'static> {
         served: crate::engine_script_reads::Served::Simulated,
         cert_file: None,
         cert_dir: None,
+        rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
         home: Some(HOME),
         cargo_home: Some(CARGO_HOME),
         start: Some("/"),

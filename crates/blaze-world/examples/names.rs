@@ -1141,7 +1141,7 @@ fn print_procs(t: usize, p: &Procs) {
 /// each proc-macro crate registered by its lock identity (registry checksum, a path package's
 /// files, a git commit and folder: the folder from the store's module identities, as the lock
 /// does not say it).
-fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, root: &FsPath, world: &World<'static>, graph: &UnitGraph<'static>, lock: &Lock<'static>, lock_text: &str, paths: &[(LockId, &'static str)], places: &mut P, heap: &'static blaze_own::Heap) -> Procs {
+fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, root: &FsPath, world: &World<'static>, graph: &UnitGraph<'static>, lock: &Lock<'static>, paths: &[(LockId, &'static str)], places: &mut P, heap: &'static blaze_own::Heap) -> Procs {
     use blaze_proc_macro::hook::ProcMacros;
     let runtime: &'static blaze_proc_macro::host::Runtime = Box::leak(Box::new(blaze_proc_macro::host::Runtime::timed(proc_clock, heap).unwrap_or_else(|e| panic!("the proc-macro runtime: {e}"))));
     let records: &'static blaze_proc_macro::record::DirStore = Box::leak(Box::new(blaze_proc_macro::record::DirStore::new(out)));
@@ -1186,7 +1186,7 @@ fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, roo
         }
     }
     let path_dir = |id: LockId| paths.iter().find(|(p, _)| *p == id).map(|(_, dir)| root.join(dir));
-    let made = blaze_world::procs::register_macro_crates(&mut procs, store, lock, lock_text, macro_units, path_dir).unwrap_or_else(|e| panic!("{e}"));
+    let made = blaze_world::procs::register_macro_crates(&mut procs, store, lock, macro_units, path_dir).unwrap_or_else(|e| panic!("{e}"));
     for (i, why) in &made.unregistered {
         println!("procs         {} {}: not registered: {why:?}", world.crates[*i].package, world.crates[*i].version);
     }
@@ -1687,8 +1687,7 @@ fn main() {
     // `--procs <module store> --procs-out <dir>`: proc macros run through blaze-proc-macro's hook.
     let procs: Option<&'static Procs> = flag("--procs").map(|store| {
         let out = flag("--procs-out").unwrap_or_else(|| panic!("--procs needs --procs-out <dir>"));
-        let lock_text = std::str::from_utf8(lock_bytes).expect("Cargo.lock is UTF-8");
-        let procs: &'static Procs = Box::leak(Box::new(procs_of(FsPath::new(&store), FsPath::new(&out), &root, world, graph, lock, lock_text, &paths, &mut packages, blaze_own::Heap::process())));
+        let procs: &'static Procs = Box::leak(Box::new(procs_of(FsPath::new(&store), FsPath::new(&out), &root, world, graph, lock, &paths, &mut packages, blaze_own::Heap::process())));
         // Every module compiled or loaded from its compiled record before resolution starts:
         // no worker waits on a compile. With `--records` a module is loaded by the first call
         // a solved crate makes ([`Runtime::load`]): a found crate calls nothing, so a repeat

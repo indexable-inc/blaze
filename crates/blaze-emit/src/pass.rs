@@ -17,7 +17,8 @@ use crate::{
 
 /// `asm!` blocks: operands placed in registers around the template's words (asm.rs).
 mod asm;
-mod atomic;
+/// Atomics and fences; its ordering map ([`atomic::sides`]) is the Fast tier's too.
+pub(crate) mod atomic;
 mod bulk;
 mod float;
 mod float_width;
@@ -29,7 +30,8 @@ mod runtime;
 pub(crate) mod sites;
 pub(crate) mod stack;
 mod target;
-mod tls_index;
+/// The indexed thread-local access; its offsets are the Fast tier's template's too.
+pub(crate) mod tls_index;
 pub(crate) mod unwind;
 pub(crate) mod variadic;
 mod wide;
@@ -68,8 +70,9 @@ const MOST_SLOT_ALIGN: u8 = 12;
 /// may ask of its placement (blaze-code record.rs `MOST_PART_ALIGN`). A row is placed at a
 /// multiple of its alignment from its part's first byte, and the part asks the most of its
 /// rows' alignments of placement: [`crate::Code::align`] in the literal-word form, the
-/// record's `code_align` and `relro_align` in the record form (pass/sites.rs).
-const MOST_DATA_ALIGN: u32 = blaze_code::record::MOST_PART_ALIGN as u32;
+/// record's `code_align` and `relro_align` in the record form (pass/sites.rs, and the Fast
+/// tier's compose/emit.rs `place_rows`).
+pub(crate) const MOST_DATA_ALIGN: u32 = blaze_code::record::MOST_PART_ALIGN as u32;
 /// The refusal of a row aligned past [`MOST_DATA_ALIGN`].
 pub(crate) const DATA_ALIGN_PAST: &str = "data aligned past a 4 KiB page (the most a code record's part asks of its placement)";
 

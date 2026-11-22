@@ -62,6 +62,9 @@ use crate::{
 pub mod grow;
 pub mod table;
 
+#[cfg(test)]
+mod shelf_tests;
+
 pub use grow::{Abandoned, abandoned_on_thread};
 pub use table::{FrameTable, TableRefused};
 
@@ -92,6 +95,54 @@ const SPAN_WARM: usize = CHUNK;
 /// and [`SPANS`] spans of [`SPAN_WARM`] bytes each. What a task's frame leaves behind is never
 /// more.
 pub const WARM: usize = SHELF * CHUNK + SPANS * SPAN_WARM;
+
+/// The frame memory all of a machine's threads keep warm between tasks, at most: eight shelves
+/// at their most, 256 MiB, what a typical Mac's eight workers keep. A machine of more threads
+/// shares it ([`ShelfSize::for_threads`]): before, every thread kept [`WARM`], 32 MiB, so 128
+/// workers kept 4 GiB idle and charged to no task (the outside review, thoughts2.md 4.2).
+pub const WARM_ALL: usize = 8 * WARM;
+
+/// Warm spans the process keeps behind its threads' shelves, for a thread whose shelf has none:
+/// 16 of [`SPAN_WARM`], 32 MiB. Chunks have the process's cache behind them already
+/// ([`chunks::WARM_KEEP`]); a span past this goes to the kernel.
+pub const SPAN_POOL: usize = 16;
+
+/// How many blocks one thread's shelf keeps warm, from the machine it is on (rule 75: the pool
+/// that starts the thread hands it in, [`size_shelf`]; one code path, sized by the machine).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShelfSize {
+    /// Chunks, at most [`SHELF`].
+    pub chunks: usize,
+    /// Spans of [`SPAN_WARM`] committed, at most [`SPANS`].
+    pub spans: usize,
+}
+
+impl ShelfSize {
+    /// Today's on every thread that is handed no size: [`WARM`].
+    pub const MOST: ShelfSize = ShelfSize { chunks: SHELF, spans: SPANS };
+
+    /// A thread's part of [`WARM_ALL`] on a machine of `threads` workers, as chunks and spans
+    /// half each: [`ShelfSize::MOST`] up to eight threads, one of each (4 MiB) from 64 threads
+    /// on, so 128 threads keep at most 512 MiB (and the process's pools behind them).
+    pub const fn for_threads(threads: usize) -> ShelfSize {
+        let threads = if threads == 0 { 1 } else { threads };
+        let blocks = WARM_ALL / threads / CHUNK;
+        let half = blocks / 2;
+        let half = if half == 0 {
+            1
+        } else if half > SHELF {
+            SHELF
+        } else {
+            half
+        };
+        ShelfSize { chunks: half, spans: half }
+    }
+
+    /// The most a shelf of this size keeps committed.
+    pub const fn bytes(self) -> usize {
+        self.chunks * CHUNK + self.spans * SPAN_WARM
+    }
+}
 
 /// An allocation bigger than this goes in a span rather than a chunk.
 const SPAN_AT: usize = CHUNK / 2;
@@ -1023,9 +1074,106 @@ struct Shelf {
     /// Spans, linked through their headers' `next`.
     spans: Cell<*mut Block>,
     span_count: Cell<usize>,
+    /// What it keeps at most ([`size_shelf`]): [`ShelfSize::MOST`] until its thread is sized.
+    most_chunks: Cell<usize>,
+    most_spans: Cell<usize>,
+}
+
+/// Warm spans no thread's shelf had room for ([`SPAN_POOL`] at most), each with its pages past
+/// [`SPAN_WARM`] given back.
+struct SpanPool {
+    spans: [*mut Block; SPAN_POOL],
+    len: usize,
+}
+
+// SAFETY: a pooled span is the pool's alone: by the invariant above `header`, its header and
+// committed pages are owned by their one holder, here the pool, and no thread keeps a pointer
+// into it; handing it to another thread moves that ownership whole.
+unsafe impl Send for SpanPool {}
+
+/// The process's [`SpanPool`]. A `std` mutex (as os.rs's and region.rs's): blaze-mem is below
+/// blaze-core's named locks, and the lock is taken only when a shelf is full or empty of spans.
+static SPANS_POOLED: std::sync::Mutex<SpanPool> = std::sync::Mutex::new(SpanPool { spans: [ptr::null_mut(); SPAN_POOL], len: 0 });
+
+fn span_pool() -> std::sync::MutexGuard<'static, SpanPool> {
+    // A panic while it was held left a consistent pool: each push and pop is one store each.
+    SPANS_POOLED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `span`, which no shelf kept, to the process's pool with its pages past [`SPAN_WARM`] given
+/// back, or to the kernel when the pool is full.
+fn pool_or_drop_span(span: *mut Block) {
+    let mut pool = span_pool();
+    if pool.len >= SPAN_POOL {
+        drop(pool);
+        drop_span(span);
+        return;
+    }
+    if let Some(region) = header_mut(span).span.as_deref_mut() {
+        // A refused decommit leaves the pages committed: memory held, nothing broken.
+        _ = region.decommit_after(SPAN_WARM);
+    }
+    let len = pool.len;
+    pool.spans[len] = span;
+    pool.len = len + 1;
+}
+
+/// A pooled span whose reservation holds `need` bytes, out of the pool.
+fn take_pooled_span(need: usize) -> Option<*mut Block> {
+    let mut pool = span_pool();
+    let len = pool.len;
+    let at = pool.spans[..len].iter().position(|&span| header(span).end - data(span).addr() >= need)?;
+    let span = pool.spans[at];
+    pool.spans[at] = pool.spans[len - 1];
+    pool.spans[len - 1] = ptr::null_mut();
+    pool.len = len - 1;
+    Some(span)
+}
+
+/// The bytes the process's pool of spans keeps committed.
+pub fn pooled_span_bytes() -> usize {
+    let pool = span_pool();
+    pool.spans[..pool.len].iter().map(|&span| header(span).span.as_deref().map_or(0, Region::committed)).sum()
+}
+
+/// Gives every pooled span to the kernel: with [`trim_spare`], after a burst.
+pub fn trim_span_pool() {
+    let mut pool = span_pool();
+    let len = pool.len;
+    pool.len = 0;
+    let spans = pool.spans;
+    drop(pool);
+    for &span in &spans[..len] {
+        drop_span(span);
+    }
+}
+
+/// Sizes the calling thread's shelf for the machine: what a pool's worker does as it starts,
+/// with the size its pool was handed ([`ShelfSize::for_threads`] of the pool's workers). What
+/// the shelf keeps past the size goes to the process's pools now.
+pub fn size_shelf(size: ShelfSize) {
+    _ = SHELF_OF.try_with(|shelf| shelf.resize(size));
 }
 
 impl Shelf {
+    /// Keeps at most `size` from now on; what it keeps past it goes to the process's pools.
+    fn resize(&self, size: ShelfSize) {
+        self.most_chunks.set(size.chunks.min(SHELF));
+        self.most_spans.set(size.spans.min(SPANS));
+        while self.len.get() > self.most_chunks.get() {
+            let len = self.len.get() - 1;
+            self.len.set(len);
+            // Past the new most, so to the process's cache warm (`give_chunk`'s other arm).
+            self.give_chunk(Chunk::from_index(self.chunks[len].get()), false);
+        }
+        while self.span_count.get() > self.most_spans.get() {
+            let span = self.spans.get();
+            self.spans.set(header(span).next);
+            self.span_count.set(self.span_count.get() - 1);
+            pool_or_drop_span(span);
+        }
+    }
+
     /// The shelf's top chunk, if it keeps any.
     fn take_chunk(&self) -> Option<Chunk> {
         let len = self.len.get();
@@ -1040,7 +1188,7 @@ impl Shelf {
     /// (to the kernel's pages with `cold`).
     fn give_chunk(&self, chunk: Chunk, cold: bool) {
         let len = self.len.get();
-        if len < SHELF && !cold {
+        if len < self.most_chunks.get() && !cold {
             self.chunks[len].set(chunk.index());
             self.len.set(len + 1);
             return;
@@ -1051,7 +1199,8 @@ impl Shelf {
         }
     }
 
-    /// A warm span whose reservation holds `need` bytes, out of the shelf.
+    /// A warm span whose reservation holds `need` bytes, out of the shelf, else out of the
+    /// process's pool.
     fn take_span(&self, need: usize) -> Option<*mut Block> {
         let mut prev: *mut Block = ptr::null_mut();
         let mut span = self.spans.get();
@@ -1068,15 +1217,15 @@ impl Shelf {
             prev = span;
             span = head.next;
         }
-        None
+        take_pooled_span(need)
     }
 
-    /// Keeps a span a task's frame gave up, its pages past
-    /// [`SPAN_WARM`] given to the kernel, or gives it whole to the kernel when the shelf is
-    /// full.
+    /// Keeps a span a task's frame gave up, its pages past [`SPAN_WARM`] given to the kernel,
+    /// or gives it to the process's pool when the shelf is full (whole to the kernel when that
+    /// is full too).
     fn give_span(&self, span: *mut Block) {
-        if self.span_count.get() >= SPANS {
-            drop_span(span);
+        if self.span_count.get() >= self.most_spans.get() {
+            pool_or_drop_span(span);
             return;
         }
         let head = header_mut(span);
@@ -1189,6 +1338,8 @@ thread_local! {
             len: Cell::new(0),
             spans: Cell::new(ptr::null_mut()),
             span_count: Cell::new(0),
+            most_chunks: Cell::new(SHELF),
+            most_spans: Cell::new(SPANS),
         }
     };
     static STACK: Stack = const {
@@ -1675,6 +1826,7 @@ pub fn settle_spare() -> bool {
         return false;
     }
     trim_spare(0);
+    trim_span_pool();
     true
 }
 

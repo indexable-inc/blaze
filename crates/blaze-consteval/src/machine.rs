@@ -228,7 +228,9 @@ pub(crate) fn discriminants_planted<'a, W: ConstWorld, T: Allocator>(
 
 /// The integer an enum's discriminants are in: its `repr`, or `isize`.
 fn discriminant_repr<'a, W: ConstWorld>(world: &W, adt: ItemKey) -> R<'a, (u32, bool)> {
-    let repr = match world.repr(adt).int {
+    // An unmade head is the head's need, as an unanswered `adt` (consts.rs makes it, D194).
+    let attrs = world.repr(adt).map_err(|m| Stop::Refused(Refusal::Missing { what: "ADT definition", item: m.item }))?;
+    let repr = match attrs.int {
         Some(IntRepr::Signed(i)) => PNode::Int(i),
         Some(IntRepr::Unsigned(u)) => PNode::Uint(u),
         None => PNode::Int(IntTy::Isize),
@@ -1514,14 +1516,23 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 let n = if i == Intrinsic::RotateLeft { n } else { (bits - n) % bits };
                 s(if n == 0 { a } else { mask((a << n) | (a >> (bits - n)), bits) })
             }
-            Intrinsic::Ctpop | Intrinsic::Ctlz | Intrinsic::Cttz | Intrinsic::Bswap | Intrinsic::Bitreverse => {
+            Intrinsic::Ctpop | Intrinsic::Ctlz | Intrinsic::CtlzNonzero | Intrinsic::Cttz | Intrinsic::CttzNonzero | Intrinsic::Bswap | Intrinsic::Bitreverse => {
                 let t = vals.first().ok_or(malformed("a bit intrinsic's argument"))?.1;
                 let (bits, _) = info(self, t)?;
                 let a = int(0)?;
+                // The pinned core (intrinsics/mod.rs): `ctlz_nonzero` and `cttz_nonzero` are
+                // `ctlz` and `cttz` except "returns `undef` when given an `x` with value `0`":
+                // undefined behaviour, which a constant refuses (rustc's const evaluator,
+                // interpret/intrinsics.rs: "`{name}` called on 0"). Before (tempo t1935d, 7
+                // lines): ruint's `LowerHex` constant refused "ctlz_nonzero is not evaluated yet".
+                if a == 0 && matches!(i, Intrinsic::CtlzNonzero | Intrinsic::CttzNonzero) {
+                    let name = if i == Intrinsic::CtlzNonzero { "ctlz_nonzero" } else { "cttz_nonzero" };
+                    return Err(Stop::Refused(Refusal::NonzeroOnZero { name }));
+                }
                 s(match i {
                     Intrinsic::Ctpop => u128::from(a.count_ones()),
-                    Intrinsic::Ctlz => u128::from(a.leading_zeros() - (128 - bits)),
-                    Intrinsic::Cttz => u128::from(a.trailing_zeros().min(bits)),
+                    Intrinsic::Ctlz | Intrinsic::CtlzNonzero => u128::from(a.leading_zeros() - (128 - bits)),
+                    Intrinsic::Cttz | Intrinsic::CttzNonzero => u128::from(a.trailing_zeros().min(bits)),
                     Intrinsic::Bswap => a.swap_bytes() >> (128 - bits),
                     _ => a.reverse_bits() >> (128 - bits),
                 })

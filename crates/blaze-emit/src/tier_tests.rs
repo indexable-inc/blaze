@@ -48,6 +48,19 @@ mod pressure;
 /// live caller-saved registers, a flag across stores, and the scratch pool's control.
 mod directed;
 
+/// The routine table as the seam's input (D197 root 6, piece (a)): Reference's record through
+/// the seam equals `emit_record`'s, an `f128` add runs through `__addtf3`, and the control.
+mod routines;
+
+/// The function's own data in the record form's columns by both tiers, run: a row aligned past
+/// 8 bytes placed where its record asks, a source position left to the placer, and the controls.
+mod own_data;
+
+/// `tls_addr` through the seam by both tiers, run on two threads (the table's root form is
+/// macOS's: `tpidrro_el0`).
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+mod thread_locals;
+
 /// One tier as the harness calls it: piece 0's `Tier::emit` as a plain function, so the list can
 /// hold tiers whose state (a table) the function makes itself.
 type TierFn = for<'a> fn(View<'_>, &dyn Names, Machine, Alloc<'a>) -> Result<Emitted<'a>, TierError>;
@@ -242,6 +255,10 @@ impl Names for Nameless {
     fn name(&self, _: Outside) -> Option<Named<'_>> {
         None
     }
+
+    fn routines(&self) -> crate::RoutinePlaces {
+        crate::RoutinePlaces::NONE
+    }
 }
 
 /// A readable page standing for the runtime's poll page.
@@ -270,7 +287,8 @@ impl Words for PollOnly {
 }
 
 /// `e` sealed, encoded, read back and placed by the one new placer into executable memory: its
-/// code where it runs, its relro part 8-aligned in the data after it.
+/// code where it runs (a mapping's start, page-aligned), its relro part at its record's
+/// alignment in the data after it.
 fn placed(e: Emitted<'static>, tier: TierName) -> Result<Executable, Broke> {
     let name = tier.as_str();
     let sealed = seal(e).map_err(|error| Broke::Oracle(format!("the {name} tier's record does not seal: {error}")))?;
@@ -278,10 +296,11 @@ fn placed(e: Emitted<'static>, tier: TierName) -> Result<Executable, Broke> {
     encode(&sealed, &mut bytes);
     let view = read(&bytes).map_err(|error| Broke::Oracle(format!("the {name} tier's record does not read back: {error}")))?;
     let relro_len = view.relro().len();
+    let align = 1usize << view.relro_align();
     let symbol = Symbol::of_name("blaze-emit tier_tests: the function under test");
     let mut done: Result<(), PlaceError> = Ok(());
-    let exec = Executable::written(view.code().len(), relro_len + 8, |code, data| {
-        let skip = (8 - data.as_ptr() as usize % 8) % 8;
+    let exec = Executable::written(view.code().len(), relro_len + align, |code, data| {
+        let skip = (align - data.as_ptr() as usize % align) % align;
         let relro = &mut data[skip..skip + relro_len];
         let at = At { code: code.as_ptr() as u64, relro: relro.as_ptr() as u64 };
         let mut words = PollOnly { page: core::ptr::addr_of!(POLL) as u64 };

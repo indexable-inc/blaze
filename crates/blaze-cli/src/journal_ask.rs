@@ -90,41 +90,59 @@ pub(crate) enum HelperStart {
 pub(crate) struct Me {
     pub(crate) version: Version,
     pub(crate) checkout: CheckoutKey,
-    /// Whether the helper's socket's path fits a socket's address under this checkout: a
-    /// command does not connect, and a helper does not bind, where it does not.
+    /// The checkout's socket, relative to blaze's folder in the home (blaze-watch helper.rs
+    /// `socket_path`: `v2/journal/<16 hex of the key>.sock`).
+    pub(crate) socket_path: [u8; helper::SOCKET_PATH_BYTES],
+    /// Whether that socket's absolute path fits a socket's address: a command does not
+    /// connect, and a helper does not bind, where it does not.
     pub(crate) socket: SocketFits,
 }
 
 impl Me {
     /// This build (`host.build_id()`) in the checkout whose root the command's edge resolved
-    /// (engine_script_reads.rs `Served::at_edge`, `root_text`; `None` in a simulated world).
-    pub(crate) fn of(build: &bstd::host::BuildId, root: Option<&str>, frame: &Frame) -> Me {
+    /// (engine_script_reads.rs `Served::at_edge`, `root_text`; `None` in a simulated world),
+    /// with `HOME` as the program's start read it (`None`: no home, no socket to fit).
+    pub(crate) fn of(build: &bstd::host::BuildId, root: Option<&str>, home: Option<&str>, frame: &Frame) -> Me {
         let version = Version::of(build.as_bytes()).expect("a build id is 1 to 32 bytes, as a helper's version");
-        Me { version, checkout: checkout_key(root, frame), socket: SocketFits::of(root) }
+        let checkout = checkout_key(root, frame);
+        Me { version, checkout, socket_path: helper::socket_path(&checkout), socket: SocketFits::of(home) }
+    }
+
+    /// [`Me::socket_path`] as a path beneath blaze's folder in the home.
+    pub(crate) fn socket_beneath_home(&self) -> Result<Path, CliError> {
+        let text = core::str::from_utf8(&self.socket_path).map_err(|_| CliError::Text { what: "the helper's socket's name is not UTF-8 (blaze-watch helper.rs `socket_path`)" })?;
+        Ok(Path::new(text)?)
     }
 }
 
-/// Whether `<root>/.blaze/v2/journal/helper.sock` ([`helper::SOCKET`]), its NUL counted, fits
-/// a local socket's path (`bstd::local::SOCKET_PATH_MOST`: `sun_path`, 104 bytes on macOS).
-/// Checked from the root's text before any connect or bind, both sides by this one function: a
-/// checkout too deep for one is said as itself (`TooLong`), never as "no socket" or "a stale
-/// socket", which is what the connect's failure would look like, and no helper is offered for
-/// it, since none could listen there.
+/// Whether `<HOME>/.blaze/v2/journal/<16 hex>.sock` (blaze-watch helper.rs `socket_path`,
+/// under store.rs `HOME_FOLDER`), its NUL counted, fits a local socket's path
+/// (`bstd::local::SOCKET_PATH_MOST`: `sun_path`, 104 bytes on macOS). Its length is the home's
+/// plus a constant ([`PAST_HOME`]: 40 bytes and the NUL), whatever the checkout's depth: a home
+/// of 63 bytes or fewer fits (a macOS home is 7 bytes and the name). Checked from the home's text before any connect or bind, both sides by this one
+/// function: a home too long for one is said as itself (`TooLong`, naming the path and the
+/// limit), never as "no socket" or "a stale socket", which is what the connect's failure would
+/// look like, and no helper is offered, since none could listen there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SocketFits {
     Fits,
-    /// The socket's absolute path would be `bytes` long with its NUL; its root is `root` bytes.
-    TooLong { bytes: usize, root: usize },
+    /// The socket's absolute path would be `bytes` long with its NUL; the home is `home` bytes.
+    TooLong { bytes: usize, home: usize },
 }
 
+/// Bytes of a socket's absolute path past the home's own: `/`, blaze's folder, `/`, the socket
+/// beneath it, the NUL.
+const PAST_HOME: usize = 1 + crate::store::HOME_FOLDER.len() + 1 + helper::SOCKET_PATH_BYTES + 1;
+
 impl SocketFits {
-    /// The fit under the root whose text is `root` (`None`, a simulated world: no path to fit).
-    pub(crate) fn of(root: Option<&str>) -> SocketFits {
-        let Some(root) = root else { return SocketFits::Fits };
-        let bytes = root.len() + 1 + helper::SOCKET.len() + 1;
+    /// The fit under the home whose text is `home` (`None`: no home, no path to fit).
+    pub(crate) fn of(home: Option<&str>) -> SocketFits {
+        let Some(home) = home else { return SocketFits::Fits };
+        let home = home.trim_end_matches('/').len();
+        let bytes = home + PAST_HOME;
         match bytes <= bstd::local::SOCKET_PATH_MOST {
             true => SocketFits::Fits,
-            false => SocketFits::TooLong { bytes, root: root.len() },
+            false => SocketFits::TooLong { bytes, home },
         }
     }
 }
@@ -132,11 +150,13 @@ impl SocketFits {
 impl core::fmt::Display for SocketFits {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            SocketFits::Fits => write!(f, "{} fits a socket's path", helper::SOCKET),
-            SocketFits::TooLong { bytes, root } => write!(
+            SocketFits::Fits => write!(f, "the helper's socket under the home's {}/{} fits a socket's path", crate::store::HOME_FOLDER, helper::SOCKET_FOLDER),
+            SocketFits::TooLong { bytes, home } => write!(
                 f,
-                "the helper's socket {} under this checkout's root ({root} bytes) is {bytes} bytes with its NUL, over the {} a local socket's path may hold (`sun_path`; journal_ask.rs `SocketFits`)",
-                helper::SOCKET,
+                "the helper's socket <HOME>/{}/{}/<{} bytes>, under a home of {home} bytes, is {bytes} bytes with its NUL, over the {} a local socket's path may hold (`sun_path`; journal_ask.rs `SocketFits`)",
+                crate::store::HOME_FOLDER,
+                helper::SOCKET_FOLDER,
+                helper::SOCKET_NAME_BYTES,
                 bstd::local::SOCKET_PATH_MOST
             ),
         }
@@ -179,12 +199,12 @@ impl ChangedSince for Asked {
     const NAME: &'static str = "asked";
 
     fn changed_since<'f>(
-        &self, cx: &Cx, root: &Dir<ReadWrite>, _home: &Dir<ReadWrite>, clock: &Clock, stored: Stored<'_>, frame: &'f Frame,
+        &self, cx: &Cx, root: &Dir<ReadWrite>, home: &Dir<ReadWrite>, clock: &Clock, stored: Stored<'_>, frame: &'f Frame,
     ) -> Result<Taken<'f>, CliError> {
         let cx = cx.span("sweep: the changes since the stored answer's place, asked of the journal helper");
         let cx = cx.until(clock.after(JOURNAL_WAIT));
         let mut taken = Taken::begin(&cx, root, clock, frame)?;
-        let asked = ask(&cx, root, clock, self.me, paired_place(stored), frame)?;
+        let asked = ask(&cx, home, clock, self.me, paired_place(stored), frame)?;
         let names = match asked.outcome {
             Outcome::Answered { answer: AskAnswer::Vouched { place, journal, .. }, names } => match Cursor::decode(journal.as_bytes()) {
                 Some(cursor) => {
@@ -218,14 +238,14 @@ impl ChangedSince for Both {
     const NAME: &'static str = "both: asked, then replayed";
 
     fn changed_since<'f>(
-        &self, cx: &Cx, root: &Dir<ReadWrite>, _home: &Dir<ReadWrite>, clock: &Clock, stored: Stored<'_>, frame: &'f Frame,
+        &self, cx: &Cx, root: &Dir<ReadWrite>, home: &Dir<ReadWrite>, clock: &Clock, stored: Stored<'_>, frame: &'f Frame,
     ) -> Result<Taken<'f>, CliError> {
         let cx = cx.span("sweep: the changes since the stored answer's place, asked of the journal helper and replayed");
         let cx = cx.until(clock.after(JOURNAL_WAIT));
         let mut taken = Taken::begin(&cx, root, clock, frame)?;
         // The ask FIRST: the replay then ends after the helper's journal place (the module's
         // doc), so the union covers every write up to the place saved.
-        let asked = ask(&cx, root, clock, self.me, paired_place(stored), frame)?;
+        let asked = ask(&cx, home, clock, self.me, paired_place(stored), frame)?;
         taken.replay_checkout(&cx, clock, root, stored);
         // The differential is read before the helper's names join the unit: it borrows the
         // replay's names from `taken`.
@@ -292,12 +312,13 @@ struct AskedOnce<'f> {
 }
 
 /// The ask's driver (blaze-watch helper.rs `Asking`, sans-IO, decides each step): the socket's
-/// folder made the user's alone, connect, hello, ask, answer, all under
-/// `helper::ASK_DEADLINE`. Never an error: every way it ends is an [`Outcome`] the line prints,
-/// and the caller replays. `Err` only for the socket's path, a constant.
-fn ask<'f>(cx: &Cx, root: &Dir<ReadWrite>, clock: &Clock, me: Me, since: Option<Place>, frame: &'f Frame) -> Result<AskedOnce<'f>, CliError> {
+/// folder under blaze's folder in the home (`home`) made the user's alone, connect, hello,
+/// ask, answer, all under `helper::ASK_DEADLINE`. Never an error: every way it ends is an
+/// [`Outcome`] the line prints, and the caller replays. `Err` only for the socket's path, made
+/// from a constant and the checkout's key.
+fn ask<'f>(cx: &Cx, home: &Dir<ReadWrite>, clock: &Clock, me: Me, since: Option<Place>, frame: &'f Frame) -> Result<AskedOnce<'f>, CliError> {
     let folder = Path::new(helper::SOCKET_FOLDER)?;
-    let socket = Path::new(helper::SOCKET)?;
+    let socket = me.socket_beneath_home()?;
     let outer = cx;
     let cx = cx.span("journal: the helper asked (its folder checked, connect, hello, ask, answer)");
     let born = clock.now();
@@ -307,15 +328,15 @@ fn ask<'f>(cx: &Cx, root: &Dir<ReadWrite>, clock: &Clock, me: Me, since: Option<
         return Ok(AskedOnce { outcome: Outcome::TooLong(me.socket), detail: Detail::None, hangup: None, ns: took(clock) });
     }
     let (mut asking, _connect) = Asking::new(me.version, me.checkout, since, Nanos(0));
-    if let Err(why) = root.make_private(&cx, &folder) {
+    if let Err(why) = home.make_private(&cx, &folder) {
         return Ok(AskedOnce { outcome: Outcome::NotPrivate(why), detail: Detail::None, hangup: None, ns: took(clock) });
     }
-    let conn = match Local::beneath(root).connect(&cx, &socket) {
+    let conn = match Local::beneath(home).connect(&cx, &socket) {
         Ok(conn) => conn,
         Err(error) => {
             let (why, detail) = match &error.kind {
                 NetKind::Stopped(_) => (NotAsked::Deadline { at: AskStep::Connect }, Detail::Net(error)),
-                _ => match root.stat(&cx, &socket) {
+                _ => match home.stat(&cx, &socket) {
                     Ok(None) => (NotAsked::NoSocket, Detail::None),
                     Ok(Some(_)) => (NotAsked::Stale, Detail::Net(error)),
                     Err(stat) => (NotAsked::Broken { at: AskStep::Connect }, Detail::Fs(stat)),
@@ -473,8 +494,9 @@ pub(crate) struct Differ<'a, 'f> {
 }
 
 /// Names of blaze's own traffic, compared by neither side: the replay's and the helper's cookies
-/// (blaze-core fsevents.rs `COOKIE_AREA`) and the helper's socket folder.
-const OWN_TRAFFIC: [&str; 2] = [".blaze/v2/fsevents", helper::SOCKET_FOLDER];
+/// (blaze-core fsevents.rs `COOKIE_AREA`). The helper's socket is under the home since
+/// 2026-11-21 (blaze-watch helper.rs `SOCKET_FOLDER`), no name of the checkout's.
+const OWN_TRAFFIC: [&str; 1] = [".blaze/v2/fsevents"];
 
 fn compared(name: &str) -> bool {
     !name.is_empty() && !OWN_TRAFFIC.iter().any(|own| since::covers(own, name))

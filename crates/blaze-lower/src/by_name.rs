@@ -567,12 +567,16 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
         depth: u32,
         locals: &[LocalMacro<'_>],
         mut cfg: Option<&mut (dyn crate::Cfg + '_)>,
+        written: Option<u32>,
     ) -> Result<(ContentId, TokenStream<'a>), Refused<'a>> {
         // `panic!` takes the edition of the code that writes it: a path a macro wrote carries
         // its definition's mark, whose edition is the defining crate's (the token was read in
         // it). Gap: rustc's `use_panic_2021` skips macros under
         // `#[allow_internal_unstable(edition_panic)]` (core's `debug_assert!`) to their caller;
         // `DefAt` does not record that flag yet, so such a macro's own edition is taken.
+        // The written call this one is, or is nested in through eager input: a nested call's
+        // own `PathAt` has none (`PathAt::of`), so the outermost's is carried down.
+        let written = at.written.map(|range| range.start).or(written);
         let panic_edition = at.mark.map_or(edition, |mark| mark.edition);
         let site = CallSite { edition, panic_edition, ctx: Ctx::root(edition) };
         let resolved = match self.local(path, locals, edition) {
@@ -598,7 +602,7 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
             let key = call_key(def, &call).0;
             let result = match cfg.as_deref_mut() {
                 Some(cfg) => {
-                    let cx = BodyCx { host: &self.cx, cfg: core::cell::RefCell::new(cfg), alloc: self.alloc };
+                    let cx = BodyCx { host: &self.cx, cfg: core::cell::RefCell::new(cfg), alloc: self.alloc, written };
                     expand_with(def, prepared, &call, &cx, self.alloc)
                 }
                 None => expand_with(def, prepared, &call, &self.cx, self.alloc),
@@ -627,7 +631,7 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                             .map_err(|e| Refused::Failed(Failure::Stream(e)))?;
                         let at = PathAt::of(input, n.path.start);
                         let (key, mut tokens) =
-                            self.call(&path, at, &args, edition, Inside::EagerInput, depth + 1, locals, cfg.as_deref_mut())?;
+                            self.call(&path, at, &args, edition, Inside::EagerInput, depth + 1, locals, cfg.as_deref_mut(), written)?;
                         tokens.seal(key);
                         answers.push(tokens);
                     }
@@ -686,6 +690,12 @@ struct BodyCx<'x, 'c, 'm, C> {
     cfg: core::cell::RefCell<&'x mut (dyn crate::Cfg + 'c)>,
     /// The predicate's scratch.
     alloc: Alloc<'m>,
+    /// The first byte, in the body's own text (item-relative, rule 71), of the written call
+    /// this expansion comes from ([`BodyCall::written`]): what `line!()`/`column!()` in eager
+    /// input place (core `line!`: "the first macro invocation leading up to the expansion"),
+    /// asked of the host by [`ExpandCx::place_of_call`]. `None`: no written call (the host's
+    /// `place`, which refuses them).
+    written: Option<u32>,
 }
 
 impl<C: ExpandCx> ExpandCx for BodyCx<'_, '_, '_, C> {
@@ -702,7 +712,10 @@ impl<C: ExpandCx> ExpandCx for BodyCx<'_, '_, '_, C> {
     }
 
     fn place(&self, what: blaze_expand::PlaceOf) -> Result<blaze_expand::Place<'_>, blaze_expand::HostError> {
-        self.host.place(what)
+        match self.written {
+            Some(call) => self.host.place_of_call(what, call),
+            None => self.host.place(what),
+        }
     }
 
     fn run_proc_macro<'b>(
@@ -746,7 +759,7 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         let at = PathAt { mark: path_mark, written: None, block: None };
         let result = self
             .input(CallInput::Text(input), input_marks, edition)
-            .and_then(|input| self.call(path, at, &input, edition, Inside::Plain, 0, &[], Some(cfg)));
+            .and_then(|input| self.call(path, at, &input, edition, Inside::Plain, 0, &[], Some(cfg), None));
         match result {
             Ok((key, tokens)) => {
                 out.key = key;
@@ -784,7 +797,7 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         let before = self.reads.list().len();
         let result = self
             .input(call.input, call.input_marks, call.edition)
-            .and_then(|input| self.call(call.path, at, &input, call.edition, Inside::Plain, 0, call.locals, Some(cfg)));
+            .and_then(|input| self.call(call.path, at, &input, call.edition, Inside::Plain, 0, call.locals, Some(cfg), None));
         // Its reads (an eager input's nested calls' included) joined on success and on the
         // call's error alike (`call`): placed at this call.
         self.note_reads(Some(call.range), call.path, blaze_surface::CallShape::FnLike, before);

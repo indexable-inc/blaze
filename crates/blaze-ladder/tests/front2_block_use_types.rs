@@ -23,7 +23,14 @@
 //! Rule 23: every row fails with the call of `block_type_uses::through_use` in front2 types.rs
 //! `Builder::resolve_at` removed: rows but `import_shadows_the_module_item` as E0412 "cannot
 //! find type" (the walk's refusal names the fn), that row as a type mismatch (its written type
-//! is then the module's `struct Other { b: bool }`, its value `m::Slice`).
+//! is then the module's `struct Other { b: bool }`, its value `m::Slice`). Rows
+//! `local_fn_signature_sees_the_block_import`, `local_fn_with_no_inner_block_sees_the_block_import`
+//! and `local_const_type_sees_the_block_import` fail as E0412 "cannot find type `Slice`" with
+//! either half of the local-signature rule removed: front2 scope_table.rs `written`'s arm for
+//! a path of no scope in a local's body (asked at its declaring block), or heads.rs `fn_head`'s
+//! `body` for a local's head (a head was read with no body at its `names_at`, the fn's module).
+//! The 22:12 tree had a first form of the rule inside `through_use` only, which `written`
+//! never reached for a path of no scope, and failed so.
 //!
 //! The test prints one line per row, failures first:
 //! ```text
@@ -220,7 +227,60 @@ const ROWS: &[Row] = &[
     inner()
 }",
     },
+    // alloc's `custom_owner_from_box` (library/alloc/src/io/error.rs): a fn declared in the
+    // block names the block's import in its SIGNATURE, and its body writes a block (alloc's
+    // `unsafe { .. }`), so the library writes the outer block as a module and the fn's head
+    // reads its names there. The body's lowering converts the signature again, and read it at
+    // the enclosing body's module: E0412 "cannot find type `Slice`" (ladder rungs f3-dyn,
+    // x0-ref-11-deref-unsized, x0-ref-12-wide-ptr-eq, on alloc's `drop_box_raw`). Now a local
+    // item's signature path asks the blocks around its declaration (front2 block_type_uses.rs
+    // `through_use`), and its other names read at the module its head read (body.rs
+    // `lower_at`, `types_at`).
+    Row {
+        name: "local_fn_signature_sees_the_block_import",
+        items: "fn f() -> i32 {
+    use self::m::Slice;
+    fn inner(s: Slice) -> i32 {
+        let n = { s.n };
+        n
+    }
+    inner(Slice { n: 3 })
+}",
+    },
+    // The same with no block in `inner`'s body: `inner`'s own body has no scope that holds a
+    // name, so only its declaring block's `use` binds `Slice` (front2 scope_table.rs
+    // `written`, a local signature's path asked at its declaring block).
+    Row {
+        name: "local_fn_with_no_inner_block_sees_the_block_import",
+        items: "fn f() -> i32 {
+    use self::m::Slice;
+    fn inner(s: Slice) -> i32 {
+        s.n
+    }
+    inner(Slice { n: 3 })
+}",
+    },
+    // A local const's type: its head is a fn of no inputs, made by the same `fn_head`.
+    Row {
+        name: "local_const_type_sees_the_block_import",
+        items: "fn f() -> i32 {
+    use self::m::Slice;
+    const C: Slice = Slice { n: 3 };
+    C.n
+}",
+    },
 ];
+
+/// The twin of row `local_fn_signature_sees_the_block_import`: the same program with the
+/// block's `use` removed, so `Slice` names nothing where `inner` is written (the module
+/// declares no `Slice`; it is `m::Slice`): the program's E0412, never a clean walk.
+const NOT_IMPORTED: &str = "fn f() -> i32 {
+    fn inner(s: Slice) -> i32 {
+        let n = { s.n };
+        n
+    }
+    inner(m::Slice { n: 3 })
+}";
 
 const MAIN: &str = "
 
@@ -385,4 +445,37 @@ fn written_types_through_block_imports_check_over_records() {
         }
     }
     assert_eq!(failed, 0, "rows whose walk was not clean (each printed above with its refusal)");
+}
+
+/// [`NOT_IMPORTED`] walked as the rows are: not clean, and the refusal (or the records' log)
+/// names the type that names nothing. The control that the row above passes by the block's
+/// import, not by reading every name somewhere.
+/// Prints "block use types not imported: <the refusal>".
+#[test]
+fn a_local_fn_signature_naming_an_unimported_type_is_refused() {
+    let frame: &'static Frame = Box::leak(Box::new(Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame")));
+    let erased: &'static Erased<&'static Frame> = frame.alloc(Erased::new(frame));
+    let a = erased.handle();
+    let b = builder();
+    let mut text = AString::new_in(a);
+    text.push_str(HEAD);
+    text.push_str(NOT_IMPORTED);
+    text.push_str(MAIN);
+    let f = fixture(frame, a, text.as_str());
+    let main = fn_named(reader(frame, a, &f).records, "main");
+    let names = reader(frame, a, &f);
+    let mut store = MemoryStore::new_in(a);
+    let mut maker = Maker::new(names, Some(main), &b, a);
+    let walked = walk_records(main, &EveryItem, &mut store, &b, &producer(), &mut maker, a);
+    let mut said = match walked {
+        Ok((_, counts)) => format!("walked ({counts})"),
+        Err(e) => format!("{e}"),
+    };
+    let errors = names.records.errors();
+    for e in errors.iter() {
+        said.push_str(&format!("; logged: {e}"));
+    }
+    println!("block use types not imported: {said}");
+    assert!(said.contains("Slice"), "the refusal names `Slice`: {said}");
+    assert!(!said.starts_with("walked") || !errors.is_empty(), "an unimported type walked clean: {said}");
 }

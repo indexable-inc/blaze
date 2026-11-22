@@ -747,6 +747,29 @@ impl<'a> TokenStream<'a> {
         Ok(out)
     }
 
+    /// This stream again, in its own allocator, each token offered to `fill` in order: one it
+    /// pushes a replacement for (and answers `true`) is that replacement, every other is copied
+    /// as it is. The contexts table is copied whole first, so a token's [`Ctx`] means the same in
+    /// both streams and a replacement takes the token's own. How a reader fills an expansion's
+    /// holes ([`crate::Expansion::fill_holes`]).
+    pub(crate) fn refilled<E: From<StreamError>>(
+        &self,
+        fill: &mut dyn FnMut(usize, Token, &mut TokenStream<'a>) -> Result<bool, E>,
+    ) -> Result<TokenStream<'a>, E> {
+        let alloc = self.allocator();
+        let mut out = TokenStream {
+            tokens: Vec::with_capacity_in(self.tokens.len(), alloc),
+            text: Vec::with_capacity_in(self.text.len(), alloc),
+            contexts: Vec::from_slice_in(&self.contexts[..], alloc),
+        };
+        for (at, token) in self.tokens.iter().enumerate() {
+            if !fill(at, *token, &mut out)? {
+                out.push_whole(token.kind, self.whole_at(at), token.ctx)?;
+            }
+        }
+        Ok(out)
+    }
+
     /// Names this stream's own expansion by its key: every [`MarkOf::This`] becomes
     /// [`MarkOf::Outer`] of `key`. An expansion's tokens are sealed so before they are the
     /// input of another call.

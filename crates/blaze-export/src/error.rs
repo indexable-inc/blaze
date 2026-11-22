@@ -60,10 +60,17 @@ pub enum ExportError {
     PersonalityNotPlaced { personality: Symbol },
     /// A placed function has no record among those the unwind tables were given: a bug here.
     EhNoRecord { symbol: Symbol },
-    /// The unwind tables outgrew the room the layout kept for them: a bug in `eh_room`.
+    /// The unwind tables outgrew the room `eh_room` measured for them (`Laid::tables_room`, not
+    /// the page the layout rounded it to): a bug in the measure, refused in every build.
     EhRoom { need: u64, room: u64 },
+    /// A second pass wrote `what` at `written` bytes where its first pass measured `measured`:
+    /// a bug in the writer, refused in every build (never a debug assertion).
+    Remeasured { what: &'static str, measured: u64, written: u64 },
     /// The image grew past what one of its encodings can say (`what`).
     TooLarge { what: &'static str, len: u64 },
+    /// `what`'s header and load commands need `need` bytes and the layout kept `room` before the
+    /// code (macho.rs `command_room`, computed from the same commands): refused in every build.
+    HeaderRoom { what: &'static str, need: u64, room: u64 },
     /// A start record this crate makes broke the record's form: a bug here, named.
     StartRecord(RecordError),
     /// A `bzcode02` record of `symbol` (a start record brought into the form by
@@ -162,7 +169,15 @@ impl fmt::Display for ExportError {
                 f,
                 "export: the unwind tables need {need} bytes after the code and the layout kept {room} (a bug in blaze-export eh_out.rs `eh_room`)"
             ),
+            ExportError::Remeasured { what, measured, written } => write!(
+                f,
+                "export: {what} was measured at {measured} bytes and written at {written} (a bug in blaze-export: the measure and the writer disagree)"
+            ),
             ExportError::TooLarge { what, len } => write!(f, "export: the image is too large for {what} ({len} bytes)"),
+            ExportError::HeaderRoom { what, need, room } => write!(
+                f,
+                "export: {what}'s header and load commands need {need} bytes and the layout kept {room} before the code (blaze-export macho.rs `command_room`)"
+            ),
             ExportError::StartRecord(error) => write!(f, "export: the start record blaze-export made is not a record: {error}"),
             ExportError::Record { symbol, error } => {
                 write!(f, "export: function {symbol}: its bzcode02 record breaks the form (blaze-tier record/form.rs): {error}")

@@ -177,6 +177,34 @@ pub(crate) struct SweepCounts {
     /// What the checkout's journal helper said ([`ChangedSince`]'s `Asked` and `Both`,
     /// journal_ask.rs); `None` where it was not asked ([`Replay`]).
     pub(crate) helper: Option<HelperRow>,
+    /// What the follow's batched looks did and the follow's wall time (sweep.rs, "batched
+    /// looks"); `None` before a follow.
+    pub(crate) looks: Option<SweepLooks>,
+}
+
+/// The follow's batched looks for the `sweep:` line: the paths asked, the batches, folders
+/// listed and names stamped, the rows proved, and the follow's wall time against its floor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SweepLooks {
+    pub(crate) counts: crate::sweep::LookCounts,
+    /// The follow's wall time, looks and the rows decided one by one together.
+    pub(crate) wall_ns: u64,
+}
+
+impl fmt::Display for SweepLooks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let c = self.counts;
+        write!(
+            f,
+            "looks: {} path(s) in {} batch(es), {} folder(s) listed and {} name(s) stamped, {} row(s) proved by them; the follow {:.2} ms (floor: one batched call a folder, the slowest folder's)",
+            c.asked,
+            c.batches,
+            c.listed,
+            c.stamped,
+            c.proved,
+            self.wall_ns as f64 / 1e6
+        )
+    }
 }
 
 /// What the journal helper said to one request, for the `sweep:` line: which strategy asked,
@@ -274,6 +302,12 @@ impl SweepCounts {
         let home = parts.map_or(0, |parts| parts.home);
         SweepCounts { parts, statted: self.statted.saturating_sub(home), leaves: self.leaves.saturating_sub(home), ..self }
     }
+
+    /// These counts, with the follow's batched looks (sweep.rs `Followed::looks`) and its wall
+    /// time.
+    pub(crate) fn with_looks(self, counts: crate::sweep::LookCounts, wall_ns: u64) -> SweepCounts {
+        SweepCounts { looks: Some(SweepLooks { counts, wall_ns }), ..self }
+    }
 }
 
 /// What a request's journal replays cost in wall time (the profile's `replays:` part): each is
@@ -351,6 +385,9 @@ impl fmt::Display for SweepCounts {
         }
         if let Some(parts) = &self.parts {
             write!(f, "; {parts}")?;
+        }
+        if let Some(looks) = &self.looks {
+            write!(f, "; {looks}")?;
         }
         match &self.status {
             Some(status) => write!(f, "\nsweep: {status}"),
@@ -614,7 +651,7 @@ fn blazes_folder_ignores_all(cx: &Cx, root: &Dir<ReadWrite>, frame: &Frame) -> R
 /// - [`Replay`]: this process makes the streams, replays them from the stored places and
 ///   flushes them ([`take`]): tens of milliseconds on tempo, nearly all of it the streams' setup.
 /// - `Asked` (journal_ask.rs): connect to the checkout's helper (journal_helper.rs) at
-///   blaze-watch's `helper::SOCKET`, check its hello (version, checkout), send the stored
+///   blaze-watch's `helper::socket_path` under the home, check its hello (version, checkout), send the stored
 ///   helper place ([`Stored::helper_place`]), take the names and the new place under
 ///   `helper::ASK_DEADLINE`. A `helper::NotAsked` or a `CannotVouch` answer runs [`Replay`]
 ///   from the journal place the stored answer kept beside the helper's, and the line says why.
@@ -1001,7 +1038,7 @@ impl<'t> Taken<'t> {
     /// The counts of a sweep that looked at `statted` rows of `leaves`.
     pub(crate) fn counts(&self, statted: u32, leaves: u32) -> SweepCounts {
         // clone: the request's one count of its journal, kept for its tests.
-        SweepCounts { journal: self.journal.clone(), events: self.events, statted, leaves, settled: 0, since: self.since, streams: self.streams, replays: self.replays, parts: None, status: None, helper: self.helper }
+        SweepCounts { journal: self.journal.clone(), events: self.events, statted, leaves, settled: 0, since: self.since, streams: self.streams, replays: self.replays, parts: None, status: None, helper: self.helper, looks: None }
     }
 }
 

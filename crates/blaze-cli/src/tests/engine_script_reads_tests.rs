@@ -75,7 +75,7 @@ fn table(io: &Io, cells: &[CheckoutRead]) -> std::vec::Vec<u8> {
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
     let frame = cx.frame();
     let mut rows = Rows::new_in(frame);
-    reads::keep_rows(None, cells.iter(), |_| true, &mut rows);
+    reads::keep_rows(None, cells.iter().map(|read| (read.kind, read.path.as_str(), read.answer)), |_| true, &mut rows);
     Leaves::bytes_in(&rows, frame).expect("the table is written").to_vec()
 }
 

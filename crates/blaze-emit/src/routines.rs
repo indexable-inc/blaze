@@ -29,58 +29,46 @@ pub(crate) fn legalized<'a>(
         return Ok((None, Called::NONE));
     }
     let mut owned = func.to_func_in(alloc);
-    let rows = routines.add_rows(&mut owned)?;
+    let rows = add_rows(routines, &mut owned)?;
     let done = legalize::legalize(&mut owned, &rows, alloc)?;
     Ok((Some(owned), Called::of_bits(done.routines)))
 }
 
+/// Whether `func` holds an `f128` value: the one type whose operations become routine calls
+/// (an `f16` one is widened to `f32` in place; a vector is scalarized). The Fast tier legalizes
+/// exactly such a function before composing (compose/fast.rs) and keeps every other as it is:
+/// its `f16` and vector homes are its own (compose/analysis.rs `class_of`), while an `f128`
+/// has no class there and no template.
+pub(crate) fn holds_quad(func: &View<'_>) -> bool {
+    func.tys.iter().any(|&bits| {
+        let ty = blaze_lir::Ty(bits);
+        matches!(ty.form(), blaze_lir::ty::Form::Scalar) && matches!(ty.elem(), blaze_lir::Scalar::F128)
+    })
+}
+
+/// The routine table: blaze-tier's, the seam's input (`blaze_tier::Names::routines`).
+pub use blaze_tier::RoutinePlaces;
+
 /// How many routines there are: [`SoftFloat::ALL`]'s length.
 const COUNT: usize = SoftFloat::ALL.len();
 
-/// No place: the routine is not bound.
+/// No row: the routine is not bound.
 const UNBOUND: u32 = u32::MAX;
 
-/// Where each [`SoftFloat`] routine is among the caller's function references (the place an
-/// `Outside::Func(place)` names through the caller's [`crate::Names`]); an unbound routine has
-/// none. Indexed by `SoftFloat as usize` (the order of [`SoftFloat::ALL`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct RoutinePlaces {
-    places: [u32; COUNT],
-}
-
-impl RoutinePlaces {
-    /// No routine bound: every `f128` operation is refused by name.
-    pub const NONE: RoutinePlaces = RoutinePlaces { places: [UNBOUND; COUNT] };
-
-    /// Routine `r` is function reference `place` of the caller's names. `place` is not
-    /// `u32::MAX` (no names table has that many references).
-    pub fn bind(&mut self, r: SoftFloat, place: u32) {
-        self.places[r as usize] = place;
-    }
-
-    /// Where routine `r` is, if bound.
-    pub fn place(&self, r: SoftFloat) -> Option<u32> {
-        match self.places[r as usize] {
-            UNBOUND => None,
-            place => Some(place),
+/// Adds a `RefKind::Func` row to `func` for each routine `routines` binds (the rows legalize's
+/// calls name) and gives legalize's view of them.
+fn add_rows(routines: &RoutinePlaces, func: &mut Func<Alloc<'_>>) -> Result<Rows, LegalizeError> {
+    let mut rows = Rows { rows: [UNBOUND; COUNT] };
+    for r in SoftFloat::ALL {
+        let Some(place) = routines.place(r) else { continue };
+        let row = u32::try_from(func.refs.len()).map_err(|_| LegalizeError::Full { table: "references" })?;
+        if row == UNBOUND {
+            return Err(LegalizeError::Full { table: "references" });
         }
+        func.refs.push(RefRec { place, kind: RefKind::Func as u32 });
+        rows.rows[r as usize] = row;
     }
-
-    /// Adds a `RefKind::Func` row to `func` for each bound routine (the rows legalize's calls
-    /// name) and gives legalize's view of them.
-    pub(crate) fn add_rows(&self, func: &mut Func<Alloc<'_>>) -> Result<Rows, LegalizeError> {
-        let mut rows = Rows { rows: [UNBOUND; COUNT] };
-        for r in SoftFloat::ALL {
-            let Some(place) = self.place(r) else { continue };
-            let row = u32::try_from(func.refs.len()).map_err(|_| LegalizeError::Full { table: "references" })?;
-            if row == UNBOUND {
-                return Err(LegalizeError::Full { table: "references" });
-            }
-            func.refs.push(RefRec { place, kind: RefKind::Func as u32 });
-            rows.rows[r as usize] = row;
-        }
-        Ok(rows)
-    }
+    Ok(rows)
 }
 
 /// The function's own reference row of each bound routine: what legalize asks

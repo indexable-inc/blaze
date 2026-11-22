@@ -6,12 +6,13 @@
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
 use blaze_surface::{
-    BindingState, Def, DefKind, GlobEdge, Namespace, Origin, ScopeBuilder, TextualDef, Visibility,
+    BindingState, Def, DefKind, GlobEdge, Globs, Namespace, Origin, TextualDef, Visibility,
     globs_digest, textual_digest,
 };
 
 use crate::facts::Name;
 use crate::read::{Answer, NameAnswer, Read};
+use crate::scope_record::ScopeOf;
 
 const HELPERS_DOMAIN: &str = "blaze-scope derive helpers 1";
 
@@ -27,8 +28,9 @@ pub struct Variant<N> {
 /// What the records hold of one key.
 pub enum Held<'h, N> {
     /// A module's finished scope; `chain` is the module and each parent up to its crate's
-    /// root (`None`: the module alone).
-    Scope { scope: &'h ScopeBuilder<'h, N>, krate: CrateItemKey, chain: Option<&'h [ItemKey]> },
+    /// root (`None`: the module alone). A working form's scope or a dependency's exports
+    /// record's, read in place (crate::scope_record).
+    Scope { scope: ScopeOf<'h, N>, krate: CrateItemKey, chain: Option<&'h [ItemKey]> },
     /// An enum's variants.
     Variants { variants: AVec<'h, Variant<N>>, krate: CrateItemKey },
     /// A module whose resolution failed: it is read as empty, and the read is noted.
@@ -133,10 +135,10 @@ pub fn answer<'a, N: Name, R: Records<N>>(
     let (own, note) = match records.held(owner) {
         Held::Scope { scope, krate, chain } => {
             let own = match read {
-                Read::Name { ns, name, .. } => Own::Name(NameAnswer::from(scope.get(ns, name).copied())),
-                Read::Globs { module } => globs(&scope.globs, krate, chain, module, alloc),
+                Read::Name { ns, name, .. } => Own::Name(NameAnswer::from(scope.get(ns, name))),
+                Read::Globs { module } => globs(scope.globs(), krate, chain, module, alloc),
                 _ => {
-                    let defs = AVec::from_slice_in(&scope.textual, alloc);
+                    let defs = AVec::from_slice_in(scope.textual(), alloc);
                     let digest = textual_digest(&defs, alloc);
                     Own::Textual(defs, digest)
                 }
@@ -147,7 +149,7 @@ pub fn answer<'a, N: Name, R: Records<N>>(
             let own = match read {
                 Read::Name { ns, name, .. } => Own::Name(variant_answer(&variants, ns, name)),
                 // An enum has no glob edges: its variants are its own names.
-                Read::Globs { module } => globs(&[], krate, None, module, alloc),
+                Read::Globs { module } => globs(Globs::of(&[]), krate, None, module, alloc),
                 _ => empty_textual(),
             };
             (own, None)
@@ -165,14 +167,14 @@ pub fn answer<'a, N: Name, R: Records<N>>(
 fn empty<'a, N: Name>(read: Read<N>, krate: CrateItemKey, chain: Option<&[ItemKey]>, alloc: Alloc<'a>) -> Own<'a, N> {
     match read {
         Read::Name { .. } => Own::Name(NameAnswer::Absent),
-        Read::Globs { module } => globs(&[], krate, chain, module, alloc),
+        Read::Globs { module } => globs(Globs::of(&[]), krate, chain, module, alloc),
         _ => Own::Textual(AVec::new_in(alloc), textual_digest::<N>(&[], alloc)),
     }
 }
 
 /// A `Globs` answer: the module's edges, its crate, its chain up to its crate's root.
-fn globs<'a, N>(edges: &[GlobEdge], krate: CrateItemKey, chain: Option<&[ItemKey]>, module: ItemKey, alloc: Alloc<'a>) -> Own<'a, N> {
-    let edges = AVec::from_slice_in(edges, alloc);
+fn globs<'a, N>(edges: Globs<'_>, krate: CrateItemKey, chain: Option<&[ItemKey]>, module: ItemKey, alloc: Alloc<'a>) -> Own<'a, N> {
+    let edges = AVec::from_iter_in(edges.iter(), alloc);
     let chain = match chain {
         Some(chain) => AVec::from_slice_in(chain, alloc),
         None => AVec::from_slice_in(&[module], alloc),
@@ -207,7 +209,8 @@ fn entry<'a, N: Name, R: Records<N>>(module: ItemKey, records: &R, alloc: Alloc<
     match records.held(parent) {
         Held::Scope { scope, .. } => {
             let len = scope.mark(module).unwrap_or(0) as usize;
-            out.extend_from_slice(&scope.textual[..len.min(scope.textual.len())]);
+            let textual = scope.textual();
+            out.extend_from_slice(&textual[..len.min(textual.len())]);
             Ok(out)
         }
         Held::Failed { .. } => Ok(out),

@@ -20,7 +20,7 @@ use blaze_keyed::{
 };
 
 use super::{
-    core::{Batch, Committed, Found, Got, Liveness, Plain, PlainConfig, Probe, Probes, PutError, Report, Scrubbed, Sliced, TAGS},
+    core::{Batch, Committed, Found, Got, LentRecord, Liveness, Plain, PlainConfig, Probe, Probes, PutError, Report, Scrubbed, Sliced, TAGS},
     format::{self, Segment},
     settings::Settings,
 };
@@ -222,6 +222,7 @@ impl<A: Allocator + Clone> Driven<Native, A> {
             reads: settings.reads(alloc.clone()),
             // The keyed handle's callers root nothing of their own.
             liveness: Liveness::Everything,
+            lock_step: crate::plain::LockStep::Backoff,
         };
         let mut it = Driven::with(driver, root, cfg, alloc)?;
         it.open_files()?;
@@ -325,7 +326,43 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         // [`Driven::acknowledge`]). An open that fails hands nothing, and the marks stay for
         // the next.
         it.core.handed();
+        it.unroot_holed()?;
         Ok(self)
+    }
+
+    /// D200: before any reader sees the store, every root that reaches a record a power cut
+    /// took is dropped, by one flip, so a reader finds a root whole or no root, never a root
+    /// with a hole (a lost record is rebuilt as on a first run).
+    ///
+    /// When: only when this open can have lost something a root reaches: the generation names
+    /// a root ([`Plain::names_a_root`]) and an earlier boot's unsealed tail (from the rows, [`Plain::earlier_tail`]), or the open
+    /// reported losses (a mark an earlier open left: its unrooting flip did not land). Then
+    /// every row is mapped and the tail checked whole (the check its first probe would make
+    /// this boot anyway), and only if something is lost are the roots walked
+    /// ([`Plain::holed_roots`]: a find for each root, index and named key).
+    ///
+    /// Crash-safe and idempotent: the unrooting is one flip, which also clears the marks of
+    /// the losses this open reported ([`Plain::handed`]), so a kill before it lands leaves the
+    /// roots and the marks both, and the next open, seeing the marks, walks and drops again; a
+    /// kill after leaves no root and no mark. Never half a root: a root is one manifest row.
+    fn unroot_holed(&mut self) -> Result<(), StoreError> {
+        if !self.core.names_a_root() || (!self.core.earlier_tail() && self.core.report().lost.is_empty()) {
+            return Ok(());
+        }
+        self.map_all()?;
+        if self.core.report().lost.is_empty() || self.core.keeps_holed_root() {
+            return Ok(());
+        }
+        let holed = self.core.holed_roots();
+        if holed.is_empty() {
+            return Ok(());
+        }
+        for name in holed.iter() {
+            blaze_trace::warn!(target: "blaze_cas::plain", root = %name, "a root reached a record lost in a power cut: dropped before any reader saw it (D200); what it named is made again as on a first run");
+            self.core.unroot(name);
+        }
+        self.commit_with(&[])?;
+        Ok(())
     }
 
     /// One flip that clears the "lost, not yet reported" marks of the losses this open
@@ -512,7 +549,48 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     }
 
     pub fn root(&mut self, name: &str, keys: &[Key]) -> Result<Key, StoreError> {
+        self.root_names_held(name, keys, &|_| false)?;
         self.core.root(name, keys)
+    }
+
+    /// D200's set-time guard, the one home of it: every key a root record names directly is
+    /// `own` (put by the caller and not yet handed to this store: a `Lent`'s arena) or found
+    /// as [`Driven::get`] finds (put uncommitted here, or committed in a namespace read; a row
+    /// mapped at its first probe), else [`StoreError::RootNamesUnheld`] naming the root and
+    /// the first such key. A name no one put is a writer's bug, refused here on every boot;
+    /// what a power cut lost is the open's ([`Driven::unroot_holed`]).
+    ///
+    /// Cost, per key: `own` (a `Lent`'s hash lookup), then this store's held batches (a
+    /// `BTreeMap` lookup per namespace), then the rows in probe order (a binary search of each
+    /// row's sorted entries, until a hit). An indexed root names its indexes alone here; what an
+    /// index holds is not looked for. Counted in [`super::PutPath::root_probes`].
+    pub(crate) fn root_names_held(&mut self, name: &str, keys: &[Key], own: &dyn Fn(&Key) -> bool) -> Result<(), StoreError> {
+        // Bounded before any probe: the bound the root's own setting refuses past
+        // (`ROOT_KEYS_MOST` direct records, `ROOT_INDEXES_MOST` indexes: equal).
+        if keys.len() > super::core::ROOT_KEYS_MOST {
+            return Err(StoreError::IndexOver { keys: keys.len() as u64, most: super::core::ROOT_KEYS_MOST as u64 });
+        }
+        self.core.count_root_probes(keys.len() as u64);
+        for key in keys {
+            if own(key) || self.get(key)?.is_some() {
+                continue;
+            }
+            return Err(StoreError::RootNamesUnheld { root: name.to_owned(), key: key.0 });
+        }
+        Ok(())
+    }
+
+    /// [`Driven::root_for`], with `own` the caller's puts not yet handed here
+    /// ([`Driven::root_names_held`]).
+    pub(crate) fn root_for_owned(&mut self, name: &str, keys: &[Key], life_ns: u64, own: &dyn Fn(&Key) -> bool) -> Result<Key, StoreError> {
+        self.root_names_held(name, keys, own)?;
+        self.core.root_for(name, keys, life_ns)
+    }
+
+    /// [`Driven::root_through`], with `own` the caller's puts not yet handed here.
+    pub(crate) fn root_through_owned(&mut self, name: &str, indexes: &[Key], life_ns: u64, own: &dyn Fn(&Key) -> bool) -> Result<Key, StoreError> {
+        self.root_names_held(name, indexes, own)?;
+        self.core.root_through(name, indexes, life_ns)
     }
 
     pub fn unroot(&mut self, name: &str) {
@@ -522,13 +600,19 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     /// Writes the store's puts and `batches` as one segment for each namespace that holds
     /// records, and flips to a generation naming them, driven until done.
     pub fn commit_with(&mut self, batches: &[&Batch]) -> Result<Committed<A>, StoreError> {
+        self.commit_records(batches, &[])
+    }
+
+    /// [`Driven::commit_with`] with `records` lent where they lie (core.rs
+    /// [`Plain::commit_records`]): a `Lent`'s shared arena, copied once, by the layout.
+    pub fn commit_records(&mut self, batches: &[&Batch], records: &[LentRecord<'_>]) -> Result<Committed<A>, StoreError> {
         // After the answer: what is left unmapped is mapped, so the layout refuses two values
         // under one key against every row. A commit with nothing to lay out maps nothing.
-        if self.core.holds_uncommitted() || batches.iter().any(|it| !it.is_empty()) {
+        if self.core.holds_uncommitted() || batches.iter().any(|it| !it.is_empty()) || !records.is_empty() {
             self.map_all()?;
         }
         let now = self.driver.wall_ns();
-        self.core.commit(batches, now, &mut self.effects)?;
+        self.core.commit_records(batches, records, now, &mut self.effects)?;
         self.run("committing")?;
         match self.core.take_committed() {
             Some(outcome) => outcome,
@@ -582,7 +666,7 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
 
     /// [`Plain::root_for`].
     pub fn root_for(&mut self, name: &str, keys: &[Key], life_ns: u64) -> Result<Key, StoreError> {
-        self.core.root_for(name, keys, life_ns)
+        self.root_for_owned(name, keys, life_ns, &|_| false)
     }
 
     /// [`Plain::index`].
@@ -592,7 +676,7 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
 
     /// [`Plain::root_through`].
     pub fn root_through(&mut self, name: &str, indexes: &[Key], life_ns: u64) -> Result<Key, StoreError> {
-        self.core.root_through(name, indexes, life_ns)
+        self.root_through_owned(name, indexes, life_ns, &|_| false)
     }
 
     /// [`Plain::index_beside`].

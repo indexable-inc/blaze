@@ -20,6 +20,7 @@ blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-keyed.workspace = true
 blaze-mem.workspace = true
+blaze-own.workspace = true
 libc.workspace = true
 # `store.json`, read as JSON into its typed value.
 blaze-data.workspace = true

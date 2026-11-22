@@ -251,6 +251,7 @@ impl<'c, 'f> View<'c, 'f> {
             return false;
         }
         let next = at + 1;
+        // astlog-ignore: expand-hand-extent (the macro language: a separator of `$(..),*`)
         let ends = next == level.end || matches!(self.char(next), Some(',' | ';'));
         if !ends {
             return false;
@@ -283,15 +284,15 @@ impl<'c, 'f> View<'c, 'f> {
     }
 
     /// Parses a fragment of `entry` at the start of `level`: where the input goes on after it,
-    /// and the first error, as mbe's `expect_fragment` gives them.
+    /// and the first error, as mbe's `expect_fragment` gives them; and whether it [`Joins`].
     pub(crate) fn parse_fragment(
         &mut self,
         engine: &mut Engine<'_, '_, 'f>,
         entry: PrefixEntryPoint,
         level: Level,
-    ) -> (u32, Option<CallError>) {
+    ) -> (u32, Option<CallError>, Joins) {
         if self.one_token_fragment(entry, level) {
-            return (level.at + 1, None);
+            return (level.at + 1, None, Joins::No);
         }
         // The parser reads the level's first tokens, a window doubled until it provably read
         // nothing past it: its position only moves forward, and it reads at most
@@ -342,9 +343,33 @@ impl<'c, 'f> View<'c, 'f> {
         };
         let mut cursor = Cursor { at: start, end: level.end, depth: 0 };
         let mut error = None;
+        // The fragment's node (the first entered), the node at depth 2 being read, the depth.
+        let (mut root, mut second, mut depth) = (None, None, 0u32);
+        let mut joins = Joins::No;
         for step in output.iter() {
             match step {
+                Step::Enter { kind } => {
+                    depth += 1;
+                    match depth {
+                        1 if root.is_none() => root = Some(kind),
+                        2 => second = Some(kind),
+                        _ => {}
+                    }
+                    // `A | B`, `| A`: an or-pattern is a list of `|`.
+                    if depth == 1 && kind == SyntaxKind::OR_PAT {
+                        joins = Joins::Yes;
+                    }
+                }
+                Step::Exit => depth = depth.saturating_sub(1),
                 Step::Token { kind, n_input_tokens } => {
+                    // `A + B`, `dyn A + B`, `impl A + B`: a `+` of the type's bounds.
+                    if depth == 2
+                        && kind == T![+]
+                        && second == Some(SyntaxKind::TYPE_BOUND_LIST)
+                        && matches!(root, Some(SyntaxKind::DYN_TRAIT_TYPE | SyntaxKind::IMPL_TRAIT_TYPE))
+                    {
+                        joins = Joins::Yes;
+                    }
                     let n = match kind {
                         SyntaxKind::LIFETIME_IDENT => 2,
                         _ => n_input_tokens,
@@ -358,7 +383,6 @@ impl<'c, 'f> View<'c, 'f> {
                     cursor.skip_invisible(self);
                     cursor.bump_or_end(self);
                 }
-                Step::Enter { .. } | Step::Exit => {}
                 Step::Error { msg } => {
                     if error.is_none() {
                         let at = cursor.tree_origin(self);
@@ -378,8 +402,20 @@ impl<'c, 'f> View<'c, 'f> {
         while cursor.depth != 0 {
             cursor.bump_or_end(self);
         }
-        (cursor.at, error)
+        (cursor.at, error, joins)
     }
+}
+
+/// Whether a fragment the parser read is a list that a parse of the output would join with
+/// the tokens around it where it is put: an or-pattern (`A | B` in `&$p`) or a type of bounds
+/// (`A + B` in `&$t`). rustc reads a fragment as one operand (its invisible group is one
+/// token tree, parsed whole); the transcriber puts such a fragment in parentheses, as it does
+/// an expression (`2 * $e` of `1 + 2` is `2 * (1 + 2)`: transcribe.rs `var`, mbe's), so every
+/// parse of the output, a body's lowering and a derive's input alike, reads it whole.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Joins {
+    No,
+    Yes,
 }
 
 /// tt's buffer cursor over the flat tokens: `depth` groups entered within the level.
@@ -655,7 +691,7 @@ mod tests {
             let mut engine = Engine::new_in(&program, Def::of(&def), frame);
             let mut view = View::new_in(&call, Style::FnLike, frame);
             let top = view.top();
-            let (end, error) = view.parse_fragment(&mut engine, PrefixEntryPoint::Vis, top);
+            let (end, error, _) = view.parse_fragment(&mut engine, PrefixEntryPoint::Vis, top);
             assert_eq!((end, error.is_none()), (4, true), "`pub(crate)` is the `vis`");
             let made = view.window.len() - Tokens::PAD;
             assert!(made <= 16, "a `vis` of 4 tokens made {made} parser words of an input of {} tokens", view.len());

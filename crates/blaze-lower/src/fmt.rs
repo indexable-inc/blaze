@@ -26,6 +26,47 @@ pub(crate) fn string_contents(text: &str) -> Option<(usize, usize)> {
     (text.starts_with('"') && text.ends_with('"') && end >= 1).then_some((1, end))
 }
 
+/// A template literal's VALUE, the string a format string is (the Reference, "String
+/// literals": a non-raw literal's escapes applied, a raw literal's value its text), with the
+/// source offset of each value byte. rustc parses the value
+/// (rustc_builtin_macros format.rs, `rustc_parse_format::Parser`) and maps it back to the
+/// snippet only for spans. So `\u{e9}` is one char, and `\x7b` is a brace.
+pub(crate) struct TemplateValue<'a> {
+    pub(crate) value: blaze_own::AString<'a>,
+    /// `src[k]`: the offset, in the literal's contents, of the source char value byte `k` came
+    /// from; `src[value.len()]` is the contents' length.
+    pub(crate) src: AVec<'a, u32>,
+    /// The first escape the literal's rules refuse, by its range in the contents (its value
+    /// is left out of `value`).
+    pub(crate) bad: Option<core::ops::Range<usize>>,
+}
+
+/// [`TemplateValue`] of a string literal's `contents` (between its quotes); `raw` for
+/// `r".."` and `r#".."#`.
+pub(crate) fn template_value<'a>(contents: &str, raw: bool, alloc: blaze_own::Alloc<'a>) -> TemplateValue<'a> {
+    let mut value = blaze_own::AString::new_in(alloc);
+    let mut src: AVec<'a, u32> = Vec::new_in(alloc);
+    let mut bad = None;
+    let mut each = |r: core::ops::Range<usize>, c: Result<char, parser::unescape::EscapeError>| match c {
+        Ok(c) => {
+            for _ in 0..c.len_utf8() {
+                src.push(idx(r.start));
+            }
+            value.push(c);
+        }
+        Err(e) if e.is_fatal() && bad.is_none() => bad = Some(r),
+        // A warning (a skipped line's whitespace) has no value; a second refusal adds nothing.
+        Err(_) => {}
+    };
+    if raw {
+        parser::unescape::check_raw_str(contents, &mut each);
+    } else {
+        parser::unescape::unescape_str(contents, &mut each);
+    }
+    src.push(idx(contents.len()));
+    TemplateValue { value, src, bad }
+}
+
 /// The first token at or after `from` that is not trivia, in `lexed`.
 fn non_trivia(lexed: &LexedStr<'_>, from: usize) -> Option<usize> {
     (from..lexed.len()).find(|&i| !lexed.kind(i).is_trivia() && lexed.kind(i) != SyntaxKind::EOF)
@@ -77,7 +118,8 @@ impl Machine<'_, '_, '_> {
             let a = FmtArg::decode(node).map_err(|_| Why::NonStringTemplate)?;
             written.push(Written { name: a.name, expr: a.expr, range });
         }
-        self.format_args_of(template, &written, false, r)
+        let raw = tr.of(self.text()).starts_with('r');
+        self.format_args_of(template, raw, &written, false, r)
     }
 
     /// Lowers `format_args!(input)` (`input` the token tree's range, delimiters included).
@@ -99,6 +141,7 @@ impl Machine<'_, '_, '_> {
         }
         let tok_start = inner.start + idx(lexed.text_start(first));
         let tok_text = lexed.text(first);
+        let raw = tok_text.starts_with('r');
         let Some((cs, ce)) = string_contents(tok_text) else { return Err(Why::NonStringTemplate) };
         let template = Range::new(tok_start + idx(cs), tok_start + idx(ce));
         let mut at = inner.start + idx(lexed.text_start(first) + lexed.text_len(first));
@@ -158,22 +201,33 @@ impl Machine<'_, '_, '_> {
             }
             at = end_at;
         }
-        self.format_args_of(template, &written, newline, r)
+        self.format_args_of(template, raw, &written, newline, r)
     }
 
     /// The node of `format_args!` with `template` (its string's contents) and the `written`
     /// arguments: the template's pieces, and the arguments it captures.
-    fn format_args_of(&mut self, template: Range, written: &[Written], newline: bool, r: Range) -> Result<ExprId, Why> {
+    ///
+    /// The template is parsed from its VALUE ([`template_value`]), as rustc parses it: the
+    /// `{` of an escape `\u{e9}` is no brace, and `\x7b` is one. The pieces keep the record's
+    /// ranges in the template's SOURCE (front2 fmt_template.rs unescapes them), through the
+    /// value's map back to the source.
+    fn format_args_of(&mut self, template: Range, raw: bool, written: &[Written], newline: bool, r: Range) -> Result<ExprId, Why> {
         let alloc = *self.vals.allocator();
-        let mut owned = blaze_own::AString::new_in(alloc);
-        owned.push_str(template.of(self.text()));
-        let of = |x: Range| &owned[(x.start - template.start) as usize..(x.end - template.start) as usize];
+        let tv = template_value(template.of(self.text()), raw, alloc);
+        let base = template.start;
+        if let Some(bad) = &tv.bad {
+            // The literal's rules refuse the escape (the Reference, "String literals"); its
+            // value is not a template to cut.
+            self.diag(DiagKind::Syntax, Range::new(base + idx(bad.start), base + idx(bad.end)));
+        }
+        // The source position of value byte `k`.
+        let at = |k: usize| base + tv.src[k];
+        let text = tv.value.as_str();
+        let bytes = text.as_bytes();
         // The template's pieces, and the arguments it captures.
         let mut pieces: AVec<'_, (Node, Range)> = Vec::new_in(alloc);
         let mut captured: AVec<'_, (u64, NameIdx, ExprId, Range)> = Vec::new_in(alloc);
         let mut next = 0u32;
-        let bytes = of(template).as_bytes();
-        let base = template.start;
         let mut i = 0usize;
         let mut run = 0usize;
         while i < bytes.len() {
@@ -182,22 +236,23 @@ impl Machine<'_, '_, '_> {
                 b'}' if bytes.get(i + 1) == Some(&b'}') => i += 2,
                 b'{' => {
                     if run < i {
-                        let text = BodyRange::building(Range::new(base + idx(run), base + idx(i)));
-                        pieces.push((FmtPiece::Text(text).encode(), template));
+                        let piece = BodyRange::building(Range::new(at(run), at(i)));
+                        pieces.push((FmtPiece::Text(piece).encode(), template));
                     }
                     let Some(close) = bytes[i + 1..].iter().position(|b| *b == b'}').map(|p| i + 1 + p) else {
-                        self.diag(DiagKind::Syntax, Range::new(base + idx(i), template.end));
+                        self.diag(DiagKind::Syntax, Range::new(at(i), template.end));
                         run = bytes.len();
                         break;
                     };
-                    let inside = &bytes[i + 1..close];
-                    let colon = inside.iter().position(|b| *b == b':');
-                    let (arg, spec) = match colon {
-                        Some(c) => (&inside[..c], Range::new(base + idx(i + 2 + c), base + idx(close))),
-                        None => (inside, Range::new(base + idx(close), base + idx(close))),
+                    let inside = &text[i + 1..close];
+                    let colon = inside.find(':');
+                    // The spec by value offsets, and by its source range for the record.
+                    let (arg, spec_v) = match colon {
+                        Some(c) => (&inside[..c], i + 2 + c..close),
+                        None => (inside, close..close),
                     };
-                    let arg_at = base + idx(i + 1);
-                    let spec_text = of(spec);
+                    let spec = Range::new(at(spec_v.start), at(spec_v.end));
+                    let spec_text = &text[spec_v.clone()];
                     // `name$` and `n$` in the spec name arguments; `.*` takes a positional
                     // before the value's own.
                     for (d, _) in spec_text.match_indices('$') {
@@ -210,47 +265,47 @@ impl Machine<'_, '_, '_> {
                             .map_or(d, |(s, _)| s);
                         let word = &before[start..];
                         if word.chars().next().is_some_and(|c| !c.is_ascii_digit()) {
-                            let wr = Range::new(spec.start + idx(start), spec.start + idx(d));
-                            self.fmt_named(&written, &mut captured, wr);
+                            let (ws, we) = (spec_v.start + start, spec_v.start + d);
+                            self.fmt_named(&written, &mut captured, &text[ws..we], Range::new(at(ws), at(we)));
                         }
                     }
                     if spec_text.contains(".*") {
                         next += 1;
                     }
-                    let arg_text = core::str::from_utf8(arg).unwrap_or("").trim();
+                    let arg_text = arg.trim();
                     let positional = |index: u32| (index as usize) < written.len();
                     let index = if arg_text.is_empty() {
                         next += 1;
                         if !positional(next - 1) {
-                            self.diag(DiagKind::FormatArgMissing, Range::new(base + idx(i), base + idx(close + 1)));
+                            self.diag(DiagKind::FormatArgMissing, Range::new(at(i), at(close + 1)));
                         }
                         next - 1
                     } else if let Ok(n) = arg_text.parse::<u32>() {
                         if !positional(n) {
-                            self.diag(DiagKind::FormatArgMissing, Range::new(base + idx(i), base + idx(close + 1)));
+                            self.diag(DiagKind::FormatArgMissing, Range::new(at(i), at(close + 1)));
                         }
                         n
                     } else {
-                        let lead = arg.len() - core::str::from_utf8(arg).unwrap_or("").trim_start().len();
-                        let wr = Range::new(arg_at + idx(lead), arg_at + idx(lead + arg_text.len()));
-                        self.fmt_named(&written, &mut captured, wr)
+                        let ws = i + 1 + (arg.len() - arg.trim_start().len());
+                        let we = ws + arg_text.len();
+                        self.fmt_named(&written, &mut captured, &text[ws..we], Range::new(at(ws), at(we)))
                     };
                     let piece = FmtPiece::Arg { arg: index, spec: BodyRange::building(spec) };
-                    pieces.push((piece.encode(), Range::new(base + idx(i), base + idx(close + 1))));
+                    pieces.push((piece.encode(), Range::new(at(i), at(close + 1))));
                     i = close + 1;
                     run = i;
                 }
                 b'}' => {
                     // rustc: "invalid format string: unmatched `}` found".
-                    self.diag(DiagKind::Syntax, Range::new(base + idx(i), base + idx(i + 1)));
+                    self.diag(DiagKind::Syntax, Range::new(at(i), at(i + 1)));
                     i += 1;
                 }
                 _ => i += 1,
             }
         }
         if run < bytes.len() {
-            let text = BodyRange::building(Range::new(base + idx(run), template.end));
-            pieces.push((FmtPiece::Text(text).encode(), template));
+            let piece = BodyRange::building(Range::new(at(run), template.end));
+            pieces.push((FmtPiece::Text(piece).encode(), template));
         }
         let pieces = self.put_rows_of(&pieces);
         let mut args: AVec<'_, (Node, Range)> = Vec::new_in(alloc);
@@ -267,21 +322,25 @@ impl Machine<'_, '_, '_> {
 
     /// The argument `{name}` names at `wr`: a written one by its name, else one captured (made
     /// once per name). Its position among all the arguments.
+    ///
+    /// `text` is the name in the template's VALUE, and `wr` its source range: they differ only
+    /// where an escape spells the name (`{\x61}` is `{a}`).
     fn fmt_named(
         &mut self,
         written: &[Written],
         captured: &mut AVec<'_, (u64, NameIdx, ExprId, Range)>,
+        text: &str,
         wr: Range,
     ) -> u32 {
-        let text = wr.of(self.text());
-        let hash = blaze_typeck::Name::of(text.strip_prefix("r#").unwrap_or(text)).0;
+        let spelled = text.strip_prefix("r#").unwrap_or(text);
+        let hash = blaze_typeck::Name::of(spelled).0;
         if let Some(at) = written.iter().position(|w| w.name.is_some_and(|n| self.out.names[n.0 as usize] == hash)) {
             return idx(at);
         }
         if let Some(at) = captured.iter().position(|c| c.0 == hash) {
             return idx(written.len() + at);
         }
-        let name = self.name(wr);
+        let name = if wr.of(self.text()) == text { self.name(wr) } else { self.synth_name(spelled, wr) };
         let seg = Segment {
             kind: SegKind::Ident,
             name: Some(name),

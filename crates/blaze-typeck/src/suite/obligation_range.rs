@@ -5,7 +5,8 @@
 //! trait Show { fn shown() -> u8; }               // no impl for B
 //! struct B;
 //! struct W<T>;
-//! impl<T> W<T> where T: Show { fn get(&self) -> u8; fn make() -> W<T>; }
+//! impl<T> W<T> where T: Show { fn bounded(&self) -> u8; fn make() -> W<T>; }
+//! impl<T> W<T> { fn get(&self) -> u8 where T: Show; }
 //! fn grant<T: Show>(n: u8) -> u8;
 //! fn need<T: Show>(t: &T) -> u8;
 //!
@@ -14,7 +15,19 @@
 //! fn c3(w: W<B>) -> u8 { w.get() }               // at `w`
 //! fn c4() { let w: W<B> = W::make(); }           // at `make`
 //! fn c5() -> u8 { <B as Show>::shown() }         // at `B` of `<B as Show>`
+//! fn c6(w: W<B>) -> u8 { w.bounded() }           // E0599 at `bounded`, naming `B: Show`
 //! ```
+//!
+//! c3's bound is the METHOD's own where-clause. The probe does not check it, so the method is
+//! picked and the bound is an obligation, E0277. c6's bound is on the IMPL. The probe checks
+//! it (rustc method/probe.rs `consider_probe`, `InherentImplCandidate`: the impl's clauses are
+//! registered and any error is `ProbeResult::NoMatch`, kept in `unsatisfied_predicates`), so
+//! nothing applies. rustc then says E0599 (method/suggest.rs): "the method `bounded` exists for
+//! struct `W<B>`, but its trait bounds were not satisfied", at the method name, with "the
+//! following trait bounds were not satisfied: `B: Show`". blaze files the same E0599, at the
+//! name, carrying the unmet `B: Show` (rules/method.rs `unmet_impl_clause`). Until
+//! 2026-11-21, c3 here was `get` on the bounded impl and wanted E0277 at `w`. That was not
+//! rustc's behavior.
 //!
 //! The Reference, "Trait and lifetime bounds": "Trait and lifetime bounds provide a way for
 //! generic items to restrict which types and lifetimes are used as their parameters": each body
@@ -58,6 +71,8 @@ struct Items {
     c3: ItemKey,
     c4: ItemKey,
     c5: ItemKey,
+    c6: ItemKey,
+    show: ItemKey,
 }
 
 /// The world of the module doc. No `Sized` lang item, so no implied `Sized` clause: each item
@@ -79,16 +94,19 @@ fn world() -> (Fx, Items) {
     let w_p0 = fx.adt(w_k, &[p0]);
     let imp = fx.imp("impl<T> W<T> where T: Show", 1, w_p0, None, &[], std::vec![t_show]);
     let r_w = fx.r(Mutbl::Not, w_p0);
-    fx.impl_fn(imp, "get", true, &[r_w], u8_);
+    fx.impl_fn(imp, "bounded", true, &[r_w], u8_);
     fx.impl_fn(imp, "make", false, &[], w_p0);
+    let own = fx.imp("impl<T> W<T>", 1, w_p0, None, &[], std::vec::Vec::new());
+    fx.impl_fn_own(own, "get", true, 0, &[r_w], u8_, std::vec![t_show]);
     let w_b = fx.adt(w_k, &[b]);
     let c1 = fx.func("c1", 0, &[], u8_, std::vec::Vec::new());
     let c2 = fx.func("c2", 0, &[b], u8_, std::vec::Vec::new());
     let c3 = fx.func("c3", 0, &[w_b], u8_, std::vec::Vec::new());
     let c4 = fx.func("c4", 0, &[], unit, std::vec::Vec::new());
     let c5 = fx.func("c5", 0, &[], u8_, std::vec::Vec::new());
+    let c6 = fx.func("c6", 0, &[w_b], u8_, std::vec::Vec::new());
     fx.finish();
-    (fx, Items { b: b_k, w: w_k, c1, c2, c3, c4, c5 })
+    (fx, Items { b: b_k, w: w_k, c1, c2, c3, c4, c5, c6, show })
 }
 
 /// The five bodies of the module doc.
@@ -239,8 +257,8 @@ fn bound_on_a_parameter_type_is_at_the_argument_passed() {
     assert_filed_at_want(Case::FnParam, "need(&b)");
 }
 
-/// c3, `w.get()`: the impl's `T: Show`, `T` in the receiver's type `&W<T>`, is filed at the
-/// receiver `w`, not at the call or at the name `get`.
+/// c3, `w.get()`: the method's own `T: Show`, `T` in the receiver's type `&W<T>`, is filed at
+/// the receiver `w`, not at the call or at the name `get`.
 /// Prints: `test suite::obligation_range::receiver_bound_is_at_the_receiver ... ok`
 #[test]
 fn receiver_bound_is_at_the_receiver() {
@@ -263,9 +281,34 @@ fn anchor_self_bound_is_at_the_anchor_type() {
     assert_filed_at_want(Case::Anchor, "<B as Show>::shown()");
 }
 
+/// c6, `w.bounded()`: the IMPL's `T: Show` fails in the probe, so nothing applies. This is
+/// rustc's E0599 "the method `bounded` exists for struct `W<B>`, but its trait bounds were not
+/// satisfied", at the method's name. The finding carries `B: Show` (rule 19) and no E0277.
+/// Prints: `test suite::obligation_range::impl_bound_unmet_is_e0599_at_the_method_name ... ok`
+#[test]
+fn impl_bound_unmet_is_e0599_at_the_method_name() {
+    let (fx, it) = world();
+    let mut b = Bb::new();
+    let p = b.param("w");
+    let x = b.local(p);
+    let m = b.method_ranged(x, "bounded", &[], &[]);
+    let root = b.block(&[], Some(m.expr));
+    let c = check_body(&fx, &b, it.c6, root, Plant::None, InferPlant::None);
+    let found: std::vec::Vec<_> = c.diags.iter().map(|d| (d.code, d.at)).collect();
+    assert_eq!(found, [(DiagCode::NoMethod, m.name)], "w.bounded(): want one E0599 at the name `bounded`");
+    let d = c.diags[0];
+    assert_eq!(d.name, Some(crate::ids::Name::of("bounded")), "the finding names the method");
+    let Some(crate::diag::Because::Unmet { goal: crate::diag::UnmetGoal::Trait { trait_, args }, leaf: None }) = d.because else {
+        panic!("w.bounded(): want the unmet `B: Show` as the reason, got {:?}", d.because);
+    };
+    assert_eq!(trait_, it.show, "the unmet bound is `Show`");
+    let self_ty = c.types.view().list(args).expect("the bound's arguments in the body's table")[0];
+    assert_eq!(c.types.view().get(self_ty), Some(&PNode::Adt(it.b, List::EMPTY)), "the unmet bound's self type is `B`");
+}
+
 /// The control: with every obligation filed at the whole expression (`Plant::ClauseAtWholeExpr`)
 /// each case's E0277s are all at `whole` and none at `want`, so each test above fails under the
-/// planted bug.
+/// planted bug. (c6 has no E0277: its E0599 is the probe's, and no obligation is filed.)
 /// Prints "whole expression: every case's E0277 left its narrow place (5 of 5)".
 #[test]
 fn control_whole_expression_fails_all_four() {

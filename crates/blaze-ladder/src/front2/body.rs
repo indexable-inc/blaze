@@ -211,6 +211,8 @@ struct ModuleValues<'n, 's, S> {
     /// ([`super::glob_uses::by_uses`]).
     krate: usize,
     item: LibKey,
+    /// The body's checker key: a member is found by it (locals.rs `library_item_or_member`).
+    owner: ItemKey,
     text: &'n str,
     blocks: Option<super::glob_uses::PatternBlocks<'static>>,
 }
@@ -244,11 +246,12 @@ impl<'n, S: NamesSource<'n>> blaze_lower::ValueNames for ModuleValues<'n, '_, S>
         if self.failed.is_some() {
             return Some(V::Need);
         }
-        let (names, krate, item, text) = (self.names, self.krate, self.item, self.text);
+        let (names, krate, item, owner, text) = (self.names, self.krate, self.item, self.owner, self.text);
         let planted = self.store.locals.planted();
         let alloc = self.store.tys.alloc();
         let kept = &self.store.locals;
-        let blocks = self.blocks.get_or_insert_with(|| super::glob_uses::PatternBlocks::of(names, kept, krate, item, text, alloc));
+        let keys: &Keys = &*self.keys;
+        let blocks = self.blocks.get_or_insert_with(|| super::glob_uses::PatternBlocks::of(names, kept, keys, krate, item, owner, text, alloc));
         let target = match super::glob_uses::by_uses(&Paths { names }, self.module, item, blocks, view, name, uses, locals, planted, alloc) {
             Ok(Some(target)) => target,
             Ok(None) => return None,
@@ -337,6 +340,7 @@ impl<'n> Body<'n> {
             traits: &self.traits,
             blocks: &self.blocks,
             path_marks: &self.typeck.path_marks,
+            path_ns: &self.typeck.path_ns,
         }
     }
 }
@@ -881,28 +885,7 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
     /// token, never an identifier); one that only a block's glob `use` gives is not seen.
     fn names_body_item(&self, text: &str, scope: u32) -> bool {
         use super::locals::LocalNs;
-        let bytes = text.as_bytes();
-        let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
-        let mut i = 0;
-        while i < bytes.len() {
-            if !word(bytes[i]) {
-                i += 1;
-                continue;
-            }
-            let start = i;
-            while i < bytes.len() && word(bytes[i]) {
-                i += 1;
-            }
-            if bytes[start].is_ascii_digit() {
-                continue;
-            }
-            // `word` splits only at ASCII bytes, so both ends are char boundaries.
-            let Some(ident) = text.get(start..i) else { continue };
-            if self.locals.find(self.owner, Some(scope), ident, LocalNs::Value).is_some() || self.locals.find(self.owner, Some(scope), ident, LocalNs::Type).is_some() {
-                return true;
-            }
-        }
-        false
+        identifiers(text).any(|ident| self.locals.find(self.owner, Some(scope), ident, LocalNs::Value).is_some() || self.locals.find(self.owner, Some(scope), ident, LocalNs::Type).is_some())
     }
 
     /// File a constant with its enclosing scope when it refers to a block item or carries
@@ -922,6 +905,15 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
                 || self.env.params.iter().any(|(n, _)| *n == Name::of(inner))
                 || parser::LexedStr::single_token(parser::Edition::CURRENT, digits).is_some_and(|(kind, _)| kind.is_literal())
             {
+                return None;
+            }
+            // An expression that names nothing (`12 - 4`, chacha20's `32 - $r` from a
+            // `literal` fragment): its marks place no name, so it is read where an unmarked
+            // one is, with no block. Hygiene (the Reference, "Macros by example", "Hygiene")
+            // is about where names resolve. Before (tempo t1935d, 7 lines; ladder
+            // legacy_const_anon_arg_run), such an argument had no path to take a block from
+            // (`scope_within`) and was refused "whose enclosing block is missing".
+            if identifiers(inner).next().is_none() {
                 return None;
             }
         }
@@ -1069,6 +1061,35 @@ fn gat_segment(view: &View<'_>, at: ArgAt) -> Result<Option<(blaze_typeck::PathI
 /// The block of the first path written inside `at` (an expression's range), which is the
 /// block the expression's names are read in; `None` when no path is written there (the
 /// expression names nothing).
+/// The words of the constant expression `text` that may be names: each run of identifier
+/// bytes not starting with a digit (a number's digits and suffix are one token, never an
+/// identifier). A word inside a string literal is one too: a superset, never short of a name.
+fn identifiers(text: &str) -> impl Iterator<Item = &str> {
+    let bytes = text.as_bytes();
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
+    let mut i = 0;
+    core::iter::from_fn(move || {
+        while i < bytes.len() {
+            if !word(bytes[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && word(bytes[i]) {
+                i += 1;
+            }
+            if bytes[start].is_ascii_digit() {
+                continue;
+            }
+            // `word` splits only at ASCII bytes, so both ends are char boundaries.
+            if let Some(ident) = text.get(start..i) {
+                return Some(ident);
+            }
+        }
+        None
+    })
+}
+
 fn scope_within(view: &View<'_>, at: blaze_lower::BodyRange) -> Result<Option<lf::ScopeId>, Refused> {
     for p in 0..view.paths.len() {
         let p = blaze_typeck::PathIdx(p as u32);
@@ -1275,23 +1296,61 @@ fn defaults_gate<'n, S: NamesSource<'n>>(names: S, krate: usize, typeck: &Typeck
     }
 }
 
-/// The names library's key of the body whose text is `text`, lowered under `item`: `item`
-/// itself when its text is that slice, or the first member of `item` whose text is (a member's
-/// body is lowered under its container). `None`: a text the library lists under `item` as no
-/// body (a local item's own, an anonymous constant's rendering). The rule of front2 locals.rs
-/// `Locals::library_body`, by the same slice test.
-fn library_body<'n, S: NamesSource<'n>>(names: S, item: LibKey, text: &str) -> Option<LibKey> {
-    let same = |t: &str| core::ptr::eq(t.as_ptr(), text.as_ptr()) && t.len() == text.len();
-    if names.seeded_text_of(item).is_some_and(|it| same(it.text)) {
-        return Some(item);
-    }
-    let mut found = None;
-    names.each_member(item, &mut |m| {
-        if found.is_none() && same(m.text) {
-            found = Some(m.key);
+/// How many bodies a local item can be declared inside, one in another, for [`body_at`]: a
+/// chain longer than this is no program's (each level is a body's block in its enclosing
+/// body's text); one longer is not placed (`line!()` refused by name), never cut short.
+const MOST_LOCAL_LEVELS: usize = 64;
+
+/// Where the body lowered from `text` under `item` (checker key `owner`) stands in its file
+/// (body_host.rs [`super::body_host::BodyAt`]): the library body the names place, the free fn
+/// or member whose body `text` is ([`super::locals::library_item_or_member`]: a member by its
+/// container, kind and name), at 0; a local item's, its outermost
+/// enclosing library body's, at the local's place in it, walked out through each enclosing
+/// body's [`super::locals::LocalHead::range`] (rule 71: item-relative to the end). A local a
+/// macro call wrote ([`super::locals::LocalHead::copied`]) is placed at that call: every call
+/// in its copy is (core `line!`: "the first macro invocation leading up to the expansion"), so
+/// the offsets inside it are dropped. `None`: no library body (an anonymous constant's
+/// rendering, a chain past [`MOST_LOCAL_LEVELS`]).
+fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: LibKey, owner: ItemKey, text: &str) -> Option<super::body_host::BodyAt> {
+    let mut key = owner;
+    let mut off = 0u32;
+    let mut fixed = false;
+    for _ in 0..MOST_LOCAL_LEVELS {
+        let Some(h) = store.locals.head(key) else {
+            // A library body: the lowered body itself (a free fn: its item; a member: the member
+            // whose text it is, never its container, whose first byte is not the member's), or
+            // the enclosing body a local was declared in, lowered from its own item's or
+            // member's text.
+            // A MEMBER by its container, kind and name (locals.rs `library_item_or_member`), never
+            // by its text's slice: tempo's check refused `line!()` in 167 bodies, every one a
+            // method, none of its free fns (tracing's callsite statics in `handle_tip`, `run`,
+            // ..: rt-loop a2210; blaze-cli engine_check_tests.rs
+            // `engine_check_checks_a_tracing_event_in_a_method`).
+            let lib = if key == owner {
+                match keys.library_in(names, owner) {
+                    Some(lib) if lib == item => item,
+                    _ => super::locals::library_item_or_member(names, keys, item, owner, text)?,
+                }
+            } else {
+                match keys.library_in(names, key) {
+                    Some(lib) => lib,
+                    None => {
+                        let head = store.fns.get(&key)?;
+                        super::locals::library_item_or_member(names, keys, head.lib, key, head.text)?
+                    }
+                }
+            };
+            return Some(super::body_host::BodyAt { lib, off, fixed });
+        };
+        if h.copied {
+            off = h.range.start;
+            fixed = true;
+        } else {
+            off = off.checked_add(h.range.start)?;
         }
-    });
-    found
+        key = h.enclosing;
+    }
+    None
 }
 
 fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, site: Site<'n>, mut into: Option<&mut PortableTys<'static>>) -> Result<Body<'n>, BodyError> {
@@ -1314,17 +1373,23 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     // an expansion, reads its path there (scoped.rs `body_blocks`). Only for a text that is the
     // library's item's or member's own (a local item's body, an anonymous constant's
     // rendering: none).
-    let blocks = match (library_body(names, item, text), names.crate_key(krate)) {
+    // A member by its key, never by its text's slice (locals.rs `library_item_or_member`: a
+    // method's blocks had no modules before).
+    let blocks = match (super::locals::library_item_or_member(names, keys, item, owner, text), names.crate_key(krate)) {
         (Some(body), Some(crate_key)) => super::scoped::body_blocks(crate_key, body, text, alloc),
         _ => None,
     };
     let scoped = ScopedBy { names, module, prepared: Some(prepared), blocks: blocks.as_ref().map(super::scoped::BodyBlocks::modules) };
     // The crate's host, the one item-level expansion answers from (census 13, brief 13): env,
     // includes, proc macros; `NoHost` refused them all.
-    let host = super::body_host::BodyHost::of(names, store.sources, krate, item, module, alloc);
+    // Placed by the body it is (a local item's: its enclosing item's), so `line!()` in a local
+    // static's initializer counts where the static is (tempo rt-loop a2000: tracing's callsite
+    // statics, checked as bodies of their own, were placed at their local key: refused).
+    let at = body_at(names, keys, store, item, owner, text);
+    let host = super::body_host::BodyHost::of_body(names, store.sources, krate, item, at, module, alloc);
     let body_sources = store.sources;
     let mut expand = ByName::with_names(&scoped, host, alloc);
-    let mut values = ModuleValues { names, module, store: &mut *store, keys: &mut *keys, failed: None, krate, item, text, blocks: None };
+    let mut values = ModuleValues { names, module, store: &mut *store, keys: &mut *keys, failed: None, krate, item, owner, text, blocks: None };
     let lowered = match marks {
         Some(marks) => blaze_lower::lower_body_expanding_marked(marks, edition, &mut CrateCfg(atoms), &mut values, &mut expand, alloc),
         None => blaze_lower::lower_body_expanding(text, edition, &mut CrateCfg(atoms), &mut values, &mut expand, alloc),
@@ -1413,6 +1478,16 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
         Some(t) => Some((t, super::async_output::of(store, owner).ok_or(BodyError::NoHead(owner))?)),
     };
 
+    // Where the body's written types are read when no block of its own is a module: a local
+    // item's at the module its HEAD read them at (locals.rs `LocalHead::names_at`: its block's
+    // module, whose chain reaches the blocks around it and then the body's module), not its
+    // enclosing body's module. Its signature is lowered again with its body, and a signature's
+    // path has no block scope for the blocks' imports to answer (block_type_uses.rs
+    // `through_use`): alloc's `custom_owner_from_box` writes `use core::ptr::NonNull;` and then
+    // `unsafe fn drop_box_raw<T: ?Sized>(ptr: NonNull<T>)` in its block, whose head resolved
+    // `NonNull` there while its body read it at `alloc::io::error`: E0412 (ladder rungs f3-dyn,
+    // x0-ref-11, x0-ref-12). Any other body: its own module.
+    let types_at = store.locals.head(owner).map_or(module, |h| h.names_at);
     let mut last = item;
     let mut typeck = None;
     for _ in 0..MOST_ROUNDS {
@@ -1425,7 +1500,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             // A written type's first segment is asked of the blocks' named imports first
             // (super::block_type_uses): a block holding only `use`s is no module to read at.
             env: Env {
-                module,
+                module: types_at,
                 params: &params,
                 bounds: Bounds::Done(&bounds),
                 self_,

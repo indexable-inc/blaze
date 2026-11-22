@@ -4,6 +4,10 @@
 //! OTHER FORMS (D160: `<HOME>/.blaze/v2/store/f<N>s<M>` of forms not this blaze's, and the
 //! legacy layout's files directly in `v2/store`: store/forms.rs), which this blaze never reads;
 //! `--store` removes the home's whole store root, `<HOME>/.blaze/v2/store`, every form in it.
+//! `--all` is `--store` and every folder of layout.rs's `Scope::All` (the derived caches), and
+//! says each folder of the home it keeps and why. Every folder it removes is a row of the one
+//! layout table (layout.rs), found by that row's exact path ([`walk`]), and each is checked
+//! before any is removed.
 //! The cleanup after a command's answer removes a store of another form once it is unused for
 //! forms.rs `EXPIRY_DAYS` ([`sweep_other_forms`]). Everything it removes is derived: the next
 //! command makes it again. It removes only what it can show is blaze's, and refuses by name
@@ -52,6 +56,10 @@ pub enum CheckoutEntry {
     At,
     /// `packs`: the checkout store before the one store (store.rs `OLD_CHECKOUT`).
     Packs,
+    /// `fsevents`: the file watch's cookies, `<pid>-<n>` (blaze-core fsevents.rs `COOKIE_AREA`,
+    /// journal_ask.rs `OWN_TRAFFIC`). Before it was listed, a clean of any checkout a watch had
+    /// run in was refused by this name.
+    Cookies,
     /// `last`, `leaves`, `records`: older forms a checkout may still hold.
     Last,
     Leaves,
@@ -59,8 +67,16 @@ pub enum CheckoutEntry {
 }
 
 impl CheckoutEntry {
-    pub const ALL: [CheckoutEntry; 7] =
-        [CheckoutEntry::At, CheckoutEntry::Last, CheckoutEntry::Leaves, CheckoutEntry::Packs, CheckoutEntry::Profile, CheckoutEntry::Records, CheckoutEntry::Start];
+    pub const ALL: [CheckoutEntry; 8] = [
+        CheckoutEntry::At,
+        CheckoutEntry::Cookies,
+        CheckoutEntry::Last,
+        CheckoutEntry::Leaves,
+        CheckoutEntry::Packs,
+        CheckoutEntry::Profile,
+        CheckoutEntry::Records,
+        CheckoutEntry::Start,
+    ];
 
     /// Its name in `.blaze/v2`.
     pub const fn name(self) -> &'static str {
@@ -69,6 +85,7 @@ impl CheckoutEntry {
             CheckoutEntry::Start => "start.txt",
             CheckoutEntry::At => "at",
             CheckoutEntry::Packs => "packs",
+            CheckoutEntry::Cookies => "fsevents",
             CheckoutEntry::Last => "last",
             CheckoutEntry::Leaves => "leaves",
             CheckoutEntry::Records => "records",
@@ -83,6 +100,7 @@ impl CheckoutEntry {
             CheckoutEntry::Start => ".blaze/v2/start.txt",
             CheckoutEntry::At => ".blaze/v2/at",
             CheckoutEntry::Packs => ".blaze/v2/packs",
+            CheckoutEntry::Cookies => ".blaze/v2/fsevents",
             CheckoutEntry::Last => ".blaze/v2/last",
             CheckoutEntry::Leaves => ".blaze/v2/leaves",
             CheckoutEntry::Records => ".blaze/v2/records",
@@ -108,6 +126,9 @@ pub const CHECKOUT_STATE: &str = ".blaze/v2";
 /// The store root, beneath the home: `.blaze/` and plain_place.rs `STORE_ROOT` (a test holds
 /// them equal); this blaze's store is the folder of its forms in it (`STORE_DIR`).
 pub const HOME_STORE: &str = ".blaze/v2/store";
+
+// The derived per-user cache folders `--all` removes besides [`HOME_STORE`] are layout.rs's
+// `Scope::All` rows (one table, rule 30); `toolchain` and `sources`, fetched upstream, are kept.
 
 /// How deep a removed tree may go below the folder removed.
 pub const DEPTH_MOST: u32 = 8;
@@ -280,10 +301,15 @@ pub fn run(cx: &Cx, io: &bstd::Io, args: &bstd::args::Args, out: &bstd::out::Out
 pub fn run_with<'w>(cx: &Cx, io: &bstd::Io, words: impl Iterator<Item = &'w str>, home: Option<&str>, out: &bstd::out::Out) -> Result<bstd::entry::Status, crate::CliError> {
     let mut dir = None;
     let mut with_store = false;
+    let mut with_all = false;
     for arg in words {
         match arg {
             "--store" => with_store = true,
-            flag if flag.starts_with('-') => return Err(crate::CliError::Usage("`blaze clean` takes a folder and `--store`")),
+            "--all" => {
+                with_store = true;
+                with_all = true;
+            }
+            flag if flag.starts_with('-') => return Err(crate::CliError::Usage("`blaze clean` takes a folder and `--store` or `--all`")),
             _ if dir.is_some() => return Err(crate::CliError::Usage("`blaze clean` takes one folder")),
             folder => dir = Some(folder),
         }
@@ -298,28 +324,23 @@ pub fn run_with<'w>(cx: &Cx, io: &bstd::Io, words: impl Iterator<Item = &'w str>
     // Both folders are checked before either is removed: a refusal removes nothing.
     let state = checkout_state(cx, &root).map_err(crate::CliError::Clean)?;
     let mut not_blazes = None;
+    let mut home_root_dir = None;
     // The home's store root, when HOME names one and it is blaze's (its cache directory tag):
-    // `--store` removes it whole; without it, only its stores of other forms go (D160: they
-    // are cleanup's, never read by this blaze). No HOME and no `--store`: no home to clean.
+    // `--store` removes it whole; `--all` also removes derived caches under `.blaze/v2/`;
+    // without either, only stores of other forms go (D160).
     let held = match home {
         None if with_store => return Err(crate::CliError::Clean(CleanError::NoHome)),
         None => None,
-        // A home that does not exist (HOME names a folder never made) holds no store: nothing
-        // of it to remove, and no failure, as for a home with no store root (below). It is
-        // looked at in the file system's root before it is opened as a tree, whose listing of a
-        // missing folder is an error.
         Some(home) if fs.root().stat(cx, &Path::new(home.trim_matches('/'))?)?.is_none() => None,
         Some(home) => {
-            // The home as a folder of the filesystem's root as a second tree (as roster.rs
-            // opens a binary's folder), so its `.blaze` is listed before it is entered.
             let below = home.trim_matches('/');
             let dir = fs.home(cx, "/", &Path::new(below)?).map_err(|error| crate::CliError::Clean(CleanError::Home(error)))?;
-            // A home with no store root (a new user, one who never ran blaze) is `None`:
-            // nothing of it to remove, and no failure. A root not shown blaze's (no tag, or
-            // another tool's) is refused with `--store`; without it, the checkout is still
-            // cleaned and the line below says the home's root was not looked into.
+            let lead_str = bstd::mem::format_in!(frame, "/{below}/");
+            if with_all {
+                home_root_dir = Some((dir.clone(), bstd::mem::format_in!(frame, "/{below}/")));
+            }
             match store(cx, &dir, frame) {
-                Ok(found) => found.map(|found| (dir, bstd::mem::format_in!(frame, "/{below}/"), found)),
+                Ok(found) => found.map(|found| (dir, lead_str, found)),
                 Err(refusal @ CleanError::NotTheStore { .. }) if !with_store => {
                     not_blazes = Some(refusal);
                     None
@@ -328,6 +349,13 @@ pub fn run_with<'w>(cx: &Cx, io: &bstd::Io, words: impl Iterator<Item = &'w str>
             }
         }
     };
+    // `--all`: each of layout.rs's `All` folders checked (a folder, no link on its way) before
+    // anything is removed, so a refusal removes nothing.
+    if let Some((home_dir, _)) = &home_root_dir {
+        for row in crate::layout::of(crate::layout::Scope::All) {
+            walk(cx, home_dir, row).map_err(crate::CliError::Clean)?;
+        }
+    }
     let mut any = false;
     if let Some(found) = state {
         let removed = remove(cx, &root, found).map_err(crate::CliError::Clean)?;
@@ -348,6 +376,23 @@ pub fn run_with<'w>(cx: &Cx, io: &bstd::Io, words: impl Iterator<Item = &'w str>
             }
         }
     }
+    if let Some((home_dir, lead)) = home_root_dir {
+        // Each row's folder by its exact path, never a name matched in a listing: a folder
+        // beside them that no row names is never looked at.
+        for row in crate::layout::of(crate::layout::Scope::All) {
+            let Some(found) = walk(cx, &home_dir, row).map_err(crate::CliError::Clean)? else { continue };
+            let removed = remove(cx, &home_dir, found).map_err(crate::CliError::Clean)?;
+            out.line(cx, format_args!("{} ({})", Said { lead: lead.as_str(), removed: &removed }, row.holds))?;
+            any = true;
+        }
+        // What `--all` keeps of the home, each said with why (a look only: nothing is entered
+        // or removed, so a link there is no refusal).
+        for (row, why) in crate::layout::kept_at_home() {
+            if home_dir.stat(cx, &Path::new(row.path)?)?.is_some() {
+                out.line(cx, format_args!("kept: {}: {why}", row.short()))?;
+            }
+        }
+    }
     if let Some(CleanError::NotTheStore { path, why }) = &not_blazes {
         out.line(cx, format_args!("{}", NotLooked { path, why }))?;
     }
@@ -357,44 +402,47 @@ pub fn run_with<'w>(cx: &Cx, io: &bstd::Io, words: impl Iterator<Item = &'w str>
     Ok(bstd::entry::Status::OK)
 }
 
-/// The checkout's `.blaze/v2`, when it is there and blaze's: `root` is the checkout. `None`
-/// when there is nothing to remove.
+/// The folder layout.rs's `row` names, beneath `dir` (the root of the row's place), when it is
+/// there: each folder on its way looked at in its parent's listing, which never follows a
+/// link, and refused by name when it is not a folder. The one way `clean` finds what it
+/// removes: only a row's exact path is ever returned, never a name matched in a listing.
+fn walk(cx: &Cx, dir: &Dir<ReadWrite>, row: &crate::layout::Row) -> Result<Option<Found>, CleanError> {
+    let path = row.path;
+    let mut listing = dir.own_entries(cx)?;
+    let mut start = 0;
+    // Bounded by the row's path: one listing a `/` in it.
+    loop {
+        let end = path[start..].find('/').map_or(path.len(), |at| start + at);
+        let Some(at) = listing.find(&path[start..end]) else { return Ok(None) };
+        folder(row.place, listing.kind(at), &path[..end])?;
+        if end == path.len() {
+            return Ok(Some(Found { place: row.place, path: Path::new(path)? }));
+        }
+        let Some(next) = dir.entries(cx, &Path::new(&path[..end])?)? else { return Ok(None) };
+        listing = next;
+        start = end + 1;
+    }
+}
+
+/// The checkout's `.blaze/v2` (layout.rs `CHECKOUT`), when it is there and blaze's: `root` is
+/// the checkout. `None` when there is nothing to remove.
 pub fn checkout_state(cx: &Cx, root: &Dir<ReadWrite>) -> Result<Option<Found>, CleanError> {
-    let place = Place::Checkout;
-    // Each step looks at its folder in its parent's listing, which never follows a link.
-    let top = root.own_entries(cx)?;
-    let Some(at) = top.find(".blaze") else { return Ok(None) };
-    folder(place, top.kind(at), ".blaze")?;
-    let Some(blaze) = root.entries(cx, &Path::new(".blaze")?)? else { return Ok(None) };
-    let Some(at) = blaze.find("v2") else { return Ok(None) };
-    folder(place, blaze.kind(at), CHECKOUT_STATE)?;
-    let state = Path::new(CHECKOUT_STATE)?;
-    let Some(entries) = root.entries(cx, &state)? else { return Ok(None) };
+    let Some(found) = walk(cx, root, &crate::layout::CHECKOUT)? else { return Ok(None) };
+    let Some(entries) = root.entries(cx, &found.path)? else { return Ok(None) };
     for (i, (name, _)) in entries.iter().enumerate() {
         if !CHECKOUT_ENTRIES.contains(&name) {
             return Err(CleanError::Unknown { path: entries.path(i)? });
         }
     }
-    Ok(Some(Found { place, path: state }))
+    Ok(Some(found))
 }
 
-/// The home's store, when it is there and blaze's: `home` is the home folder. `None` when
-/// there is nothing to remove.
+/// The home's store root (layout.rs `STORE`), when it is there and blaze's: `home` is the home
+/// folder. `None` when there is nothing to remove.
 pub fn store(cx: &Cx, home: &Dir<ReadWrite>, frame: &Frame) -> Result<Option<Found>, CleanError> {
-    let place = Place::Home;
-    // Each step looks at its folder in its parent's listing, which never follows a link.
-    let own = home.own_entries(cx)?;
-    let Some(at) = own.find(".blaze") else { return Ok(None) };
-    folder(place, own.kind(at), ".blaze")?;
-    let Some(blaze) = home.entries(cx, &Path::new(".blaze")?)? else { return Ok(None) };
-    let Some(at) = blaze.find("v2") else { return Ok(None) };
-    folder(place, blaze.kind(at), ".blaze/v2")?;
-    let Some(v2) = home.entries(cx, &Path::new(".blaze/v2")?)? else { return Ok(None) };
-    let Some(at) = v2.find("store") else { return Ok(None) };
-    folder(place, v2.kind(at), HOME_STORE)?;
-    let path = Path::new(HOME_STORE)?;
-    let Some(entries) = home.entries(cx, &path)? else { return Ok(None) };
-    let refused = |why| Err(CleanError::NotTheStore { path: path.clone(), why });
+    let Some(found) = walk(cx, home, &crate::layout::STORE)? else { return Ok(None) };
+    let Some(entries) = home.entries(cx, &found.path)? else { return Ok(None) };
+    let refused = |why| Err(CleanError::NotTheStore { path: found.path.clone(), why });
     let Some(tag) = entries.find(blaze_cas::plain::CACHEDIR_TAG) else { return refused("holds no CACHEDIR.TAG") };
     if entries.kind(tag) != EntryKind::File {
         return refused("holds a CACHEDIR.TAG that is not a file");
@@ -407,7 +455,7 @@ pub fn store(cx: &Cx, home: &Dir<ReadWrite>, frame: &Frame) -> Result<Option<Fou
     if !blazes_tag(bytes.as_slice()) {
         return refused("holds a CACHEDIR.TAG that blaze did not write");
     }
-    Ok(Some(Found { place, path }))
+    Ok(Some(found))
 }
 
 /// The folder `found` names (beneath `dir`, the directory it was found in) removed with

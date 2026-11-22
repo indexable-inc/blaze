@@ -38,6 +38,7 @@ fn cfg(n: u64, root: &blaze_mem::Frame) -> PlainConfig<&blaze_mem::Frame> {
         writes,
         reads,
         liveness: super::super::Liveness::Everything,
+        lock_step: crate::plain::LockStep::Backoff,
     }
 }
 

@@ -1717,6 +1717,8 @@ fn statx_at(dir: RawFd, leaf: &[u8]) -> Stamp {
         size: stat.size,
         mtime_ns: ns(&stat.mtime),
         ctime_ns: ns(&stat.ctime),
+        // Always filled, whatever the mask; encoded as `st_dev` is, as uring/files.rs's `Meta`.
+        dev: blaze_sys::posix::proc::makedev(stat.dev_major, stat.dev_minor),
         mode: u32::from(stat.mode),
     }
 }

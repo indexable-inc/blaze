@@ -7,7 +7,7 @@
 //!
 //! Keyed by the program's manifest (the key of the record that lists the program's items and
 //! their code records, run.md): [`StartupImage::key_for`]. Stored under
-//! [`Namespace::LOCAL`] with [`IMAGE_TAG`], as any record; a new manifest is a new key, so an
+//! [`Namespace::LOCAL`] with blaze-keyed's `ReservedTag::Image`, as any record; a new manifest is a new key, so an
 //! edit never reads the image of another program. Bytes, little-endian, deterministic (the
 //! order is the placement order, which the program's own run fixes):
 //!
@@ -28,13 +28,8 @@
 use std::alloc::Allocator;
 
 use blaze_ids::ContentId;
-use blaze_keyed::kind::Tag;
-
-use super::core::{Placed, ROOT_TAG};
+use super::core::Placed;
 use crate::Key;
-
-/// The tag of startup images: reserved beside [`ROOT_TAG`], no kind of blaze-keyed's takes it.
-pub const IMAGE_TAG: Tag = Tag(ROOT_TAG.0 - 1);
 
 const MAGIC: [u8; 4] = *b"BLSI";
 const FORMAT: u32 = 1;

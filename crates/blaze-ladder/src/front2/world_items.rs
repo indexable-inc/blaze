@@ -125,6 +125,9 @@ pub enum Gap {
     /// (`World::member_visible`): why (a `pub(in path)` in the impl's crate, a module chain
     /// the names do not hold, no frame for the impl).
     MemberVisibility { impl_: ItemKey, name: Name, why: &'static str },
+    /// Whether member `name` of inherent impl `impl_` is unstable under a feature the body's
+    /// crate does not turn on could not be told (`World::member_unstable`): why.
+    MemberStability { impl_: ItemKey, name: Name, why: &'static str },
     /// An import through the one ask (`AsksMet::Once`, front2 asks.rs) was refused: the need
     /// and why.
     Ask(super::asks::AskRefused),
@@ -183,6 +186,9 @@ impl core::fmt::Display for Gap {
             Gap::MemberVisibility { impl_, name, why } => {
                 write!(f, "whether the body may name the member {name:?} of inherent impl {impl_:?} (the Reference, \"Visibility and privacy\"): {why}")
             }
+            Gap::MemberStability { impl_, name, why } => {
+                write!(f, "whether the member {name:?} of inherent impl {impl_:?} is unstable under a feature this crate does not turn on (rustc's `eval_stability`): {why}")
+            }
             Gap::Ask(refused) => write!(f, "{refused}"),
         }
     }
@@ -239,6 +245,9 @@ pub struct BodyWorld<'w, 'n, S = &'n Names<'n>> {
     /// read ([`Self::path`], by `blaze_lower::mark_site::site_of`). Empty for a world that
     /// resolves no path (a projection's, a selection's): a path asked there is a gap.
     pub path_marks: &'w [Option<blaze_lower::mark_site::TextMark>],
+    /// Parallel to the same paths: the namespace each is resolved in (blaze-lower
+    /// `TypeckBody::path_ns`; rustc `PathSource::namespace`). Empty where `path_marks` is.
+    pub path_ns: &'w [blaze_lower::typeck::PathNs],
     pub fills: RefCell<Vec<Fill, Global>>,
     pub gaps: RefCell<Vec<Gap, Global>>,
     /// Which opaques this world answers the hidden type of: a body's check sees only its leak
@@ -277,10 +286,17 @@ pub(super) fn ctor_world<'n, S: NamesSource<'n>, T>(
     // closure, clone_shim.rs `language_clone`: each field's `clone` is resolved here): its
     // world is its trait's. Every question it asks is at ground arguments (`Reveal::All`, the
     // whole program's impls: coherence makes the answer the same in every world).
+    // A fn row with a head and no live body: the world of its own module, for the same reason
+    // (every question at ground arguments). Asked only by a found code entry's read list asked
+    // again before any body is checked (run/make_one.rs `verify_instance`: its `Resolve`,
+    // `DropImpl` and `Normalize` rows); a make checks its fn first, so its world is the body's.
     let at = match store.ctors.get(&ctor) {
         Some(c) => c.adt,
         None => match keys.origin(ctor) {
             Some(super::keys::Origin::Member { container, .. }) if store.trait_defs.contains_key(container) => *container,
+            // An impl's fn: the impl's module, as its library item.
+            Some(super::keys::Origin::Member { container, .. }) if store.fns.contains_key(&ctor) => *container,
+            _ if store.fns.contains_key(&ctor) => ctor,
             _ => return Err(refused),
         },
     };
@@ -302,6 +318,7 @@ pub(super) fn ctor_world<'n, S: NamesSource<'n>, T>(
         traits: &[],
         blocks: &blocks,
         path_marks: &[],
+        path_ns: &[],
         fills: RefCell::new(Vec::new_in(Global)),
         gaps: RefCell::new(Vec::new_in(Global)),
         reveal: super::opaque_auto::Reveal::All,
@@ -516,6 +533,14 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     fn goal_share(&self) -> Option<&dyn blaze_solve::share::GoalShare> {
         self.store.goals
     }
+    /// Under the one ask over frozen heads (`AsksMet::Once` with `Store::seeds`: D161, front2
+    /// asks.rs) every head and impl answer that can be made is made on the spot, so a hole is a
+    /// fact this world cannot make inline (a body-local item's head, an impl candidate left
+    /// `NotHere`, another body's record): the run stops at it, never reading a stand-in past
+    /// it, and the round's fill is exactly that fact. Elsewhere the stand-in path, as before.
+    fn stops_at_holes(&self) -> bool {
+        self.store.stops_at_holes()
+    }
     /// The syntactic prefetch of a body with no record: the questions its text names, before
     /// the walk enters it. Not answered here (no read enters the list); collected as the
     /// body's gate set while round 0 collects (front2 asks.rs `Gate`).
@@ -538,6 +563,9 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     }
     fn member_visible(&self, _: Seal, container: ItemKey, name: Name) -> Fetch<bool> {
         self.again(|| self.member_visible_once(container, name))
+    }
+    fn member_unstable(&self, _: Seal, container: ItemKey, name: Name) -> Fetch<bool> {
+        self.again(|| self.member_unstable_once(container, name))
     }
     fn adt(&self, _: Seal, item: ItemKey) -> Fetch<Option<tc::Adt<'_>>> {
         self.again(|| self.adt_once(item))
@@ -714,6 +742,47 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// restriction names the nearest NORMAL module (a block's module is passed over:
     /// `written_module(m, 0)`), and a module sees it when that module is on its chain
     /// (`written_module(body, n)` for n = 0, 1, ..). What cannot be told is a named gap.
+    /// Whether member `name` of inherent impl `container` is unstable under a library feature
+    /// the body's crate does not turn on ([`World::member_unstable`]): rustc_middle
+    /// stability.rs `eval_stability_allow_unstable`. The member's stability is its impl head's
+    /// (`ImplHead::unstable`, read from its `#[unstable(..)]`); an item of the body's own crate
+    /// is allowed ("Only the cross-crate scenario matters"), and so is one whose `feature` or
+    /// `implied_by` the body's crate root turns on (`NamesSource::has_feature`, the crate
+    /// root's `#![feature]` list: a read of the root over records). Not read: a macro's
+    /// `#[allow_internal_unstable(..)]` at the call (rustc's `span.allows_unstable`) and a
+    /// module's own `#[unstable]` over an unmarked impl.
+    fn member_unstable_once(&self, container: ItemKey, name: Name) -> Fetch<bool> {
+        let Some(i) = self.store.impls.get(&container) else {
+            return match self.detail(container) {
+                Some(ItemDetail::Impl) => self.want(container),
+                // No inherent impl: the question was asked of no member, nothing marks it.
+                _ => Ok(false),
+            };
+        };
+        let Some((_, u)) = i.unstable.iter().find(|(n, _)| *n == name) else { return Ok(false) };
+        let gap = |why: &'static str| self.gap(Gap::MemberStability { impl_: container, name, why });
+        let home = self.keys.library_in(self.names, container).and_then(|k| self.names.crate_of(k));
+        let (Some(home_crate), Some(body_crate)) = (home, self.names.crate_of(self.module)) else {
+            return gap("the names hold no crate for the impl or the body's module");
+        };
+        if home_crate == body_crate {
+            return Ok(false);
+        }
+        let Some(on) = self.names.has_feature(body_crate, &u.feature) else {
+            return gap("the body's crate root features are not answered");
+        };
+        if on {
+            return Ok(false);
+        }
+        match u.implied_by.as_deref() {
+            None => Ok(true),
+            Some(by) => match self.names.has_feature(body_crate, by) {
+                Some(on) => Ok(!on),
+                None => gap("the body's crate root features are not answered"),
+            },
+        }
+    }
+
     fn member_visible_once(&self, container: ItemKey, name: Name) -> Fetch<bool> {
         let Some(i) = self.store.impls.get(&container) else {
             return match self.detail(container) {

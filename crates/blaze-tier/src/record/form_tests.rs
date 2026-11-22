@@ -1,6 +1,7 @@
-//! The `bzcode02` form: a round trip of a record with every section, each list the caller sorts
-//! refused unsorted by its own variant, and `from_v1` placed against blaze-code's `bzcode01`
-//! `place` as the oracle. Each test prints the line its doc comment names.
+//! The `bzcode08` form: a round trip of a record with every section, each list the caller sorts
+//! refused unsorted by its own variant, each rule of the trap, alignment and slot columns
+//! refused by its own variant, and `from_v1` placed against blaze-code's `place` and
+//! `place_resolved` as the oracle. Each test prints the line its doc comment names.
 
 extern crate std;
 
@@ -9,14 +10,17 @@ use std::println;
 use blaze_code::a64::adrp_ldr_target;
 use blaze_code::image::ImageError;
 use blaze_code::place::{At, Words};
-use blaze_code::record::{CodeRecord, CodeView, NO_TARGET, OWN_CODE, OWN_RELRO, Pad, Site, SiteKind, Space, Symbol, Target, Word};
+use blaze_code::record::{
+    CodeRecord, CodeView, Held, NO_TARGET, OWN_CODE, OWN_RELRO, Pad, PositionField, PositionPart, PositionRow, Site, SiteKind, Space,
+    Subject, Symbol, Target, TrapKind, TrapRow, Word,
+};
 use blaze_code::unwind::{Action, Frame, Row};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_run::InstanceKey;
 use blaze_run::parent::Read;
 
 use super::form::{FormError, encode, read, seal};
-use super::place::place;
+use super::place::{place, place_resolved};
 use super::v1::from_v1;
 use super::{Declare, DeclaredKind, Declares, Emitted, InlineFrame, Live, LoopHeader, OUTERMOST, Place, Poll, Position, Reloc, RelocKind, declare};
 use crate::Reg;
@@ -112,6 +116,23 @@ fn every(alloc: Alloc<'static>) -> Emitted<'static> {
     e.text.extend_from_slice(b"unusedputs");
     e.names.push((Symbol::of_name("unused"), 0, 6));
     e.names.push((Symbol::of_name("puts"), 6, 4));
+    // The bzcode08 columns: the parts' alignments, two trap rows out of order (one with a
+    // subject keeping a discriminant past its count, which the seal zeroes), and a slot in each
+    // part (a zero word after the code, one after the relro words), out of order.
+    e.code_align = 6;
+    e.relro_align = 4;
+    e.traps.push(TrapRow {
+        at: 44,
+        kind: TrapKind::Discriminant,
+        site: Some((0x55, 7)),
+        held: Held::Reg(3),
+        subject: Some(Subject { item: 0x66, count: 2, discriminants: [1, 5, 9, 0, 0, 0, 0, 0] }),
+    });
+    e.traps.push(TrapRow { at: 40, kind: TrapKind::BodyEnd, site: None, held: Held::Stack(24), subject: None });
+    e.code.extend_from_slice(&[0; 4]);
+    e.relro.extend_from_slice(&[0; 8]);
+    e.position_slots.push(PositionRow { part: PositionPart::Relro, at: 24, item: 0x77, site: 3, field: PositionField::Col });
+    e.position_slots.push(PositionRow { part: PositionPart::Code, at: 48, item: 0x77, site: 3, field: PositionField::Line });
     declare(&mut e, &BySymbol).unwrap();
     e
 }
@@ -138,6 +159,16 @@ fn every_section_round_trips_to_equal_bytes() {
     assert_eq!(view.inline_frame(1).instance, InstanceKey([8; 32]));
     assert_eq!(view.read_row(1), Read { fact: [3; 32], digest: [4; 32] });
     assert_eq!(view.unwind_frame(), Some(Frame::PLAIN));
+    assert_eq!((view.code_align(), view.relro_align()), (6, 4), "the parts' alignments");
+    assert_eq!(view.traps(), 2);
+    assert_eq!(view.trap(0), TrapRow { at: 40, kind: TrapKind::BodyEnd, site: None, held: Held::Stack(24), subject: None }, "trap rows by offset");
+    let subject = view.trap_at(44).and_then(|t| t.subject);
+    assert_eq!(subject.map(|s| s.discriminants), Some([1, 5, 0, 0, 0, 0, 0, 0]), "the subject, zeroed past its count");
+    assert_eq!(view.trap_at(44).map(|t| (t.site, t.held)), Some((Some((0x55, 7)), Held::Reg(3))));
+    assert_eq!(view.trap_at(42), None, "no trap row between");
+    assert_eq!(view.position_slots(), 2);
+    assert_eq!((view.position_slot(0).part, view.position_slot(0).at), (PositionPart::Code, 48), "slots by (part, offset)");
+    assert_eq!(view.position_slot(1).field, PositionField::Col);
     let again = seal(view.to_emitted(alloc)).unwrap();
     let mut second: AVec<'static, u8> = Vec::new_in(alloc);
     encode(&again, &mut second);
@@ -179,7 +210,40 @@ fn each_unsorted_list_is_refused_by_its_own_variant() {
     let mut e = every(alloc);
     e.reads.push(Read { fact: [3; 32], digest: [9; 32] });
     assert_eq!(seal(e).err(), Some(FormError::ReadsUnsorted { row: 2 }), "a repeated fact is refused too");
-    println!("bzcode03: each unsorted list is refused by its own variant");
+    println!("bzcode08: each unsorted list is refused by its own variant");
+}
+
+/// Prints `bzcode08: each broken rule of the new columns is refused by its own variant`. Fails
+/// if an alignment out of range, a trap row off the code, twice at one `brk`, with the form's
+/// word for no site or a register past x30, or a slot misaligned, outside, not zero, twice, or
+/// on a relocation's or a relro word's bytes seals (the control seals).
+#[test]
+fn each_broken_column_rule_is_refused_by_its_own_variant() {
+    let alloc = Alloc::global();
+    assert!(seal(every(alloc)).is_ok(), "the control record seals");
+    let refused = |change: &dyn Fn(&mut Emitted<'static>)| {
+        let mut e = every(alloc);
+        change(&mut e);
+        seal(e).err()
+    };
+    assert_eq!(refused(&|e| e.code_align = 3), Some(FormError::Align { part: "code", align: 3 }));
+    assert_eq!(refused(&|e| e.relro_align = 13), Some(FormError::Align { part: "relro part", align: 13 }));
+    let trap = |at, site, held| TrapRow { at, kind: TrapKind::MatchNoArm, site, held, subject: None };
+    assert_eq!(refused(&|e| e.traps.push(trap(2, None, Held::Unknown))), Some(FormError::TrapOutside { at: 2 }));
+    assert_eq!(refused(&|e| e.traps.push(trap(52, None, Held::Unknown))), Some(FormError::TrapOutside { at: 52 }));
+    assert_eq!(refused(&|e| e.traps.push(trap(40, None, Held::Unknown))), Some(FormError::TrapsUnsorted { at: 40 }));
+    assert_eq!(refused(&|e| e.traps.push(trap(4, Some((1, u32::MAX)), Held::Unknown))), Some(FormError::TrapSite { at: 4 }));
+    assert_eq!(refused(&|e| e.traps.push(trap(4, None, Held::Reg(31)))), Some(FormError::HeldReg { at: 4, reg: 31 }));
+    let slot = |part, at| PositionRow { part, at, item: 1, site: 0, field: PositionField::Line };
+    let (code, relro) = (PositionPart::Code, PositionPart::Relro);
+    assert_eq!(refused(&|e| e.position_slots.push(slot(relro, 26))), Some(FormError::SlotMisaligned { part: relro, at: 26 }));
+    assert_eq!(refused(&|e| e.position_slots.push(slot(relro, 32))), Some(FormError::SlotOutside { part: relro, at: 32 }));
+    assert_eq!(refused(&|e| e.position_slots.push(slot(code, 0))), Some(FormError::SlotNonzero { part: code, at: 0 }));
+    assert_eq!(refused(&|e| e.position_slots.push(slot(relro, 24))), Some(FormError::SlotsUnsorted { part: relro, at: 24 }));
+    // Relro 16..24 is the `Abs64`'s, 0..8 a word's: zero bytes, so only the reference rule stops them.
+    assert_eq!(refused(&|e| e.position_slots.push(slot(relro, 20))), Some(FormError::SlotOverlapsReference { part: relro, at: 20 }));
+    assert_eq!(refused(&|e| e.position_slots.push(slot(relro, 4))), Some(FormError::SlotOverlapsReference { part: relro, at: 4 }));
+    println!("bzcode08: each broken rule of the new columns is refused by its own variant");
 }
 
 /// The run's reservation: the slot words at `TABLE`, the thunk words 64 KiB after them (another
@@ -271,5 +335,68 @@ fn from_v1_places_like_bzcode01() {
     assert_eq!(adrp_ldr_target(inst(&old_code, 12), inst(&old_code, 16), at.code + 12), Some(THUNK_WORDS + 8), "the oracle's load reaches g's thunk word");
     assert!(code == old_code, "code differs from bzcode01's place");
     assert!(relro == old_relro, "relro differs from bzcode01's place");
-    println!("bzcode03: from_v1 places to the bytes bzcode01's place makes (call, load, relro, words)");
+    println!("bzcode08: from_v1 places to the bytes bzcode01's place makes (call, load, relro, words)");
+}
+
+/// Prints `bzcode08: from_v1 carries the alignments, trap rows and slots; the slots place as
+/// bzcode07's`. The oracle is blaze-code's `place_resolved` on the same record. Fails if
+/// from_v1 drops or changes a part's alignment, a trap row (its held value or subject) or a
+/// source-position slot, if the placer fills a slot other than bzcode07's does, or if a record
+/// with slots places with no answers or an answer of 0 (each refused by name).
+#[test]
+fn from_v1_carries_the_columns_and_places_slots_alike() {
+    let alloc = Alloc::global();
+    let at = At { code: CODE + 0x40, relro: CODE + 0x8000 };
+    let symbol = Symbol::of_name("h");
+    let with_columns = || {
+        let mut r = v1_record(alloc);
+        // A zero word after the code and one after the relro words: a line and a column slot.
+        r.code.extend_from_slice(&[0; 4]);
+        r.relro.extend_from_slice(&[0; 8]);
+        r.positions.push(PositionRow { part: PositionPart::Relro, at: 24, item: 0x21, site: 9, field: PositionField::Col });
+        r.positions.push(PositionRow { part: PositionPart::Code, at: 40, item: 0x21, site: 9, field: PositionField::Line });
+        r.code_align = 5;
+        r.relro_align = 4;
+        let subject = Subject { item: 0x44, count: 3, discriminants: [0, 1, 2, 0, 0, 0, 0, 0] };
+        r.traps.push(TrapRow { at: 36, kind: TrapKind::Discriminant, site: Some((0x21, 4)), held: Held::Reg(9), subject: Some(subject) });
+        r
+    };
+    let values: [u8; 8] = [12, 0, 0, 0, 34, 0, 0, 0];
+
+    let sealed = with_columns().seal().unwrap();
+    let mut old_bytes: AVec<'static, u8> = Vec::new_in(alloc);
+    sealed.encode(&mut old_bytes);
+    let old_view = CodeView::read(&old_bytes).unwrap();
+    let mut old_code = [0u8; 44];
+    let mut old_relro = [0u8; 32];
+    blaze_code::place::place_resolved(&old_view, symbol, at, &mut Table, &mut old_code, &mut old_relro, &values).unwrap();
+
+    let mut emitted = from_v1(with_columns(), alloc).unwrap();
+    declare(&mut emitted, &BySymbol).unwrap();
+    let sealed = seal(emitted).unwrap();
+    let mut new_bytes: AVec<'static, u8> = Vec::new_in(alloc);
+    encode(&sealed, &mut new_bytes);
+    let view = read(&new_bytes).unwrap();
+    assert_eq!((view.code_align(), view.relro_align()), (old_view.code_align(), old_view.relro_align()), "the alignments carried");
+    assert_eq!(view.traps(), old_view.traps());
+    assert_eq!(view.trap(0), old_view.trap(0), "the trap row carried whole, its subject too");
+    assert_eq!(view.position_slots(), old_view.positions());
+    for i in 0..view.position_slots() {
+        assert_eq!(view.position_slot(i), old_view.position(i), "slot {i} carried, in the same order");
+    }
+    let mut code = [0u8; 44];
+    let mut relro = [0u8; 32];
+    place_resolved(&view, symbol, at, &mut Table, &mut code, &mut relro, &values).unwrap();
+    assert!(code == old_code, "code differs from bzcode07's place_resolved");
+    assert!(relro == old_relro, "relro differs from bzcode07's place_resolved");
+    assert_eq!((inst(&code, 40), inst(&relro, 24)), (12, 34), "the line in the code's slot, the column in relro's");
+
+    let no_answers = place(&view, symbol, at, &mut Table, &mut code, &mut relro);
+    assert!(matches!(no_answers, Err(blaze_code::place::PlaceError::PositionBytes { rows: 2, bytes: 0, .. })), "slots with no answers are refused");
+    let zero = place_resolved(&view, symbol, at, &mut Table, &mut code, &mut relro, &[0; 8]);
+    assert!(matches!(zero, Err(blaze_code::place::PlaceError::Site(ImageError::ZeroPosition { .. }))), "an answer of 0 is refused");
+    let off = At { code: CODE + 0x50, relro: at.relro };
+    let misaligned = place_resolved(&view, symbol, off, &mut Table, &mut code, &mut relro, &values);
+    assert!(matches!(misaligned, Err(blaze_code::place::PlaceError::Misaligned { align: 32, .. })), "code off its 32-byte alignment is refused");
+    println!("bzcode08: from_v1 carries the alignments, trap rows and slots; the slots place as bzcode07's");
 }

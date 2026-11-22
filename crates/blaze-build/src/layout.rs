@@ -163,13 +163,20 @@ pub struct ValidRange {
 /// the records: equal questions, equal answers.
 pub trait LayoutFacts {
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>>;
-    fn repr(&self, key: ItemKey) -> ReprAttrs;
+    /// ADT `key`'s `#[repr(..)]`. `Err(Missing)` when its head is not made yet (a lazy front end
+    /// asked before the ADT's head): never a default `repr(Rust)`, which would lay a packed,
+    /// `simd` or niche-hiding type out wrong depending on what was asked before (D194). Its
+    /// `item` is the ADT, and the asker refuses as for `adt`'s `None` ([`Missing::head`]:
+    /// [`Refusal::NoAdt`], a build's `BuildError::NoAdt`), which every driver answers by making
+    /// the head and asking again.
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, Missing>;
     /// The explicit discriminant `= n` of variant `variant` of enum `key`, evaluated; `None`
     /// when it is not written (it is then one more than the previous variant's).
-    /// `Err(Missing)` when that value's record is not made yet: the layout then refuses with
-    /// [`Refusal::Missing`] and caches nothing.
+    /// `Err(Missing)` when that value's record (or the enum's head) is not made yet: the layout
+    /// then refuses with [`Refusal::Missing`] and caches nothing.
     fn discriminant(&self, key: ItemKey, variant: u32) -> Result<Option<i128>, Missing>;
-    fn valid_range(&self, key: ItemKey) -> ValidRange;
+    /// ADT `key`'s `rustc_layout_scalar_valid_range_*` bounds; `Err(Missing)` as [`Self::repr`].
+    fn valid_range(&self, key: ItemKey) -> Result<ValidRange, Missing>;
 
     /// The projection `<args[0] as trait_<args[1..]>>::name` (as `PNode::Alias` holds it) at
     /// concrete arguments, normalized by the front end's solver: `args` are types of `ground`
@@ -774,11 +781,20 @@ pub enum Refusal {
     NoSize(ItemKey),
 }
 
-/// A fact [`LayoutFacts`] cannot answer yet: the record of `item` (an enum whose explicit
-/// discriminant is not evaluated) is not made.
+/// A fact [`LayoutFacts`] cannot answer yet: the record of `item` is not made (an enum whose
+/// explicit discriminant is not evaluated, or an ADT whose head is not made: its `repr`, valid
+/// range or discriminants).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Missing {
     pub item: ItemKey,
+}
+
+impl Missing {
+    /// A head fact's `Missing` (`repr`, `valid_range`: `item` is the ADT) as the refusal of an
+    /// unanswered head, the one every driver makes and asks again: [`Refusal::NoAdt`].
+    pub fn head(self) -> Refusal {
+        Refusal::NoAdt(self.item)
+    }
 }
 
 /// A type with no layout: the type of the ground table, and why.
@@ -1234,7 +1250,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             }
             let node = cx.ground.view().node(t).map_err(|_| LayoutError { ty: t, why: Refusal::Malformed("a type past the ground table") })?;
             if let PNode::Adt(key, _) = node
-                && cx.facts.repr(key).hide_niche
+                && cx.facts.repr(key).map_err(|m| LayoutError { ty: t, why: m.head() })?.hide_niche
             {
                 return Ok(true);
             }
@@ -1704,7 +1720,7 @@ impl<A: Allocator + Clone> Layouts<A> {
     fn adt(&mut self, t: PTy, key: ItemKey, cx: &mut LayoutCx<'_, '_>, parts: &[PTy]) -> Result<LayoutId, Refusal> {
         let facts = cx.facts;
         let adt = facts.adt(key).ok_or(Refusal::NoAdt(key))?;
-        let attrs = facts.repr(key);
+        let attrs = facts.repr(key).map_err(Missing::head)?;
         // A vector (layout/simd.rs): its array at the target's short-vector alignment.
         if attrs.simd {
             return self.simd(t, &adt, attrs, cx, parts);
@@ -1714,7 +1730,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 let [variant] = adt.variants else { return Err(Refusal::Malformed("a struct without exactly one variant")) };
                 let fields = parts.get(variant.fields.range()).ok_or(Refusal::Malformed("a struct's fields past their column"))?;
                 let mut u = if attrs.transparent { self.transparent(fields)? } else { self.univariant(fields, Order::Decreasing, attrs, 0, 0)? };
-                let range = facts.valid_range(key);
+                let range = facts.valid_range(key).map_err(Missing::head)?;
                 if range.start.is_some() || range.end.is_some() {
                     let narrow = |s: Scalar| {
                         let m = mask(s.prim.bits());

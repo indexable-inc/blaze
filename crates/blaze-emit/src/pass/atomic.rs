@@ -23,8 +23,9 @@ std::thread_local! {
 }
 
 /// Whether an ordering acquires and whether it releases (`SeqCst` both: the acquire-release
-/// forms are RCsc on Armv8).
-const fn sides(ordering: Ordering) -> (bool, bool) {
+/// forms are RCsc on Armv8). The Fast tier's atomics read the same map (compose/emit.rs
+/// `Composer::atomic`).
+pub(crate) const fn sides(ordering: Ordering) -> (bool, bool) {
     match ordering {
         Ordering::Relaxed => (false, false),
         Ordering::Acquire => (true, false),

@@ -132,6 +132,14 @@ impl Topology {
     /// another. Workers of level 1 and below used to be slow and run at `utility` QoS, which a
     /// loaded host starves (about 2% of a core against 30% for `user-initiated`), while they
     /// still stole critical jobs and did most of a build's work.
+    ///
+    /// The levels' counts are read (`detect`), and only shape the groups: `fast` stays `true`
+    /// on the efficiency levels because the pool reads it to exclude cores. With any group not
+    /// `fast`, `crate::pool`'s `mixed` holds, and `place` sends a critical job only to `fast`
+    /// groups (`least_loaded(only_fast)`, its tie-break in `least`), so marking the efficiency
+    /// cores would keep every critical job off them (checked 2026-11-21). The work that
+    /// belongs at `utility` is the work after the answer, the file effects it asks for among
+    /// it (blaze_core::threads::qos), never a worker.
     pub fn from_perflevels(levels: &[(u32, u32)]) -> Topology {
         // alloc: the pool's shape, once per pool
         let (mut cpus, mut id, mut first_group) = (Vec::new(), 0u32, 0u32);

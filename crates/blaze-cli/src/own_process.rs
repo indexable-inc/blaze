@@ -52,6 +52,7 @@ use bstd::path::Path;
 use crate::code_store::HomeCodeStore;
 use crate::host_grants::{HostGrantError, host_grant};
 use crate::program::Launch;
+use crate::run_bytes::{Chosen, Delivery};
 use crate::run_loop::{self, LoopError};
 use crate::run_parent::{self, Front, Lazy, Needs, ParentError, RECORDS, RecordsDir};
 use crate::start_list;
@@ -200,6 +201,8 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     let err = io.need_err().map_err(OwnError::Missing)?;
     // 1. The records folder, under the home the command was started with (rule 75: read here,
     // at the edge, from the command's own environment), and the lazy parent: nothing built.
+    // The folder is the launcher's `BLAZE_LAUNCH_STORE` either way (the program's native
+    // library is a file there, engine_native.rs).
     let home_name = VarName::new("HOME").map_err(|_| OwnError::Parent(ParentError::NoHome))?;
     let home = env.get(&home_name).ok().flatten().ok_or(OwnError::Parent(ParentError::NoHome))?;
     let records = Path::new(RECORDS).map_err(|why| OwnError::Parent(ParentError::Path(why)))?;
@@ -208,7 +211,9 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     let alloc = erased.handle();
     let toolchain = builder.toolchain;
     let mut codes = HomeCodeStore::new(lent);
-    let mut lazy = Lazy::new(cx, front, RecordsDir { cx, dir: &folder }, &mut codes, builder, alloc);
+    // THE SEAM LINE: how the records reach the program (run_bytes.rs `Delivery`; `Inline` sends
+    // them over descriptor 3 and files none).
+    let mut lazy = Lazy::new(cx, front, Chosen::of(Delivery::Files, RecordsDir { cx, dir: &folder }, alloc), &mut codes, builder, alloc);
     let store = bstd::mem::format_in!(frame, "{}/{RECORDS}", home.trim_end_matches('/'));
     // 2. The start list held for this (program, request shape), read before the spawn; its
     // rows placed, and the entry line.
@@ -390,7 +395,7 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     let mut struck_in = bstd::mem::Bytes::new_in(frame, "the code record a crash struck in");
     let crash = needs.fault().map(|fault| {
         let record = match fault.at {
-            Some(spot) if spot.placed == blaze_launch::wire::fault::Placed::Code => Some(lazy.folder().read(&spot.record, &mut struck_in).map(|()| struck_in.as_slice())),
+            Some(spot) if spot.placed == blaze_launch::wire::fault::Placed::Code => Some(lazy.read_record(&spot.record, &mut struck_in).map(|()| struck_in.as_slice())),
             _ => None,
         };
         crate::run_fault::report(fault, &mut lazy, record)

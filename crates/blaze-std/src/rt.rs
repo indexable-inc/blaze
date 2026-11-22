@@ -472,6 +472,7 @@ pub(crate) mod pool {
                 {
                     super::fatal(&StartError { worker: at, why }.to_string());
                 }
+                blaze_mem::frame::size_shelf(blaze_mem::frame::ShelfSize::for_threads(mine.workers() as usize));
                 mine.work(at);
             });
         // The handle is dropped: the thread is detached, and a stop waits on the workers'

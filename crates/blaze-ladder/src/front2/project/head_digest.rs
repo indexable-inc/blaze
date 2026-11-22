@@ -100,6 +100,7 @@ pub const fn reads_a_head(kind: FactKind) -> bool {
             | FactKind::AssocGenerics
             | FactKind::TypeAlias
             | FactKind::MemberVisible
+            | FactKind::MemberUnstable
     )
 }
 

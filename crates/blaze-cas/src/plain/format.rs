@@ -35,8 +35,12 @@ pub const FORMAT: u32 = 5;
 /// through a bucket): its own number, so a change to the store's own files never changes a
 /// segment's bytes or digest. Format 1 put a kind's byte in an entry's place (bits 56..64);
 /// format 2 puts blaze-keyed's [`Tag`] there (bits 40..56, the u16 little-endian at bytes
-/// 37..39 of the entry). A segment of another format is refused naming both.
-pub const SEGMENT_FORMAT: u32 = 2;
+/// 37..39 of the entry); format 3 has the bytes of format 2 and a new meaning of a reserved
+/// tag (blaze-keyed `ReservedTag`): an expansion record has its own (`u16::MAX - 9`), where
+/// format 2 filed it under the index's (`u16::MAX - 6`), which the reach walk follows. A
+/// segment of another format is refused naming both; a home's store of format 2 is another
+/// form's folder, reported and rebuilt (blaze-cli store/forms.rs), never read.
+pub const SEGMENT_FORMAT: u32 = 3;
 
 /// EVERY FORM A BLAZE MUST AGREE ON TO READ A STORE'S FOLDER (D160), each with the letter its
 /// number takes in the folder's name: `f` the store's own files ([`FORMAT`]), `s` its segments
@@ -50,7 +54,7 @@ pub const SEGMENT_FORMAT: u32 = 2;
 pub const FORMS: [(u8, u32); 2] = [(b'f', FORMAT), (b's', SEGMENT_FORMAT)];
 
 /// The name of a store's folder of one set of [`FORMS`]: each form's letter and its number in
-/// decimal, in order: `f5s2` for this blaze. Why letters and numbers, not a digest of them: the
+/// decimal, in order: `f5s3` for this blaze. Why letters and numbers, not a digest of them: the
 /// name says to a person (and to the note that lists other folders) which forms a folder holds,
 /// a newer one sorts after an older one of the same width, and the forms are few (a digest would
 /// hide them for nothing: the name is no key, and nothing is shared by it).
@@ -954,7 +958,7 @@ impl LostMark {
     }
 }
 
-/// A named root: the store's own record (tag [`super::ROOT_TAG`]) listing the keys compaction
+/// A named root: the store's own record (tag [`blaze_keyed::kind::ReservedTag::Root`]) listing the keys compaction
 /// keeps for it, until `expires_ns` on the wall clock the flips pass in ([`NEVER`]: kept until
 /// it is unset). A root past its expiry keeps nothing, and the next flip drops it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1161,7 +1165,7 @@ impl Entry {
     pub fn decode(bytes: &[u8]) -> Result<Entry, &'static str> {
         let place = u64_at(bytes, 32);
         if place >> 56 != 0 {
-            return Err("an entry's place has bits 56..64 set, which no entry of format 2 sets");
+            return Err("an entry's place has bits 56..64 set, which no entry of format 2 or 3 sets");
         }
         Ok(Entry::read(bytes))
     }

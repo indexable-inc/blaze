@@ -262,6 +262,7 @@ pub(crate) fn names_records_envs<'n>(
             env: envs.owner.map(|env| (0, env)),
             envs: envs.rest,
             read: RefCell::new(read),
+            unread: RefCell::new(blaze_own::Vec::new_in(frame)),
             data: RefCell::new(std::vec::Vec::new()),
             left: RefCell::new(std::vec::Vec::new()),
             procs,

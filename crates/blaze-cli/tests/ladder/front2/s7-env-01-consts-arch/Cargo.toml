@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s7-env-01-consts-arch"
+version = "0.1.0"
+edition = "2024"

@@ -600,7 +600,7 @@ mod tests {
     /// The same solved directory can be read against a complete generation or one with
     /// its expansion puts deliberately omitted.
     pub(super) fn kept(names: &Names<'_>, texts: bool) -> crate::store::SharedSnapshot {
-        use crate::store::{CommandStore, Facts, Home, plain_place::EXPANSION_TAG};
+        use crate::store::{CommandStore, Facts, Home};
         let io = Io::simulated(SimWorld::new(31, Limits::USUAL));
         let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
         let err = io.need_err().expect("stderr");
@@ -612,7 +612,7 @@ mod tests {
             for krate in names.crates() {
                 let split = blaze_scope::expansion_records::write(krate, alloc).expect("the expansion records");
                 for record in &split.records {
-                    store.put_record(&cx, Key(record.key), EXPANSION_TAG, &[], &record.bytes).expect("the expansion put");
+                    store.put_record(&cx, Key(record.key), blaze_keyed::kind::ReservedTag::Expansion.tag(), &[], &record.bytes).expect("the expansion put");
                 }
             }
         }

@@ -114,6 +114,11 @@ pub enum Question {
     /// visibility against the body's module, [`World::member_visible`]): what method lookup
     /// reads before it takes an inherent candidate.
     MemberVisible(ItemKey, Name),
+    /// Whether the member `name` (a fn or constant) of inherent impl `container` is unstable
+    /// under a library feature the body's crate does not turn on
+    /// ([`World::member_unstable`]): what method and path lookup read before they take an
+    /// inherent candidate.
+    MemberUnstable(ItemKey, Name),
 }
 
 /// Whether a question's record is made from items alone or from another body's check.
@@ -154,7 +159,8 @@ impl Question {
             | Question::AssocGenerics(..)
             | Question::TypeAlias(_)
             | Question::FieldDefaults(_)
-            | Question::MemberVisible(..) => RecordKind::Item,
+            | Question::MemberVisible(..)
+            | Question::MemberUnstable(..) => RecordKind::Item,
         }
     }
 }
@@ -716,6 +722,18 @@ pub trait World {
     fn goal_share(&self) -> Option<&dyn blaze_solve::share::GoalShare> {
         None
     }
+    /// How a run meets a HOLE ([`Hole`], D161 "a task that lacks a fact waits on it"): `false`
+    /// reads the answer's stand-in ([`Holed::hole`]) and goes on, so one round finds many holes
+    /// (some speculative: asked only because an earlier answer was a stand-in); `true` stops the
+    /// run at the first hole with `Stop::Need`, the hole recorded, so nothing runs past a
+    /// missing fact and every question asked was asked with real answers before it. A world
+    /// that makes every fact it can on the spot (blaze-ladder front2 `BodyWorld` under the one
+    /// ask over frozen heads) says `true`: its holes are only the facts it cannot make inline,
+    /// each one real. DEFAULTED to `false`: every other world is unchanged. Either answer gives
+    /// the same `Outcome::Done` (the oracle: blaze-ladder front2 tables/task.rs `compare_asks`).
+    fn stops_at_holes(&self) -> bool {
+        false
+    }
     fn attrs(&self, seal: Seal, item: ItemKey) -> Fetch<TypeAttrs>;
     /// The definition of trait `trait_` (`None`: not a trait).
     fn trait_def(&self, seal: Seal, trait_: ItemKey) -> Fetch<Option<TraitDef<'_>>>;
@@ -772,6 +790,23 @@ pub trait World {
     fn member_visible(&self, seal: Seal, container: ItemKey, name: Name) -> Fetch<bool> {
         let (_, _, _) = (seal, container, name);
         Ok(true)
+    }
+    /// Whether the member `name` (a fn or constant) of inherent impl `container` is unstable
+    /// under a library feature the checked body's crate does not turn on
+    /// (`Question::MemberUnstable`): rustc_middle stability.rs `eval_stability_allow_unstable`
+    /// gives `Deny` for an item of another crate whose stability is `#[unstable(feature = f,
+    /// implied_by = g)]` unless the crate turns on `#![feature(f)]` or `#![feature(g)]`; an
+    /// item of the body's own crate is always allowed ("Only the cross-crate scenario matters
+    /// when checking unstable APIs"). Method and path lookup drop such a candidate before the
+    /// pick, and search again with it only when nothing else is picked (rustc_hir_typeck
+    /// method/probe.rs `pick_core` and `consider_candidates`): std's unstable inherent
+    /// `HashMap::try_insert` beside a user trait's `try_insert` (turso's `TursoHashMapExt`).
+    /// DEFAULTED to `false` (allowed): right for every world whose crates write no stability
+    /// attributes, which is every world but the one over real crates (blaze-ladder front2
+    /// answers it).
+    fn member_unstable(&self, seal: Seal, container: ItemKey, name: Name) -> Fetch<bool> {
+        let (_, _, _) = (seal, container, name);
+        Ok(false)
     }
     /// The questions the last check of this body asked, before the walk starts: fetch them in
     /// one batch. Answers nothing.
@@ -1496,6 +1531,13 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         }
     }
 
+    /// Whether this run met a hole in a world that stops at holes ([`World::stops_at_holes`]):
+    /// then nothing past it runs, a site that met the stop and would go on (writeback's
+    /// selected rows, rules/writeback/selected_rows.rs) included.
+    pub(crate) fn stopped(&self) -> bool {
+        self.holed() && self.world.stops_at_holes()
+    }
+
     /// Whether this run met a hole: then it makes no result (`Hole`).
     pub(crate) fn holed(&self) -> bool {
         #[cfg(test)]
@@ -1615,9 +1657,14 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
                 Ok(v)
             }
             Err(Missing) => {
-                // A hole: record the need and read the stand-in; the run goes on (`Hole`).
+                // A hole: record the need; then, as the world says ([`World::stops_at_holes`]),
+                // stop the run at it (nothing past a missing fact) or read the stand-in and go on
+                // (`Hole`). Either way the run is holed and makes no result.
                 self.count(q, true, asked_at, answered_at);
                 self.holes.push(Hole { question: q });
+                if self.world.stops_at_holes() {
+                    return Err(Stop::Need(q));
+                }
                 Ok(T::hole())
             }
         }
@@ -1920,6 +1967,14 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         let asked_at = self.ask(Question::MemberVisible(container, name));
         let got = self.world.member_visible(Self::seal(), container, name);
         self.record(Question::MemberVisible(container, name), got, asked_at)
+    }
+
+    /// Whether inherent member `name` of `container` is unstable under a feature the body's
+    /// crate does not turn on ([`World::member_unstable`]).
+    pub fn member_unstable(&mut self, container: ItemKey, name: Name) -> Result<bool, Stop> {
+        let asked_at = self.ask(Question::MemberUnstable(container, name));
+        let got = self.world.member_unstable(Self::seal(), container, name);
+        self.record(Question::MemberUnstable(container, name), got, asked_at)
     }
 
     /// The test build's one backdoor: an ADT read that is not recorded. Only the planted bug

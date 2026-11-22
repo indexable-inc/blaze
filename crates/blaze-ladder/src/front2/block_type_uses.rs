@@ -108,12 +108,15 @@ fn glob_nearer(locals: &Locals<'_>, owner: ItemKey, scope: u32, named: &Row<'_>)
 /// one binding). `None`: no block's named import binds the first segment (a block's item
 /// does, or nothing does): the caller reads the path as before. `marks`: the builder's marks
 /// of the text the path is read from, for the written path's site
-/// ([`super::item_site::written_site`]).
+/// ([`super::item_site::written_site`]). `scope`: the block of `body` the path stands in, as
+/// super::scope_table `written` decides it (a local item's signature path: its declaring
+/// block, in its enclosing body).
 #[expect(clippy::too_many_arguments, reason = "one resolve of one path: the path, its view, its marks and the body")]
 pub fn through_use<'n, S: NamesSource<'n>>(
     resolver: &Paths<S>,
     marks: Option<TextMarks<'_>>,
     body: &BodyScope<'_>,
+    scope: u32,
     v: &View<'_>,
     p: PathIdx,
     abs: bool,
@@ -127,13 +130,11 @@ pub fn through_use<'n, S: NamesSource<'n>>(
     if abs || matches!(first, "self" | "super" | "crate" | "Self" | "<qualified>") || first.starts_with('$') {
         return Ok(None);
     }
-    // A signature's paths have no block scope.
-    let Some(scope) = v.path(p)?.scope else { return Ok(None) };
-    let Some(row) = body.locals.find(body.owner, Some(scope.0), first, LocalNs::Type) else { return Ok(None) };
+    let Some(row) = body.locals.find(body.owner, Some(scope), first, LocalNs::Type) else { return Ok(None) };
     if row.kind != LocalKind::Use {
         return Ok(None);
     }
-    glob_nearer(body.locals, body.owner, scope.0, &row).map_err(|form| Why::Unsupported(form, r))?;
+    glob_nearer(body.locals, body.owner, scope, &row).map_err(|form| Why::Unsupported(form, r))?;
     // Read where the written path's mark says (as world_paths reads an expression's path
     // through a block import), unless the import's path starts with a block's item: then at
     // that item's block module (super::scope_table).

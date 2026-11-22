@@ -58,6 +58,10 @@ impl Names for Nameless {
     fn name(&self, _: Outside) -> Option<Named<'_>> {
         None
     }
+
+    fn routines(&self) -> crate::RoutinePlaces {
+        crate::RoutinePlaces::NONE
+    }
 }
 
 /// The literal-word form, run: the row's address is a multiple of 64, its bytes read back.

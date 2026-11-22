@@ -22,12 +22,16 @@ use std::alloc::Allocator;
 
 use blaze_core::Driver;
 use blaze_hash::{BuildKeyHasher, Map, MapOpts};
-use blaze_ids::ContentId;
-use blaze_keyed::kind::{Namespace, Tag};
+use blaze_ids::{ContentId, crc32c};
+use blaze_keyed::kind::{Namespace, ReservedTag, Tag};
 use blaze_keyed::store::{Holder, Put, StoreError, TwoValues};
+use blaze_mem::Kept;
+use blaze_own::Arc;
 
-use super::core::{Batch, Committed, Named, POINTER_LEN, POINTER_TAG, Probes, Report, Sliced};
+use super::arena::{Arena, ArenaView, RunEntry, Visibility};
+use super::core::{Batch, Committed, LentRecord, Named, POINTER_LEN, Probes, PutPath, Report, Sliced};
 use super::driven::Driven;
+use super::format::record_crc;
 use crate::Key;
 
 /// One arena chunk's blocks (1 MiB); a larger record gets a chunk of its own size.
@@ -45,6 +49,9 @@ pub enum LentError {
     TwoValues { two: TwoValues, namespace: Namespace, held_namespace: Namespace },
     /// The arena's allocator refused a record of this many bytes.
     Arena { bytes: usize },
+    /// The shared arena (`Visibility::InArena`, arena.rs) could not take `wanted` more of
+    /// `what`: a reservation used up, or memory the kernel would not commit.
+    ArenaReserve { what: &'static str, wanted: usize },
     /// A namespace this store does not write (a trusted builder's).
     NotWritable { namespace: Namespace },
     /// A pointer met where a record was asked, or a record where a pointer was: a pointer is
@@ -73,6 +80,7 @@ impl fmt::Display for LentError {
                 }
             }
             LentError::Arena { bytes } => write!(f, "this command's records could not take {bytes} more bytes: the allocator refused"),
+            LentError::ArenaReserve { what, wanted } => write!(f, "this command's shared arena could not take {wanted} more {what} (a reservation used up, or memory not committed)"),
             LentError::NotWritable { namespace } => write!(f, "namespace {} is a trusted builder's; this machine writes only its own", namespace.0),
             LentError::PointerTag { key } => write!(f, "{:?}: a pointer met as a record, or a record as a pointer (a pointer is written by point and read by pointed alone)", key.0),
             LentError::PointsAtNothing { name, target } => write!(f, "pointer {:?}: its target {:?} is not in the store (a pointer is put after its target)", name.0, target.0),
@@ -158,16 +166,21 @@ pub struct Lend<'l> {
     pub bytes: &'l [u8],
     /// This command's own put (from the arena), not a committed record.
     pub own: bool,
+    /// An own put in the shared arena (`Visibility::InArena`, arena.rs): the one copy every
+    /// reader reads, in place for `'l` as a segment's bytes are.
+    pub shared: bool,
 }
 
 impl<'l> Lend<'l> {
-    /// The record as bytes of a segment's mapping, for a reader that reads them where they lie
-    /// for `'l` (blaze-cli engine_records.rs): refused when it is this command's own put (the
-    /// arena's copy, which a get keeps in the heap to the `Lent`'s end) or when it does not start
-    /// at a multiple of [`ALIGN`](blaze_keyed::store::ALIGN), which the layout gives every record
-    /// (core.rs `lay_out`, format.rs `check_segment`). Never a copy in its place (rule 3).
+    /// The record as bytes of a segment's mapping, or of the shared arena, for a reader that
+    /// reads them where they lie for `'l` (blaze-cli engine_records.rs): refused when it is this
+    /// command's own put in the private arena (`Visibility::AfterCommit`'s copy, which a get
+    /// keeps in the heap to the `Lent`'s end) or when it does not start at a multiple of
+    /// [`ALIGN`](blaze_keyed::store::ALIGN), which the layout gives every record (core.rs
+    /// `lay_out`, format.rs `check_segment`) and the shared arena every put (a block boundary).
+    /// Never a copy in its place (rule 3).
     pub fn in_place(self) -> Result<Aligned16<'l>, NotInPlace> {
-        if self.own {
+        if self.own && !self.shared {
             return Err(NotInPlace::Arena { len: self.bytes.len() });
         }
         Aligned16::new(self.bytes).map_err(NotInPlace::Misaligned)
@@ -272,6 +285,80 @@ pub struct LentCounts {
     /// Records a commit carried forward because a cleanup slice swept their segment under it
     /// (`Plain::carried`): work kept, not refused.
     pub carried: u64,
+    /// Bytes [`Lent::commit`] copied out of the arena into its batches (each with its CRC-32C).
+    pub batch_bytes: u64,
+    /// [`Lent::commit`]s, and the wall nanoseconds the calling thread spent in them.
+    pub commits: u32,
+    pub commit_ns: u64,
+}
+
+/// THE PUT PATH'S TALLY (rule 16: measured before it is changed; rule 67, its floor): what one
+/// command's puts cost from the arena to a mapped segment, each number counted where its step
+/// runs. The floor this is held against: `arena_bytes` once (the one copy, worker's bytes into
+/// the arena), `batch_bytes` and `laid_bytes` 0 (no copy out of the arena: the layout is the
+/// arena's slices, written by a vectored write), no commit on the command thread before the
+/// answer, one segment and one barrier a namespace a command. `put - before` of two tallies is
+/// the stretch between ([`PutTally::since`]).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct PutTally {
+    /// Records copied into the arena (puts and points), and their bytes rounded to blocks.
+    pub copied: u64,
+    pub arena_bytes: u64,
+    /// Bytes copied out of the arena into the commits' batches.
+    pub batch_bytes: u64,
+    /// Commits, and the wall nanoseconds the committing thread spent in them.
+    pub commits: u32,
+    pub commit_ns: u64,
+    /// The disk side, from the plain store ([`PutPath`]).
+    pub disk: PutPath,
+}
+
+impl PutTally {
+    /// What happened after `before` was taken: each count less `before`'s.
+    pub fn since(self, before: PutTally) -> PutTally {
+        let d = |a: u64, b: u64| a.saturating_sub(b);
+        let n = |a: u32, b: u32| a.saturating_sub(b);
+        let (now, was) = (self.disk, before.disk);
+        PutTally {
+            copied: d(self.copied, before.copied),
+            arena_bytes: d(self.arena_bytes, before.arena_bytes),
+            batch_bytes: d(self.batch_bytes, before.batch_bytes),
+            commits: n(self.commits, before.commits),
+            commit_ns: d(self.commit_ns, before.commit_ns),
+            disk: PutPath {
+                laid_commits: n(now.laid_commits, was.laid_commits),
+                laid_bytes: d(now.laid_bytes, was.laid_bytes),
+                digested_bytes: d(now.digested_bytes, was.digested_bytes),
+                segments_written: n(now.segments_written, was.segments_written),
+                merged_bytes: d(now.merged_bytes, was.merged_bytes),
+                barriers: n(now.barriers, was.barriers),
+                syncs: n(now.syncs, was.syncs),
+                root_probes: d(now.root_probes, was.root_probes),
+            },
+        }
+    }
+}
+
+impl fmt::Display for PutTally {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let disk = &self.disk;
+        write!(
+            f,
+            "{} records copied into the arena ({} bytes); {} commits, {:.3} ms in them; copied out {} bytes to batches, {} to layouts; digested {} bytes; {} segments written, {} bytes merged; {} barriers, {} syncs; {} root names looked for",
+            self.copied,
+            self.arena_bytes,
+            self.commits,
+            self.commit_ns as f64 / 1e6,
+            self.batch_bytes,
+            disk.laid_bytes,
+            disk.digested_bytes,
+            disk.segments_written,
+            disk.merged_bytes,
+            disk.barriers,
+            disk.syncs,
+            disk.root_probes,
+        )
+    }
 }
 
 /// The planted bug of `lent_tests` (an arena that moves what it lent); outside tests, none.
@@ -303,10 +390,21 @@ pub(crate) enum LentPlant {
 #[repr(C, align(16))]
 struct Block([u8; 16]);
 
+/// Where an own put's bytes lie.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Place {
+    /// In the private arena's chunk of this index (`Visibility::AfterCommit`).
+    Chunk(u32),
+    /// In the current shared arena (`Inner::shared`, `Visibility::InArena`), with its record's
+    /// CRC (`format::record_crc`), made at the put while its parts were in cache: the commit's
+    /// layout takes it and reads the bytes once, to copy them (core.rs `LentRecord`).
+    Shared { crc: u32 },
+}
+
 #[derive(Clone, Copy)]
 struct PutAt {
-    chunk: u32,
-    /// In blocks.
+    place: Place,
+    /// In blocks, from the start of its chunk or of the shared arena.
     block: u32,
     len: u32,
     tag: Tag,
@@ -330,6 +428,31 @@ struct Inner<D: Driver, A: Allocator + Clone> {
     committed: usize,
     uncommitted_bytes: u64,
     counts: LentCounts,
+    /// `Visibility::InArena`: the shared arena of the puts since the last commit (made at the
+    /// first put after it), whether a get lent from it, and `order`'s index below which its
+    /// puts are sealed into runs (each snapshot take seals the rest: [`Lent::seal_run`]).
+    shared: Option<Arc<Arena, Kept>>,
+    shared_lent: bool,
+    sealed: usize,
+    /// Arenas a get lent from, kept to the `Lent`'s end (`lend`'s contract), in the arena's
+    /// shared allocator: a commit drops the current one otherwise.
+    kept_arenas: Vec<Arc<Arena, Kept>, A>,
+}
+
+impl<D: Driver, A: Allocator + Clone> Inner<D, A> {
+    /// The bytes of the own put `at`, for the borrow of the `Inner`.
+    fn kept(&self, at: &PutAt) -> &[u8] {
+        match at.place {
+            Place::Chunk(chunk) => block_bytes(&self.chunks[chunk as usize][at.block as usize..], at.len as usize),
+            // A shared put is in the current arena, published whole before its key entered
+            // `puts` (`Lent::copy_in`), and every key leaves `puts` at the commit that drops it.
+            Place::Shared { .. } => self
+                .shared
+                .as_ref()
+                .and_then(|arena| arena.bytes(u32::MAX, at.block, at.len))
+                .expect("an own put in the shared arena lies in the current arena, published whole (lent.rs copy_in)"),
+        }
+    }
 }
 
 /// The command's one owner of every byte a get lends: see the module's docs.
@@ -337,6 +460,8 @@ pub struct Lent<D: Driver, A: Allocator + Clone> {
     inner: RefCell<Inner<D, A>>,
     alloc: A,
     plant: LentPlant,
+    /// Where readers find this command's own puts (arena.rs, the put path's seam).
+    visibility: Visibility,
 }
 
 /// `len` bytes at `ptr`, lent for `'l`.
@@ -351,7 +476,11 @@ pub struct Lent<D: Driver, A: Allocator + Clone> {
 /// are lent beyond a call, marks the chunk (`Inner::lent`) before it lends, and a commit frees
 /// only an unmarked chunk (whose bytes no reference outlives: every other read of a chunk, a
 /// put's compare, a commit's layout, a pointer's decode, ends inside its call), and takes every
-/// key out of `Inner::puts`, so no later get reaches a freed chunk. The caller borrows that `Lent` for `'l`,
+/// key out of `Inner::puts`, so no later get reaches a freed chunk. Or `ptr..ptr + len` lies in
+/// that `Lent`'s current shared arena (arena.rs: `AppendVec`s, whose reservations never move
+/// and whose published slots are never written again): a get that lends from it marks it
+/// (`Inner::shared_lent`) and the commit that drops it moves it into `Inner::kept_arenas`
+/// instead, to the `Lent`'s end. The caller borrows that `Lent` for `'l`,
 /// so it lives, with nothing lent of it dropped, for `'l`; no `&mut` to those bytes is ever made
 /// (a mapping is read-only, a block is written once, before its first lend).
 unsafe fn lend<'l>(ptr: *const u8, len: usize) -> &'l [u8] {
@@ -374,7 +503,16 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         Lent::planted(store, alloc, LentPlant::None)
     }
 
+    /// [`Lent::new`] with its put path's [`Visibility`] chosen (the seam; arena.rs).
+    pub fn with_visibility(store: Driven<D, A>, alloc: A, visibility: Visibility) -> Lent<D, A> {
+        Lent::planted_in(store, alloc, LentPlant::None, visibility)
+    }
+
     pub(crate) fn planted(store: Driven<D, A>, alloc: A, plant: LentPlant) -> Lent<D, A> {
+        Lent::planted_in(store, alloc, plant, Visibility::AfterCommit)
+    }
+
+    pub(crate) fn planted_in(store: Driven<D, A>, alloc: A, plant: LentPlant, visibility: Visibility) -> Lent<D, A> {
         let inner = Inner {
             store,
             chunks: Vec::new_in(alloc.clone()),
@@ -384,8 +522,23 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
             committed: 0,
             uncommitted_bytes: 0,
             counts: LentCounts::default(),
+            shared: None,
+            shared_lent: false,
+            sealed: 0,
+            kept_arenas: Vec::new_in(alloc.clone()),
         };
-        Lent { inner: RefCell::new(inner), alloc, plant }
+        Lent { inner: RefCell::new(inner), alloc, plant, visibility }
+    }
+
+    /// Where readers find this command's own puts.
+    pub fn visibility(&self) -> Visibility {
+        self.visibility
+    }
+
+    /// The store's driver's wall clock (rule 75: the clock the command handed the store; the
+    /// simulation's under a test), for a caller's checkpoint by age.
+    pub fn wall_ns(&self) -> u64 {
+        self.inner.borrow_mut().store.driver().wall_ns()
     }
 
     /// The record under `key`, for the life of this borrow: this command's own put while it
@@ -397,25 +550,30 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         let inner = &mut *inner;
         inner.counts.gets += 1;
         if let Some(at) = inner.puts.get(&key.0.0).copied() {
-            if at.tag == POINTER_TAG {
+            if at.tag == ReservedTag::Pointer.tag() {
                 return Err(LentError::PointerTag { key: *key });
             }
-            let bytes = block_bytes(&inner.chunks[at.chunk as usize][at.block as usize..], at.len as usize);
+            let bytes = inner.kept(&at);
             let (ptr, len) = (bytes.as_ptr(), bytes.len());
             inner.counts.from_puts += 1;
-            // Marked before the lend: this chunk is kept to the `Lent`'s end (`lend`'s contract).
-            inner.lent[at.chunk as usize] = true;
-            // SAFETY: `ptr..ptr + len` is in this `Lent`'s arena chunk `at.chunk`, written by
-            // the put before this lend, marked lent just now; the lend is for `&self` (`lend`'s
-            // contract).
-            return Ok(Some(Lend { tag: at.tag, namespace: at.namespace, bytes: unsafe { lend(ptr, len) }, own: true }));
+            // Marked before the lend: this chunk, or this shared arena, is kept to the `Lent`'s
+            // end (`lend`'s contract).
+            match at.place {
+                Place::Chunk(chunk) => inner.lent[chunk as usize] = true,
+                Place::Shared { .. } => inner.shared_lent = true,
+            }
+            // SAFETY: `ptr..ptr + len` is in this `Lent`'s arena chunk `at.place` names, or in
+            // its current shared arena, written by the put before this lend, marked lent just
+            // now; the lend is for `&self` (`lend`'s contract).
+            let shared = matches!(at.place, Place::Shared { .. });
+            return Ok(Some(Lend { tag: at.tag, namespace: at.namespace, bytes: unsafe { lend(ptr, len) }, own: true, shared }));
         }
         let Some(found) = inner.store.get(key).map_err(stopped("reading a record"))? else {
             inner.counts.misses += 1;
             return Ok(None);
         };
         let got = inner.store.got(found);
-        if got.tag == POINTER_TAG {
+        if got.tag == ReservedTag::Pointer.tag() {
             // Found in the largest-first order, which may be an older value of it.
             return Err(LentError::PointerTag { key: *key });
         }
@@ -425,7 +583,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         // this `Lent`, or from a record held uncommitted by it (only roots are put into the
         // `Driven` itself, and they are never read through a `Lent`); the lend is for `&self`
         // (`lend`'s contract).
-        Ok(Some(Lend { tag, namespace, bytes: unsafe { lend(ptr, len) }, own: false }))
+        Ok(Some(Lend { tag, namespace, bytes: unsafe { lend(ptr, len) }, own: false, shared: false }))
     }
 
     /// Whether `key` is held with exactly `bytes`, in any namespace: this command's own put,
@@ -439,17 +597,17 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         let mut inner = self.inner.borrow_mut();
         let inner = &mut *inner;
         if let Some(at) = inner.puts.get(&key.0.0).copied() {
-            if at.tag == POINTER_TAG {
+            if at.tag == ReservedTag::Pointer.tag() {
                 return Err(LentError::PointerTag { key: *key });
             }
-            let kept = block_bytes(&inner.chunks[at.chunk as usize][at.block as usize..], at.len as usize);
+            let kept = inner.kept(&at);
             return Ok(kept == bytes);
         }
         let Some(found) = inner.store.get(key).map_err(stopped("checking whether a record is held"))? else {
             return Ok(false);
         };
         let got = inner.store.got(found);
-        if got.tag == POINTER_TAG {
+        if got.tag == ReservedTag::Pointer.tag() {
             return Err(LentError::PointerTag { key: *key });
         }
         Ok(got.bytes == bytes)
@@ -471,13 +629,13 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         if !inner.store.core().writes().contains(&namespace) {
             return Err(LentError::NotWritable { namespace });
         }
-        if tag == POINTER_TAG {
+        if tag == ReservedTag::Pointer.tag() {
             return Err(LentError::PointerTag { key: *key });
         }
         inner.counts.puts += 1;
         let total: usize = parts.iter().map(|part| part.len()).sum();
         if let Some(at) = inner.puts.get(&key.0.0).copied() {
-            let kept = block_bytes(&inner.chunks[at.chunk as usize][at.block as usize..], at.len as usize);
+            let kept = inner.kept(&at);
             if parts_equal(kept, parts) && at.namespace == namespace && at.tag == tag {
                 inner.counts.puts_same += 1;
                 return Ok(Put::Same);
@@ -494,8 +652,8 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
             let held = Held { namespace: got.namespace, tag: got.tag, bytes: got.bytes, own: false };
             return Err(held.against(key, namespace, tag, &joined(parts, self.alloc.clone())));
         }
-        let (chunk, block, len) = self.copy_in(inner, parts)?;
-        let at = PutAt { chunk, block, len, tag, namespace, order: inner.order.len() as u32 };
+        let (place, block, len) = self.copy_in(inner, key, tag, parts)?;
+        let at = PutAt { place, block, len, tag, namespace, order: inner.order.len() as u32 };
         inner.puts.insert(key.0.0, at);
         inner.order.push(key.0.0);
         inner.uncommitted_bytes += total as u64;
@@ -504,10 +662,32 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
 
     /// The concatenation of `parts` copied into the arena, within a chunk's capacity (`lend`'s
     /// contract), with room reserved for one more put and its place in the order:
-    /// `(chunk, block, len)`.
-    fn copy_in(&self, inner: &mut Inner<D, A>, parts: &[&[u8]]) -> Result<(u32, u32, u32), LentError> {
+    /// `(place, block, len)`. Under `Visibility::InArena`, into the shared arena (made at the
+    /// first put after a commit), whole, with one publish (arena.rs `Arena::append`).
+    fn copy_in(&self, inner: &mut Inner<D, A>, key: &Key, tag: Tag, parts: &[&[u8]]) -> Result<(Place, u32, u32), LentError> {
         let total: usize = parts.iter().map(|part| part.len()).sum();
         let need = total.div_ceil(16).max(1);
+        if let Visibility::InArena { shared } = self.visibility {
+            // The CRC at the put (rule 77): over the parts as they are copied in, so the commit
+            // reads the record once (its layout's copy) and never computes it again.
+            let crc = parts.iter().fold(record_crc(&key.0, tag, &[]), |crc, part| crc32c::extend(crc, part));
+            let len = u32::try_from(total).map_err(|_| LentError::Arena { bytes: total })?;
+            inner.puts.try_reserve(1).map_err(|_| LentError::Arena { bytes: total })?;
+            inner.order.try_reserve(1).map_err(|_| LentError::Arena { bytes: total })?;
+            if inner.shared.is_none() {
+                inner.kept_arenas.try_reserve(1).map_err(|_| LentError::Arena { bytes: total })?;
+                let arena = Arc::try_new_in(Arena::new()?, shared).map_err(|_| LentError::Arena { bytes: total })?;
+                inner.shared = Some(arena);
+                inner.shared_lent = false;
+                inner.counts.chunks += 1;
+            }
+            let arena = inner.shared.as_ref().expect("made just above");
+            let block = arena.append(parts, total)?;
+            inner.counts.arena_bytes += (need * 16) as u64;
+            inner.counts.held_bytes += (need * 16) as u64;
+            inner.counts.copied += 1;
+            return Ok((Place::Shared { crc }, block, len));
+        }
         let chunk_at = match self.plant {
             LentPlant::OneBuffer => {
                 if inner.chunks.is_empty() {
@@ -564,7 +744,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         inner.counts.arena_bytes += (need * 16) as u64;
         inner.counts.held_bytes += (need * 16) as u64;
         inner.counts.copied += 1;
-        Ok((chunk_at as u32, block as u32, len))
+        Ok((Place::Chunk(chunk_at as u32), block as u32, len))
     }
 
     /// The pointer `name` set to `target`, a record this store holds under `tag` (this
@@ -593,9 +773,9 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
             inner.counts.puts_same += 1;
             return Ok(Put::Same);
         }
-        let (chunk, block, len) = self.copy_in(inner, &[&target.0.0])?;
+        let (place, block, len) = self.copy_in(inner, name, ReservedTag::Pointer.tag(), &[&target.0.0])?;
         let order = kept.unwrap_or(inner.order.len());
-        inner.puts.insert(name.0.0, PutAt { chunk, block, len, tag: POINTER_TAG, namespace: Namespace::LOCAL, order: order as u32 });
+        inner.puts.insert(name.0.0, PutAt { place, block, len, tag: ReservedTag::Pointer.tag(), namespace: Namespace::LOCAL, order: order as u32 });
         if kept.is_none() {
             inner.order.push(name.0.0);
         }
@@ -626,18 +806,18 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
             Ok(Key(ContentId(key)))
         };
         if let Some(at) = inner.puts.get(&name.0.0).copied() {
-            if at.tag != POINTER_TAG {
+            if at.tag != ReservedTag::Pointer.tag() {
                 return Err(LentError::PointerTag { key: *name });
             }
             // Not committed yet: newer than any row. A committed one is read from the rows,
             // where another process's later commit may stand after it.
             if at.order as usize >= inner.committed {
-                return decode(block_bytes(&inner.chunks[at.chunk as usize][at.block as usize..], at.len as usize)).map(Some);
+                return decode(inner.kept(&at)).map(Some);
             }
         }
         let Some(found) = inner.store.newest(name).map_err(stopped("reading a pointer"))? else { return Ok(None) };
         let got = inner.store.got(found);
-        if got.tag != POINTER_TAG {
+        if got.tag != ReservedTag::Pointer.tag() {
             return Err(LentError::PointerTag { key: *name });
         }
         decode(got.bytes).map(Some)
@@ -657,7 +837,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// Keeps `keys` under the root `name` from the next commit on (`Driven::root`): a running
     /// program's records, a checkout's leaf table and its last answer for each request shape.
     pub fn root(&self, name: &str, keys: &[Key]) -> Result<Key, LentError> {
-        self.inner.borrow_mut().store.root(name, keys).map_err(stopped("setting a root"))
+        self.root_for(name, keys, super::format::NEVER)
     }
 
     /// The roots the generation this store holds names: `(name, record key)`.
@@ -675,35 +855,48 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         if self.plant == LentPlant::RootFirst {
             inner.store.commit_with(&[]).map_err(stopped("committing the roots first (planted)"))?;
         }
+        // The measure (rule 16): the calling thread's time in the commit, from its layout to its
+        // flip and the new segment's map (the driver's wall clock: the simulation's in a test).
+        let began = inner.store.driver().wall_ns();
         let upto = inner.order.len();
-        let mut writes: Vec<Namespace, A> = Vec::with_capacity_in(inner.store.core().writes().len(), self.alloc.clone());
-        writes.extend_from_slice(inner.store.core().writes());
-        let mut batches: Vec<Batch, A> = Vec::with_capacity_in(writes.len(), self.alloc.clone());
-        batches.extend(writes.iter().map(|namespace| Batch::new(*namespace)));
-        let mut first = Batch::new(Namespace::LOCAL);
-        for key in &inner.order[inner.committed..upto] {
-            let Some(at) = inner.puts.get(key).copied() else { continue };
-            let bytes = block_bytes(&inner.chunks[at.chunk as usize][at.block as usize..], at.len as usize);
-            if self.plant == LentPlant::PointerFirst && at.tag == POINTER_TAG {
-                // The planted bug: the pointers laid apart, for a commit before their targets'.
-                first.put(Key(ContentId(*key)), at.tag, bytes).map_err(|why| LentError::Store { doing: "laying out the pointers first (planted)", why: why.into_store(at.tag) })?;
-                continue;
+        // THE SEAM (rule 78): under `InArena` the puts are lent to the layout where they lie,
+        // no batch between (copy 2 gone, the CRC made at the put); under `AfterCommit` each is
+        // copied into its namespace's batch first, as before. The same segments either way
+        // (arena_tests.rs `the_two_visibilities_write_the_same_segments`).
+        let (committed, batch_bytes) = if matches!(self.visibility, Visibility::InArena { .. }) {
+            (self.commit_shared(inner, upto)?, 0)
+        } else {
+            let mut writes: Vec<Namespace, A> = Vec::with_capacity_in(inner.store.core().writes().len(), self.alloc.clone());
+            writes.extend_from_slice(inner.store.core().writes());
+            let mut batches: Vec<Batch, A> = Vec::with_capacity_in(writes.len(), self.alloc.clone());
+            batches.extend(writes.iter().map(|namespace| Batch::new(*namespace)));
+            let mut first = Batch::new(Namespace::LOCAL);
+            for key in &inner.order[inner.committed..upto] {
+                let Some(at) = inner.puts.get(key).copied() else { continue };
+                let bytes = inner.kept(&at);
+                if self.plant == LentPlant::PointerFirst && at.tag == ReservedTag::Pointer.tag() {
+                    // The planted bug: the pointers laid apart, for a commit before their targets'.
+                    first.put(Key(ContentId(*key)), at.tag, bytes).map_err(|why| LentError::Store { doing: "laying out the pointers first (planted)", why: why.into_store(at.tag) })?;
+                    continue;
+                }
+                let Some(batch) = batches.iter_mut().find(|batch| batch.namespace() == at.namespace) else {
+                    return Err(LentError::NotWritable { namespace: at.namespace });
+                };
+                batch.put(Key(ContentId(*key)), at.tag, bytes).map_err(|why| LentError::Store { doing: "laying out a commit", why: why.into_store(at.tag) })?;
             }
-            let Some(batch) = batches.iter_mut().find(|batch| batch.namespace() == at.namespace) else {
-                return Err(LentError::NotWritable { namespace: at.namespace });
-            };
-            batch.put(Key(ContentId(*key)), at.tag, bytes).map_err(|why| LentError::Store { doing: "laying out a commit", why: why.into_store(at.tag) })?;
-        }
-        if !first.is_empty() {
-            inner.store.commit_with(&[&first]).map_err(stopped("committing the pointers first (planted)"))?;
-        }
-        let mut refs: Vec<&Batch, A> = Vec::with_capacity_in(batches.len(), self.alloc.clone());
-        refs.extend(batches.iter().filter(|batch| !batch.is_empty()));
-        let committed = inner.store.commit_with(&refs).map_err(stopped("committing"))?;
+            let batch_bytes = batches.iter().map(Batch::bytes).sum::<u64>() + first.bytes();
+            if !first.is_empty() {
+                inner.store.commit_with(&[&first]).map_err(stopped("committing the pointers first (planted)"))?;
+            }
+            let mut refs: Vec<&Batch, A> = Vec::with_capacity_in(batches.len(), self.alloc.clone());
+            refs.extend(batches.iter().filter(|batch| !batch.is_empty()));
+            (inner.store.commit_with(&refs).map_err(stopped("committing"))?, batch_bytes)
+        };
         inner.committed = upto;
         inner.uncommitted_bytes = 0;
-        drop(refs);
-        drop(batches);
+        inner.counts.batch_bytes += batch_bytes;
+        inner.counts.commits += 1;
+        inner.counts.commit_ns += inner.store.driver().wall_ns().saturating_sub(began);
         // Every put is in a segment now and is read from its mapping from here on: EVERY key
         // leaves `puts`, so a later get reads the segment in place whichever chunk held the put.
         // (Until 2026-11-18 the keys of a chunk that lent stayed: one get of an own put before
@@ -713,7 +906,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         // no key: its lends are read until then (`lend`'s contract), and nothing new reaches it.
         let free_lent = self.plant == LentPlant::FreesLent;
         let keep_lent_keys = self.plant == LentPlant::KeepsLentKeys;
-        let Inner { chunks, lent, puts, counts, .. } = inner;
+        let Inner { chunks, lent, puts, counts, shared, shared_lent, sealed, kept_arenas, .. } = inner;
         for (chunk, lent) in chunks.iter_mut().zip(lent.iter()) {
             if (!*lent || free_lent) && chunk.capacity() > 0 {
                 counts.held_bytes = counts.held_bytes.saturating_sub(chunk.len() as u64 * 16);
@@ -721,8 +914,86 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
                 *chunk = Vec::new_in(self.alloc.clone());
             }
         }
-        puts.retain(|_, at| keep_lent_keys && chunks[at.chunk as usize].capacity() > 0);
+        // The shared arena's puts are in segments now: the next put starts a new arena. This
+        // one lives on in every snapshot that holds it, and to the `Lent`'s end when a get
+        // lent from it (`lend`'s contract; room reserved when it was made).
+        // (`LentPlant::FreesLent` is the private arena's control alone: a shared arena that lent
+        // is always kept, as its drop would free what a lend still reads.)
+        if let Some(arena) = shared.take() {
+            if *shared_lent {
+                kept_arenas.push(arena);
+            } else {
+                counts.held_bytes = counts.held_bytes.saturating_sub(u64::from(arena.blocks()) * 16);
+                counts.freed_chunks += 1;
+            }
+        }
+        *shared_lent = false;
+        *sealed = upto;
+        puts.retain(|_, at| match at.place {
+            Place::Chunk(chunk) => keep_lent_keys && chunks[chunk as usize].capacity() > 0,
+            Place::Shared { .. } => false,
+        });
         Ok(committed)
+    }
+
+    /// `Visibility::InArena`'s commit of the puts `order[committed..upto]`: each lent to the
+    /// layout from the shared arena where it lies, with the CRC its put made (core.rs
+    /// `LentRecord`, `Plain::commit_records`): its bytes read once, by the layout's one copy
+    /// into the segment's piece. The list of records is in the handed allocator.
+    /// (`LentPlant::PointerFirst`, planted: the pointers committed alone first, as the batch
+    /// path's control does.)
+    fn commit_shared(&self, inner: &mut Inner<D, A>, upto: usize) -> Result<Committed<A>, LentError> {
+        let Inner { store, shared, puts, order, committed, .. } = inner;
+        let from = (*committed).min(upto);
+        let mut records: Vec<LentRecord<'_>, A> = Vec::new_in(self.alloc.clone());
+        records.try_reserve_exact(upto - from).map_err(|_| LentError::Arena { bytes: (upto - from) * core::mem::size_of::<LentRecord<'_>>() })?;
+        for key in &order[from..upto] {
+            let Some(at) = puts.get(key) else { continue };
+            let Place::Shared { crc } = at.place else {
+                // Under `InArena` every own put is the shared arena's (`copy_in`); a chunk's here
+                // is this file's bug, named, never laid out from another place (rule 3).
+                panic!("lent.rs commit_shared: an own put of the private arena under Visibility::InArena (copy_in places every put in the shared arena)");
+            };
+            let bytes = shared
+                .as_ref()
+                .and_then(|arena| arena.bytes(u32::MAX, at.block, at.len))
+                .expect("an own put in the shared arena lies in the current arena, published whole (lent.rs copy_in)");
+            records.push(LentRecord { key: Key(ContentId(*key)), tag: at.tag, namespace: at.namespace, crc, bytes });
+        }
+        if self.plant == LentPlant::PointerFirst && records.iter().any(|it| it.tag == ReservedTag::Pointer.tag()) {
+            // The planted bug: the pointers laid apart, for a commit before their targets'.
+            let mut first: Vec<LentRecord<'_>, A> = Vec::new_in(self.alloc.clone());
+            first.extend(records.iter().filter(|it| it.tag == ReservedTag::Pointer.tag()).copied());
+            records.retain(|it| it.tag != ReservedTag::Pointer.tag());
+            store.commit_records(&[], &first).map_err(stopped("committing the pointers first (planted)"))?;
+        }
+        store.commit_records(&[], &records).map_err(stopped("committing"))
+    }
+
+    /// `Visibility::InArena`: the puts since the last take sealed into one run of the current
+    /// shared arena (sorted by key; arena.rs `Arena::seal`), and the view a snapshot takes of
+    /// it: every run and block published now. `None`: no shared arena (no put since the last
+    /// commit, or `Visibility::AfterCommit`). A pointer pointed again after its name was sealed
+    /// keeps its sealed entry: a snapshot never reads a pointer (`SnapshotError::PointerTag`).
+    pub(super) fn seal_run(&self) -> Result<Option<ArenaView>, LentError> {
+        let mut inner = self.inner.borrow_mut();
+        let inner = &mut *inner;
+        let Some(arena) = inner.shared.as_ref() else { return Ok(None) };
+        let from = inner.sealed.max(inner.committed);
+        let mut run: Vec<RunEntry, A> = Vec::new_in(self.alloc.clone());
+        let count = inner.order.len().saturating_sub(from);
+        run.try_reserve_exact(count).map_err(|_| LentError::Arena { bytes: count * core::mem::size_of::<RunEntry>() })?;
+        for key in &inner.order[from.min(inner.order.len())..] {
+            let Some(at) = inner.puts.get(key) else { continue };
+            if matches!(at.place, Place::Shared { .. }) {
+                run.push(RunEntry { key: *key, block: at.block, len: at.len, tag: at.tag, namespace: at.namespace });
+            }
+        }
+        // Sorted by key: a run is searched by bisection, and the commit's layout merges runs.
+        run.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+        arena.seal(&run)?;
+        inner.sealed = inner.order.len();
+        Ok(Some(ArenaView::of(arena)))
     }
 
     /// Every segment mapped and every parked one checked (probe.rs): asked once, when the
@@ -775,7 +1046,11 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
 
     /// [`Lent::root`], kept for `life_ns` from the commit that sets it (`Plain::root_for`).
     pub fn root_for(&self, name: &str, keys: &[Key], life_ns: u64) -> Result<Key, LentError> {
-        self.inner.borrow_mut().store.root_for(name, keys, life_ns).map_err(stopped("setting a root"))
+        let mut inner = self.inner.borrow_mut();
+        let Inner { store, puts, .. } = &mut *inner;
+        // This command's puts are in its arena, not yet the store's: D200's set-time guard
+        // takes them as put (`Driven::root_names_held`).
+        store.root_for_owned(name, keys, life_ns, &|key| puts.get(&key.0.0).is_some()).map_err(stopped("setting a root"))
     }
 
     /// An index of `keys` for the next commit (`Plain::index`): its key, which an indexed root
@@ -787,7 +1062,9 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// The root `name` naming the indexes `indexes` from the next commit on, for `life_ns`
     /// (`Plain::root_through`): reach keeps each index and every key it holds.
     pub fn root_through(&self, name: &str, indexes: &[Key], life_ns: u64) -> Result<Key, LentError> {
-        self.inner.borrow_mut().store.root_through(name, indexes, life_ns).map_err(stopped("setting an indexed root"))
+        let mut inner = self.inner.borrow_mut();
+        let Inner { store, puts, .. } = &mut *inner;
+        store.root_through_owned(name, indexes, life_ns, &|key| puts.get(&key.0.0).is_some()).map_err(stopped("setting an indexed root"))
     }
 
     /// An index of `keys` filed beside the record `owner` (`Plain::index_beside`).
@@ -852,6 +1129,14 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     pub fn counts(&self) -> LentCounts {
         let inner = self.inner.borrow();
         LentCounts { carried: inner.store.core().carried(), ..inner.counts }
+    }
+
+    /// The put path's tally so far ([`PutTally`]): this `Lent`'s copies and commits, and the
+    /// plain store's disk side.
+    pub fn put_tally(&self) -> PutTally {
+        let inner = self.inner.borrow();
+        let counts = &inner.counts;
+        PutTally { copied: counts.copied, arena_bytes: counts.arena_bytes, batch_bytes: counts.batch_bytes, commits: counts.commits, commit_ns: counts.commit_ns, disk: inner.store.core().put_path() }
     }
 
     /// The open's report (and losses found at first probes since), for the profile.

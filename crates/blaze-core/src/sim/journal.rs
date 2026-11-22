@@ -316,6 +316,7 @@ impl Disk {
                 size: file.len(),
                 mtime_ns: inode.mtime,
                 ctime_ns: inode.ctime,
+                dev: SIM_DEV,
                 mode: if file.link { S_IFLNK | 0o777 } else { S_IFREG | (file.mode & 0o7777) },
             };
         }
@@ -331,6 +332,7 @@ impl Disk {
                 size: 0,
                 mtime_ns: inode.mtime,
                 ctime_ns: inode.ctime,
+                dev: SIM_DEV,
                 mode: S_IFDIR | 0o755,
             };
         }

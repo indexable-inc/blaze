@@ -42,6 +42,13 @@ struct Items {
 }
 
 fn world() -> (Fx, Items) {
+    world_with(true)
+}
+
+/// The world, with core's `impl Copy for u8` or (`u8_copy` false) without it, as in a
+/// `no_core` crate that declares `Copy` and no impl (ladder rung front2/f5-closures before
+/// its fix).
+fn world_with(u8_copy: bool) -> (Fx, Items) {
     let mut fx = Fx::new();
     let sized = fx.tr("Sized", 1, Vec::new(), &[]);
     fx.lang(LangItem::Sized, sized);
@@ -49,7 +56,9 @@ fn world() -> (Fx, Items) {
     let copy = fx.tr("Copy", 1, Vec::new(), &[]);
     fx.lang(LangItem::Copy, copy);
     let u8_c = fx.ty(PNode::Uint(UintTy::U8));
-    fx.imp("impl Copy for u8", 0, u8_c, Some((copy, &[])), &[], Vec::new());
+    if u8_copy {
+        fx.imp("impl Copy for u8", 0, u8_c, Some((copy, &[])), &[], Vec::new());
+    }
     let (p0, p1, p2) = (fx.param(0), fx.param(1), fx.param(2));
     let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe, c_variadic: false };
 
@@ -406,4 +415,38 @@ fn a_stored_closure_is_called_directly_and_through_references() {
         let root = b.block(&stmts, Some(tail));
         assert_eq!(findings(&fx, &b, it.main_x, root), Vec::new(), "case {case}");
     }
+}
+
+/// `fn main_x(x: u8) -> u16 { apply(BODY) }` (ladder rung front2/f5-closures: `apply(|x| x *
+/// k, 21)` with `apply<F: Fn(u8) -> u8>`), the world with or without `impl Copy for u8`.
+fn apply_case(u8_copy: bool, captures: bool) -> Vec<DiagCode> {
+    let (fx, it) = world_with(u8_copy);
+    let mut b = Bb::new();
+    let x = b.param("x");
+    let y = b.bind("y");
+    let w = b.path(&["widen"]);
+    // `|y| widen(x)` uses the capture `x` by value; `|y| widen(y)` captures nothing.
+    let arg = if captures { b.local(x) } else { b.local(y) };
+    let body = b.call(w, &[arg]);
+    let cl = b.closure(&[y], body);
+    let a = b.path(&["apply"]);
+    let e = b.call(a, &[cl]);
+    let root = b.block(&[], Some(e));
+    findings(&fx, &b, it.main_x, root).into_iter().map(|(code, _)| code).collect()
+}
+
+/// A closure that uses a captured `u8` by value meets `F: Fn(u8) -> u16` (local `Fn*` lang
+/// items) when `u8: Copy` holds: the use is a copy, so the capture is a shared borrow (the
+/// Reference, "Closure types", capture modes) and the closure is `Fn`. Without the impl (a
+/// `no_core` crate declaring `Copy` and no impl: a primitive is `Copy` only by core's impl,
+/// rustc select/mod.rs `copy_clone_conditions`) the use moves `x`, the closure is only
+/// `FnOnce` (rustc upvar.rs: a by-value capture), and the bound is unmet (E0277; rustc gives
+/// E0525/E0507 for the same program). Control: the closure that captures nothing meets the
+/// bound in both worlds, so the refusal is the capture's.
+#[test]
+fn a_closure_using_a_capture_by_value_is_fn_only_when_the_capture_is_copy() {
+    assert_eq!(apply_case(true, true), Vec::new(), "with `impl Copy for u8`: `|y| widen(x)` is Fn");
+    assert_eq!(apply_case(false, true), std::vec![DiagCode::Unsatisfied], "without it: `|y| widen(x)` is FnOnce");
+    assert_eq!(apply_case(false, false), Vec::new(), "control: `|y| widen(y)` captures nothing");
+    assert_eq!(apply_case(true, false), Vec::new(), "control with the impl");
 }

@@ -14,12 +14,14 @@
 use core::{fmt, ops::Range};
 
 use blaze_own::{AString, AVec, Alloc, String, Vec};
+use parser::SyntaxKind;
 
 use crate::{
     call::{AlsoCopy, Constness, DeriveFacts},
     cfg::{CfgAttrError, CfgPredicateError, cfg_attr_metas, cfg_predicate_at},
     derive::{attr_call, derive_meta},
     error::StreamError,
+    extent::ExtentError,
     tokens::{Delim, TokenKind, TokenStream, index},
 };
 
@@ -32,6 +34,13 @@ pub enum ItemAttrsError<E> {
     CfgAttr { token: u32, error: CfgAttrError<E> },
     /// The `#[cfg(..)]` at this token of the item (as it stood then) has no answer.
     Cfg { token: u32, error: CfgPredicateError<E> },
+    /// The item a derive sees does not parse: the element and the token it stops at
+    /// (extent.rs, the one reading of an element's extent).
+    Syntax(ExtentError),
+    /// An inner `#![cfg]` or `#![cfg_attr]` at this token, inside the item a derive sees:
+    /// refused, not applied (what it would remove is the block around it, which rustc refuses
+    /// in most positions too).
+    InnerCfg { token: u32 },
 }
 
 impl<E> From<StreamError> for ItemAttrsError<E> {
@@ -46,6 +55,10 @@ impl<E: fmt::Debug> fmt::Display for ItemAttrsError<E> {
             ItemAttrsError::Stream(e) => write!(f, "an item's attributes: {e}"),
             ItemAttrsError::CfgAttr { token, error } => write!(f, "the `#[cfg_attr]` at token {token} of an item: {error:?}"),
             ItemAttrsError::Cfg { token, error } => write!(f, "the `#[cfg]` at token {token} of an item: {error}"),
+            ItemAttrsError::Syntax(error) => write!(f, "the item a derive sees: {error}"),
+            ItemAttrsError::InnerCfg { token } => {
+                write!(f, "an inner `#![cfg]` or `#![cfg_attr]` at token {token} of the item a derive sees: not applied, refused")
+            }
         }
     }
 }
@@ -128,21 +141,22 @@ impl<'a> ItemAttrs<'a> {
         loop {
             let at = self.at;
             let Some(close) = outer_attr(&self.item, at) else { return Ok(NextAttr::End) };
-            match name_of(&self.item, at) {
+            let meta = meta_at(&self.item, at + 1, close);
+            match meta_name(&self.item, &meta) {
                 "cfg_attr" => {
-                    let attr = self.item.copy_in(at..close + 1, alloc)?;
+                    let attr = attr_copy(&self.item, at, close, meta)?;
                     let metas = cfg_attr_metas(&attr, alloc, atom).map_err(|error| ItemAttrsError::CfgAttr { token: index(at), error })?;
                     self.item = splice(&self.item, at..close + 1, &attr, &metas)?;
                 }
                 "cfg" => {
-                    if !cfg_holds(&self.item, at, close, alloc, atom)? {
+                    if !cfg_holds(&self.item, at, meta, alloc, atom)? {
                         return Ok(NextAttr::Removed);
                     }
                     self.item = splice(&self.item, at..close + 1, &self.item, &[])?;
                 }
                 _ => {
                     self.at = close + 1;
-                    let attr = self.item.copy_in(at..close + 1, alloc)?;
+                    let attr = attr_copy(&self.item, at, close, meta)?;
                     if derive_meta(&attr, 2..index(attr.len() - 1), alloc).is_some() {
                         continue;
                     }
@@ -178,11 +192,12 @@ impl<'a> ItemAttrs<'a> {
         let alloc = self.item.allocator();
         let mut at = from;
         while let Some(close) = outer_attr(&self.item, at) {
-            if name_of(&self.item, at) != "cfg_attr" {
+            let meta = meta_at(&self.item, at + 1, close);
+            if meta_name(&self.item, &meta) != "cfg_attr" {
                 at = close + 1;
                 continue;
             }
-            let attr = self.item.copy_in(at..close + 1, alloc)?;
+            let attr = attr_copy(&self.item, at, close, meta)?;
             let metas = cfg_attr_metas(&attr, alloc, atom).map_err(|error| ItemAttrsError::CfgAttr { token: index(at), error })?;
             self.item = splice(&self.item, at..close + 1, &attr, &metas)?;
             // `at` now starts the first attribute it left (none: the next one); none of them is
@@ -204,7 +219,7 @@ impl<'a> ItemAttrs<'a> {
     pub fn attr_call(&self, attr: Range<u32>) -> Result<AttrCall<'a>, StreamError> {
         let alloc = self.item.allocator();
         let (start, end) = (attr.start as usize, attr.end as usize);
-        let tokens = self.item.copy_in(start..end, alloc)?;
+        let tokens = attr_copy(&self.item, start, end - 1, meta_at(&self.item, start + 1, end - 1))?;
         let args = match attr_call(&tokens).and_then(|(_, args)| args) {
             Some(r) => Some(tokens.copy_in(r.start as usize..r.end as usize, alloc)?),
             None => None,
@@ -214,7 +229,7 @@ impl<'a> ItemAttrs<'a> {
         let mut at = 0;
         // The outer attributes before the call, each read once: a derive is cut, the rest kept.
         while let Some(close) = outer_attr(&self.item, at).filter(|&close| close < start) {
-            let written = self.item.copy_in(at..close + 1, alloc)?;
+            let written = attr_copy(&self.item, at, close, meta_at(&self.item, at + 1, close))?;
             match derive_meta(&written, 2..index(written.len() - 1), alloc) {
                 Some((_, paths)) => derives_taken += paths.len(),
                 None => {
@@ -236,10 +251,11 @@ impl<'a> ItemAttrs<'a> {
     /// ([`crate::same_path`]), so an item of a file's text and one an expansion wrote are found
     /// alike, a `$crate` head held as one token, as a `$` then `crate`, or rendered `crate`.
     pub fn attr_is(&self, attr: Range<u32>, path: &TokenStream<'_>) -> bool {
-        // `#`, `[`, then the path.
-        let start = attr.start as usize + 2;
+        // `#`, `[`, then the path (inside the invisible groups that are all of a `$m:meta`).
+        let meta = meta_at(&self.item, attr.start as usize + 1, attr.end as usize - 1);
+        let start = meta.start;
         match crate::attr_path::path_end(&self.item, start) {
-            Some(end) if end < attr.end as usize => crate::attr_path::same_path(&self.item, start..end, path, 0..path.len()),
+            Some(end) if end <= meta.end => crate::attr_path::same_path(&self.item, start..end, path, 0..path.len()),
             _ => false,
         }
     }
@@ -259,7 +275,7 @@ impl<'a> ItemAttrs<'a> {
         let mut uses = Vec::new_in(alloc);
         let mut at = 0;
         while let Some(close) = outer_attr(&self.item, at) {
-            let attr = self.item.copy_in(at..close + 1, alloc)?;
+            let attr = attr_copy(&self.item, at, close, meta_at(&self.item, at + 1, close))?;
             if let Some((constness, paths)) = derive_meta(&attr, 2..index(attr.len() - 1), alloc) {
                 for p in paths.iter() {
                     let tokens = attr.copy_in(p.start as usize..p.end as usize, alloc)?;
@@ -272,7 +288,7 @@ impl<'a> ItemAttrs<'a> {
             true => AlsoCopy::Yes,
             false => AlsoCopy::No,
         };
-        let input = derive_input(&self.item, atom)?;
+        let Some(input) = derive_input(&self.item, atom)? else { return Ok(None) };
         Ok(Some(Derives { uses, input, copy }))
     }
 }
@@ -285,28 +301,60 @@ fn outer_attr(item: &TokenStream<'_>, at: usize) -> Option<usize> {
     if hash && bracket { item.close_of(at + 1) } else { None }
 }
 
-/// The first name inside the attribute at `at` (`cfg` of `#[cfg(..)]`), or `""`.
-fn name_of<'s>(item: &'s TokenStream<'_>, at: usize) -> &'s str {
-    match item.tokens().get(at + 2).map(|t| t.kind) {
-        Some(TokenKind::Ident { .. }) => item.text_at(at + 2),
+/// The meta of the attribute whose `[` is at `open` and `]` at `close` (`cfg(x)` of
+/// `#[cfg(x)]`): its tokens without the invisible groups that are all of it, as `#[$attr]`
+/// writes a `$attr:meta` fragment (libc's `s!`, pin-project-lite).
+fn meta_at(item: &TokenStream<'_>, open: usize, close: usize) -> Range<usize> {
+    let mut meta = open + 1..close;
+    while meta.len() >= 2
+        && item.tokens()[meta.start].kind == TokenKind::Open(Delim::Invisible)
+        && item.close_of(meta.start) == Some(meta.end - 1)
+    {
+        meta = meta.start + 1..meta.end - 1;
+    }
+    meta
+}
+
+/// Whether the `#[cfg(pred)]` at `at` holds, `meta` its `cfg(pred)`.
+fn cfg_holds<E>(
+    item: &TokenStream<'_>,
+    at: usize,
+    meta: Range<usize>,
+    alloc: Alloc<'_>,
+    atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
+) -> Result<bool, ItemAttrsError<E>> {
+    let open = meta.start + 1;
+    let inside = match item.close_of(open) {
+        Some(end) if end < meta.end && matches!(item.tokens()[open].kind, TokenKind::Open(Delim::Paren)) => open + 1..end,
+        _ => open..open,
+    };
+    cfg_predicate_at(item, inside, alloc, atom).map_err(|error| ItemAttrsError::Cfg { token: index(at), error })
+}
+
+/// The first name of the meta `meta` (`cfg` of `cfg(..)`), or `""`.
+fn meta_name<'s>(item: &'s TokenStream<'_>, meta: &Range<usize>) -> &'s str {
+    match item.tokens().get(meta.start).map(|t| t.kind) {
+        Some(TokenKind::Ident { .. }) if meta.start < meta.end => item.text_at(meta.start),
         _ => "",
     }
 }
 
-/// Whether the `#[cfg(pred)]` at `at`..=`close` holds.
-fn cfg_holds<E>(
-    item: &TokenStream<'_>,
-    at: usize,
-    close: usize,
-    alloc: Alloc<'_>,
-    atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
-) -> Result<bool, ItemAttrsError<E>> {
-    let open = at + 3;
-    let inside = match item.close_of(open) {
-        Some(end) if end < close && matches!(item.tokens()[open].kind, TokenKind::Open(Delim::Paren)) => open + 1..end,
-        _ => open..open,
-    };
-    cfg_predicate_at(item, inside, alloc, atom).map_err(|error| ItemAttrsError::Cfg { token: index(at), error })
+/// The attribute `#[meta]` at `at`..=`close` as a stream of its own, `meta` its meta's
+/// tokens: the item's tokens copied, the invisible groups that were all of the meta (a
+/// `$attr:meta` fragment's) left out, so cfg.rs reads `#[cfg_attr(..)]` as written.
+fn attr_copy<'a>(item: &TokenStream<'a>, at: usize, close: usize, meta: Range<usize>) -> Result<TokenStream<'a>, StreamError> {
+    let alloc = item.allocator();
+    if meta.start == at + 2 && meta.end == close {
+        return item.copy_in(at..close + 1, alloc);
+    }
+    let mut out = TokenStream::new_in(alloc);
+    out.push_from(item, at)?;
+    out.push_from(item, at + 1)?;
+    for t in meta {
+        out.push_from(item, t)?;
+    }
+    out.push_from(item, close)?;
+    Ok(out)
 }
 
 /// A path's tokens as written: `::` kept, no spaces (a `$` then `crate` as `$crate`).
@@ -342,176 +390,136 @@ fn splice<'a>(item: &TokenStream<'a>, cut: Range<usize>, attr: &TokenStream<'_>,
     Ok(out)
 }
 
-/// An attribute of the element [`derive_input`] is reading, held until the element is known to
-/// stay.
-enum HeldAttr<'a> {
-    /// Tokens of the item as written (`#[serde(skip)]`, a doc comment's `#[doc = ".."]`).
-    Written(Range<usize>),
-    /// What a `#[cfg_attr]` leaves: each meta of `attr` (its tokens from the `#`) as `#[meta]`.
-    Left { attr: TokenStream<'a>, metas: AVec<'a, Range<u32>> },
+/// One change [`derive_input`] makes to the item: the tokens `cut` go, and in their place, when
+/// `with` holds what a `#[cfg_attr]` leaves (its tokens from the `#`, and each meta it leaves
+/// as a range of them), each meta written as `#[meta]`.
+struct Edit<'a> {
+    cut: Range<usize>,
+    with: Option<(TokenStream<'a>, AVec<'a, Range<u32>>)>,
 }
 
-/// The held attributes of the element, in order, out to `out`; none held after.
-fn flush_held<'a>(out: &mut TokenStream<'a>, item: &TokenStream<'a>, held: &mut AVec<'a, HeldAttr<'a>>) -> Result<(), StreamError> {
-    for h in held.iter() {
-        match h {
-            HeldAttr::Written(range) => {
-                for m in range.clone() {
-                    out.push_from(item, m)?;
-                }
-            }
-            HeldAttr::Left { attr, metas } => {
-                for meta in metas.iter() {
-                    out.push_from(attr, 0)?;
-                    out.push_from(attr, 1)?;
-                    for m in meta.clone() {
-                        out.push_from(attr, m as usize)?;
-                    }
-                    out.push_from(attr, attr.len() - 1)?;
-                }
-            }
-        }
-    }
-    held.clear();
-    Ok(())
-}
-
-/// The item a derive sees ([`Derives::input`]), from `item` with its outer attributes applied.
-/// An attribute starts an element after `{`, `(`, `,` or another attribute.
+/// The item a derive sees ([`Derives::input`]), from `item` with its own outer attributes
+/// applied; `None` when a false `cfg` of the item itself removes it.
 ///
 /// The Reference, "Conditional compilation": a false `cfg` removes the thing it is on, and a
-/// derive's input is the item after `cfg` and `cfg_attr` are applied: a field or variant whose
-/// `cfg` is false goes WITH EVERY ATTRIBUTE IT CARRIES, the ones written before the `cfg` too
+/// derive's input is the item after `cfg` and `cfg_attr` are applied (rustc's `cfg_eval`, every
+/// node of it). The item is parsed once (extent.rs) and an attribute's element is the parser's
+/// node it is an attribute of: a field, a variant, a generic parameter, a statement, an arm,
+/// an expression. A false `cfg` removes that node whole, with the comma that ends it and WITH
+/// EVERY ATTRIBUTE IT CARRIES, the ones written before the `cfg` too
 /// (`#[command(flatten)] #[cfg(feature = "x")] f: F,`; a doc comment is a `#[doc]` of the same
-/// field). So the element's attributes are held until a token that is not an attribute shows
-/// it stays; each is read once, in order, and nothing after the first false `cfg` is asked.
+/// field). Each attribute is read once, in order, and nothing of an element after its first
+/// false `cfg` is asked. No comma or `<`/`>` is counted here: reth-ethereum-forks'
+/// `ChainHardforks` (`map: BTreeMap<&'static str, ForkCondition>,` under a false `cfg`,
+/// tempo-chainspec t1545) had a walk that did cut the field at its type's comma.
 fn derive_input<'a, E>(
     item: &TokenStream<'a>,
     atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
-) -> Result<TokenStream<'a>, ItemAttrsError<E>> {
+) -> Result<Option<TokenStream<'a>>, ItemAttrsError<E>> {
     let alloc = item.allocator();
+    let tree = crate::extent::item(item, alloc).map_err(ItemAttrsError::Syntax)?;
     let list = item.tokens();
-    let mut out = TokenStream::new_in(alloc);
-    let mut held: AVec<'a, HeldAttr<'a>> = Vec::new_in(alloc);
-    let starts_element = |at: usize| {
-        at == 0 || matches!(list[at - 1].kind, TokenKind::Open(_) | TokenKind::Punct { char: ',', .. } | TokenKind::Close(Delim::Bracket))
-    };
-    let mut at = 0;
-    while at < list.len() {
-        let close = if starts_element(at) { outer_attr(item, at) } else { None };
-        let Some(close) = close else {
-            // Not an attribute: the element stays, with the attributes held for it.
-            flush_held(&mut out, item, &mut held)?;
-            out.push_from(item, at)?;
-            at += 1;
+    let mut edits: AVec<'a, Edit<'a>> = Vec::new_in(alloc);
+    let mut node = 0;
+    while node < tree.len() {
+        if tree.kind(node) != SyntaxKind::ATTR {
+            node += 1;
             continue;
-        };
-        match name_of(item, at) {
-            "derive" | "derive_const" => at = close + 1,
+        }
+        let this = node;
+        let attr = tree.range(this);
+        // From its `#` to its `]`: the range is the whole node, with an invisible group that
+        // is all of the attribute.
+        let at = tree.token(this);
+        let mut close = attr.end - 1;
+        while close > at && list[close].kind == TokenKind::Close(Delim::Invisible) {
+            close -= 1;
+        }
+        node = tree.past(this);
+        let meta = crate::extent::meta_of(item, &tree, this);
+        if matches!(list.get(at + 1).map(|t| t.kind), Some(TokenKind::Punct { char: '!', .. })) {
+            // An inner attribute (`{ #![cfg(x)] .. }` in a default's block).
+            if matches!(meta_name(item, &meta), "cfg" | "cfg_attr") {
+                return Err(ItemAttrsError::InnerCfg { token: index(at) });
+            }
+            continue;
+        }
+        // A derive by any path (libc writes `::core::prelude::v1::derive(..)`) goes.
+        if derive_meta(item, index(meta.start)..index(meta.end), alloc).is_some() {
+            edits.push(Edit { cut: attr, with: None });
+            continue;
+        }
+        let owner_goes = match meta_name(item, &meta) {
             "cfg" => {
-                let holds = cfg_holds(item, at, close, alloc, atom)?;
-                at = close + 1;
-                if !holds {
-                    held.clear();
-                    at = element_end(list, at);
+                let holds = cfg_holds(item, at, meta, alloc, atom)?;
+                if holds {
+                    edits.push(Edit { cut: attr, with: None });
                 }
+                !holds
             }
             "cfg_attr" => {
-                let attr = item.copy_in(at..close + 1, alloc)?;
-                let metas = cfg_attr_metas(&attr, alloc, atom).map_err(|error| ItemAttrsError::CfgAttr { token: index(at), error })?;
+                let copy = attr_copy(item, at, close, meta)?;
+                let metas = cfg_attr_metas(&copy, alloc, atom).map_err(|error| ItemAttrsError::CfgAttr { token: index(at), error })?;
                 // What it leaves, with any derive it leaves gone and a `cfg` it leaves applied.
                 let mut kept: AVec<'a, Range<u32>> = Vec::new_in(alloc);
                 let mut removed = false;
                 for meta in metas.iter() {
-                    if derive_meta(&attr, meta.clone(), alloc).is_some() {
+                    if derive_meta(&copy, meta.clone(), alloc).is_some() {
                         continue;
                     }
-                    let is_cfg = matches!(attr.tokens()[meta.start as usize].kind, TokenKind::Ident { .. })
-                        && attr.text_at(meta.start as usize) == "cfg"
+                    let is_cfg = matches!(copy.tokens()[meta.start as usize].kind, TokenKind::Ident { .. })
+                        && copy.text_at(meta.start as usize) == "cfg"
                         && meta.end - meta.start >= 2;
                     if is_cfg {
                         let inside = meta.start as usize + 2..meta.end as usize - 1;
-                        removed |= !cfg_predicate_at(&attr, inside, alloc, atom).map_err(|error| ItemAttrsError::Cfg { token: index(at), error })?;
+                        removed |= !cfg_predicate_at(&copy, inside, alloc, atom).map_err(|error| ItemAttrsError::Cfg { token: index(at), error })?;
+                        if removed {
+                            break;
+                        }
                         continue;
                     }
                     kept.push(meta.clone());
                 }
-                at = close + 1;
-                if removed {
-                    held.clear();
-                    at = element_end(list, at);
-                } else {
-                    held.push(HeldAttr::Left { attr, metas: kept });
+                if !removed {
+                    edits.push(Edit { cut: attr, with: Some((copy, kept)) });
                 }
+                removed
             }
-            _ => {
-                held.push(HeldAttr::Written(at..close + 1));
-                at = close + 1;
-            }
+            _ => false,
+        };
+        if owner_goes {
+            // The element the attribute is on; the item's own (node 0) removes the item.
+            let owner = match tree.parent(this) {
+                None | Some(0) => return Ok(None),
+                Some(owner) => owner,
+            };
+            let cut = tree.removal(owner);
+            // What was changed inside it goes with it: its attributes before this one too.
+            edits.retain(|e| e.cut.start < cut.start);
+            edits.push(Edit { cut, with: None });
+            node = node.max(tree.past(owner));
         }
     }
-    // Attributes with nothing after them (no item is written so): kept as written.
-    flush_held(&mut out, item, &mut held)?;
-    Ok(out)
-}
-
-/// Where the element from `at` ends: past the comma that ends it, or at what closes the list
-/// it is in (its group's close, or the `>` of a generic parameter list).
-///
-/// The Reference, "Structs" (`StructField : OuterAttribute* Visibility? IDENTIFIER : Type`,
-/// `TupleField : OuterAttribute* Visibility? Type`), "Enumerations" (a variant's
-/// `= Expression` discriminant), "Generic parameters": an element is one field, variant or
-/// parameter, and the comma that ends it is outside every group AND every `<..>` of its type.
-/// `<` and `>` delimit no token tree, so `map: BTreeMap<&'static str, ForkCondition>,` holds
-/// a comma inside its type: counting groups alone, a false `cfg` on it removed only
-/// `map: BTreeMap<&'static str,` and left `ForkCondition>,` in the derive's input, which no
-/// derive reads (reth-ethereum-forks' `ChainHardforks`, its two `map` fields under opposite
-/// `cfg`s: every builtin derive of it refused, so `ChainHardforks: Default` met core's blanket
-/// impl alone, tempo-chainspec t1545). The angles are counted as adt.rs `split` counts them
-/// for the same pieces (`Angles::UntilEq`): until the element's first lone `=` (a
-/// discriminant or a field's default value, an expression whose `<` is a comparison or a
-/// shift), and never the `>` of `->`.
-fn element_end(list: &[crate::tokens::Token], mut at: usize) -> usize {
-    let mut depth = 0u32;
-    let mut angles = 0u32;
-    let mut counting = true;
-    // The index of the last `>` that closed an angle: a `=` glued to it (`Vec<u8>= ..`, one
-    // `>=` as lexed) is lone all the same.
-    let mut closed_at = None;
-    while at < list.len() {
-        match list[at].kind {
-            TokenKind::Open(_) => depth += 1,
-            TokenKind::Close(_) if depth == 0 => return at,
-            TokenKind::Close(_) => depth -= 1,
-            TokenKind::Punct { char: ',', .. } if depth == 0 && angles == 0 => return at + 1,
-            TokenKind::Punct { char: '<', .. } if depth == 0 && counting => angles += 1,
-            TokenKind::Punct { char: '>', .. } if depth == 0 && counting && !arrow_end(list, at) => {
-                // A `>` closing no angle of the element closes the generic parameter list the
-                // element is in (`struct S<A, #[cfg(x)] B: Tr<C, D>>`).
-                let Some(less) = angles.checked_sub(1) else { return at };
-                angles = less;
-                closed_at = Some(at);
-            }
-            TokenKind::Punct { char: '=', .. } if depth == 0 && angles == 0 && counting && lone_eq(list, at, closed_at) => counting = false,
-            _ => {}
+    let mut out = TokenStream::new_in(alloc);
+    let mut at = 0;
+    for edit in edits.iter() {
+        for t in at..edit.cut.start {
+            out.push_from(item, t)?;
         }
-        at += 1;
+        if let Some((attr, metas)) = &edit.with {
+            for meta in metas.iter() {
+                out.push_from(attr, 0)?;
+                out.push_from(attr, 1)?;
+                for m in meta.clone() {
+                    out.push_from(attr, m as usize)?;
+                }
+                out.push_from(attr, attr.len() - 1)?;
+            }
+        }
+        at = edit.cut.end;
     }
-    at
-}
-
-/// Whether the `>` at `at` ends a `->` (adt.rs `arrow_end`).
-fn arrow_end(list: &[crate::tokens::Token], at: usize) -> bool {
-    at > 0 && matches!(list[at - 1].kind, TokenKind::Punct { char: '-', spacing: crate::tokens::Spacing::Joint })
-}
-
-/// Whether the `=` at `at` stands alone (adt.rs `lone_eq`): not of `==`, `=>`, `<=`, `!=`, `+=`
-/// and the like. A `>` glued before it that closed an angle (`closed_at`) is no operator.
-fn lone_eq(list: &[crate::tokens::Token], at: usize, closed_at: Option<usize>) -> bool {
-    let joint = |i: usize| matches!(list.get(i).map(|t| t.kind), Some(TokenKind::Punct { spacing: crate::tokens::Spacing::Joint, .. }));
-    let glued_after = joint(at) && matches!(list.get(at + 1).map(|t| t.kind), Some(TokenKind::Punct { char: '=' | '>', .. }));
-    let glued_before = at > 0
-        && closed_at != Some(at - 1)
-        && matches!(list[at - 1].kind, TokenKind::Punct { char, spacing: crate::tokens::Spacing::Joint } if "<>!=+-*/%^&|".contains(char));
-    !glued_after && !glued_before
+    for t in at..item.len() {
+        out.push_from(item, t)?;
+    }
+    Ok(Some(out))
 }

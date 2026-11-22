@@ -1044,8 +1044,9 @@ impl TreeRunner for ShelfTree<'_> {
         }
 
         // 6. What the tree made or changed under `out`: a file equal to its laid bytes is the
-        // state's, not the tree's; one holding a host folder is left out (a log, a depfile:
-        // rule 25), unless the link asks for it, which is refused.
+        // state's, not the tree's; one holding a host folder is left out when it is a log or a
+        // depfile (rule 25, c_tasks_tree.rs `left_out_holding_a_host_folder`), and any other,
+        // or one the link asks for, is refused naming the file and the folder it holds.
         let listed = listed_under(out.as_str()).map_err(|e| fail(&["the tree's OUT_DIR could not be listed: ", &e.to_string()]))?;
         let demand = self.demand;
         let demanded = |name: &str| demand.iter().any(|asked| *asked == name);
@@ -1065,9 +1066,14 @@ impl TreeRunner for ShelfTree<'_> {
             if same {
                 continue;
             }
-            if shown.iter().any(|(_, host)| holds(&bytes, host.as_bytes())) || holds(&bytes, folder.as_bytes()) {
+            let host = shown.iter().map(|(_, host)| *host).find(|host| holds(&bytes, host.as_bytes())).or_else(|| holds(&bytes, folder.as_bytes()).then_some(folder.as_str()));
+            if let Some(host) = host {
                 if demanded(name) {
                     return Err(fail(&["the process tree's `", name, "`, which the link asks for, holds a folder of this machine (rule 25: equal inputs, equal bytes)"]));
+                }
+                // Only a log or a depfile is let go; any other is said, by name (rule 3).
+                if !c_tasks_tree::left_out_holding_a_host_folder(name) {
+                    return Ok(TreeRan::HostPath { file: String::from_str_in(name, alloc), host: String::from_str_in(host, alloc) });
                 }
                 left_out += 1;
                 continue;

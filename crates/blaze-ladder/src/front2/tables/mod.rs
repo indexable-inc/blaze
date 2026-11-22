@@ -8,6 +8,8 @@
 
 pub mod cost;
 #[cfg(test)]
+mod enter_once_tests;
+#[cfg(test)]
 mod failed_once_tests;
 #[cfg(test)]
 mod fn_text_tests;

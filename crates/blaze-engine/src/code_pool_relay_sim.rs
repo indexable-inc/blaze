@@ -96,7 +96,8 @@ fn bytes_of(order: Order) -> Vec<u8> {
 #[derive(Debug, PartialEq, Eq)]
 enum Seen {
     Made(Vec<u8>),
-    Refused,
+    /// The refusal of the key at this index: every asker of it sees the same one (rule 19).
+    Refused(usize),
     Late,
 }
 
@@ -138,7 +139,7 @@ impl Sim {
     fn serial(&self, child: usize, at: usize) -> Seen {
         let key = self.kids[child].script[at];
         match key {
-            Some(i) if self.refuses[i] => Seen::Refused,
+            Some(i) if self.refuses[i] => Seen::Refused(i),
             _ => Seen::Made(bytes_of(Order { key, child, at })),
         }
     }
@@ -185,7 +186,7 @@ impl Sim {
             Move::Take(child) => {
                 let seen = relayed(self.relay.answer(Child(child), |reply| match reply {
                     Reply::Made(bytes) => Seen::Made(bytes.to_vec()),
-                    Reply::Refused(_) | Reply::RefusedElsewhere { .. } => Seen::Refused,
+                    Reply::Refused(Refusal(i)) => Seen::Refused(*i),
                     Reply::Late { .. } => Seen::Late,
                 }))?
                 .ok_or_else(|| Broken::Harness(format!("child {child}'s answer was ready and none came")))?;

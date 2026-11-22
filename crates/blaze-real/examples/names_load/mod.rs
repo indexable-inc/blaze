@@ -357,7 +357,6 @@ fn procs_of(
     crates: &UnitCrates<'static>,
     graph: &blaze_unit_graph::UnitGraph<'static>,
     lock: &Lock<'static>,
-    lock_text: &str,
     member_dirs: &BTreeMap<u32, PathBuf>,
     places: &[(String, Place)],
     heap: &'static blaze_own::Heap,
@@ -411,7 +410,7 @@ fn procs_of(
         }
     }
     let path_dir = |id: blaze_manifest::lock::LockId| member_dirs.get(&id.0).cloned();
-    let made = blaze_world::procs::register_macro_crates(&mut procs, modules, lock, lock_text, macro_units, path_dir).map_err(|e| LoadError::Procs(e.to_string()))?;
+    let made = blaze_world::procs::register_macro_crates(&mut procs, modules, lock, macro_units, path_dir).map_err(|e| LoadError::Procs(e.to_string()))?;
     for (i, why) in &made.unregistered {
         println!("  procs: crate {}: not registered: {why:?}", crates.crates[*i].name);
     }
@@ -602,8 +601,7 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
     }
     let procs = match modules {
         Some((modules, out)) => {
-            let lock_text = core::str::from_utf8(bytes).map_err(|_| LoadError::Lock("not UTF-8".to_string()))?;
-            Some(&*leak(procs_of(root, modules, out, crates, graph, lock, lock_text, &member_dirs, &places, heap)?))
+            Some(&*leak(procs_of(root, modules, out, crates, graph, lock, &member_dirs, &places, heap)?))
         }
         None => None,
     };

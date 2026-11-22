@@ -93,6 +93,11 @@ fn expanding_defs<'t>(defs: &[Def<'_>], text: &'t str) -> Lowered<'static, 't> {
 
 /// The expander of `defs`: each prepared once, found by its last name.
 fn by_name(defs: &[Def<'_>]) -> ByName<'static, 'static, Host> {
+    by_name_with(defs, Host)
+}
+
+/// [`by_name`] over the host `host`.
+fn by_name_with<C: ExpandCx>(defs: &[Def<'_>], host: C) -> ByName<'static, 'static, C> {
     let mut rules: StdVec<(&'static str, Prepared<'static>)> = StdVec::new();
     for d in defs {
         let stream = lex(d.body, Edition::E2024, Alloc::global()).expect("the rules lex");
@@ -104,7 +109,74 @@ fn by_name(defs: &[Def<'_>]) -> ByName<'static, 'static, Host> {
         rules.push((d.name, prepare(def).expect("the rules compile")));
     }
     let rules: &'static [(&'static str, Prepared<'static>)] = Box::leak(rules.into_boxed_slice());
-    ByName::new(rules, at(), Host, Alloc::global())
+    ByName::new(rules, at(), host, Alloc::global())
+}
+
+/// A body's host as the ladder's is (front2 body_host.rs): `file!()` is `src/lib.rs`, and
+/// `line!()`/`column!()` are answered only when told the written call (`place_of_call`), each
+/// as `1000 + call` / `call` so the test reads which byte it was told.
+struct Placing;
+
+impl ExpandCx for Placing {
+    fn env(&self, _: &str) -> Result<Option<&str>, HostError> {
+        Ok(None)
+    }
+    fn cfg(&self, _: &TokenStream<'_>) -> Result<bool, HostError> {
+        Ok(false)
+    }
+    fn include(&self, _: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
+        Ok(Included::Missing)
+    }
+    fn place(&self, what: PlaceOf) -> Result<Place<'_>, HostError> {
+        match what {
+            PlaceOf::File => Ok(Place::Text("src/lib.rs")),
+            _ => Err(HostError { ask: HostAsk::Place, why: HostWhy::Refused }),
+        }
+    }
+    fn place_of_call(&self, what: PlaceOf, call: u32) -> Result<Place<'_>, HostError> {
+        match what {
+            PlaceOf::Line => Ok(Place::Number(1000 + call)),
+            PlaceOf::Column => Ok(Place::Number(call)),
+            _ => self.place(what),
+        }
+    }
+    fn run_proc_macro<'a>(&self, _: &MacroDefinition<'_>, _: ProcCall<'_>, _: Alloc<'a>) -> Result<Produced<'a>, HostError> {
+        Err(HostError { ask: HostAsk::ProcMacro, why: HostWhy::Failed })
+    }
+}
+
+/// The dump of `text`'s body lowered with `defs` over [`Placing`], every form handled.
+fn placed_dump(defs: &[(&'static str, &str)], text: &str) -> String {
+    let defs: StdVec<Def> = defs.iter().map(|&(name, body)| Def { name, body, macro2: false }).collect();
+    let mut expander = by_name_with(&defs, Placing);
+    let l = match lower_body_expanding(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()) {
+        Ok(l) => l,
+        Err(need) => panic!("{text}: needs {:?}", need.atoms),
+    };
+    let dump = dump_of(&l);
+    let unhandled: StdVec<_> = l.view().unhandled().collect();
+    assert!(unhandled.is_empty(), "{text}: unhandled {unhandled:?}\n{dump}");
+    dump
+}
+
+/// tempo t1855d: tracing's `event!` writes `concat!(file!(), ":", line!())`, so `line!()` is
+/// in eager input in a MACRO'S expansion in a body. Its line is the outermost WRITTEN call's
+/// (core `line!`: "the first macro invocation leading up to the expansion"): `m!()` at the
+/// body's byte 25, which the host is told through the nested eager call (by_name.rs
+/// `BodyCx::written`). Twin: the `concat!` written in the body itself, at the same byte, gives
+/// the same answer; and `column!()` the same byte. Control: over a host made for one call
+/// ([`Host`], the default `place_of_call` is its `place`) the answer is that host's, 1.
+/// Prints nothing; passes.
+#[test]
+fn line_in_eager_input_is_placed_at_the_written_call() {
+    let m = ("m", "() => { concat!(file!(), \":\", line!()) }");
+    let through = placed_dump(&[m], "fn f() -> &'static str { m!() }");
+    assert!(through.contains("(lit \"src/lib.rs:1025\")"), "{through}");
+    let written = placed_dump(&[], "fn f() -> &'static str { concat!(file!(), \":\", line!()) }");
+    assert!(written.contains("(lit \"src/lib.rs:1025\")"), "twin: {written}");
+    let column = placed_dump(&[], "fn f() -> &'static str { concat!(column!()) }");
+    assert!(column.contains("(lit \"25\")"), "twin: {column}");
+    assert_expands(&[], "fn f() -> &'static str { concat!(\"a\", line!()) }", &["(lit \"a1\")"]);
 }
 
 pub(crate) fn dump_of(l: &Lowered<'_, '_>) -> String {

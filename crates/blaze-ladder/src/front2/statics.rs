@@ -52,6 +52,9 @@ pub struct Statics {
     pub values: Vec<(ItemKey, DataRecord<Global>), Global>,
     /// Each static's kind, sorted by key: the seam's `static_item`.
     pub kinds: Vec<(ItemKey, StaticItem), Global>,
+    /// Each static an `extern` block declares, with its C symbol, sorted by key: the seam's
+    /// `foreign_static`. Its kind is in `kinds`; it has no record in `values` (no initializer).
+    pub foreign: Vec<(ItemKey, Box<str>), Global>,
 }
 
 impl Statics {
@@ -60,24 +63,26 @@ impl Statics {
         let at = self.kinds.binary_search_by_key(&item, |(k, _)| *k).ok()?;
         Some(self.kinds[at].1)
     }
+
+    /// Static `item`'s C symbol when an `extern` block declares it; `None` for any other.
+    pub fn foreign(&self, item: ItemKey) -> Option<&str> {
+        let at = self.foreign.binary_search_by_key(&item, |(k, _)| *k).ok()?;
+        Some(&self.foreign[at].1)
+    }
 }
 
 /// Every static `bodies` name (`Def::Static`), and every static a record among them points
 /// at, evaluated once by the evaluator in `r.consts`, by a work list in key order. Returns the
 /// statics made and each static refused with its words (the evaluator's refusal, no head, an
 /// attribute row that does not read): a run stops at the first, a survey files them.
+///
+/// A static an `extern` block declares is never evaluated (the Reference, "External blocks",
+/// "Statics": it has no initializer; its storage is the foreign object's): its kind and C
+/// symbol are filed (program.rs `foreign_static_symbol`, the one rule), and a body's path to
+/// it is a place at that symbol (code_records.rs `InstanceNames::c_statics`). secp256k1-sys's
+/// `extern "C" { pub static secp256k1_context_no_precomp: *const Context; }` was evaluated
+/// as a Rust static and refused for its missing initializer (tempo t1855d).
 pub fn static_values<'c, 'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, bodies: impl Iterator<Item = &'c Checked<'static>>) -> (Statics, Vec<(ItemKey, Box<str>), Global>) {
-    static_values_but(r, bodies, &|_| false)
-}
-
-/// [`static_values`] with each static `foreign` says yes to left out: a static an `extern`
-/// block declares has no initializer to evaluate (the Reference, "External blocks", "Statics":
-/// it is "declared without an initializer"; its storage is the foreign object's), so it has no
-/// record here: a path to it is a place at its C symbol (lazy/fill.rs `foreign_static`), and
-/// nothing evaluates it.
-pub fn static_values_but<'c, 'n, S: NamesSource<'n>>(
-    r: &mut Records<'_, 'n, S>, bodies: impl Iterator<Item = &'c Checked<'static>>, foreign: &dyn Fn(ItemKey) -> bool,
-) -> (Statics, Vec<(ItemKey, Box<str>), Global>) {
     let mut todo: Vec<ItemKey, Global> = Vec::new_in(Global);
     for c in bodies {
         todo.extend(c.expr_defs.column::<1>().iter().filter_map(|d| match d {
@@ -92,15 +97,30 @@ pub fn static_values_but<'c, 'n, S: NamesSource<'n>>(
     let mut values: Vec<(ItemKey, DataRecord<Global>), Global> = Vec::new_in(Global);
     let mut kinds: Vec<(ItemKey, StaticItem), Global> = Vec::new_in(Global);
     let mut refused: Vec<(ItemKey, Box<str>), Global> = Vec::new_in(Global);
+    let mut foreign: Vec<(ItemKey, Box<str>), Global> = Vec::new_in(Global);
     while let Some(k) = todo.pop() {
         let Err(at) = done.binary_search(&k) else { continue };
         done.insert(at, k);
-        if foreign(k) {
-            continue;
-        }
         if done.len() > MOST_STATICS {
             refused.push((k, format!("more than {MOST_STATICS} statics reached (the work list's bound)").into_boxed_str()));
             break;
+        }
+        match super::program::foreign_static_symbol(r.names, &*r.keys, &*r.store, k) {
+            Ok(Some(symbol)) => {
+                match foreign_kind(r, k) {
+                    Ok(kind) => {
+                        kinds.push((k, kind));
+                        foreign.push((k, symbol));
+                    }
+                    Err(why) => refused.push((k, why)),
+                }
+                continue;
+            }
+            Ok(None) => {}
+            Err(why) => {
+                refused.push((k, why));
+                continue;
+            }
         }
         match one_static(r, k) {
             Ok((record, kind)) => {
@@ -121,7 +141,8 @@ pub fn static_values_but<'c, 'n, S: NamesSource<'n>>(
     }
     values.sort_unstable_by_key(|(k, _)| *k);
     kinds.sort_unstable_by_key(|(k, _)| *k);
-    (Statics { values, kinds }, refused)
+    foreign.sort_unstable_by_key(|(k, _)| *k);
+    (Statics { values, kinds, foreign }, refused)
 }
 
 /// Static `k`'s record (copied out of the evaluator's arena) and its kind. The run's static

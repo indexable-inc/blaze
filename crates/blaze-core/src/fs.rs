@@ -1586,6 +1586,9 @@ pub(crate) fn stamp_of(stat: &libc::stat) -> Stamp {
         size: stat.st_size as u64,
         mtime_ns: ns(stat.st_mtime as i64, stat.st_mtime_nsec as i64),
         ctime_ns: ns(stat.st_ctime as i64, stat.st_ctime_nsec as i64),
+        // As `meta_of` (std's `MetadataExt::dev`) and the listing's `Meta` widen it.
+        #[allow(clippy::unnecessary_cast, reason = "st_dev is u64 on Linux, narrower on other Unixes")]
+        dev: stat.st_dev as u64,
         #[allow(clippy::useless_conversion, reason = "st_mode is u16 on macOS, u32 on Linux")]
         mode: u32::from(stat.st_mode),
     }

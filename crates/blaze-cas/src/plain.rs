@@ -57,7 +57,7 @@
 //! head is short or missing is the durable `Effect::Write` of `CACHEDIR.TAG` (core.rs
 //! `HEAD_MAKE` 0), which makes each missing folder of its path, from the top, and syncs each
 //! one's name into its parent (blaze-core `make_parent_durably`): a store three levels down
-//! (`.blaze/v2/store/f5s2`) a fresh home makes whole is as durable as one in a folder its
+//! (`.blaze/v2/store/f5s3`) a fresh home makes whole is as durable as one in a folder its
 //! caller made. Only then is the head made (a Truncate, which then makes no folder), synced,
 //! and its name synced into the store's folder; a SyncDir of a folder makes its CONTENTS'
 //! names durable, never its own, which is why the tag's write comes first. Below that, every
@@ -78,8 +78,9 @@
 //!    once (n log n on its entries).
 //! 2. Each `seg-<id>` in turn is made at its length and every piece written at its offset, in
 //!    parallel. No lock is held. No sync (durable mode: one sync of each segment here).
-//! 3. The flip lock is taken (`flock`, never waiting in the kernel: a 2 ms timer between
-//!    asks, stopped by name after 60 s). Under it: the head is read again, and the manifest
+//! 3. The flip lock is taken (`flock`, never waiting in the kernel: a timer between asks,
+//!    jittered and doubling from 100 us to 2 ms, stopped by name once the steps sum to 60 s:
+//!    core.rs `lock_step`). Under it: the head is read again, and the manifest
 //!    when another process flipped since (so no update is lost); the new manifest is built
 //!    (this segment added, roots changed, files retired past the grace period dropped) and
 //!    appended to the log; the inactive slot is written. No sync (durable: the log is synced
@@ -167,7 +168,7 @@
 //! work after its answer is refused or lost.
 //!
 //! A root may name INDEXES instead of records ([`Plain::root_through`], its record filed under
-//! [`INDEXED_ROOT_TAG`]): an index ([`Plain::index`], [`INDEX_TAG`]) is one record of sorted
+//! blaze-keyed's `ReservedTag::IndexedRoot`): an index ([`Plain::index`], `ReservedTag::Index`) is one record of sorted
 //! keys, keyed by its bytes, so a program that reached 100,000 records is kept by a root of
 //! one key, and a set many roots share (a toolchain's compiled code) is one record. Reach
 //! follows one level: the root's record, each index, every key each index holds.
@@ -184,6 +185,7 @@
 pub mod settings;
 
 pub mod bottom;
+mod arena;
 mod core;
 mod driven;
 mod format;
@@ -196,6 +198,8 @@ mod verified;
 #[cfg(test)]
 mod aligned_tests;
 #[cfg(test)]
+mod arena_tests;
+#[cfg(test)]
 mod cleanup_tests;
 #[cfg(test)]
 mod index_tests;
@@ -206,9 +210,13 @@ mod bottom_tests;
 #[cfg(test)]
 mod lazy_tests;
 #[cfg(test)]
+mod lock_wait_tests;
+#[cfg(test)]
 mod phase_commit_tests;
 #[cfg(test)]
 mod pointer_tests;
+#[cfg(test)]
+mod reserved_tag_tests;
 #[cfg(test)]
 mod root_commit_tests;
 #[cfg(test)]
@@ -224,16 +232,17 @@ pub(crate) fn test_root() -> blaze_mem::Frame {
 }
 
 pub use self::core::{
-    Batch, CACHEDIR_SIGNATURE, CACHEDIR_TAG, CARRY_ROUNDS, Committed, Found, GRACE_NS, Got, INDEX_KEYS_MOST, INDEX_TAG, INDEXED_ROOT_TAG, LEASE_NS, Liveness, Lost, Named, POINTER_LEN, POINTER_TAG,
-    Placed, Plain, PlainConfig, Probe, Probes, PutError, ROOT_INDEXES_MOST, ROOT_LIFE_NS, ROOT_TAG, Report, SEGMENTS_MOST, SLICE_BYTES, SWEEP_BYTES, Scrubbed, Sliced, TAGS, TOUCH_NS, WINDOW,
+    Batch, CACHEDIR_SIGNATURE, CACHEDIR_TAG, CARRY_ROUNDS, Committed, Found, GRACE_NS, Got, INDEX_KEYS_MOST, LEASE_NS, LentRecord, Liveness, LockStep, LockWaited, Lost, Named, POINTER_LEN,
+    Placed, Plain, PlainConfig, Probe, Probes, PutError, PutPath, ROOT_INDEXES_MOST, ROOT_LIFE_NS, Report, SEGMENTS_MOST, SLICE_BYTES, SWEEP_BYTES, Scrubbed, Sliced, TAGS, TOUCH_NS, WINDOW,
     beside_key, store_leaf,
 };
-pub use self::lent::{Aligned16, Lend, Lent, LentCounts, LentError, Misaligned, NotInPlace, first_difference};
+pub use self::arena::Visibility;
+pub use self::lent::{Aligned16, Lend, Lent, LentCounts, LentError, Misaligned, NotInPlace, PutTally, first_difference};
 pub use self::snapshot::{Proved, SNAPSHOT_SEGMENTS_MOST, Snapshot, SnapshotError};
 pub use self::driven::{Driven, LocalDir, lower_this_thread};
 pub use self::format::{Described, Entry, FORMAT, FORMS, PlaceName, SEGMENT_FORMAT, Segment, check_segment, describe, find_many, record_crc, seal_segment};
 pub use self::handle::{LANES_MOST, LaneId, PlainStore};
-pub use self::image::{IMAGE_TAG, ImageError, Placement, StartupImage};
+pub use self::image::{ImageError, Placement, StartupImage};
 pub use self::settings::Settings;
 pub use self::verified::{Checks, Proof};
 // The vocabulary is blaze-keyed's (rule 30): re-exported where the remote lane looks for it.

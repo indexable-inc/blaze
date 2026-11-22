@@ -105,6 +105,21 @@
 //!    halves against fresh builds). The owed names are sorted and kept once (rule 25: the
 //!    answer is the same whatever the workers' order), and a name the phase did not enter is
 //!    [`EngineError::Unplanned`]; a made record is never owed (its maker makes it again).
+//! 14. **A file found while the request runs is planned as if it had been in the edit.** A task
+//!    may need a file no plan named (a crate's names expanding a macro that writes `mod $n;`:
+//!    D161, "a task that lacks a fact waits on it"). [`Engine::plan_file`] takes the file's whole
+//!    plan, the same tasks the edit would have held for it (its outline, its heads, bodies and
+//!    lint units), with the outline's result: the outline is filed at once as its phase's merge
+//!    files it (keyed from its text, a planned row, never an inline one, so its row is the
+//!    bytes a file the walk found would have), its cells move, and every other task is a
+//!    candidate of its phase, which must still be ahead ([`EngineError::FiledLate`]). The file's
+//!    tasks of the last answer it no longer plans are retired, as for a changed file. A file
+//!    already planned or merged this request is [`EngineError::FiledTwice`]. Both drivers call
+//!    it: the phase path between phases (as [`Engine::grow`]), the ready path when a task's Need
+//!    names an outline no kind planned. A file found by an earlier request is in the edit as
+//!    the walk planned it from its kept place; once the names have said what they read, a plan
+//!    of it that moved is given again with no outline (the outline's row already in), and one
+//!    no crate's names read any more is dropped by [`Engine::drop_file`], as a removed file.
 //!
 //! # The last answer and this request's writes
 //!
@@ -804,6 +819,20 @@ pub enum EngineError {
     GrownForeign { by: Name, name: Name },
     /// `by` grew `count` tasks, past [`GROWN_CAP`] (rule 18).
     GrownTooMany { by: Name, count: u32 },
+    /// A file found while the request ran ([`Engine::plan_file`], invariant 14) plans `name` into
+    /// `phase`, which is not after `passed`, the last phase the request took: only the file's
+    /// own outline is filed at once; every other task of it must still be ahead.
+    FiledLate { file: Name, name: Name, phase: Phase, passed: Phase },
+    /// [`Engine::plan_file`] of a file this request already plans or merged: a file's plan is
+    /// given once a request (invariant 14).
+    FiledTwice { file: Name },
+    /// [`Engine::plan_file`] of `file` was given `name`, whose own file is another, or whose
+    /// plan holds no task named `file` (its outline): a file's plan is its own (invariant 14).
+    FiledForeign { file: Name, name: Name },
+    /// [`Engine::plan_file`] of `file` with no outline (a file planned again after the names
+    /// said what they read), but no row of its outline stands or was merged under the plan's
+    /// key: only a file this request already planned is planned again (invariant 14).
+    FiledUnplanned { file: Name },
     /// The last answer refused a question (last.rs): it contradicts itself.
     Last { error: LastError },
     /// The last answer names a `what` (a task, a cell) its dictionary does not: in the row, the
@@ -873,6 +902,18 @@ impl fmt::Display for EngineError {
             EngineError::GrownTooMany { by, count } => {
                 write!(f, "{by:?} grew {count} tasks, past the cap of {GROWN_CAP} (rule 18, engine.rs `grow`)")
             }
+            EngineError::FiledLate { file, name, phase, passed } => write!(
+                f,
+                "the file {file:?}, found while the request ran, plans {name:?} into {phase:?}, which is not after {passed:?}: a found file's tasks but its outline must still be ahead (engine.rs invariant 14, `plan_file`)"
+            ),
+            EngineError::FiledTwice { file } => write!(f, "the file {file:?} was planned twice in one request: a found file's plan is given once (engine.rs invariant 14, `plan_file`)"),
+            EngineError::FiledForeign { file, name } => {
+                write!(f, "the plan given for the found file {file:?} holds {name:?}, which is not its own, or holds no outline of it (engine.rs invariant 14, `plan_file`)")
+            }
+            EngineError::FiledUnplanned { file } => write!(
+                f,
+                "the file {file:?} was planned again with no outline, but no row of its outline stands or was merged under the plan's key: only a file this request planned is planned again (engine.rs invariant 14, `plan_file`)"
+            ),
             EngineError::Last { error } => write!(f, "{error} (engine.rs, read through overlay.rs)"),
             EngineError::LastUnnamed { what, by: Some(by) } => {
                 write!(f, "the stored answer: {by:?}'s entry names {what} its dictionary does not (overlay.rs)")
@@ -1728,6 +1769,126 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
         }
         if !names.is_empty() {
             self.view.put_file(by, names);
+        }
+        Ok(())
+    }
+
+    /// Plans `file`, found while the request ran (invariant 14): `planned` is its whole plan, one
+    /// task of it named `file` (its outline, of the outlines' stage) whose result is `outline`;
+    /// every other task of a phase after the last one taken. Called with no phase open, as
+    /// [`Engine::grow`] is. The outline is filed now unless its row stands under today's key;
+    /// each other task whose row is not under today's key is a candidate of its phase.
+    ///
+    /// `outline` is `None` for a file this request already plans (the walk took it from the last
+    /// answer's places, and the names said after what they read of it): its outline's row stands
+    /// or was merged under `planned`'s key ([`EngineError::FiledUnplanned`] if not), and only the
+    /// rest of its plan is given again, the tasks it no longer plans retired.
+    pub fn plan_file(&mut self, file: Name, outline: Option<Done<'a>>, planned: &[Planned]) -> Result<(), EngineError> {
+        if self.open.is_some() || !self.saved.is_empty() {
+            return Err(EngineError::OutOfTurn);
+        }
+        if outline.is_some() && (self.planned.contains_key(&file) || self.view.row_now(file).is_some_and(|row| row.serial == self.serial)) {
+            return Err(EngineError::FiledTwice { file });
+        }
+        let Some(own) = planned.iter().find(|one| one.name == file).copied() else {
+            return Err(EngineError::FiledForeign { file, name: file });
+        };
+        let key = self.tools.key(file, &own.source);
+        match &outline {
+            Some(outline) if outline.name != file => return Err(EngineError::FiledForeign { file, name: outline.name }),
+            Some(outline) if outline.key != key => return Err(EngineError::KeyMoved { name: file, planned: key, got: outline.key }),
+            Some(_) => {}
+            None => {
+                if !self.view.row(file)?.is_some_and(|row| row.key == key) {
+                    return Err(EngineError::FiledUnplanned { file });
+                }
+            }
+        }
+        let alloc = self.alloc;
+        let mut names: SVec<'a, Name> = Vec::with_capacity_in(planned.len(), alloc);
+        for one in planned.iter() {
+            if one.file != file {
+                return Err(EngineError::FiledForeign { file, name: one.name });
+            }
+            if one.name != file
+                && let Some(passed) = self.passed
+                && one.phase <= passed
+            {
+                return Err(EngineError::FiledLate { file, name: one.name, phase: one.phase, passed });
+            }
+            names.push(one.name);
+        }
+        names.sort_unstable();
+        if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
+            return Err(EngineError::TwoValues { name: pair[0] });
+        }
+        // As a changed file's plan at the request's start (`with_index_in`): what the last answer
+        // planned of the file and this plan does not is retired.
+        let old = self.view.take_file(file)?;
+        for name in old.iter() {
+            if names.binary_search(name).is_ok() {
+                continue;
+            }
+            self.view.unowe(*name);
+            self.planned.remove(name);
+            self.report.retired += u32::from(self.view.row(*name)?.is_some());
+            self.remove_row(*name, self.passed)?;
+        }
+        for one in planned.iter() {
+            self.planned.insert(one.name, *one);
+            // Planned again (no outline): only a task the earlier plan did not hold is new to
+            // the edit's counts.
+            if outline.is_some() || old.binary_search(&one.name).is_err() {
+                let count = self.edit_counts.entry(one.phase).or_insert(0);
+                *count = count.saturating_add(1);
+            }
+        }
+        // The outline, filed as its phase's merge files a planned result: a planned row (not
+        // inline), its cells moved once it is in, each reader that did not see them a candidate.
+        if let Some(outline) = outline
+            && !self.view.member_stands(file, file, key)?
+        {
+            let cause = match self.view.row(file)? {
+                Some(_) => Cause::KeyMoved,
+                None => Cause::New,
+            };
+            let mut changes: SVec<'a, (CellId, Option<ContentId>)> = Vec::new_in(alloc);
+            self.report.entered += 1;
+            self.report.results += 1;
+            self.entered.push(file);
+            let identical = self.apply(own, outline, own.phase, false, &mut changes)?;
+            self.count(own, cause, identical);
+            for (id, digest) in changes.iter() {
+                self.move_cell(*id, *digest, Some(own.phase))?;
+            }
+        }
+        for one in planned.iter() {
+            if one.name == file {
+                continue;
+            }
+            let key = self.tools.key(one.name, &one.source);
+            if !self.view.member_stands(file, one.name, key)? {
+                self.candidate(*one, None)?;
+            }
+        }
+        self.view.put_file(file, names);
+        Ok(())
+    }
+
+    /// Drops `file`, a file found by an earlier request that no crate's names read now
+    /// (invariant 14): every task it plans, this request's plan of it or the last answer's, is
+    /// retired as for a file the edit removes, its rows gone and their cells absent from the last
+    /// phase taken. Called with no phase open, as [`Engine::plan_file`] is.
+    pub fn drop_file(&mut self, file: Name) -> Result<(), EngineError> {
+        if self.open.is_some() || !self.saved.is_empty() {
+            return Err(EngineError::OutOfTurn);
+        }
+        let old = self.view.take_file(file)?;
+        for name in old.iter() {
+            self.view.unowe(*name);
+            self.planned.remove(name);
+            self.report.retired += u32::from(self.view.row(*name)?.is_some());
+            self.remove_row(*name, self.passed)?;
         }
         Ok(())
     }

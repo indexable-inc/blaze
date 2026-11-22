@@ -108,10 +108,10 @@ fn image(tp_rel: bool) -> Image<'static> {
     put64(&mut bytes, 0x3_0060, 0xBEEF);
     let mut fixups: AVec<'static, Fixup> = Vec::new_in(a);
     fixups.push(Fixup { at: 0x2_0000, to: FixTo::Import { index: 0, addend: 0 } });
-    fixups.push(Fixup { at: 0x3_0050, to: FixTo::Rebase { target: 0x1_0000 } });
+    fixups.push(Fixup { at: 0x3_0050, to: FixTo::rebase(0x1_0000) });
     fixups.push(Fixup { at: 0x3_0058, to: FixTo::Import { index: 1, addend: 8 } });
     fixups.push(Fixup { at: 0x3_0060, to: FixTo::Word { index: 0 } });
-    fixups.push(Fixup { at: 0x3_0070, to: FixTo::Rebase { target: 0x1_0004 } });
+    fixups.push(Fixup { at: 0x3_0070, to: FixTo::rebase(0x1_0004) });
     let mut tls: AVec<'static, TlsReloc> = Vec::new_in(a);
     if tp_rel {
         tls.push(TlsReloc::TpRel { got_at: 0x2_0008, offset: 0 });

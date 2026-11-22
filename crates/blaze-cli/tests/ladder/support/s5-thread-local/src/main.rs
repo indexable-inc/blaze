@@ -11,6 +11,9 @@ trait Sized {}
 #[lang = "copy"]
 trait Copy {}
 
+// core's own impls (core/src/marker.rs `marker_impls!`): a primitive is `Copy` only by an impl.
+impl Copy for u64 {}
+
 unsafe extern "C" {
     fn write(fd: i32, buf: *const u8, len: usize) -> isize;
     fn pthread_create(thread: *mut usize, attr: *const u8, start: extern "C" fn(*mut u8) -> *mut u8, arg: *mut u8) -> i32;

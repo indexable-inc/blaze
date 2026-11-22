@@ -36,7 +36,8 @@
 //! `journal:` line prints the ask's whole time and the helper's barrier time beside it, and an
 //! ask over [`ASK_DEADLINE`] is refused by its deadline, never waited out.
 //!
-//! **The socket.** [`SOCKET`] under the checkout, in [`SOCKET_FOLDER`], which the helper
+//! **The socket.** [`socket_path`] under blaze's folder in the home, named by the checkout's
+//! key, in [`SOCKET_FOLDER`], which the helper
 //! before it listens and each command before it connects make the user's alone (mode 0700,
 //! owned by the user, nothing in it another may write: bstd's private-folder check, the
 //! store's): only this user can make an entry there, so a socket found there is this user's,
@@ -65,14 +66,39 @@ use crate::since::{self, Answer, AskId, CannotVouch, Death, Fault, Place, SinceE
 /// The wire's form: a frame of another form is refused whole, never read in part.
 pub const FORM: u64 = 1;
 
-/// The socket's folder, relative to the checkout: made the user's alone (mode 0700, checked
-/// owned by the user with nothing in it another may write) by the helper before it listens and
-/// by a command before it connects, so a socket found there was made by this user.
-pub const SOCKET_FOLDER: &str = ".blaze/v2/journal";
+/// The sockets' folder, relative to blaze's folder in the home (`<HOME>/.blaze`, blaze-cli
+/// store.rs `HOME_FOLDER`), one for every checkout of the user: made the user's alone (mode
+/// 0700, checked owned by the user with nothing in it another may write) by the helper before
+/// it listens and by a command before it connects, so a socket found there was made by this
+/// user. Under the home, not the checkout (since 2026-11-21): the path's length is the home's
+/// plus a constant, never the checkout's depth, so no checkout is too deep for a helper.
+pub const SOCKET_FOLDER: &str = "v2/journal";
 
-/// The socket, relative to the checkout: mode 0600 (blaze-core net.rs makes it so before its
-/// name appears), in [`SOCKET_FOLDER`].
-pub const SOCKET: &str = ".blaze/v2/journal/helper.sock";
+/// Bytes of a socket's name in [`SOCKET_FOLDER`] ([`socket_path`]): 16 hex digits, `.sock`.
+pub const SOCKET_NAME_BYTES: usize = 16 + ".sock".len();
+
+/// Bytes of [`socket_path`]: the folder, a `/`, the name.
+pub const SOCKET_PATH_BYTES: usize = SOCKET_FOLDER.len() + 1 + SOCKET_NAME_BYTES;
+
+/// The checkout's socket, relative to blaze's folder in the home: `v2/journal/<the first 8
+/// bytes of its key in hex>.sock`, mode 0600 (blaze-core net.rs makes it so before its name
+/// appears). Named by the key, never by a path (no absolute path in a name): two checkouts
+/// whose keys share their first 8 bytes (2^-64 a pair) meet at one socket, where the hello's
+/// whole key refuses the other's helper ([`NotAsked::OtherCheckout`]), never trusts it.
+pub fn socket_path(key: &CheckoutKey) -> [u8; SOCKET_PATH_BYTES] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; SOCKET_PATH_BYTES];
+    let folder = SOCKET_FOLDER.as_bytes();
+    out[..folder.len()].copy_from_slice(folder);
+    out[folder.len()] = b'/';
+    let name = &mut out[folder.len() + 1..];
+    for (at, byte) in key.0[..8].iter().enumerate() {
+        name[2 * at] = HEX[usize::from(byte >> 4)];
+        name[2 * at + 1] = HEX[usize::from(byte & 0xf)];
+    }
+    name[16..].copy_from_slice(b".sock");
+    out
+}
 
 /// How long a command waits for the whole ask (connect, hello, ask, answer): a helper that
 /// has not answered by then is not waited for (rule 18). Ten times the barrier's expected
@@ -284,7 +310,7 @@ impl<A: Allocator + Copy> Helper<A> {
 /// and the profile says this.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NotAsked {
-    /// No socket at [`SOCKET`]: no helper was started, or it exited and removed it.
+    /// No socket at [`socket_path`]: no helper was started, or it exited and removed it.
     NoSocket,
     /// A socket with no process behind it (the connect was refused): a helper that died.
     Stale,
@@ -333,7 +359,7 @@ impl fmt::Display for AskStep {
 /// What the command's driver does next.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AskNext {
-    /// Connect to [`SOCKET`], by [`Asking::deadline`].
+    /// Connect to [`socket_path`], by [`Asking::deadline`].
     Connect,
     /// Read a frame (the hello, then the answer), by the deadline.
     Read,

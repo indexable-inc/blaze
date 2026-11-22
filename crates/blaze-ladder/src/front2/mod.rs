@@ -115,7 +115,7 @@ pub mod statics;
 pub mod tables;
 pub mod test_entry;
 pub mod texts;
-mod tait;
+pub mod tait;
 mod type_expand;
 mod type_marks;
 pub mod types;

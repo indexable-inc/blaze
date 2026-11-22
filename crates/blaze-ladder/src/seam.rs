@@ -33,30 +33,9 @@ pub type SeamData = blaze_build::data::DataRecord<Global>;
 /// As [`CheckedBodies`]: a coroutine's state recipe as the seam hands it.
 pub type SeamRecipe = blaze_flow_lower::state_recipe::StateRecipe<Global>;
 
-/// Why [`FrontEnd::source_position`] gave no line and column.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PositionGap {
-    /// The front end does not answer the question (the old front).
-    Unanswered,
-    /// The item is not one the front end places: not tabled, or no first byte today.
-    NoItem,
-    /// The item's text is not in a file of its crate (a macro's expansion), or the file is not
-    /// one the front end holds.
-    NoFile,
-    /// The site is past the end of the file's text, or not on a char's first byte.
-    PastText,
-}
-
-impl core::fmt::Display for PositionGap {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            PositionGap::Unanswered => "this front end does not place source positions (`FrontEnd::source_position`)",
-            PositionGap::NoItem => "the front end places no such item today",
-            PositionGap::NoFile => "the item's text is in no file the front end holds (a macro's expansion, or an unknown file)",
-            PositionGap::PastText => "the site is past its file's text, or inside a char",
-        })
-    }
-}
+/// Why [`FrontEnd::source_position`] gave no line and column: one home in blaze-build (rule 30),
+/// where a caller site's [`blaze_build::SiteGap::Placement`] names it too.
+pub use blaze_build::PositionGap;
 
 /// The fns the back half calls on its own account, with no call any checked body recorded:
 /// the one list both front ends answer from, so each tables the same set. A front end that
@@ -257,6 +236,31 @@ pub trait FrontEnd {
     /// Trait `t` as a trait object sees it (blaze-build's `Adts::object_trait`); `None` where
     /// the front end made no table of it (the builder then refuses the vtable by name).
     fn object_trait(&self, t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>>;
+    /// A MAKE ASKS FOR WHAT IT READS (D194, 2026-11-21): the build asked
+    /// [`FrontEnd::object_trait`] of trait `t` and found no table, so the record walk's make
+    /// (run/make_one.rs `make_instance`) asks for it here by name and builds again. The table of
+    /// `t` and of every supertrait under it is made from their heads alone, so what an instance
+    /// is built with never depends on which bodies this program checked before (a `dyn` that
+    /// only an instance's ground arguments hold: core's `<&mut F as FnMut>::call_mut` at
+    /// `F = dyn FnMut(..)`). `Ok(true)`: made; `Ok(false)`: this front end makes none here
+    /// (one that tables every trait up front, or `t`'s table is there already), and the build's
+    /// `NoTrait` is the refusal. A trait whose table cannot be made is the front end's refusal
+    /// by name. The default makes nothing.
+    fn object_table(&mut self, t: ItemKey) -> Result<bool, RunError> {
+        let _ = t;
+        Ok(false)
+    }
+    /// A MAKE ASKS FOR WHAT IT READS (D194), as [`FrontEnd::object_table`]: before an instance
+    /// of `owner` is built (run/make_one.rs `make_instance`), the heads its `#[track_caller]`
+    /// sites count from ([`FrontEnd::caller_site`]): for a body-local `owner`, each enclosing
+    /// item's, which before came only from a check of the enclosing body this program happened
+    /// to make. A head that cannot be made is the front end's refusal by name; one the ask could
+    /// not serve stays the site's typed gap (`blaze_build::SiteGap::NoEnclosingRow`). The default
+    /// asks nothing: a front end that files every head up front.
+    fn site_heads(&mut self, owner: ItemKey) -> Result<(), RunError> {
+        let _ = owner;
+        Ok(())
+    }
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>>;
     /// An item's name for messages, where the front end can give it.
     fn item_named(&self, key: ItemKey) -> Option<Box<str>>;
@@ -286,23 +290,24 @@ pub trait FrontEnd {
     }
     /// Where the call at `expr` of `owner`'s body is, item-relative (rule 71): the file as the
     /// program sees it, `owner`, and the expression's first byte from the item's first, or the
-    /// outermost macro call's when the call is in an expansion. `None`: `owner` not tabled with
-    /// a body, or a front end that does not answer.
-    fn caller_site(&self, _owner: ItemKey, _expr: blaze_typeck::ExprId) -> Option<blaze_build::CallerSite<'_>> {
-        None
+    /// outermost macro call's when the call is in an expansion. `Err`: the step that gave no
+    /// place ([`blaze_build::SiteGap`]: `owner` not live, a fact not made, a front end that does
+    /// not answer).
+    fn caller_site(&self, _owner: ItemKey, _expr: blaze_typeck::ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
+        Err(blaze_build::SiteGap::Unanswered)
     }
     /// Where fn `item` is defined, in [`FrontEnd::caller_site`]'s form (blaze-build
     /// `Adts::def_site`: rustc's `def_span`, the first token after the fn's outer attributes
-    /// and doc comments). `None`: `item` not tabled, or a front end that does not answer.
-    fn def_site(&self, _item: ItemKey) -> Option<blaze_build::CallerSite<'_>> {
-        None
+    /// and doc comments). `Err`: the step that gave no place, as [`FrontEnd::caller_site`]'s.
+    fn def_site(&self, _item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
+        Err(blaze_build::SiteGap::Unanswered)
     }
     /// The first byte of expression `expr` of `owner`'s body counted from `owner`'s first, with
     /// no file: a trap row's site (blaze-build `Adts::expr_site`). By default the offset of
     /// [`FrontEnd::caller_site`]'s answer; the lazy front end answers from the body alone, so
     /// an item whose file has no shown path (a toolchain crate's) still has one.
     fn expr_site(&self, owner: ItemKey, expr: blaze_typeck::ExprId) -> Option<u32> {
-        self.caller_site(owner, expr).map(|site| site.offset)
+        self.caller_site(owner, expr).ok().map(|site| site.offset)
     }
     /// The line and the column (each from 1; the column in chars) of byte `site` of item
     /// `item`'s text, from the item's present first byte in today's text of its file and that
@@ -345,6 +350,24 @@ pub trait FrontEnd {
     /// program made it, or a front end that does not answer.
     fn opaque_of(&self, _opaque: ItemKey) -> Option<(ItemKey, u32)> {
         None
+    }
+    /// The fn that defines the `impl Trait` types of type alias `alias` (an [`Self::opaque_of`]
+    /// owner whose index is an alias's: front2 tait.rs `of_alias`), by its checker key: the fn
+    /// whose check record holds their hidden types (front2 tait.rs `defining_fn`, the
+    /// `#[define_opaque(alias)]` fn). `Err`: why none was found.
+    fn alias_definer(&self, _alias: ItemKey) -> Result<ItemKey, crate::front2::tait::DefinerMiss> {
+        Err(crate::front2::tait::DefinerMiss::NotAnswered)
+    }
+    /// The fn whose check record holds the hidden type of the opaque type `opaque`, the one
+    /// that must be checked before a layout reads it: its [`Self::opaque_of`] owner, or for a
+    /// type alias's `impl Trait` (the owner row is the alias) the alias's
+    /// [`Self::alias_definer`]. An alias is no fn and has no body: taken for the fn to check,
+    /// its check refused "NotAHead(.., \"a type alias\")" (tests/local_statics.rs
+    /// `an_alias_opaque_whose_defining_fn_is_not_called_is_laid_out`). `None`: no head made it;
+    /// `Some(Err)`: an alias whose defining fn was not found, and why.
+    fn opaque_definer(&self, opaque: ItemKey) -> Option<Result<ItemKey, crate::front2::tait::DefinerMiss>> {
+        let (owner, index) = self.opaque_of(opaque)?;
+        Some(if crate::front2::tait::of_alias(index) { self.alias_definer(owner) } else { Ok(owner) })
     }
     /// The cause of the last `normalize` that gave no type (the trait by name, `Self`'s form,
     /// the solver's error or "no answer"): the build's `Projection` refusal then names it.
@@ -436,11 +459,14 @@ pub trait FrontEnd {
         let _ = (trait_, name, args, ground);
         Ok(None)
     }
-    fn repr(&self, key: ItemKey) -> ReprAttrs;
+    /// ADT `key`'s `#[repr(..)]`, as its head read it. `Err(Missing { item: key })` when the
+    /// head is not made yet (a lazy front notes it for `make_asked`): never a default
+    /// `repr(Rust)`, which would make the answer depend on what was asked first (D194).
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, blaze_build::layout::Missing>;
     /// ADT `key`'s valid range of its one scalar (`rustc_layout_scalar_valid_range_start` and
     /// `_end`, as its head read them): what the layout narrows the scalar to and takes niches
-    /// outside of. The default range: the whole scalar.
-    fn valid_range(&self, key: ItemKey) -> blaze_build::layout::ValidRange;
+    /// outside of. The default range: the whole scalar. `Err(Missing)` as [`Self::repr`].
+    fn valid_range(&self, key: ItemKey) -> Result<blaze_build::layout::ValidRange, blaze_build::layout::Missing>;
     fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic>;
     fn static_item(&self, key: ItemKey) -> Option<StaticItem>;
     /// Static `key`'s C symbol when an `extern` block declares it (the Reference, "External
@@ -453,9 +479,11 @@ pub trait FrontEnd {
     }
     /// Variant `variant` of enum `adt`'s discriminant value, explicit or implicit; `None` is
     /// its index (the old front refuses an explicit discriminant, so it answers `None`).
-    fn discriminant(&self, adt: ItemKey, variant: u32) -> Option<i128> {
+    /// `Err(Missing { item: adt })` when the enum's head is not made yet (as [`Self::repr`]),
+    /// never `None`, which would number its variants by index.
+    fn discriminant(&self, adt: ItemKey, variant: u32) -> Result<Option<i128>, blaze_build::layout::Missing> {
         let _ = (adt, variant);
-        None
+        Ok(None)
     }
     fn ctor_of(&self, key: ItemKey) -> Option<(ItemKey, u32)>;
     /// The fn's code identity: what its instances' keys are made from.
@@ -587,13 +615,14 @@ impl FrontEnd for Front<'_> {
         Front::string(self, owner, e)
     }
 
-    fn repr(&self, key: ItemKey) -> ReprAttrs {
-        Front::repr(self, key)
+    /// The old front end reads every head before a build: always answered.
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, blaze_build::layout::Missing> {
+        Ok(Front::repr(self, key))
     }
 
     /// The old front end never read the attribute: the whole scalar.
-    fn valid_range(&self, _: ItemKey) -> blaze_build::layout::ValidRange {
-        blaze_build::layout::ValidRange::default()
+    fn valid_range(&self, _: ItemKey) -> Result<blaze_build::layout::ValidRange, blaze_build::layout::Missing> {
+        Ok(blaze_build::layout::ValidRange::default())
     }
 
     fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic> {

@@ -4911,6 +4911,19 @@ mod tests {
         assert!(rx.recv_timeout(LONG).unwrap());
     }
 
+    /// The pool's class is as it was before the after-answer class came (2026-11-21):
+    /// `user-initiated`, or `default` where the process is lowered; never the after-answer
+    /// class (`utility`, blaze_core::threads::qos::AFTER_ANSWER), which only the work after the
+    /// answer takes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_pools_class_is_unchanged_by_the_after_answer_class() {
+        let lowered = matches!(blaze_core::cores::get(), Ok(cores) if cores.lowered());
+        let wanted = if lowered { blaze_sys::posix::proc::QOS_CLASS_DEFAULT } else { blaze_sys::posix::proc::QOS_CLASS_USER_INITIATED };
+        assert_eq!(super::worker_qos(), wanted);
+        assert_ne!(super::worker_qos(), blaze_core::threads::qos::AFTER_ANSWER.raw());
+    }
+
     /// Every worker of a bound pool runs at one class ([`super::worker_qos`]: `user-initiated`,
     /// or `default` at background priority), whatever the performance level of its CPU: none
     /// at `utility` or `background`, which a loaded host starves while the

@@ -45,7 +45,19 @@ impl Scratch {
     pub(crate) const fn reg(&self) -> Reg {
         self.reg
     }
+
+    /// The register as enc.rs's encoders take it (the Reference tier's pass names registers
+    /// so).
+    #[allow(dead_code, reason = "T3 step 2: the Reference tier's helpers encode their held registers through this")]
+    pub(crate) const fn enc(&self) -> crate::enc::Reg {
+        self.reg.0 as crate::enc::Reg
+    }
 }
+
+/// The Reference tier's general scratch registers: x9 to x17 (pass.rs: x9 to x15 its operands'
+/// and results', x16 and x17 its call sites', veneers' and stack probe's).
+#[allow(dead_code, reason = "T3 step 2: the Reference tier's pass makes its pool over this set")]
+pub(crate) const REFERENCE_SCRATCH: RegSet = RegSet(((1u64 << 18) - 1) & !((1u64 << 9) - 1));
 
 /// Why the pool refused. Each is a bug of the composer or of the description, named.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -119,6 +131,19 @@ impl Pool {
         }
         if regs.scratch.0 & regs.allocatable.0 != 0 {
             return Err(ScratchError::Description("a register description whose scratch registers are also allocatable"));
+        }
+        Ok(Pool { all, free: all, spent: RegSet::EMPTY })
+    }
+
+    /// The pool of exactly `all`, for an emitter that allocates no register to a value: the
+    /// Reference tier keeps every value in its cell (pass.rs), so each of its scratch
+    /// registers ([`REFERENCE_SCRATCH`]) is only ever held or lent, and there is no allocatable
+    /// set to check against (T3 step 1; [`Pool::of`] is the Fast tier's, over a description).
+    /// Refused below two registers, as [`Pool::of`] is.
+    #[allow(dead_code, reason = "T3 step 2: the Reference tier's mid-instruction helpers (pass.rs FAR, the probe's x17, call sites' x16, tls_index, the overflow flag) take their registers from this pool")]
+    pub(crate) fn over(all: RegSet) -> Result<Pool, ScratchError> {
+        if all.len() < 2 {
+            return Err(ScratchError::Description("a scratch set of fewer than two general registers"));
         }
         Ok(Pool { all, free: all, spent: RegSet::EMPTY })
     }

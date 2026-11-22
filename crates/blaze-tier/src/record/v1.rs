@@ -1,5 +1,5 @@
 //! [`from_v1`]: a `bzcode01` record (blaze-code's `CodeRecord`, what the Reference tier, today's
-//! cell emitter, makes) in the new form, so the Reference tier enters `bzcode02` unchanged and
+//! cell emitter, makes) in the new form, so the Reference tier enters the one form unchanged and
 //! is placed by the one new `place`. Retired with `bzcode01` when its last user has moved.
 //!
 //! Each paired site becomes relocations (D100 point 11):
@@ -14,9 +14,10 @@
 //! for a call, the entry thunk's word for a load), which is what piece 0's `GotPage21` and
 //! `GotPageOff12` mean ("adrp of the target's import word", "ldr of the target's import word,
 //! low 12 bits scaled by 8"); `Page21` and `PageOff12` reach the target's own address. The
-//! relro words, the pads, the targets and the names are carried over as they are; the frame word
-//! becomes the unwind frame and the pads also become its unwind rows. `bzcode01` holds no frame
-//! size, so `frame` is 0.
+//! relro words, the pads, the targets, the names, the parts' alignments, the trap rows and the
+//! source-position slots are carried over as they are; the frame word becomes the unwind frame
+//! and the pads also become its unwind rows. `bzcode01` holds no frame size, so `frame` is 0.
+//! (`bzcode01` here is blaze-code's `CodeRecord`, whose form is now `bzcode07`.)
 
 use blaze_code::record::{CodeRecord, CodeView, OWN_RELRO, SiteKind, Space};
 use blaze_code::unwind;
@@ -34,11 +35,21 @@ pub fn from_v1<'a>(record: CodeRecord<'a>, alloc: Alloc<'a>) -> Result<Emitted<'
     sealed.encode(&mut bytes);
     drop(sealed);
     let view = CodeView::read(&bytes).map_err(FormError::V1Decode)?;
-    view.require_positionless("tier record conversion").map_err(FormError::V1Record)?;
     let rows = unwind::read(view).map_err(FormError::Unwind)?;
     let mut e = Emitted::new_in(alloc);
     e.code.extend_from_slice(view.code());
     e.relro.extend_from_slice(view.relro());
+    // The columns `bzcode08` shares with blaze-code's form, carried whole (nothing of the
+    // source record is dropped): each part's alignment, the trap rows with their held values
+    // and subjects, the source-position slots.
+    e.code_align = view.code_align();
+    e.relro_align = view.relro_align();
+    for i in 0..view.traps() {
+        e.traps.push(view.trap(i));
+    }
+    for i in 0..view.positions() {
+        e.position_slots.push(view.position(i));
+    }
     for i in 0..view.targets() {
         e.targets.push(view.target(i));
     }

@@ -22,12 +22,13 @@ use blaze_own::{BTreeMap, SharedAlloc, Vec, VecDeque};
 use blaze_scope::crate_env::EnvLent;
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::resolve::{CrateInput, SourceTexts};
+use blaze_scope::scope_record::Verified;
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::{Frame, Tag};
 use bstd::task::Class;
 
-use crate::engine_check::EngineCheckError;
+use crate::engine_check::{EngineCheckError, Table};
 use crate::engine_records::{EngineRecords, InPlace, ReadError};
 use crate::engine_tasks::{CELLS, Outlined, WHOLE};
 use crate::engine_units::{Failure, Published};
@@ -98,6 +99,9 @@ pub(crate) struct NamesStage<'f> {
     oracle: Vec<OracleCrate, &'f Frame>,
     /// The crates filed with no comparison: failed or refused before their check reported.
     oracle_missed: Vec<Name, &'f Frame>,
+    /// What each crate whose names answered this command said of the files found (D161), sorted
+    /// by its task's name: read once by engine_check.rs `serve_found`, after the last names phase.
+    found: Vec<FoundBy, &'f Frame>,
 }
 
 /// The phase-independent handles a names phase reads.
@@ -113,6 +117,44 @@ pub(crate) struct Handles<'h, 'f> {
     pub(crate) board: &'h crate::engine_status::Board<'h>,
     /// Whether each crate's names are decided twice and compared (D158 step 1, [`NamesOracle`]).
     pub(crate) oracle: NamesOracle,
+    /// The stamps the request's walk probed its files by (sweep.rs `FromMeta`): a file a crate's
+    /// names find is probed by them too ([`Job::run`], engine_check.rs `outline_found`).
+    pub(crate) stamps: crate::sweep::FromMeta,
+    /// A test's plants for those outlines, read on the command's thread.
+    pub(crate) plants: crate::engine_check::OutlinePlants,
+    /// The found files the walk took from the last answer's places, sorted by name
+    /// (engine_check.rs `PLACE_FOUND`): a crate's names say which of them they read now.
+    pub(crate) found: &'h [(Name, blaze_engine::pages::FilePlace)],
+}
+
+/// What a crate's names worker is handed to serve the files its crate finds (D161,
+/// [`Job::run`]): [`Handles`]' stamps, plants and found files.
+#[derive(Clone, Copy)]
+struct Serve<'j> {
+    stamps: crate::sweep::FromMeta,
+    plants: crate::engine_check::OutlinePlants,
+    found: &'j [(Name, blaze_engine::pages::FilePlace)],
+}
+
+impl<'h> Handles<'h, '_> {
+    fn serve(&self) -> Serve<'h> {
+        Serve { stamps: self.stamps, plants: self.plants, found: self.found }
+    }
+}
+
+/// What one crate's names said of the files found (D161), filed with its result
+/// ([`NamesStage::found`]): each found file of the walk's it read (by name, sorted), and each
+/// file it read that no outline held, outlined on its worker with the slot's probe. Kept for
+/// every crate whose names ran and answered: a crate with none says it read none.
+pub(crate) struct FoundBy {
+    /// The crate's `CrateScope` task.
+    pub(crate) unit: Name,
+    pub(crate) read: SVec<'static, Name>,
+    pub(crate) outlined: SVec<'static, Outlined<'static>>,
+    /// Each of `outlined`'s slot, its probe and whether a module names it (its place's
+    /// [`crate::engine_check::PLACE_MODULE`]), in the same order: the leaf rows the next
+    /// request's sweep proves them unchanged by (sweep.rs `opened`).
+    pub(crate) probes: SVec<'static, (SVec<'static, u8>, crate::sweep::Probed, bool)>,
 }
 
 /// D158 step 1: D116's equality check run by the command. Each `CrateScope` task decides every
@@ -279,7 +321,13 @@ impl<'f> NamesStage<'f> {
         let list = names.list();
         let mut crate_names = Vec::with_capacity_in(blaze_world::crate_list::CrateGraph::len(list), frame);
         crate_names.extend((0..blaze_world::crate_list::CrateGraph::len(list)).map(|r| blaze_drive::key::crate_scope_name(&list.key(r))));
-        NamesStage { names: Some(names), crate_names, plan: core::cell::OnceCell::new(), admissions: Admissions(BTreeMap::new_in(frame)), heads: Vec::new_in(frame), failed_out: work::failed_out(), made: Vec::new_in(frame), results: Vec::new_in(frame), memory: crate::engine_memory::NamesMemory::new(), oracle: Vec::new_in(frame), oracle_missed: Vec::new_in(frame) }
+        NamesStage { names: Some(names), crate_names, plan: core::cell::OnceCell::new(), admissions: Admissions(BTreeMap::new_in(frame)), heads: Vec::new_in(frame), failed_out: work::failed_out(), made: Vec::new_in(frame), results: Vec::new_in(frame), memory: crate::engine_memory::NamesMemory::new(), oracle: Vec::new_in(frame), oracle_missed: Vec::new_in(frame), found: Vec::new_in(frame) }
+    }
+
+    /// What each crate whose names answered this command said of the files found (D161,
+    /// [`FoundBy`]), sorted by its task's name.
+    pub(crate) fn found(&self) -> &[FoundBy] {
+        &self.found
     }
 
     /// The oracle's sums over every crate filed.
@@ -426,7 +474,7 @@ impl<'f> NamesStage<'f> {
         }
         let mut planned = SVec::new_in(alloc);
         for (name, source) in crate::names::parts(names).iter() {
-            let at = names.crate_at(name.subject).ok_or(EngineCheckError::Unseen { task: *name, read: *name })?;
+            let at = names.crate_at(name.subject).ok_or(EngineCheckError::MissingEntry { task: *name, table: Table::WorldCrates, key: *name })?;
             planned.push(Planned { name: *name, phase: Phase::new(Stage::Names, plan[at].depth), source: *source, file: *name });
         }
         planned.sort_unstable_by_key(|one| one.name);
@@ -477,6 +525,7 @@ impl<'f> NamesStage<'f> {
         let workers = handles.workers;
         let kept = handles.env.heap.shared();
         let oracle = handles.oracle;
+        let serve = handles.serve();
         let failed_out = self.failed_out;
         let mut exports = ReadExports { read, route: crate::engine_memory::route_now() };
         let mut stack = Vec::new_in(&own);
@@ -534,7 +583,7 @@ impl<'f> NamesStage<'f> {
                             Mapped::Failed
                         } else {
                             match exports.exports(&cx, store, &input, crates[g].input.name, &own, wave) {
-                                Ok(bytes) => Mapped::Exports(bytes),
+                                Ok(bytes) => checked(bytes, crates[g].input.name, wave),
                                 Err(ReadError::Load(crate::front_load::LoadError::Store(error))) => return Err(error),
                                 Err(error) => Mapped::Unreadable(blaze_own::Box::leak(blaze_own::format_in!(wave, "{error}").into_boxed_str())),
                             }
@@ -576,8 +625,8 @@ impl<'f> NamesStage<'f> {
                             };
                             for dep in &mut deps {
                                 let g = dep.index;
-                                match inputs.slots[g].get().ok_or(EngineCheckError::Unseen { task: name, read: dep.input.name })? {
-                                    Mapped::Exports(bytes) => dep.exports = Some(*bytes),
+                                match inputs.slots[g].get().ok_or(EngineCheckError::MissingEntry { task: name, table: Table::MappedExports, key: dep.input.name })? {
+                                    Mapped::Exports(proof) => dep.exports = Some(*proof),
                                     Mapped::Failed => {}
                                     Mapped::Unreadable(why) => {
                                         let words = blaze_own::format_in!(alloc, "crate `{}`: the record of its dependency `{}`: {why}", crates[at].input.name, crates[g].input.name);
@@ -586,7 +635,7 @@ impl<'f> NamesStage<'f> {
                                     }
                                 }
                             }
-                            let job = Job { at, crates, all, deps: &deps, script: script_bytes, home, env, packs, corrected, procs, kept, workers, oracle, clock };
+                            let job = Job { at, crates, all, deps: &deps, script: script_bytes, home, env, packs, corrected, procs, kept, workers, oracle, clock, serve };
                             job.run(cx, root, task, outlined, alloc)
                         });
                         shown.end(board.now(clock));
@@ -676,7 +725,12 @@ impl<'f> NamesStage<'f> {
         let name = task.planned.name;
         self.admissions.finish(name)?;
         let (made, key, header) = match answer.result {
-            Ok(Finished { record, resolved, ok, unresolved, key, head, oracle }) => {
+            Ok(Finished { record, resolved, ok, unresolved, key, head, oracle, found }) => {
+                let at = self.found.partition_point(|one| one.unit < found.unit);
+                if self.found.get(at).is_some_and(|one| one.unit == found.unit) {
+                    return Err(EngineCheckError::Twice { task: name }.into());
+                }
+                self.found.insert(at, found);
                 match oracle {
                     Some(one) => {
                         let at = self.oracle.partition_point(|filed| filed.krate.as_str() < one.krate.as_str());
@@ -684,7 +738,7 @@ impl<'f> NamesStage<'f> {
                     }
                     None => self.oracle_missed.push(name),
                 }
-                let names = self.names.as_mut().ok_or(EngineCheckError::Unseen { task: name, read: name })?;
+                let names = self.names.as_mut().ok_or(EngineCheckError::MissingEntry { task: name, table: Table::NamesWorld, key: name })?;
                 names.keep_resolution(name, resolved, ok, unresolved).map_err(|_| EngineCheckError::Twice { task: name })?;
                 let at = self.heads.partition_point(|entry| entry.0 < name);
                 self.heads.insert(at, (name, key, head));
@@ -706,7 +760,7 @@ impl<'f> NamesStage<'f> {
     }
     /// The key and wire header for this phase's put, including filed resolution failures.
     pub(crate) fn publication(&self, name: Name) -> Result<(Key, &[u8]), EngineCheckError> {
-        let index = self.heads.binary_search_by_key(&name, |entry| entry.0).map_err(|_| EngineCheckError::Unseen { task: name, read: name })?;
+        let index = self.heads.binary_search_by_key(&name, |entry| entry.0).map_err(|_| EngineCheckError::MissingEntry { task: name, table: Table::WaveHeads, key: name })?;
         let (_, key, bytes) = &self.heads[index];
         Ok((*key, bytes.as_slice()))
     }
@@ -973,13 +1027,14 @@ fn cells_of<'a>(name: Name, record: &work::Record<SharedAlloc<'_>>, table: &[u8]
     Ok(defines)
 }
 
-/// The mapped exports of a dependency, or its failed out (the worker makes an error crate).
+/// The mapped exports of a dependency, checked once ([`checked`]), or its failed out (the
+/// worker makes an error crate).
 #[derive(Clone, Copy)]
 struct Dependency<'j> {
     index: usize,
     input: Input,
     absent: bool,
-    exports: Option<&'j [u8]>,
+    exports: Option<Verified<'j>>,
 }
 
 /// Scratch shared by successive producer walks. Only visited indices need clearing.
@@ -1174,7 +1229,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         } else { next()? };
         #[cfg(not(test))]
         let name = next()?;
-        let run = self.running.get(&name).ok_or(EngineCheckError::Unseen { task: name, read: name })?;
+        let run = self.running.get(&name).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::NamesRunning, key: name })?;
         crate::engine_scripts::wait_finished(cx, run.clock, run.waiter, || run.done.is_set(), "the selected Names output", self.running.len())?;
         let run = self.running.remove(&name).expect("the selected Names output");
         // A bstd join may run unrelated jobs while the signalled closure is
@@ -1201,7 +1256,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         let name = task.planned.name;
         stage.admissions.admit(name)?;
         let feeds_names = stage.feeds_names(name);
-        let names = stage.names.as_ref().ok_or(EngineCheckError::Unseen { task: name, read: name })?;
+        let names = stage.names.as_ref().ok_or(EngineCheckError::MissingEntry { task: name, table: Table::NamesWorld, key: name })?;
         // A names task runs: the world is made now if no task made it yet (as `run_phase`).
         let made = match names.made_or_make(cx, handles.root, store, handles.env, crate::names::NeededBy::NamesTask)? {
             Ok(made) => made,
@@ -1209,7 +1264,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         };
         let runner = NamesStage::runner(names, made, handles, frame);
         let world = made.world();
-        let at = names.crate_at(name.subject).ok_or(EngineCheckError::Unseen { task: name, read: name })?;
+        let at = names.crate_at(name.subject).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::WorldCrates, key: name })?;
         let columns = *self.columns.get_or_insert_with(|| WorldColumns {
             crates: self.frame.alloc_slice_copy(&world.crates),
             packs: self.frame.alloc_slice_copy(world.texts.packs()),
@@ -1257,7 +1312,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
                             Mapped::Failed
                         } else {
                             match exports.exports(cx, store, &input, columns.crates[g].input.name, self.frame, self.local) {
-                                Ok(bytes) => Mapped::Exports(bytes),
+                                Ok(bytes) => checked(bytes, columns.crates[g].input.name, self.local),
                                 Err(ReadError::Load(crate::front_load::LoadError::Store(error))) => return Err(error),
                                 Err(error) => Mapped::Unreadable(blaze_own::Box::leak(blaze_own::format_in!(self.local, "{error}").into_boxed_str())),
                             }
@@ -1267,7 +1322,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
                     }
                 };
                 match mapped {
-                    Mapped::Exports(bytes) => dep.exports = Some(bytes),
+                    Mapped::Exports(proof) => dep.exports = Some(proof),
                     Mapped::Failed => {}
                     Mapped::Unreadable(why) => {
                         if unreadable.is_none_or(|(first, _)| g < first) {
@@ -1299,7 +1354,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         let workers = core::num::NonZeroU32::new(width.saturating_sub(width.div_ceil(4))).unwrap_or(core::num::NonZeroU32::MIN);
         self.width = workers.get() as usize;
         let job = Job { at, crates: columns.crates, all, deps, script: script_bytes, home: handles.env.home, env, packs: columns.packs,
-            corrected: columns.corrected, procs: gate.as_ref().ok().copied().flatten(), kept: handles.env.heap.shared(), workers, oracle: handles.oracle, clock: &handles.env.clock };
+            corrected: columns.corrected, procs: gate.as_ref().ok().copied().flatten(), kept: handles.env.heap.shared(), workers, oracle: handles.oracle, clock: &handles.env.clock, serve: handles.serve() };
         self.order.insert((!feeds_names, task.planned.phase.wave, name), task);
         self.waiting.push_back(WaitingName { task, scope, job, script, blocked: gate.err(), root: handles.root, clock: &handles.env.clock,
             board: handles.board, outlined: handles.outlined, alloc, waiter, submitted: crate::engine_times::ns(handles.env.clock.now().since_start()) });
@@ -1311,8 +1366,8 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         &mut self, _cx: &Cx, name: Name, stage: &mut NamesStage<'f>, buffer: &mut Buffer<'a>,
         times: &mut crate::engine_times::Times, frame: &'f Frame,
     ) -> Result<(), CliError> {
-        let (task, timed) = self.answered.remove(&name).ok_or(EngineCheckError::Unseen { task: name, read: name })?;
-        self.order.remove(&(!stage.feeds_names(name), task.planned.phase.wave, name)).ok_or(EngineCheckError::Unseen { task: name, read: name })?;
+        let (task, timed) = self.answered.remove(&name).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::NamesAnswered, key: name })?;
+        self.order.remove(&(!stage.feeds_names(name), task.planned.phase.wave, name)).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::NamesOrder, key: name })?;
         times.interval(name, timed.start, timed.end);
         times.queued(name, timed.submitted, timed.start);
         times.depends(&self.edges);
@@ -1358,6 +1413,10 @@ enum Blocked<'j> {
     Script(Name),
 }
 
+/// The input `name` (a dependency's names or the crate's script) as made so far. A name not in
+/// `made` is a NEED, not a table's slip: `task` reads an input its plan did not hand it (a
+/// producer not yet ended, the planner's bug), so it is [`EngineCheckError::Unseen`] naming that
+/// read (engine_script_reads_e2e_tests.rs `control_early_names_admission_reads_a_missing_script_cfg`).
 fn lookup(made: &[(Name, Option<(Key, ContentId)>)], task: Name, name: Name, failed: ContentId) -> Result<(Input, bool), EngineCheckError> {
     let i = made.binary_search_by_key(&name, |row| row.0).map_err(|_| EngineCheckError::Unseen { task, read: name })?;
     let value = made[i].1;
@@ -1392,6 +1451,8 @@ struct Job<'j> {
     /// `--names-oracle` ([`NamesOracle`]) and the clock its check is timed by (rule 75).
     oracle: NamesOracle,
     clock: &'j bstd::clock::Clock,
+    /// What it serves the files its crate finds by ([`Serve`]).
+    serve: Serve<'j>,
 }
 
 struct WorkerAnswer<'a> {
@@ -1408,6 +1469,8 @@ struct Finished<R> {
     head: SVec<'static, u8>,
     /// The crate's oracle comparison, under `--names-oracle` when its check reported.
     oracle: Option<OracleCrate>,
+    /// What its names said of the files found (D161).
+    found: FoundBy,
 }
 
 struct Completion<'a, 'f> {
@@ -1418,12 +1481,12 @@ struct Completion<'a, 'f> {
 impl<'a> WorkerAnswer<'a> {
     fn into_completion<'f>(self, frame: &'f Frame) -> Result<Completion<'a, 'f>, CliError> {
         let result = match self.result {
-            Ok(Finished { record: header, mut resolved, ok, unresolved, key, head, oracle }) => {
+            Ok(Finished { record: header, mut resolved, ok, unresolved, key, head, oracle, found }) => {
                 // Only the small record columns cross into the coordinator's frame. The
                 // payload and expansion buffers keep their worker allocation through the put.
                 let mut made = header.clone_in(frame).map_err(|_| EngineCheckError::Grow { what: work::HELD_REFUSED, had: header.reads.len() })?;
                 crate::names::hand_payload(&mut resolved, &mut made)?;
-                Ok(Finished { record: made, resolved, ok, unresolved, key, head, oracle })
+                Ok(Finished { record: made, resolved, ok, unresolved, key, head, oracle, found })
             }
             Err((failure, words)) => Err(Failure { failure, words: words.map(|s| work::held_str(s.as_str(), frame)) }),
         };
@@ -1434,6 +1497,9 @@ impl<'a> WorkerAnswer<'a> {
 enum WorkerError {
     Engine(EngineCheckError),
     Finding(&'static str),
+    /// A file the crate's names found could not be read to be outlined ([`Job::run`]): the
+    /// request stops on it, as the walk's plan does on a file it reaches (engine_check.rs `plan`).
+    Unread(crate::work::Unread),
 }
 
 impl From<EngineCheckError> for WorkerError {
@@ -1445,6 +1511,7 @@ impl From<WorkerError> for CliError {
         match error {
             WorkerError::Engine(error) => error.into(),
             WorkerError::Finding(what) => CliError::Text { what },
+            WorkerError::Unread(error) => error.into(),
         }
     }
 }
@@ -1500,18 +1567,25 @@ impl Job<'_> {
         let sysroot = Sysroot { core: ids[0], alloc: ids[1], std: ids[2], bstd: ids[3] };
         let mut exports = Vec::with_capacity_in(order.len(), local);
         for dep in &order {
-            let bytes = match dep.exports {
-                Some(bytes) => bytes,
+            let proof = match dep.exports {
+                Some(proof) => proof,
                 None => {
+                    // A failed dependency's error record: a header and one empty root, made and
+                    // checked here, for this crate alone.
                     let source = self.crates[dep.index].input;
-                    match blaze_scope::crate_scope::error_record(source.key, source.name, source.edition, local) {
+                    let record = match blaze_scope::crate_scope::error_record(source.key, source.name, source.edition, local) {
                         Ok(record) => blaze_scope::resolve::aligned(&record, local),
                         Err(error) => return Ok(refuse("a failed dependency's error record", blaze_own::format_in!(alloc, "crate `{}`: the error record of its failed dependency `{}`: {error:?}", input.name, source.name))),
+                    };
+                    match Verified::check(record) {
+                        Ok(proof) => proof,
+                        Err(error) => return Ok(refuse("a failed dependency's error record", blaze_own::format_in!(alloc, "crate `{}`: the error record of its failed dependency `{}` did not check: {error:?}", input.name, source.name))),
                     }
                 }
             };
-            exports.push(bytes);
+            exports.push(proof);
         }
+        let heads = Vec::from_iter_in(exports.iter().map(|proof| proof.bytes()), local);
         let need = |keys: &[blaze_id::CrateItemKey]| {
             for key in keys {
                 if !self.crates.iter().any(|krate| krate.input.key == *key) {
@@ -1520,7 +1594,7 @@ impl Job<'_> {
             }
             Err(EngineCheckError::Unseen { task: name, read: keys.first().map_or(name, blaze_drive::key::crate_scope_name) }.into())
         };
-        match blaze_scope::crate_scope::unmet_reaches(&exports, local) {
+        match blaze_scope::crate_scope::unmet_reaches(&heads, local) {
             Ok(keys) if keys.is_empty() => {}
             Ok(keys) => return need(&keys),
             Err(error) => return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate `{}`: a dependency's record: {error:?}", input.name))),
@@ -1542,13 +1616,130 @@ impl Job<'_> {
             Resolution::Made { resolved, ok, unresolved, oracle } => (resolved, ok, unresolved, oracle),
             Resolution::Need(keys) => return need(&keys),
         };
-        finish(task, input.name, resolved, ok, unresolved, oracle, &order, script_input, outlined, alloc, local, self.kept)
+        // THE NEED (D161): the files the resolution read that no outline holds, with the resolved
+        // crate still in hand, served here: each outlined on this worker as the walk outlines a
+        // file it reaches (engine_check.rs `outline_found`, one code), `finish` run over them, and
+        // the outlines filed after the names by `Engine::plan_file` (engine_check.rs
+        // `serve_found`). The control's plant serves none: the first is the stop that names it.
+        let needed = unoutlined(name, input.name, &resolved, outlined, self.serve.plants.found_cap(), self.kept)?;
+        if let Some(first) = needed.first()
+            && !self.serve.plants.serves()
+        {
+            return Err(unseen_file(name, first.read, input.name, first.path, self.kept).into());
+        }
+        let mut found = FoundBy { unit: name, read: SVec::new_in(self.kept), outlined: SVec::new_in(self.kept), probes: SVec::new_in(self.kept) };
+        if !needed.is_empty() {
+            // A found file is its crate's: its edition and root are the crate root's outline's.
+            // Its root's path in the checkout (the crate list's is under `/0/`, engine_body_plan.rs `root_file`).
+            let root_path = input.root.strip_prefix("/0/").unwrap_or(input.root);
+            let root_file = Name::file(root_path.as_bytes());
+            let Some(crate_root) = outline_at(outlined, root_file, root_path) else {
+                return Err(EngineCheckError::Unseen { task: name, read: root_file }.into());
+            };
+            let (unit_root, edition) = (crate_root.name, crate_root.edition);
+            for need in needed.iter() {
+                // A module's file is read at its slot `x.rs` or at `x/mod.rs`, the slot named
+                // `x.rs` either way (sweep.rs `real_path`); a data file at its own path.
+                let module = need.read.kind == Kind::Surface;
+                let slot = match (module, need.path.strip_suffix("/mod.rs")) {
+                    (true, Some(dir)) => blaze_own::format_in!(local, "{dir}.rs"),
+                    _ => blaze_own::String::from_str_in(need.path, local),
+                };
+                let want = crate::engine_check::FoundWant { slot: slot.as_str(), module, edition: if module { edition } else { blaze_drive::record::DATA_FILE }, root: unit_root };
+                let (one, probed) = crate::engine_check::outline_found(cx, root, &self.serve.stamps, &want, self.serve.plants, self.kept).map_err(WorkerError::Unread)?;
+                found.read.push(one.name);
+                found.probes.push((SVec::from_slice_in(slot.as_bytes(), self.kept), probed, module));
+                found.outlined.push(one);
+            }
+        }
+        // Its borrow of `resolved` ends before the crate moves into `finish`.
+        drop(needed);
+        // The walk's found files this crate read: by name, or by the path it read one at.
+        if !self.serve.found.is_empty() {
+            let (files, _, data) = resolved.checkout_reads();
+            for path in files.iter().map(|path| path.as_str()).chain(data.iter().map(|(path, _)| path.as_str())) {
+                let Some(one) = outline_at(outlined, Name::file(path.as_bytes()), path) else { continue };
+                if self.serve.found.binary_search_by_key(&one.name, |(file, _)| *file).is_ok() {
+                    found.read.push(one.name);
+                }
+            }
+        }
+        found.read.sort_unstable();
+        found.read.dedup();
+        // By name, the probes in the same order (rule 25: the order the crate read them in is not
+        // in what it answers).
+        found.outlined.sort_unstable_by_key(|one| one.name);
+        found.probes.sort_unstable_by_key(|(slot, ..)| Name::file(slot));
+        finish(task, input.name, resolved, ok, unresolved, oracle, &order, script_input, outlined, found, alloc, local, self.kept)
     }
 }
 
+/// The request's outline of the checkout file at `path`: by its name, else by the path it was
+/// read at (a module's `x/mod.rs`, named by its slot `x.rs`).
+fn outline_at<'o, 'h>(outlined: &'o [Outlined<'h>], name: Name, path: &str) -> Option<&'o Outlined<'h>> {
+    match outlined.binary_search_by(|one| one.name.cmp(&name)) {
+        Ok(at) => Some(&outlined[at]),
+        Err(_) => outlined.iter().find(|one| one.path.as_slice() == path.as_bytes()),
+    }
+}
+
+/// A file a crate's names read that no outline of the request holds: the cell it reads (a
+/// module file's `Surface`, a data file's outline) and the path it read it at.
+#[derive(Clone, Copy)]
+struct NeedFile<'p> {
+    read: Name,
+    path: &'p str,
+}
+
+/// Every file `resolved` read that `outlined` holds no outline of, in read order, each once: a
+/// module file a macro wrote (`cfg_if!`'s `mod unix;`, `mod $n;`), a data file of a computed
+/// path. At most `cap` ([`crate::engine_check::FOUND_CAP`], rule 18): past it
+/// [`EngineCheckError::FoundTooMany`] names the crate, the count and the first and last file.
+fn unoutlined<'p>(task: Name, krate: &str, resolved: &'p Resolved, outlined: &[Outlined<'_>], cap: usize, heap: SharedAlloc<'static>) -> Result<blaze_own::Vec<NeedFile<'p>, SharedAlloc<'static>>, EngineCheckError> {
+    let (files, _, data) = resolved.checkout_reads();
+    let mut needed: blaze_own::Vec<NeedFile<'p>, SharedAlloc<'static>> = blaze_own::Vec::new_in(heap.clone());
+    let mut count = 0u32;
+    let mut last = None;
+    let modules = files.iter().map(|path| (Name::new(Kind::Surface, Name::file(path.as_bytes()).subject), path.as_str()));
+    let datas = data.iter().map(|(path, _)| (Name::file(path.as_bytes()), path.as_str()));
+    for (read, path) in modules.chain(datas) {
+        // Held, even as a failed outline (that failure is its own row's, `finish` stops on it):
+        // only a file no entry holds is a need.
+        let file = Name::file(path.as_bytes());
+        let held = outlined.binary_search_by(|one| one.name.cmp(&file)).is_ok() || outlined.iter().any(|one| one.path.as_slice() == path.as_bytes());
+        if held || needed.iter().any(|one| one.path == path) {
+            continue;
+        }
+        count = count.saturating_add(1);
+        last = Some(path);
+        if needed.len() < cap {
+            needed.push(NeedFile { read, path });
+        }
+    }
+    if count as usize > cap {
+        return Err(EngineCheckError::FoundTooMany {
+            task,
+            krate: blaze_own::String::from_str_in(krate, heap.clone()),
+            count,
+            cap: u32::try_from(cap).unwrap_or(u32::MAX),
+            first: blaze_own::String::from_str_in(needed.first().map_or(last.unwrap_or(""), |one| one.path), heap.clone()),
+            last: blaze_own::String::from_str_in(last.unwrap_or(""), heap),
+        });
+    }
+    Ok(needed)
+}
+
+/// The stop for a file read the plan did not hand: named by the crate and the path (rule 19),
+/// the strings made only on that stop.
+fn unseen_file(task: Name, read: Name, krate: &str, path: &str, heap: SharedAlloc<'static>) -> EngineCheckError {
+    EngineCheckError::UnseenFile { task, read, krate: blaze_own::String::from_str_in(krate, heap.clone()), path: blaze_own::String::from_str_in(path, heap) }
+}
+
 #[expect(clippy::too_many_arguments, reason = "one resolved crate and the inputs it was handed")]
-fn finish<'a>(task: &EngineTask, krate: &str, resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate>, deps: &[Dependency<'_>], script: Option<Input>, outlined: &[Outlined<'_>], alloc: SharedAlloc<'a>, scratch: blaze_own::Alloc<'_>, heap: SharedAlloc<'static>) -> Result<WorkerAnswer<'a>, WorkerError> {
+fn finish<'a>(task: &EngineTask, krate: &str, resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate>, deps: &[Dependency<'_>], script: Option<Input>, outlined: &[Outlined<'_>], found: FoundBy, alloc: SharedAlloc<'a>, scratch: blaze_own::Alloc<'_>, heap: SharedAlloc<'static>) -> Result<WorkerAnswer<'a>, WorkerError> {
     let name = task.planned.name;
+    // A file the request's outlines hold, else one this crate found and its worker outlined.
+    let outline_of = |file: Name, path: &str| outline_of(outlined, file, path).or_else(|| outline_of(&found.outlined, file, path));
     let mut record = work::Record::new_in(name, heap);
     record.out = resolved.out;
     resolved.file_findings(&mut record).map_err(|crate::names::FindingText(what)| WorkerError::Finding(what))?;
@@ -1556,18 +1747,13 @@ fn finish<'a>(task: &EngineTask, krate: &str, resolved: Resolved, ok: bool, unre
     let count = files.len() + absent.len() + data.len() + deps.len() + usize::from(script.is_some());
     record.reads.reserve(count);
     let mut reads = SVec::with_capacity_in(count, alloc);
-    // A file read the plan did not hand: named by the crate and the path (rule 19), the strings
-    // made only on that stop.
-    let unseen = |read: Name, path: &str| EngineCheckError::UnseenFile {
-        task: name,
-        read,
-        krate: blaze_own::String::from_str_in(krate, heap.clone()),
-        path: blaze_own::String::from_str_in(path, heap.clone()),
-    };
+    // A file read the plan did not hand ([`unoutlined`] found none before this call; kept so a
+    // read that slips past it still stops by name, rule 3).
+    let unseen = |read: Name, path: &str| unseen_file(name, read, krate, path, heap.clone());
     for path in files {
         let file = Name::file(path.as_bytes());
         let surface = Name::new(Kind::Surface, file.subject);
-        let digest = outline_of(outlined, file, path).and_then(crate::engine_tasks::surface_of)
+        let digest = outline_of(file, path).and_then(crate::engine_tasks::surface_of)
             .ok_or_else(|| unseen(surface, path))?;
         record.reads.push((surface, digest));
         reads.push((CellId { of: file, cell: crate::engine_tasks::SURFACE }, digest));
@@ -1581,7 +1767,7 @@ fn finish<'a>(task: &EngineTask, krate: &str, resolved: Resolved, ok: bool, unre
     }
     for (path, _) in data {
         let file = Name::file(path.as_bytes());
-        let out = outline_of(outlined, file, path).ok_or_else(|| unseen(file, path))?.out;
+        let out = outline_of(file, path).ok_or_else(|| unseen(file, path))?.out;
         record.reads.push((file, out));
         reads.push((CellId { of: file, cell: WHOLE }, out));
     }
@@ -1603,7 +1789,7 @@ fn finish<'a>(task: &EngineTask, krate: &str, resolved: Resolved, ok: bool, unre
     let done = Done { name, key: task.key, out: record.out, defines, reads, findings: u32::try_from(record.findings.len()).unwrap_or(u32::MAX), failed: false };
     let header = blaze_drive::record::write_plain_head(name, task.planned.source, record.out, &record.reads, payload.len(), scratch);
     let head = SVec::from_slice_in(&header, heap);
-    Ok(WorkerAnswer { done, result: Ok(Finished { record, resolved, ok, unresolved, key, head, oracle }) })
+    Ok(WorkerAnswer { done, result: Ok(Finished { record, resolved, ok, unresolved, key, head, oracle, found }) })
 }
 
 /// Results may arrive in any order. The engine's task index orders every observable merge.
@@ -1724,9 +1910,43 @@ fn edges_of<'w>(krate: &blaze_world::Crate<'w>, all: Sysroot, at: usize) -> impl
 
 #[derive(Clone, Copy)]
 enum Mapped<'w> {
-    Exports(&'w [u8]),
+    /// Its exports record, checked whole once as it was mapped ([`checked`]): every dependent
+    /// the slot serves opens the proof in O(1) and checks nothing again (rule 74).
+    Exports(Verified<'w>),
     Failed,
     Unreadable(&'w str),
+}
+
+/// A dependency's exports record as its slot holds it: checked whole here, once for every
+/// crate of the phase (or the pipeline) that reads it, on the one thread that maps it and
+/// before any worker that reads it starts. A record that does not check is the dependency's
+/// unreadable record, named by its table and offset; each dependent fails on it alone.
+fn checked<'w>(bytes: &'w [u8], krate: &str, alloc: blaze_own::Alloc<'w>) -> Mapped<'w> {
+    #[cfg(test)]
+    {
+        let mut checks = CHECKED.lock();
+        if !checks.krate.is_empty() && checks.krate == krate {
+            checks.count += 1;
+        }
+    }
+    #[cfg(not(test))]
+    let _ = krate;
+    match Verified::check(bytes) {
+        Ok(proof) => Mapped::Exports(proof),
+        Err(error) => Mapped::Unreadable(blaze_own::Box::leak(blaze_own::format_in!(alloc, "its exports record did not check: {error:?}").into_boxed_str())),
+    }
+}
+
+/// Tests: how many times the exports record of the crate a test names was checked
+/// ([`checked`]; tests/names_verified_once_tests.rs).
+#[cfg(test)]
+pub(crate) static CHECKED: blaze_core::lock::Lock<Checks> = blaze_core::lock::Lock::new("names.checked (tests)", Checks { krate: "", count: 0 });
+
+/// The crate a test watches and how many times its exports record was checked.
+#[cfg(test)]
+pub(crate) struct Checks {
+    pub(crate) krate: &'static str,
+    pub(crate) count: u32,
 }
 
 struct WaveInputs<'w, 'm> {

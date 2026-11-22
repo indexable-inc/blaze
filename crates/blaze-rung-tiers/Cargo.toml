@@ -1,0 +1,40 @@
+[package]
+name = "blaze-rung-tiers"
+description = "Every ladder rung run at the Reference tier and at the Fast tier through the tier seam, compared on exit status and output (D97 point 1; D197 root 6, piece (c)); the Fast tier's refusals by class are the worklist; a test crate with no library code, above blaze-ladder and blaze-emit so neither gains a cycle"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dev-dependencies]
+# The programs.
+blaze-rungs = { path = "../blaze-rungs" }
+# `blaze run`'s record walk as a census (code_records.rs `RecordRun::census`, run.rs
+# `build_records_new`), and its builder's settings.
+blaze-ladder.workspace = true
+blaze-build.workspace = true
+blaze-toolchain.workspace = true
+blaze-ids.workspace = true
+blaze-typeck.workspace = true
+edition.workspace = true
+# The tiers (`Reference`, `Fast`, the committed table) and the seam, the record form and its
+# placer.
+blaze-emit.workspace = true
+blaze-tier.workspace = true
+blaze-code.workspace = true
+blaze-lir.workspace = true
+# The executable mapping; the child, its pipe and its wait.
+blaze-inproc.workspace = true
+blaze-sys.workspace = true
+# `blaze_own::testing::heap()`, the test's root allocator.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

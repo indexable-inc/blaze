@@ -149,7 +149,7 @@ pub(crate) fn put_all(cx: &Cx, store: &mut dyn Store<'_>, puts: &mut [Put<'_>], 
                     continue;
                 }
                 let key = Key(*key);
-                let put = store.put_record(&cx, key, crate::store::plain_place::EXPANSION_TAG, &parts, bytes)?;
+                let put = store.put_record(&cx, key, blaze_keyed::kind::ReservedTag::Expansion.tag(), &parts, bytes)?;
                 written += u32::from(put == blaze_keyed::store::Put::Written);
                 ledger.put_extra(stage, key, bytes, put);
                 beside.push(key);

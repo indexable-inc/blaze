@@ -70,10 +70,15 @@
 //! | truncate | `ftruncate` | none (shrink), one `pwrite` of zeros (grow) |
 //! | read, map | `open` + `pread`/`mmap` + `close` | the same on the device |
 //!
-//! The last row is today's native driver, which opens the named file for every effect except
-//! `ReadInto` and `ReadMany` (blaze-core `descriptors`): the device's one name saves the opens
-//! only once the driver keeps its descriptor for every effect on it (the D182 list of edits
-//! outside this crate). The names' calls (rows 1 to 5) are saved by the table alone.
+//! The last row is today's native driver: on macOS (blaze-core `kqueue`, its opening
+//! `threads::opening::Kept`, 2026-11-21) `ReadInto`, `ReadMany`, `Map`, `WriteBack` and a
+//! queued `Read` go through the kept read-only descriptors (blaze-core `descriptors`);
+//! `WriteAt`, `WriteFrom` and `Truncate` through the kept writable one; `Sync` and `Barrier`
+//! of a file already there through the read-only one, and of a missing file by its name, which
+//! makes it. `Append` opens its named file (`O_APPEND`; a positional descriptor would lose one
+//! of two appends in flight). So a segment written in pieces, cut and sealed opens twice in a
+//! driver's life, once each way, not once an effect. The names' calls (rows 1 to 5) are saved
+//! by the table alone.
 //!
 //! # Proof
 //!

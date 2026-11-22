@@ -51,6 +51,7 @@ fn cfg(n: u64, root: &Frame) -> PlainConfig<&Frame> {
         writes,
         reads,
         liveness: super::Liveness::Everything,
+        lock_step: crate::plain::LockStep::Backoff,
     }
 }
 

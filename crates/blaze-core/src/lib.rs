@@ -1750,7 +1750,7 @@ impl fmt::Debug for Mapping {
 /// What [`Effect::Stat`], [`Effect::Lstat`] or [`Effect::List`] found of one name: its length
 /// and kind, and what identifies this version of it (the inode, the device, both times), from
 /// the same call that found it (macOS's `getattrlistbulk` for a listing, a `stat` for a stat).
-/// Unlike [`Stamp`], which the sweep keeps in its image, it says the device too.
+/// [`Stamp`] says the same device (`Stamp::dev`, since 2026-11-21), as this driver's `Meta`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Meta {
     pub len: u64,

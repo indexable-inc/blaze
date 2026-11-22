@@ -36,6 +36,7 @@ pub mod program_texts;
 pub mod refusal;
 pub mod resolve;
 pub mod run;
+pub mod scope;
 pub mod seam;
 pub mod stub;
 pub mod symbols;

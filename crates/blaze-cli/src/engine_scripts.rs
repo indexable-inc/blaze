@@ -29,7 +29,7 @@ use bstd::cx::Cx;
 use bstd::mem::Frame;
 
 use crate::CliError;
-use crate::engine_check::EngineCheckError;
+use crate::engine_check::{EngineCheckError, Table};
 use crate::engine_names::{Handles, NamesStage};
 use crate::engine_tasks::WHOLE;
 use crate::engine_units::{Discovered, Failure, Published, drive_task, published};
@@ -676,11 +676,20 @@ impl<'f> ScriptsStage<'f> {
         planned
     }
 
-    /// Onto `out`, the leaf rows of the build scripts' reads the answer still reads: `reads(name)`
-    /// says whether the final answer has a row for the cell `name` (engine_check.rs hook H2,
-    /// before the answer's rows are saved).
-    pub(crate) fn script_rows(&self, followed: Option<&crate::sweep::Rows<'_>>, reads: impl Fn(Name) -> bool, out: &mut crate::sweep::Rows<'_>) {
-        crate::engine_script_reads::keep_rows(followed, self.fresh.iter().map(|(_, read)| read), reads, out);
+    /// Onto `out`, the leaf rows of the checkout reads the answer still reads: the build
+    /// scripts', then `more` (the bodies' computed data includes, engine_bodies.rs
+    /// `BodiesStage::data_files`), one leaf a cell; `reads(name)` says whether a row of the
+    /// final answer reads the cell `name` (engine_check.rs hook H2, before the answer's rows are
+    /// saved).
+    pub(crate) fn script_rows<'r>(
+        &'r self,
+        followed: Option<&crate::sweep::Rows<'_>>,
+        more: impl Iterator<Item = (crate::engine_script_reads::ReadKind, &'r str, ContentId)>,
+        reads: impl Fn(Name) -> bool,
+        out: &mut crate::sweep::Rows<'_>,
+    ) {
+        let fresh = self.fresh.iter().map(|(_, read)| (read.kind, read.path.as_str(), read.answer));
+        crate::engine_script_reads::keep_rows(followed, fresh.chain(more), reads, out);
     }
 
     /// The result of `name`, if this stage entered it.
@@ -838,7 +847,7 @@ impl<'f> ScriptsStage<'f> {
 
     fn drive(&self, task: &EngineTask, heap: blaze_own::Alloc<'static>) -> Result<blaze_drive::Task<'static>, CliError> {
         let name = task.planned.name;
-        let at = self.reads.binary_search_by_key(&name, |(name, _)| *name).map_err(|_| EngineCheckError::Unseen { task: name, read: name })?;
+        let at = self.reads.binary_search_by_key(&name, |(name, _)| *name).map_err(|_| EngineCheckError::MissingEntry { task: name, table: Table::ScriptReads, key: name })?;
         let mut inputs = Vec::new_in(heap);
         let mut failed = Vec::new_in(heap);
         for &read in &self.reads[at].1 {
@@ -1046,14 +1055,14 @@ impl<'f> ScriptsStage<'f> {
         };
         #[cfg(not(test))]
         let name = next()?;
-        let finished = queue.running.get(&name).ok_or(EngineCheckError::Unseen { task: name, read: name })?.finished;
+        let finished = queue.running.get(&name).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::ScriptsRunning, key: name })?.finished;
         // A simulated completion still waits for the real worker to hand over its bytes.
         wait_finished(cx, queue.clock, queue.waiter, || finished.is_set(), "the selected Scripts worker to return", 1)?;
         let Running { task, drive, handle, output, lane, .. } = queue.running.remove(&name)
-            .ok_or(EngineCheckError::Unseen { task: name, read: name })?;
+            .ok_or(EngineCheckError::MissingEntry { task: name, table: Table::ScriptsRunning, key: name })?;
         queue.slots.release();
         queue.joined_later.push(handle);
-        let (answer, start, end) = output.lock().take().ok_or(EngineCheckError::Unseen { task: name, read: name })?;
+        let (answer, start, end) = output.lock().take().ok_or(EngineCheckError::MissingEntry { task: name, table: Table::ScriptsOutput, key: name })?;
         let done = match answer {
             WorkerOutput::Run(pooled) => Completed::pooled(drive, pooled, frame)?,
             WorkerOutput::Module(answer, crates) => {
@@ -1094,15 +1103,15 @@ impl<'f> ScriptsStage<'f> {
         let (task, start, end) = queue.answered.remove(&name).expect("the chosen script has answered");
         times.interval(name, start, end);
         if queue.order.remove(&(false, name)).is_none() && queue.order.remove(&(true, name)).is_none() {
-            return Err(EngineCheckError::Unseen { task: name, read: name }.into());
+            return Err(EngineCheckError::MissingEntry { task: name, table: Table::ScriptsOrder, key: name }.into());
         }
         if name.kind == Kind::Given {
             let at = self.given.binary_search_by_key(&name, |(name, _, _)| *name)
-                .map_err(|_| EngineCheckError::Unseen { task: name, read: name })?;
+                .map_err(|_| EngineCheckError::MissingEntry { task: name, table: Table::ScriptsGiven, key: name })?;
             buffer.done.push(crate::engine_script_reads::given_done(&task, self.given[at].1, alloc));
         } else {
             let task = &task;
-            let done = self.completed.remove(&name).ok_or(EngineCheckError::Unseen { task: name, read: name })?;
+            let done = self.completed.remove(&name).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::ScriptsCompleted, key: name })?;
             let Completed { drive, made, owed, worker } = done;
             let used_unkept = worker.as_ref().is_some_and(|run| run.unkept.is_some());
             if let Some(run) = worker {
@@ -1110,7 +1119,7 @@ impl<'f> ScriptsStage<'f> {
                     if let Some(why) = run.unkept {
                         let (unit, package, version, side) = self.runs.binary_search_by_key(&name, |run| run.task.planned.name)
                             .ok().and_then(|at| self.runs[at].script)
-                            .ok_or(EngineCheckError::Unseen { task: name, read: name })?;
+                            .ok_or(EngineCheckError::MissingEntry { task: name, table: Table::ScriptRuns, key: name })?;
                         self.unkept.push((name, unit, package, version, side, why));
                     } else {
                         self.fresh.extend(run.checkout.into_iter().map(|read| (name, read)));
@@ -1230,7 +1239,7 @@ impl<'f> ScriptsStage<'f> {
                 Ok(made) => made,
                 Err(why) => return Err(EngineCheckError::NamesWorld(why).into()),
             };
-            let module = made.script_module(name.subject).ok_or(EngineCheckError::Unseen { task: name, read: name })?;
+            let module = made.script_module(name.subject).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::WorldScriptModules, key: name })?;
             let wanted = crate::script_modules::Wanted {
                 ran_as: module.ran_as, package: module.package, version: module.version,
                 features: queue.jobs.alloc_slice_copy(&module.features),

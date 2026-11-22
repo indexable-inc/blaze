@@ -589,6 +589,30 @@ fn concat_bytes_joins_bytes_and_arrays() {
     }
 }
 
+/// An eager builtin's arguments are the parser's expressions (rustc's `get_exprs_from_tts`),
+/// not the pieces between commas outside groups.
+#[test]
+fn a_builtin_s_arguments_are_the_parser_s_expressions() {
+    let cx = TestCx::new();
+    let env = builtin(BuiltinFn::Env);
+    // `f::<A, B>()` is one argument: the message, refused as no string literal where it starts
+    // (token 2). CONTROL: the comma walk read three arguments, "`env!` takes 1 or 2 arguments",
+    // at no token.
+    let exp = call_fn(&env, "\"A\", f::<A, B>()", &cx);
+    assert!(matches!(exp.diagnostics[..], [Diagnostic::Builtin { at: Some(TokenOrigin::Input(2)), .. }]), "{:?}", exp.diagnostics);
+    // The twin: three arguments are three, refused by their count, at no token.
+    let exp = call_fn(&env, "\"A\", \"m\", \"x\"", &cx);
+    assert!(matches!(exp.diagnostics[..], [Diagnostic::Builtin { at: None, .. }]), "{:?}", exp.diagnostics);
+    // Two expressions with no `,`: refused where the second starts (token 1). CONTROL: the
+    // comma walk read one argument `"a" "b"`, "expected a literal" at token 0.
+    let exp = call_fn(&builtin(BuiltinFn::Concat), "\"a\" \"b\"", &cx);
+    assert!(matches!(exp.diagnostics[..], [Diagnostic::Builtin { at: Some(TokenOrigin::Input(1)), .. }]), "{:?}", exp.diagnostics);
+    // A trailing comma ends the list, as before.
+    let exp = call_fn(&builtin(BuiltinFn::Concat), "\"a\", 1,", &cx);
+    assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
+    assert_eq!(show(&exp.tokens), "\"a1\"");
+}
+
 #[test]
 fn cfg_select_takes_the_first_arm_that_holds() {
     let cx = TestCx::new();
@@ -622,17 +646,19 @@ fn a_cfg_select_arm_s_turbofish_comma_ends_no_arm() {
     // The site's shape: the first arm does not hold, the wildcard's turbofish is taken whole.
     let exp = call_fn(&def, "windows => simple::<T, F>, _ => cyclic::<T, F>,", &cx);
     assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
-    assert_eq!(show(&exp.tokens), "cyclic :: < T , F >");
+    // `::<` shows glued: the lexer makes a `:` before `<` joint, as the assert! tests above
+    // render `f ::< A , B >`; the arm's tokens are the input's, copied as lexed.
+    assert_eq!(show(&exp.tokens), "cyclic ::< T , F >");
     // The twin: the first arm holds, its turbofish taken whole and the rest skipped.
     let exp = call_fn(&def, "unix => simple::<T, F>, _ => cyclic::<T, F>,", &cx);
     assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
-    assert_eq!(show(&exp.tokens), "simple :: < T , F >");
+    assert_eq!(show(&exp.tokens), "simple ::< T , F >");
     // A block-like arm needs no `,` before the next arm (`classify::expr_is_complete`).
     let exp = call_fn(&def, "windows => if a { b } else { c } _ => d", &cx);
     assert_eq!(show(&exp.tokens), "d");
     // The control: the same arms with no comma inside a turbofish read as before.
     let exp = call_fn(&def, "windows => simple::<T>, _ => cyclic::<T>,", &cx);
-    assert_eq!(show(&exp.tokens), "cyclic :: < T >");
+    assert_eq!(show(&exp.tokens), "cyclic ::< T >");
 }
 
 #[test]

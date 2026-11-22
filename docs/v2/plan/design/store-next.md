@@ -91,7 +91,7 @@ as a control.
 - **A lookup that reads no run ends.** `format::find` (now `find_by`) interpolates between bounds
   that start as the whole key space and become each probe's prefix as it narrows. Each guess stays
   inside the range, and the bound stays `3 + log2 n` probes.
-- **(d) The startup image** (`plain/image.rs`, `StartupImage`, `IMAGE_TAG` = `ROOT_TAG - 1`).
+- **(d) The startup image** (`plain/image.rs`, `StartupImage`, blaze-keyed `ReservedTag::Image`).
   - Its key is `H("blaze startup image", manifest key)`. Its body lists the (slot, code record
     key) rows placed before `main`, in placement order: `BLSI`, format 1, the manifest key, then
     rows of 40 bytes.
@@ -201,7 +201,7 @@ blaze-run's `Parent`:
 1. At start, get `StartupImage::key_for(manifest)`.
 2. When found, run `read_order` against `locate` and read the records into the code region before
    the child's first ask. The Welcome's known slots come from the image's rows.
-3. After `main` is reached, put the image of what this run placed under `IMAGE_TAG` and `LOCAL`,
+3. After `main` is reached, put the image of what this run placed under `ReservedTag::Image` and `LOCAL`,
    when it differs, and commit it with the run's other records after the answer.
 
 ## Tests (`crates/blaze-cas/src/plain/tests.rs`)

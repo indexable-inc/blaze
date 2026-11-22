@@ -49,8 +49,9 @@ use blaze_ids::producer::{CodeBuilder, ProducerId};
 use blaze_own::AVec;
 
 use crate::body_ids::{BodyIds, Counts, EntryForm, Fixture, Grant, Make, Walk, WalkError};
-use crate::code_records::{Builder, Callee, CodeRecordError, CodeStore, Declared, InstanceNames, VtableDatum, make_entry_with_vtables};
-use crate::front2::const_at::{ConstTable, Needs};
+use crate::code_records::reads::{self, Answers, ReadKind, ReadLog, ReadPlant, ReadsError, Recorded, Verdict};
+use crate::code_records::{Builder, Callee, CodeRecordError, CodeStore, Declared, EntryView, InstanceNames, VtableDatum, make_entry_with_vtables};
+use crate::front2::const_at::{ConstNeed, ConstTable, Needs};
 use crate::front2::coroutines::Coroutines;
 use crate::front2::program::lazy::LazyRefusal;
 use super::lay_states::{Lay, lay_and_build, roots_of_instance, unchecked_owner};
@@ -74,6 +75,156 @@ pub struct CheckCount {
     pub coroutine_walks: usize,
 }
 
+/// A made function at or past this many bytes of code or of estimated frame is reported
+/// ([`MakeSizes`]; rule 16: a huge function is a P0 until its profile names it).
+pub const MAKE_REPORT_BYTES: u64 = 1 << 20;
+/// A make that took at least this long is reported ([`MakeSizes`]).
+pub const MAKE_REPORT_TIME: core::time::Duration = core::time::Duration::from_secs(1);
+
+/// What a maker reports its large or slow makes with: the clock the make's times are read on,
+/// and where each [`MakeSizes`] goes (the parent prints it, one line to stderr). Handed in
+/// ([`Maker::watch`]; rule 75: no clock and no output of its own); without it, no make is
+/// timed and none reported.
+#[derive(Clone, Copy)]
+pub struct MakeWatch<'n> {
+    pub clock: blaze_core::wait::Monotonic,
+    pub report: &'n (dyn Fn(&MakeSizes) + Sync),
+}
+
+/// The slots of a made function of one [`blaze_lir::func::SlotKind`]: how many, and their
+/// bytes, as the build wrote them (before the Fast tier's simplify scalarizes any).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct SlotSum {
+    pub count: u64,
+    pub bytes: u64,
+}
+
+/// One made function's size and time, reported when it is large or slow: its code or its
+/// estimated frame at least [`MAKE_REPORT_BYTES`], or its make at least [`MAKE_REPORT_TIME`].
+/// Before (tempo t1935d, tempo-precompiles-macros, 3 tests): `syn::ty::parsing::ambig_ty` took
+/// 48.9 s to make and its stack probe faulted 13.4 MB into its code (blaze-emit pass/probe.rs
+/// places the probing tail after the last instruction), a frame past the 8 MiB main stack,
+/// named by no line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MakeSizes {
+    /// The fn, by path (its instance's arguments are not named).
+    pub function: Named,
+    /// LIR blocks.
+    pub blocks: u64,
+    /// LIR instructions; each numbers a value, so this is the values' count too (blaze-lir
+    /// func.rs `View::len`).
+    pub insts: u64,
+    /// The instructions the build's aggregate copies wrote (blaze-build `Built::copy_insts`).
+    pub copy_insts: u64,
+    /// Slots by kind: `Temp`, `Named`, `ArgSpill` ([`blaze_lir::func::SlotKind::ALL`]'s order).
+    pub slots: [SlotSum; 3],
+    /// An ESTIMATE of the frame: the slots' bytes plus 8 per instruction (blaze-emit lib.rs:
+    /// every value its own 8-byte cell, a pair's 16; an instruction with no result has none).
+    /// blaze-emit does not expose its `frame_bytes`.
+    pub frame_estimate: u64,
+    /// The entry's bytes (its record, declarations and tables): the code is no longer.
+    pub entry_bytes: u64,
+    /// The record's code, read from the entry when it is at least [`MAKE_REPORT_BYTES`].
+    pub code: CodeSize,
+    /// The make's time: the checks and constant pulls before and between builds (`lower`), the
+    /// builds (`build`, every try of the instance), the emits (`emit`).
+    pub lower: core::time::Duration,
+    pub build: core::time::Duration,
+    pub emit: core::time::Duration,
+}
+
+/// A made function's code, as [`MakeSizes`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodeSize {
+    /// The entry is shorter than [`MAKE_REPORT_BYTES`], so the code is too: not read.
+    Small,
+    /// The record's instruction bytes and its whole code (instructions and their data).
+    Read { insts: u64, bytes: u64 },
+    /// The entry just made did not read back (code_records.rs `EntryView::read`'s words).
+    Unread(Box<str>),
+}
+
+impl core::fmt::Display for CodeSize {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CodeSize::Small => f.write_str("under the entry's length"),
+            CodeSize::Read { insts, bytes } => write!(f, "{bytes} B ({insts} B instructions)"),
+            CodeSize::Unread(why) => write!(f, "not read: the entry did not read back: {why}"),
+        }
+    }
+}
+
+impl core::fmt::Display for MakeSizes {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let [t, n, a] = self.slots;
+        write!(
+            f,
+            "blaze make: large or slow fn `{}`: lir blocks {}, insts {} (= values), copy insts {}; slots temp {} ({} B), named {} ({} B), arg-spill {} ({} B); frame estimate {} B (slots + 8 B per value; not blaze-emit's frame_bytes); entry {} B, code {}; make lower {:?}, build {:?}, emit {:?} (rule 16)",
+            self.function, self.blocks, self.insts, self.copy_insts, t.count, t.bytes, n.count, n.bytes, a.count, a.bytes, self.frame_estimate, self.entry_bytes, self.code, self.lower, self.build, self.emit,
+        )
+    }
+}
+
+/// The sizes of a made function, before its times: [`MakeSizes`] less `lower`, `build` and
+/// `emit`, read from the built function and its entry.
+#[derive(Clone, Debug)]
+struct MadeSizes {
+    function: Named,
+    blocks: u64,
+    insts: u64,
+    copy_insts: u64,
+    slots: [SlotSum; 3],
+    frame_estimate: u64,
+    entry_bytes: u64,
+    code: CodeSize,
+}
+
+impl MadeSizes {
+    /// The sizes of `built` and its entry `made`. The entry is read (`EntryView::read`) only
+    /// when it is at least [`MAKE_REPORT_BYTES`] long: its code is no longer than it.
+    fn of(function: Named, built: &blaze_build::Built<Global>, made: &[u8]) -> MadeSizes {
+        let view = built.func.verified().view();
+        let mut slots = [SlotSum::default(); 3];
+        for s in view.slots.iter() {
+            use blaze_lir::func::SlotKind;
+            if let Some(at) = SlotKind::from_byte(s.kind).and_then(|k| SlotKind::ALL.iter().position(|&x| x == k)) {
+                slots[at].count += 1;
+                slots[at].bytes += u64::from(s.size);
+            }
+        }
+        let insts = view.len() as u64;
+        let frame_estimate = slots.iter().map(|s| s.bytes).sum::<u64>() + 8 * insts;
+        let entry_bytes = made.len() as u64;
+        let code = if entry_bytes < MAKE_REPORT_BYTES {
+            CodeSize::Small
+        } else {
+            match crate::code_records::EntryView::read(made) {
+                Ok(e) => CodeSize::Read { insts: u64::from(e.insts), bytes: e.record.code().len() as u64 },
+                Err(why) => CodeSize::Unread(std::format!("{why}").into_boxed_str()),
+            }
+        };
+        MadeSizes { function, blocks: view.blocks() as u64, insts, copy_insts: built.copy_insts, slots, frame_estimate, entry_bytes, code }
+    }
+
+    /// Whether a make of these sizes, `took` long, is reported.
+    fn reported(&self, took: core::time::Duration) -> bool {
+        let code = match self.code {
+            CodeSize::Read { bytes, .. } => bytes,
+            CodeSize::Small => 0,
+            CodeSize::Unread(_) => self.entry_bytes,
+        };
+        code >= MAKE_REPORT_BYTES || self.frame_estimate >= MAKE_REPORT_BYTES || took >= MAKE_REPORT_TIME
+    }
+}
+
+/// The current make's times and last sizes, kept by [`Work`] while one instance is made.
+#[derive(Clone, Debug, Default)]
+struct MakeTimes {
+    build: core::time::Duration,
+    emit: core::time::Duration,
+    last: Option<MadeSizes>,
+}
+
 /// Work at the lazy program's body boundary for this run. An initial lowering counts
 /// when it produces a body. Declarations and requests for other instances of that body
 /// add none. The other two counters count calls.
@@ -82,11 +233,53 @@ pub struct LoweringCounts {
     pub bodies_lowered: u64,
     pub lower_again: u64,
     pub forks: u64,
+    /// Where the bodies' checked columns came from, by a typing that counts them ([`ByKind`]);
+    /// `None` for one that does not ([`SecondCheck`], [`FromRecord`]) or before a make.
+    pub typing: Option<TypingCounts>,
 }
 
 impl core::fmt::Display for LoweringCounts {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "bodies lowered {}, lower_again calls {}, forks {}", self.bodies_lowered, self.lower_again, self.forks)
+        write!(f, "bodies lowered {}, lower_again calls {}, forks {}", self.bodies_lowered, self.lower_again, self.forks)?;
+        match self.typing {
+            Some(typing) => write!(f, "; {typing}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The bodies a run handed over by where their checked columns came from ([`ByKind`]): read
+/// from the record `check` kept, or checked by the run, by kind (lazy typed.rs `RunChecked`).
+/// The run's closing line: "N bodies read from records, M checked by the run (kinds: …)".
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct TypingCounts {
+    pub read: u64,
+    /// By `RunChecked::index`.
+    pub checked: [u64; crate::front2::program::lazy::typed::RunChecked::ALL.len()],
+}
+
+impl TypingCounts {
+    /// Every body the run checked itself, of any kind.
+    pub fn checked_by_run(&self) -> u64 {
+        self.checked.iter().sum()
+    }
+}
+
+impl core::fmt::Display for TypingCounts {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} bodies read from records, {} checked by the run (kinds:", self.read, self.checked_by_run())?;
+        let mut none = true;
+        for kind in crate::front2::program::lazy::typed::RunChecked::ALL {
+            let n = self.checked[kind.index()];
+            if n > 0 {
+                write!(f, "{} {} {n}", if none { "" } else { "," }, kind.name())?;
+                none = false;
+            }
+        }
+        if none {
+            write!(f, " none")?;
+        }
+        write!(f, ")")
     }
 }
 
@@ -110,6 +303,9 @@ impl CheckCount {
 pub trait Typing<P: FrontEnd> {
     /// Fn `key`'s row and checked body, as the seam's [`FrontEnd::check_one`] answers.
     fn check_one(&mut self, program: &mut P, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, RunError>;
+    /// The bodies handed over by where their columns came from, for a typing that counts them
+    /// ([`ByKind`]); `None` for one that does not.
+    fn counts(&self) -> Option<TypingCounts>;
 }
 
 /// The body checked in the make, a second time (the seam's own `check_one`).
@@ -120,6 +316,10 @@ impl<P: FrontEnd> Typing<P> for SecondCheck {
     fn check_one(&mut self, program: &mut P, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, RunError> {
         program.check_one(key)
     }
+
+    fn counts(&self) -> Option<TypingCounts> {
+        None
+    }
 }
 
 /// The body's checked columns read from the check's record `R` (lazy typed.rs), never checked
@@ -129,6 +329,59 @@ pub struct FromRecord<R>(pub R);
 impl<'n, S: crate::front2::program::lazy::PositionSource<'n>, R: crate::front2::program::lazy::typed::TypedRecords> Typing<crate::front2::program::lazy::LazyProgram<'n, S>> for FromRecord<R> {
     fn check_one(&mut self, program: &mut crate::front2::program::lazy::LazyProgram<'n, S>, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, RunError> {
         program.check_one_typed(key, &mut self.0)
+    }
+
+    fn counts(&self) -> Option<TypingCounts> {
+        None
+    }
+}
+
+/// THE TYPING BY KIND (D163 part 2, D197 root 1): each body's checked columns from the record
+/// `check` kept (lazy typed.rs `KeptBodies`), read with no checker round; a body of a kind
+/// `check` keeps no record for yet (`RunChecked`) checked here, as the only check it gets,
+/// counted by kind. A gap in a kind that has records is the program's typed refusal naming the
+/// body (`LazyRefusal::Typed`), never a check in its place (rule 3).
+pub struct ByKind<K> {
+    pub kept: K,
+    counts: TypingCounts,
+}
+
+impl<K> ByKind<K> {
+    pub fn new(kept: K) -> ByKind<K> {
+        ByKind { kept, counts: TypingCounts::default() }
+    }
+
+    /// The bodies handed over so far, by where their columns came from.
+    pub fn counts(&self) -> TypingCounts {
+        self.counts
+    }
+}
+
+impl<'n, S: crate::front2::program::lazy::PositionSource<'n>, K: crate::front2::program::lazy::typed::KeptBodies> Typing<crate::front2::program::lazy::LazyProgram<'n, S>> for ByKind<K> {
+    fn check_one(&mut self, program: &mut crate::front2::program::lazy::LazyProgram<'n, S>, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, RunError> {
+        use crate::front2::program::lazy::typed::{BodySource, Given};
+        match self.kept.source(key) {
+            Ok(BodySource::Run(kind)) => {
+                let made = program.check_one(key)?;
+                if made.is_some() {
+                    self.counts.checked[kind.index()] += 1;
+                }
+                Ok(made)
+            }
+            Ok(BodySource::Read(checked)) => {
+                let made = program.check_one_typed(key, &mut Given { key, got: Some(Ok(checked)) })?;
+                if made.is_some() {
+                    self.counts.read += 1;
+                }
+                Ok(made)
+            }
+            // Refused by the program, which names the body as for any gap of its record.
+            Err(gap) => program.check_one_typed(key, &mut Given { key, got: Some(Err(gap)) }),
+        }
+    }
+
+    fn counts(&self) -> Option<TypingCounts> {
+        Some(self.counts)
     }
 }
 
@@ -160,6 +413,22 @@ struct Work {
     /// The program's compiler_builtins soft-float routines as instances, found once a run
     /// (front2/builtins_shim.rs): every instance's emitter gets their places.
     routines: crate::front2::builtins_shim::Bound,
+    /// The clock a make is timed on ([`MakeWatch::clock`]); `None`: no make is timed or
+    /// reported.
+    clock: Option<blaze_core::wait::Monotonic>,
+    /// The instance being made: its builds' and emits' times, and its last build's sizes.
+    times: MakeTimes,
+    /// The last make's report, when it was large or slow, for the maker to hand on
+    /// ([`MakeWatch::report`]).
+    reported: Option<MakeSizes>,
+    /// The questions the build being made asked ([`Asking`]): cleared as each build starts,
+    /// so a build made again after a retry keeps only its own answers (a lazy front's default
+    /// `repr` before a head was made is never kept), then sealed into the entry's read list
+    /// (code_reads.rs).
+    reads: ReadLog,
+    /// The read-list answers found holding this run, by question ([`verify_instance`]): a
+    /// question many found entries ask is asked of the front end once.
+    answers: Answers<'static>,
 }
 
 /// One maker's state over program `P` (made with the program, on the first miss).
@@ -252,8 +521,30 @@ impl MakerState {
             needs: Needs::new_in(Global),
             thread_locals: false,
             routines,
+            clock: None,
+            times: MakeTimes::default(),
+            reported: None,
+            reads: ReadLog::new(ReadPlant::None),
+            answers: Answers::new_in(alloc),
         };
         Ok(MakerState { asked: blaze_own::Vec::new_in(alloc), checked: blaze_own::Vec::new_in(alloc), tables: Some(tables), work })
+    }
+
+    /// The read-list tests' planted bug (code_reads.rs `ReadPlant`, rule 23): every build after
+    /// this records with `plant`.
+    pub fn plant_reads(&mut self, plant: ReadPlant) {
+        self.work.reads = ReadLog::new(plant);
+    }
+
+    /// Times every later make on `clock`, and keeps a large or slow one's [`MakeSizes`] for
+    /// [`MakerState::take_report`].
+    pub fn time_on(&mut self, clock: blaze_core::wait::Monotonic) {
+        self.work.clock = Some(clock);
+    }
+
+    /// The last make's report, when it was large or slow ([`MakeSizes`]); taken once.
+    pub fn take_report(&mut self) -> Option<MakeSizes> {
+        self.work.reported.take()
     }
 
     /// Fn `key` checked, once a run: its index, `None` when the front end has no body for it.
@@ -294,9 +585,12 @@ impl MakerState {
         for n in view.nodes() {
             let owner = match *n {
                 blaze_typeck::PNode::Closure { owner, .. } => owner,
-                blaze_typeck::PNode::Opaque(opaque, _) => match program.opaque_of(opaque) {
-                    Some((owner, _)) => owner,
-                    None => continue,
+                // The fn that defines it (an alias's is its `#[define_opaque]` fn); an alias
+                // whose definer is not found is left to the build, which refuses it by name
+                // (front2/coroutines.rs `opaque_hidden`).
+                blaze_typeck::PNode::Opaque(opaque, _) => match program.opaque_definer(opaque) {
+                    Some(Ok(owner)) => owner,
+                    Some(Err(_)) | None => continue,
                 },
                 _ => continue,
             };
@@ -392,6 +686,37 @@ pub fn make_instance<P: FrontEnd, T: Typing<P>>(
     name: &[u8],
     entry: &mut AVec<'_, u8>,
 ) -> Result<(), RunError> {
+    use blaze_core::wait::Clock as _;
+    let made_from = state.work.clock.map(|c| c.now());
+    state.work.times = MakeTimes::default();
+    state.work.reported = None;
+    make_instance_timed(program, typing, state, checks, tabled, name, entry)?;
+    // The make's report, when it was large or slow (rule 16): its times split, the checks and
+    // pulls (`lower`) being what the builds and emits leave of the whole.
+    if let (Some(c), Some(from)) = (state.work.clock, made_from) {
+        let took = c.now().saturating_sub(from);
+        let times = core::mem::take(&mut state.work.times);
+        if let Some(last) = times.last
+            && last.reported(took)
+        {
+            let MadeSizes { function, blocks, insts, copy_insts, slots, frame_estimate, entry_bytes, code } = last;
+            let lower = took.saturating_sub(times.build).saturating_sub(times.emit);
+            state.work.reported = Some(MakeSizes { function, blocks, insts, copy_insts, slots, frame_estimate, entry_bytes, code, lower, build: times.build, emit: times.emit });
+        }
+    }
+    Ok(())
+}
+
+/// [`make_instance`]'s work, timed by it.
+fn make_instance_timed<P: FrontEnd, T: Typing<P>>(
+    program: &mut P,
+    typing: &mut T,
+    state: &mut MakerState,
+    checks: &mut CheckCount,
+    tabled: ItemKey,
+    name: &[u8],
+    entry: &mut AVec<'_, u8>,
+) -> Result<(), RunError> {
     let alloc = state.work.alloc;
     // The bodies this ONE instance reads: its fn's, and each owner its name holds.
     let Some(i) = state.ensure(program, typing, tabled, checks)? else {
@@ -406,7 +731,20 @@ pub fn make_instance<P: FrontEnd, T: Typing<P>>(
     // checked body's types. Read from the ground tree, not by the program's rows: a lazy front
     // end has no row for an owner until it is checked (front2/program/lazy `fn_index`), so a
     // filter by row skipped `rand::rngs::thread::rng` for `LocalKey::try_with` at its closure.
-    let (owners, items) = held_owners(&*program, state.work.ground.view(), args, tabled, alloc)?;
+    let Held { owners, items, objects } = held_owners(&*program, state.work.ground.view(), args, tabled, alloc)?;
+    // Each `dyn` principal the arguments hold: its object table asked by name BEFORE the build
+    // (D194, D197): core's `<&mut F as FnMut>::call_mut` at `F = dyn FnMut(..)` reads the table
+    // of a trait no body of this instance names, which before came only from the check of the
+    // caller that coerced to the object (on another worker, or found in the store). `false` is
+    // a front end that makes none here: the build's `NoTrait` then names it.
+    for &principal in objects.iter() {
+        program.object_table(principal)?;
+    }
+    // The heads the body's `#[track_caller]` sites count from, asked BEFORE the build (D194):
+    // for a body-local fn, each enclosing item's (seam_rules.rs `body_anchor`), which before
+    // came only from a check of the enclosing body this maker happened to make. One the ask
+    // could not serve stays the build's typed `SiteGap::NoEnclosingRow`.
+    program.site_heads(tabled)?;
     for &owner in owners.iter() {
         state.ensure(program, typing, owner, checks)?;
     }
@@ -482,6 +820,22 @@ let step = build_one(&*program, &bodies, work, i, instance, entry);
                 }
                 continue;
             }
+            // INTERIM (D197, audit F2): replaced when the build asks its facts as needs through
+            // the seam before/while lowering instead of failing and being rebuilt: delete with
+            // the other `asks_again` loops. The `dyn` principals of the ground arguments are
+            // asked before the build (`Held::objects` above); this covers a `dyn` the build
+            // meets only at the instance (a projection normalized to `Box<dyn Fn()>`, a field
+            // of a head made by `make_asked`), whose trait is then made by name from its head
+            // (`FrontEnd::object_table`) and the instance built again, so its bytes never
+            // depend on which body was checked before it (D194); bounded by the same count,
+            // and nothing made is the `NoTrait` itself.
+            Err(e) if let Some(t) = object_missing(&e) && asked < crate::front2::check::MOST_ROUNDS => {
+                asked += 1;
+                if program.object_table(t)? {
+                    continue;
+                }
+                return Err(e);
+            }
             step => step?,
         };
         match step {
@@ -515,18 +869,31 @@ let step = build_one(&*program, &bodies, work, i, instance, entry);
     Ok(())
 }
 
+/// The trait a refused build found no object table for: the walk's own (blaze-build
+/// `BuildError::Vtable`, a dynamic call or an upcast) or a vtable record's words
+/// ([`vtable_rows`]' shape). `None` for every other refusal.
+fn object_missing(e: &RunError) -> Option<ItemKey> {
+    use blaze_build::vtable::VtableError;
+    match e {
+        RunError::Build { error: BuildError::Vtable { error: VtableError::NoTrait(t), .. }, .. } => Some(*t),
+        RunError::Vtable { why: VtableFail::Shape(VtableError::NoTrait(t)), .. } => Some(*t),
+        _ => None,
+    }
+}
+
 /// The owners the ground arguments `args` of an instance of `tabled` hold, each once, in the
 /// order first met: a closure's or a coroutine's owner, and an opaque type's defining fn; never
 /// `tabled` itself (checked first); and `.1`, each fn item whose type they hold (`PNode::FnDef`,
 /// a closure's parent arguments included), each once, whose row the make takes from its head.
 /// Each distinct node is visited once (ground types are interned: one id per type), so the
 /// walk is linear in the arguments' distinct nodes; bounded (rule 18).
-fn held_owners<'a, P: FrontEnd>(program: &P, ground: blaze_typeck::PTys<'_>, args: blaze_typeck::List, tabled: ItemKey, alloc: Alloc<'a>) -> Result<(AVec<'a, ItemKey>, AVec<'a, ItemKey>), RunError> {
+fn held_owners<'a, P: FrontEnd>(program: &P, ground: blaze_typeck::PTys<'_>, args: blaze_typeck::List, tabled: ItemKey, alloc: Alloc<'a>) -> Result<Held<'a>, RunError> {
     /// The most distinct type nodes one instance's arguments are walked through (rule 18).
     const MOST_NODES: usize = 1 << 20;
     let malformed = |_| RunError::OneBody { key: tabled, why: "an instance's ground arguments refer past their table (make_one.rs `held_owners`)" };
     let mut owners: AVec<'a, ItemKey> = blaze_own::Vec::new_in(alloc);
     let mut items: AVec<'a, ItemKey> = blaze_own::Vec::new_in(alloc);
+    let mut objects: AVec<'a, ItemKey> = blaze_own::Vec::new_in(alloc);
     let mut seen: AVec<'a, blaze_typeck::PTy> = blaze_own::Vec::new_in(alloc);
     let mut todo: AVec<'a, blaze_typeck::PTy> = blaze_own::Vec::new_in(alloc);
     todo.extend_from_slice(ground.list(args).map_err(malformed)?);
@@ -542,9 +909,16 @@ fn held_owners<'a, P: FrontEnd>(program: &P, ground: blaze_typeck::PTys<'_>, arg
         {
             items.push(item);
         }
+        if let blaze_typeck::PNode::Dynamic(bounds) = node
+            && let Some(principal) = blaze_typeck::object_principal(ground, bounds)
+            && !objects.contains(&principal)
+        {
+            objects.push(principal);
+        }
         let owner = match node {
             blaze_typeck::PNode::Closure { owner, .. } | blaze_typeck::PNode::Coroutine { owner, .. } => Some(owner),
-            blaze_typeck::PNode::Opaque(opaque, _) => program.opaque_of(opaque).map(|(owner, _)| owner),
+            // Its defining fn (`FrontEnd::opaque_definer`); a miss is the build's refusal.
+            blaze_typeck::PNode::Opaque(opaque, _) => program.opaque_definer(opaque).and_then(Result::ok),
             _ => None,
         };
         if let Some(owner) = owner
@@ -555,19 +929,34 @@ fn held_owners<'a, P: FrontEnd>(program: &P, ground: blaze_typeck::PTys<'_>, arg
         }
         ground.children_of(node, &mut todo).map_err(malformed)?;
     }
-    Ok((owners, items))
+    Ok(Held { owners, items, objects })
 }
 
-/// The per-item constant pull of build_from's step (`const_at::needs_of`, `const_at::pull`).
+/// What an instance's ground arguments hold that its make must have before its build
+/// ([`held_owners`]): each asked by name, never left to another body's check.
+struct Held<'a> {
+    /// A closure's or a coroutine's owner, an opaque type's defining fn: checked.
+    owners: AVec<'a, ItemKey>,
+    /// Each fn item whose type they hold: its row from its head.
+    items: AVec<'a, ItemKey>,
+    /// Each `dyn` principal: its object table (`FrontEnd::object_table`), so the build's
+    /// vtables and dynamic calls at these arguments find it (D194).
+    objects: AVec<'a, ItemKey>,
+}
+
+/// The per-item constant pull of build_from's step (`const_at::needs_of`, `const_at::pull`),
+/// and every constant the body reads at no arguments (`const_at::plain_needs_of`): the walk's
+/// builds and its verifier read every constant from the one pulled table (rule 30). A
+/// closure's and a coroutine's function read their owner's body at the owner's arguments, as
+/// `build_one` builds them, so they pull the owner's needs there.
 fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize, instance: Instance) -> Result<(), RunError> {
     let MakerState { checked, tables, work, .. } = &mut *state;
     work.needs.clear();
     let function = program.function(i);
     // A ctor's fn reads no constant: its fields in, its value out. Nor a builtin clone (a copy,
-    // or its fields' own clones).
-    if instance.item != function.key
-        || (function.kind == FnKind::Ctor && function.body.is_none())
-        || (function.body.is_none() && crate::clone_shim::language_clone(&*program, instance, &work.ground).is_some())
+    // or its fields' own clones), nor a shim of a fn with no body.
+    if (function.kind == FnKind::Ctor && function.body.is_none())
+        || (function.body.is_none() && (instance.item != function.key || crate::clone_shim::language_clone(&*program, instance, &work.ground).is_some()))
     {
         return Ok(());
     }
@@ -575,15 +964,37 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
         return Err(callee_refusal(&*program, function.named(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, work.ground.view()));
     };
     let malformed = |_| RunError::Build { function: function.named(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
-    let mut args: AVec<'_, PTy> = blaze_own::Vec::new_in(work.alloc);
-    args.extend_from_slice(work.ground.view().list(instance.args).map_err(malformed)?);
     let t = tables.take().ok_or_else(|| tables_gone(function.key))?;
     let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
     let view = body.view(program.body_types(i));
     let facts = FrontAdts(&*program, i, &[], &work.langs, &bodies);
-    let found = crate::front2::const_at::needs_of(&view, done, &args, &mut work.ground, &facts, work.alloc, &mut work.needs);
+    // The arguments `build_one` reads the body at: the instance's own; a coroutine's
+    // function's or a closure's owner's; a `Fn*` shim reads no body.
+    let at = if instance.item == function.key {
+        Some(instance.args)
+    } else if let Some((of, _)) = crate::front2::coroutines::part_of(&facts, instance, &work.ground) {
+        Some(of.owner_args)
+    } else if crate::fn_shim::fn_shim_of(&facts, instance, &work.ground).is_some() {
+        None
+    } else {
+        let first = work.ground.view().list(instance.args).ok().and_then(|a| a.first().copied());
+        first.and_then(|t| blaze_build::closure_of(work.ground.view(), t)).map(|of| of.owner_args)
+    };
+    let mut args: AVec<'_, PTy> = blaze_own::Vec::new_in(work.alloc);
+    let found = match at {
+        None => Ok(()),
+        Some(at) => match work.ground.view().list(at) {
+            Ok(list) => {
+                args.extend_from_slice(list);
+                crate::front2::const_at::needs_of(&view, done, &args, &mut work.ground, &facts, work.alloc, &mut work.needs)
+                    .and_then(|()| crate::front2::const_at::plain_needs_of(done, &mut work.needs))
+                    .map_err(|error| RunError::Build { function: function.named(), error, range: None })
+            }
+            Err(e) => Err(malformed(e)),
+        },
+    };
     *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
-    found.map_err(|error| RunError::Build { function: function.named(), error, range: None })?;
+    found?;
     if work.needs.is_empty() {
         return Ok(());
     }
@@ -595,6 +1006,339 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
         return Err(RunError::ConstAt { function: named, refusal, path });
     }
     Ok(())
+}
+
+/// The one interface a build asks the world through (F20; rule 30: the recorder of
+/// code_reads.rs, no second one): the build's facts through [`Recorded`] over [`FrontAdts`]
+/// ([`Asking::world`]), and the questions beyond them (a call's instance, a C symbol) by its
+/// own methods, each logged in `log` as it is answered. [`build_one`], [`name_ref`] and
+/// [`vtable_rows`] take this, not a `FrontAdts`: a build cannot ask a fact unlogged (rule 76).
+/// What is still asked of the program directly is in no read list (the report's OPEN rows:
+/// lang items, intrinsics, a ctor's head).
+struct Asking<'w, P> {
+    front: FrontAdts<'w, P>,
+    log: &'w ReadLog,
+}
+
+impl<'w, P: FrontEnd> Asking<'w, P> {
+    fn new(program: &'w P, i: usize, langs: &'w BackLangs, bodies: &'w Bodies<'w>, log: &'w ReadLog) -> Asking<'w, P> {
+        Asking { front: FrontAdts(program, i, &[], langs, bodies), log }
+    }
+
+    /// The build's facts, each answer logged.
+    fn world(&self) -> Recorded<'_> {
+        Recorded::new(&self.front, self.log)
+    }
+
+    /// The checked bodies (not a fact of the world: which fns this run checked).
+    fn checked(&self) -> &'w [Option<Checked<'static>>] {
+        self.front.4.checked
+    }
+
+    /// The instance a call of `called` from this build's fn runs (the seam's `resolve`, in the
+    /// fn's world), logged (`ReadKind::Resolve`); a refusal is logged as no instance.
+    fn resolve(&self, called: Instance, ground: &mut PortableTys<'_>, scratch: Alloc<'_>) -> Result<(ItemKey, List), blaze_typeck::ResolveError> {
+        let answer = self.front.0.resolve(self.front.1, called.item, called.args, ground);
+        self.log.ask_resolve(called, answer.as_ref().ok().copied(), ground.view(), scratch);
+        answer
+    }
+
+    /// `called` with its fn item self resolved (fn_item_resolve.rs), that resolution logged.
+    fn shim_self(&self, called: Instance, ground: &mut PortableTys<'static>, scratch: Alloc<'_>) -> Result<Instance, blaze_typeck::ResolveError> {
+        let world = self.world();
+        crate::fn_item_resolve::shim_self_resolved_by(&world, called, ground, |item, args, ground| self.resolve(Instance { item, args }, ground, scratch))
+    }
+
+    /// Static `s`'s C symbol (`None`: a record of its own), logged.
+    fn foreign_static(&self, s: ItemKey) -> Option<&'w str> {
+        let answer = self.front.0.foreign_static(s);
+        self.log.ask_foreign_static(s, answer);
+        answer
+    }
+
+    /// Fn row `c`'s C symbol when it is an `extern` block's fn (`None`: an instance of its
+    /// own), logged under its item.
+    fn foreign_fn(&self, c: usize) -> Option<&'w str> {
+        let f = self.front.0.function(c);
+        let answer = (f.kind == FnKind::Foreign).then_some(f.symbol);
+        self.log.ask_foreign_fn(f.key, answer);
+        answer
+    }
+}
+
+/// The questions of a read list beyond `Adts`, asked again of today's program in fn `i`'s
+/// world, as [`Asking`] asked them.
+struct Today<'p, P> {
+    program: &'p P,
+    i: usize,
+    /// Each coroutine the rows name, laid again in full and digested (lay_states.rs `relay`).
+    laid: &'p [(blaze_build::CoroutineOf, ContentId)],
+}
+
+impl<P: FrontEnd> reads::Beyond for Today<'_, P> {
+    fn resolve(&mut self, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Option<(ItemKey, List)> {
+        self.program.resolve(self.i, item, args, ground).ok()
+    }
+
+    fn foreign_static(&mut self, item: ItemKey) -> Result<Option<&str>, ReadsError> {
+        Ok(self.program.foreign_static(item))
+    }
+
+    fn foreign_fn(&mut self, item: ItemKey) -> Result<Option<&str>, ReadsError> {
+        // Its row was made from its head before the read list was asked ([`verify_instance`]);
+        // no row today: the row does not hold (code_reads.rs `verify_today`).
+        let Some(c) = self.program.fn_index(item) else {
+            return Err(ReadsError::Unanswered { kind: ReadKind::ForeignFn });
+        };
+        let f = self.program.function(c);
+        Ok((f.kind == FnKind::Foreign).then_some(f.symbol))
+    }
+
+    fn laid(&mut self, owner: ItemKey, ordinal: u32, args: List) -> Result<ContentId, ReadsError> {
+        // `args` and each lay's were interned in the one ground table, so equal lists are one.
+        self.laid
+            .iter()
+            .find(|(c, _)| c.owner == owner && c.ordinal == ordinal && c.owner_args == args)
+            .map(|&(_, digest)| digest)
+            .ok_or(ReadsError::Unanswered { kind: ReadKind::Laid })
+    }
+}
+
+/// Whether code `entry`, found under an instance key of fn `tabled`, holds today: every row of
+/// its read list asked again of today's program in `tabled`'s world (code_reads.rs
+/// `verify_today`), no body checked but an opaque type's defining fn and the owner of a
+/// coroutine whose state a row reads (laid again: lay_states.rs `relay`). Before the rows are
+/// asked, what a fresh program answers only once made is made, by name, from each row: a fn's
+/// head row (its ABI, unwinding, caller tracking, C symbol), a trait's object table, a static's
+/// value, the constants the rows read (pulled as a make pulls them); an ADT head a row meets
+/// unmade is made by the program's ask-again (`make_asked`) and the rows asked again, bounded
+/// (rule 18). A refusal of any of these is a row that does not hold (`Stale`): the make that
+/// follows meets the same question and refuses it by name, so nothing is passed over (rule 3).
+///
+/// Cost per found entry of N rows: each row a binary search of the run's [`Answers`] (a
+/// question many entries ask, the same ADT's layout, is asked of the front end once a run), or
+/// one decode, one front-end answer and one digest; the preparation above is once per item a
+/// run. Answers are kept only from an entry that held.
+pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
+    program: &mut RecordsProgram<'n>,
+    typing: &mut T,
+    state: &mut MakerState,
+    checks: &mut CheckCount,
+    tabled: ItemKey,
+    entry: &[u8],
+) -> Result<Verdict, RunError> {
+    let Some(i) = program.head_row(tabled)? else {
+        return Err(RunError::OneBody { key: tabled, why: "a found code entry's fn has no row today (make_one.rs `verify_instance`)" });
+    };
+    let refused = |program: &RecordsProgram<'n>, error| RunError::CodeRecord { function: program.function(i).named(), error };
+    let view = EntryView::read(entry).map_err(|e| refused(&*program, CodeRecordError::Entry(e)))?;
+    let alloc = state.work.alloc;
+    let mut owners: AVec<'_, ItemKey> = blaze_own::Vec::new_in(alloc);
+    // The coroutines whose states the rows read: laid again below, as the build's lay laid
+    // them, before any row is asked.
+    let mut roots: AVec<'_, blaze_build::CoroutineOf> = blaze_own::Vec::new_in(alloc);
+    state.work.needs.clear();
+    for row in view.reads() {
+        let (bytes, _) = row.map_err(|e| refused(&*program, CodeRecordError::Entry(e)))?;
+        // A row of no kind: `verify_today` refuses it by name below.
+        let Some(kind) = bytes.first().copied().and_then(ReadKind::of) else { continue };
+        match kind {
+            ReadKind::Laid | ReadKind::CoroutineState | ReadKind::CoroutineNiche
+            | ReadKind::Abi
+            | ReadKind::Nounwind
+            | ReadKind::TrackCaller
+            | ReadKind::CVariadic
+            | ReadKind::LegacyConstGenerics
+            | ReadKind::ForeignFn
+            | ReadKind::ObjectTrait
+            | ReadKind::OpaqueHidden
+            | ReadKind::Static
+            | ReadKind::Const
+            | ReadKind::ConstBlock
+            | ReadKind::Promoted => {}
+            _ => continue,
+        }
+        let (kind, extra, item, list) = reads::question(bytes, &mut state.work.ground, alloc).map_err(|e| refused(&*program, CodeRecordError::Reads(e)))?;
+        let stale = Verdict::Stale { kind, item };
+        let expr = u32::try_from(extra).ok().map(blaze_typeck::ExprId);
+        let need = match kind {
+            ReadKind::Laid | ReadKind::CoroutineState | ReadKind::CoroutineNiche => {
+                let Ok(ordinal) = u32::try_from(extra) else {
+                    return Err(refused(&*program, CodeRecordError::Reads(ReadsError::Question)));
+                };
+                let c = blaze_build::CoroutineOf { owner: item, owner_args: list, ordinal };
+                if !roots.contains(&c) {
+                    roots.push(c);
+                }
+                continue;
+            }
+            // Each answered from the fn's row (lazy front_end.rs: tabled rows only): its row
+            // made from its head; the row's answer decides whether it holds.
+            ReadKind::Abi | ReadKind::Nounwind | ReadKind::TrackCaller | ReadKind::CVariadic | ReadKind::LegacyConstGenerics | ReadKind::ForeignFn => {
+                if program.head_row(item).is_err() {
+                    return Ok(stale);
+                }
+                continue;
+            }
+            ReadKind::ObjectTrait => {
+                if program.object_table(item).is_err() {
+                    return Ok(stale);
+                }
+                continue;
+            }
+            ReadKind::OpaqueHidden => {
+                // Named by its owner row (code_reads.rs `Recorded::opaque_hidden`): `item` is
+                // the fn whose head made it, checked here, by name, though no body of this
+                // program named it yet (a fn declared in a body); an alias's is its defining
+                // fn (`FrontEnd::opaque_definer`'s rule). A miss is the build's refusal.
+                let Ok(index) = u32::try_from(extra) else {
+                    return Err(refused(&*program, CodeRecordError::Reads(ReadsError::Question)));
+                };
+                let definer = if crate::front2::tait::of_alias(index) { program.alias_definer(item).ok() } else { Some(item) };
+                if let Some(owner) = definer
+                    && !owners.contains(&owner)
+                {
+                    owners.push(owner);
+                }
+                continue;
+            }
+            ReadKind::Static => {
+                if program.make_static_value(item).is_err() {
+                    return Ok(stale);
+                }
+                continue;
+            }
+            ReadKind::Const => ConstNeed::Item(item),
+            ReadKind::ConstBlock | ReadKind::Promoted => {
+                let Some(expr) = expr else {
+                    return Err(refused(&*program, CodeRecordError::Reads(ReadsError::Question)));
+                };
+                match kind {
+                    ReadKind::ConstBlock => ConstNeed::Block { owner: item, block: expr },
+                    _ => ConstNeed::Promoted { owner: item, borrow: expr },
+                }
+            }
+            _ => continue,
+        };
+        let args = state.work.ground.view().list(list).map_err(|_| refused(&*program, CodeRecordError::Reads(ReadsError::Question)))?;
+        state.work.needs.push(need, args).map_err(|error| RunError::Build { function: program.function(i).named(), error, range: None })?;
+    }
+    // An opaque type's hidden type is its defining fn's check's (coroutines.rs `opaque_hidden`).
+    for &owner in owners.iter() {
+        if state.ensure(program, typing, owner, checks).is_err() {
+            return Ok(Verdict::Stale { kind: ReadKind::OpaqueHidden, item: owner });
+        }
+    }
+    // The constants the rows read, pulled as a make pulls them (`pull_constants`).
+    let mut pulled = 0u32;
+    while !state.work.needs.is_empty() {
+        let table = state.tables.as_mut().ok_or_else(|| tables_gone(tabled))?;
+        let Err(refusal) = crate::front2::const_at::pull(&mut *program, &state.work.needs, state.work.ground.view(), &mut table.const_at, &table.closures) else { break };
+        if pulled < crate::front2::check::MOST_ROUNDS && matches!(program.make_asked(i), Ok(true)) {
+            pulled += 1;
+            continue;
+        }
+        let kind = match refusal.need {
+            ConstNeed::Item(_) => ReadKind::Const,
+            ConstNeed::Block { .. } => ReadKind::ConstBlock,
+            ConstNeed::Promoted { .. } => ReadKind::Promoted,
+        };
+        return Ok(Verdict::Stale { kind, item: refusal.need.item() });
+    }
+    // The coroutine states the rows read, laid again as the build's lay laid them
+    // (lay_states.rs `relay`: the same order, the same `lay_one`), so a `CoroutineState` or
+    // `CoroutineNiche` row is asked of the same facts and a `Laid` row compared with the same
+    // digest: a row moves only when its answer does. An owner not checked is checked and an
+    // ADT head a lay met unmade is made, then the lay again (bounded, rule 18); a lay that
+    // cannot be made today leaves the entry stale, and the make that follows refuses by name.
+    let mut relaid: AVec<'_, (blaze_build::CoroutineOf, ContentId)> = blaze_own::Vec::new_in(alloc);
+    let mut recorded: AVec<'_, blaze_build::CoroutineOf> = blaze_own::Vec::new_in(alloc);
+    let mut lays = 0usize;
+    while !roots.is_empty() {
+        lays += 1;
+        let out = {
+            let MakerState { checked, tables, work, .. } = &mut *state;
+            let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
+            let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
+            let out = super::lay_states::relay(&*program, &work.langs, &bodies, &mut work.ground, &mut work.layouts, i, &roots, work.alloc);
+            *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
+            out
+        };
+        let stale = Verdict::Stale { kind: ReadKind::Laid, item: tabled };
+        match out {
+            Ok(super::lay_states::Relaid::Done { recorded: r, laid }) => {
+                recorded.extend_from_slice(&r);
+                relaid.extend_from_slice(&laid);
+                break;
+            }
+            Ok(super::lay_states::Relaid::Unchecked(owner)) => {
+                if lays > MOST_HELD_COROUTINES || state.ensure(program, typing, owner, checks).is_err() {
+                    return Ok(stale);
+                }
+            }
+            Err(_) => {
+                if lays > crate::front2::check::MOST_ROUNDS as usize || !matches!(program.make_asked(i), Ok(true)) {
+                    return Ok(stale);
+                }
+            }
+        }
+    }
+    let verdict = verify_rows(program, state, i, tabled, &view, &relaid);
+    // The states laid again above were built into nothing: forgotten, so a make that follows
+    // lays and builds them (lay_states.rs `forget_laid`).
+    if let Some(t) = state.tables.as_ref() {
+        for c in recorded.iter() {
+            if let Ok(args) = state.work.ground.view().list(c.owner_args) {
+                t.coroutines.states.forget(c.owner, c.ordinal, args);
+            }
+        }
+    }
+    verdict
+}
+
+/// [`verify_instance`]'s asking: every row of `view` asked again (code_reads.rs
+/// `verify_today`) over the states laid again (`relaid`), by rounds while the program makes
+/// what the rows noted unmade.
+fn verify_rows<'n>(program: &mut RecordsProgram<'n>, state: &mut MakerState, i: usize, tabled: ItemKey, view: &EntryView<'_>, relaid: &[(blaze_build::CoroutineOf, ContentId)]) -> Result<Verdict, RunError> {
+    let refused = |program: &RecordsProgram<'n>, error| RunError::CodeRecord { function: program.function(i).named(), error };
+    let mut rounds = 0u32;
+    loop {
+        let MakerState { checked, tables, work, .. } = &mut *state;
+        let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
+        let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
+        let verified = {
+            let front = FrontAdts(&*program, i, &[], &work.langs, &bodies);
+            let mut today = Today { program: &*program, i, laid: relaid };
+            reads::verify_today(view, &front, &mut today, &mut work.answers, true, &mut work.ground, work.alloc)
+        };
+        *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
+        let verified = verified.map_err(|e| refused(&*program, CodeRecordError::Reads(e)))?;
+        match verified.verdict {
+            Verdict::Holds => return Ok(Verdict::Holds),
+            // A row asked before the record it reads was made (a lazy front's unmade ADT head:
+            // its `repr`, `valid_range`, `discriminant` answer `Missing`, D194): a NEED, never
+            // compared. What the rows noted is made and they are asked again; nothing made (the
+            // item is gone today), the entry is stale and the make that follows meets the
+            // question itself.
+            Verdict::Needs { kind, item, .. } => {
+                if rounds < crate::front2::check::MOST_ROUNDS && matches!(program.make_asked(i), Ok(true)) {
+                    rounds += 1;
+                    continue;
+                }
+                return Ok(Verdict::Stale { kind, item });
+            }
+            // A row answered otherwise: what the rows asked is made (a row may differ only for
+            // a fact asked of another, unmade record) and they are asked again; nothing made,
+            // the entry is stale.
+            stale @ Verdict::Stale { .. } => {
+                if rounds < crate::front2::check::MOST_ROUNDS && matches!(program.make_asked(i), Ok(true)) {
+                    rounds += 1;
+                    continue;
+                }
+                return Ok(stale);
+            }
+        }
+    }
 }
 
 /// build_from's step for one instance, from "A closure's `Fn*` method instance" to
@@ -620,7 +1364,12 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         _ => return Err(callee_refusal(program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, work.ground.view())),
     };
     let malformed = |_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
-    let adts = FrontAdts(program, i, &[], &work.langs, bodies);
+    // Every question of THIS build logged where it is answered (F20): the log holds only this
+    // build's answers (a build made again after a retry starts it over), sealed into the
+    // entry's read list below.
+    work.reads.clear();
+    let asking = Asking::new(program, i, &work.langs, bodies, &work.reads);
+    let adts = asking.world();
     let coroutine = if instance.item == function.key { None } else { crate::front2::coroutines::part_of(&adts, instance, &work.ground) };
     let shim = if instance.item == function.key || coroutine.is_some() { None } else { crate::fn_shim::fn_shim_of(&adts, instance, &work.ground) };
     let closure = if instance.item == function.key || shim.is_some() || coroutine.is_some() {
@@ -668,6 +1417,11 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
             if work.stash[at].parts[part.index()].is_none() {
                 return Err(twice());
             }
+            // What the coroutine's build asked (logged apart: lay_states.rs `build_laid`), and
+            // the full lay it was built into, digested ([`ReadKind::Laid`]): the verifier lays
+            // it again and compares (`verify_instance`).
+            work.reads.absorb(&work.stash[at].reads);
+            work.reads.ask_laid(of.owner, of.ordinal, &args[..], work.stash[at].laid);
             Some((at, part.index()))
         }
     };
@@ -680,8 +1434,13 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         {
             return Ok(Step::Check(owner));
         }
+        // What the build reads of those states (their shapes, their niches) it asks through
+        // `adts`, logged as asked (`ReadKind::CoroutineState`, `CoroutineNiche`); the verifier
+        // lays them again before it asks.
     }
     let view = checked.map(|(body, done)| (body.view(program.body_types(i)), done));
+    use blaze_core::wait::Clock as _;
+    let built_from = work.clock.map(|c| c.now());
     let own = if from_coroutine.is_some() {
         None
     } else {
@@ -712,6 +1471,9 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         };
         Some(made.map_err(|error| build_refusal(program, name(), checked.map(|(body, _)| body), error))?)
     };
+    if let (Some(c), Some(from)) = (work.clock, built_from) {
+        work.times.build += c.now().saturating_sub(from);
+    }
     let built: &blaze_build::Built<Global> = match (&own, from_coroutine) {
         (Some(b), _) => b,
         (None, Some((at, part))) => work.stash[at].parts[part].as_ref().ok_or_else(twice)?,
@@ -723,7 +1485,7 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     let mut funcs: AVec<'_, Callee<'_>> = blaze_own::Vec::with_capacity_in(built.refs.len(), work.alloc);
     let mut untabled: Vec<(ItemKey, RunError), Global> = Vec::new_in(Global);
     for &called in built.refs.iter() {
-        match name_ref(program, &adts, &mut work.ground, work.alloc, &mut reach, i, instance.args, called)? {
+        match name_ref(program, &asking, &mut work.ground, work.alloc, &mut reach, i, instance.args, called)? {
             Named1::Instance(symbol) => funcs.push(Callee::Symbol(symbol)),
             Named1::C(c_name) => funcs.push(Callee::C(c_name)),
             Named1::Untabled(key, refusal) => {
@@ -734,8 +1496,11 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         }
     }
     let mut vtable_data: AVec<'_, (blaze_code::record::Symbol, AVec<'static, u8>)> = blaze_own::Vec::new_in(work.alloc);
+    // This build's own layouts: one cached by an earlier build was asked in that build's log,
+    // not this one's, so a vtable's size read through it would be in no read list.
+    let mut layouts: Layouts<Alloc<'static>> = Layouts::new_in(work.alloc);
     for &want in built.vtables.iter() {
-        vtable_rows(program, &adts, &mut work.ground, &mut work.layouts, work.alloc, &mut reach, i, instance.args, want, &mut untabled, &mut vtable_data)?;
+        vtable_rows(program, &asking, &mut work.ground, &mut layouts, work.alloc, &mut reach, i, instance.args, want, &mut untabled, &mut vtable_data)?;
     }
     // Every untabled callee of this build at once (its calls' and its vtables' words): checked,
     // then the instance made again.
@@ -754,7 +1519,7 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     // `foreign_static`), never by a record of its own.
     let mut c_statics: AVec<'_, (ItemKey, &str)> = blaze_own::Vec::new_in(work.alloc);
     for &s in built.statics.iter() {
-        if let Some(c) = program.foreign_static(s) {
+        if let Some(c) = asking.foreign_static(s) {
             c_statics.push((s, c));
         }
     }
@@ -768,8 +1533,16 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     for (symbol, datum) in vtable_data.iter() {
         carried.push(VtableDatum { symbol: *symbol, datum: datum.as_slice() });
     }
-    let made = make_entry_with_vtables(built.func.verified(), &names, &mut carried, routines, &mut declared, &crate::code_records::reads::ReadList::empty(), &built.traps, work.isa, work.alloc)
+    // The read list: every question this build asked, named for good now that the build is
+    // done (code_reads.rs `ReadLog::seal`); a question answered two ways is refused (rule 21).
+    let read_list = work.reads.seal(&mut work.ground, work.alloc).map_err(|error| RunError::CodeRecord { function: name(), error: CodeRecordError::Reads(error) })?;
+    let emitted_from = work.clock.map(|c| c.now());
+    let made = make_entry_with_vtables(built.func.verified(), &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
         .map_err(|error| RunError::CodeRecord { function: name(), error })?;
+    if let (Some(c), Some(from)) = (work.clock, emitted_from) {
+        work.times.emit += c.now().saturating_sub(from);
+        work.times.last = Some(MadeSizes::of(name(), built, &made));
+    }
     entry.extend_from_slice(&made);
     // The coroutine's part leaves the stash with its entry made, not before.
     if let Some((at, part)) = from_coroutine {
@@ -860,7 +1633,7 @@ enum Named1<'p> {
 #[allow(clippy::too_many_arguments)]
 fn name_ref<'p, P: FrontEnd>(
     program: &'p P,
-    adts: &FrontAdts<'_, P>,
+    asking: &Asking<'_, P>,
     ground: &mut PortableTys<'static>,
     alloc: Alloc<'static>,
     reach: &mut Reach<'_>,
@@ -868,11 +1641,13 @@ fn name_ref<'p, P: FrontEnd>(
     at: List,
     called: Instance,
 ) -> Result<Named1<'p>, RunError> {
+    let world = asking.world();
+    let adts = &world;
     let function = program.function(i);
     let name = || function.named();
     let sym = |e| RunError::CodeRecord { function: name(), error: CodeRecordError::Symbol(e) };
     // A fn item of a trait's method as an `Fn*` value: resolved first (fn_item_resolve.rs).
-    let called = match crate::fn_item_resolve::resolved_shim_self(program, adts, i, called, ground) {
+    let called = match asking.shim_self(called, ground, alloc) {
         Ok(c) => c,
         Err(error) => {
             let at = crate::callee_shown::self_shown(program, ground.view(), called.args);
@@ -915,7 +1690,7 @@ fn name_ref<'p, P: FrontEnd>(
     let is_ctor = program.ctor_of(called.item).is_some();
     let selected = match is_ctor {
         true => Ok((called.item, called.args)),
-        false => program.resolve(i, called.item, called.args, ground),
+        false => asking.resolve(called, ground, alloc),
     };
     let (item, resolved) = match selected {
         Ok(r) => r,
@@ -933,10 +1708,10 @@ fn name_ref<'p, P: FrontEnd>(
         return Ok(Named1::Untabled(callee.item, refusal));
     };
     let target = program.function(c);
-    if target.kind == FnKind::Foreign {
+    if asking.foreign_fn(c).is_some() {
         return Ok(Named1::C(target.symbol));
     }
-    if bodied(program, adts.4.checked, c) {
+    if bodied(program, asking.checked(), c) {
         return reach.declare(target.key, callee, ground, alloc).map(Named1::Instance).map_err(|e| named(e, callee, &*ground));
     }
     Err(callee_refusal(program, name(), at, callee, crate::callee_shown::CalleeGap::NoBody, ground.view()))
@@ -967,7 +1742,7 @@ fn bodied<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>], c: usi
 #[allow(clippy::too_many_arguments)]
 fn vtable_rows<P: FrontEnd>(
     program: &P,
-    adts: &FrontAdts<'_, P>,
+    asking: &Asking<'_, P>,
     ground: &mut PortableTys<'static>,
     layouts: &mut Layouts<Alloc<'static>>,
     alloc: Alloc<'static>,
@@ -978,6 +1753,8 @@ fn vtable_rows<P: FrontEnd>(
     untabled: &mut Vec<(ItemKey, RunError), Global>,
     data: &mut AVec<'_, (blaze_code::record::Symbol, AVec<'static, u8>)>,
 ) -> Result<(), RunError> {
+    let world = asking.world();
+    let adts = &world;
     let function = program.function(i);
     let name = || function.named();
     let fail = |why| RunError::Vtable { function: name(), principal: want.principal, why };
@@ -999,7 +1776,7 @@ fn vtable_rows<P: FrontEnd>(
             continue;
         }
         seen.push(t);
-        let shape = Shape::of(t.principal, |k| program.object_trait(k), Global).map_err(|e| fail(VtableFail::Shape(e)))?;
+        let shape = Shape::of(t.principal, |k| adts.object_trait(k), Global).map_err(|e| fail(VtableFail::Shape(e)))?;
         for w in shape.words.iter() {
             if let Word::Super(s) = *w {
                 todo.push(VtableRef { concrete: t.concrete, principal: s, args: List::EMPTY });
@@ -1044,7 +1821,7 @@ fn vtable_rows<P: FrontEnd>(
             };
             // As a call's callee (`name_ref` above): a fn item of a trait's method resolved
             // to the body that runs, then what the language gives (`language_owner`).
-            let f = match crate::fn_item_resolve::resolved_shim_self(program, adts, i, f, ground) {
+            let f = match asking.shim_self(f, ground, alloc) {
                 Ok(f) => f,
                 Err(error) => {
                     let at = crate::callee_shown::self_shown(program, ground.view(), f.args);
@@ -1067,7 +1844,7 @@ fn vtable_rows<P: FrontEnd>(
             }
             let (item, args) = match Some(f.item) == glue_item {
                 true => (f.item, f.args),
-                false => match program.resolve(i, f.item, f.args, &mut *ground) {
+                false => match asking.resolve(f, &mut *ground, alloc) {
                     Ok(r) => r,
                     Err(error) => return Err(resolve_refusal(program, adts, ground, name(), f, error)),
                 },
@@ -1080,7 +1857,10 @@ fn vtable_rows<P: FrontEnd>(
                 whole = false;
                 continue;
             };
-            if !bodied(program, adts.4.checked, c) {
+            // A vtable's word is never an `extern` fn's C symbol: a foreign fn has no `Self` to
+            // be a method of. Logged with the calls' (`ForeignFn`) all the same.
+            asking.foreign_fn(c);
+            if !bodied(program, asking.checked(), c) {
                 return Err(refusal());
             }
             word(reach.declare(program.function(c).key, Instance { item, args }, ground, alloc).map_err(|e| named(e, Instance { item, args }, &*ground))?);
@@ -1161,6 +1941,11 @@ pub struct Maker<'n, G: Grant = Fixture, T: Typing<RecordsProgram<'n>> = SecondC
     panic: blaze_build::Panic,
     alloc: Alloc<'static>,
     checks: CheckCount,
+    /// Where a large or slow make is reported ([`Maker::watch`]); `None`: nowhere, untimed.
+    watch: Option<MakeWatch<'n>>,
+    /// How its builds record their read lists ([`Maker::plant_reads`]): `ReadPlant::None` but
+    /// in the planted control.
+    plant: ReadPlant,
 }
 
 impl<'n> Maker<'n, Fixture, SecondCheck> {
@@ -1228,7 +2013,28 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
             panic: crate::panic_strategy::of_strategy(builder.settings.panic),
             alloc,
             checks: CheckCount::default(),
+            watch: None,
+            plant: ReadPlant::None,
         }
+    }
+
+    /// The read-list tests' planted bug (code_reads.rs `ReadPlant`, rule 23): every later build
+    /// records with `plant`.
+    pub fn plant_reads(&mut self, plant: ReadPlant) {
+        if let Some((_, state)) = self.made.as_mut() {
+            state.plant_reads(plant);
+        }
+        self.plant = plant;
+    }
+
+    /// Every later make timed on `watch.clock`, and each that is large or slow (its code or
+    /// estimated frame at least [`MAKE_REPORT_BYTES`], or its make at least
+    /// [`MAKE_REPORT_TIME`]) handed to `watch.report` as its [`MakeSizes`] (rule 16).
+    pub fn watch(&mut self, watch: MakeWatch<'n>) {
+        if let Some((_, state)) = self.made.as_mut() {
+            state.time_on(watch.clock);
+        }
+        self.watch = Some(watch);
     }
 
     /// Whether an instance made in this session touched a thread-local. A FOUND record's use of
@@ -1243,8 +2049,16 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         self.checks
     }
 
+    /// The lazy program's lowering counts, with the typing's counts of where each body's
+    /// columns came from (the run's closing line).
     pub fn lowering_counts(&self) -> LoweringCounts {
-        self.program().map_or_else(LoweringCounts::default, |program| program.lowering_counts())
+        let lowered = self.program().map_or_else(LoweringCounts::default, |program| program.lowering_counts());
+        LoweringCounts { typing: self.typing.counts(), ..lowered }
+    }
+
+    /// Where this maker's bodies' checked columns come from.
+    pub fn typing(&self) -> &T {
+        &self.typing
     }
 
     /// The lazy program, once a miss made it.
@@ -1299,7 +2113,11 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         let Some((program, state)) = self.made.as_mut() else {
             return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::make`)" });
         };
-        make_instance(program, &mut self.typing, state, &mut self.checks, tabled, name, entry)
+        make_instance(program, &mut self.typing, state, &mut self.checks, tabled, name, entry)?;
+        if let (Some(watch), Some(sizes)) = (self.watch, state.take_report()) {
+            (watch.report)(&sizes);
+        }
+        Ok(())
     }
 
     /// The program made on the first call, then static `item`'s value made its entry
@@ -1327,7 +2145,11 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
             self.checks.constructed += 1;
             // A lazy program holds no checked body when made: 0, counted as the claim reads it.
             self.checks.by_construction += (0..program.fn_count()).filter(|&c| program.function(c).body.is_some()).count();
-            let state = MakerState::new(&program, tabled, self.isa, self.overflow, self.ub, self.panic, self.alloc)?;
+            let mut state = MakerState::new(&program, tabled, self.isa, self.overflow, self.ub, self.panic, self.alloc)?;
+            if let Some(watch) = self.watch {
+                state.time_on(watch.clock);
+            }
+            state.plant_reads(self.plant);
             self.made = Some((program, state));
         }
         Ok(())
@@ -1418,6 +2240,12 @@ impl<A: Make<Error = RunError, Grant = Fixture>, B: Make<Error = RunError, Grant
         self.reading.make_thread_local(grant, item, &mut self.scratch)?;
         self.same(item, entry, at)
     }
+
+    /// `checking`'s verdict: the walk keeps its entries, and an equal entry holds the same
+    /// read list.
+    fn verify(&mut self, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<Verdict>, RunError> {
+        self.checking.verify(tabled, name, entry)
+    }
 }
 
 /// A make is handed the proof `G` (body_ids.rs `Make`): the maker reads nothing of it, its
@@ -1461,6 +2289,23 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Make for Maker<'n, G, T> {
             return Err(void);
         }
         made
+    }
+
+    /// A found entry asked again ([`verify_instance`]) over the program, made here as on a
+    /// first miss; as `make`, a verdict over an unanswered question is void.
+    fn verify(&mut self, tabled: ItemKey, _name: &[u8], entry: &[u8]) -> Result<Option<Verdict>, RunError> {
+        if let Some(void) = self.void(tabled) {
+            return Err(void);
+        }
+        self.construct(tabled)?;
+        let Some((program, state)) = self.made.as_mut() else {
+            return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::verify`)" });
+        };
+        let verdict = verify_instance(program, &mut self.typing, state, &mut self.checks, tabled, entry);
+        if let Some(void) = self.void(tabled) {
+            return Err(void);
+        }
+        verdict.map(Some)
     }
 }
 

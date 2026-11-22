@@ -786,16 +786,16 @@ impl LayoutFacts for TestWorld {
         self.adt_of(key)
     }
 
-    fn repr(&self, key: ItemKey) -> ReprAttrs {
-        self.reprs.iter().find(|(k, _)| *k == key).map_or(ReprAttrs::RUST, |&(_, r)| r)
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, Missing> {
+        Ok(self.reprs.iter().find(|(k, _)| *k == key).map_or(ReprAttrs::RUST, |&(_, r)| r))
     }
 
     fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> {
         Ok(None)
     }
 
-    fn valid_range(&self, _: ItemKey) -> ValidRange {
-        ValidRange::default()
+    fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> {
+        Ok(ValidRange::default())
     }
 
     /// The fixture solver: `<args[0] as Deref>::Target` by the rows of `projs`, compared as
@@ -961,12 +961,12 @@ impl Adts for TestAdts<'_> {
         self.world.fns.iter().any(|f| f.key == item).then(|| self.world.tracked.contains(&item))
     }
 
-    fn caller_site(&self, _: ItemKey, _: ExprId) -> Option<crate::CallerSite<'_>> {
-        self.world.location.map(|_| TRACK_SITE)
+    fn caller_site(&self, _: ItemKey, _: ExprId) -> Result<crate::CallerSite<'_>, crate::SiteGap> {
+        self.world.location.map(|_| TRACK_SITE).ok_or(crate::SiteGap::Unanswered)
     }
 
-    fn def_site(&self, _: ItemKey) -> Option<crate::CallerSite<'_>> {
-        self.world.def_site
+    fn def_site(&self, _: ItemKey) -> Result<crate::CallerSite<'_>, crate::SiteGap> {
+        self.world.def_site.ok_or(crate::SiteGap::Unanswered)
     }
 
     fn fn_trait_method(&self, _: crate::FnTrait) -> Option<ItemKey> {

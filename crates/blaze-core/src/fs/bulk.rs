@@ -143,6 +143,7 @@ fn entry(entry: &[u8]) -> Option<(&[u8], Result<Stamp, &'static str>, Option<u64
             size,
             mtime_ns: modified.ok_or("ATTR_CMN_MODTIME")?,
             ctime_ns: changed.ok_or("ATTR_CMN_CHGTIME")?,
+            dev: dev.ok_or("ATTR_CMN_DEVID")?,
             mode: kind | (access.ok_or("ATTR_CMN_ACCESSMASK")? & 0o7777),
         })
     })();
@@ -257,6 +258,7 @@ mod tests {
                     size: meta.size(),
                     mtime_ns: ns(meta.mtime(), meta.mtime_nsec()),
                     ctime_ns: ns(meta.ctime(), meta.ctime_nsec()),
+                    dev: meta.dev(),
                     mode: meta.mode(),
                 };
                 (file, stamp)

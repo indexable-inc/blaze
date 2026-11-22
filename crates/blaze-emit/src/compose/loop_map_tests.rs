@@ -112,6 +112,10 @@ impl Names for Nameless {
     fn name(&self, _: Outside) -> Option<Named<'_>> {
         None
     }
+
+    fn routines(&self) -> crate::RoutinePlaces {
+        crate::RoutinePlaces::NONE
+    }
 }
 
 /// The harness's seed 63: header 0's map holds values 0, 1, 2 at their homes and slots 0, 1, 2

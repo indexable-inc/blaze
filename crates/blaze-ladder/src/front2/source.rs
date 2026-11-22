@@ -238,6 +238,23 @@ pub trait NamesSource<'n>: Copy {
         self.call_origin(krate, call).ok().map(|origin| origin.view.text)
     }
 
+    /// Question 10i: the one NAMED member of crate `krate` whose checker key is `item`, by its
+    /// library key (`None`: no such member; refused when two begin alike, or the rows did not
+    /// read). Where a place kept by its checker key is found again (program/lazy seam_rules.rs
+    /// `source_position`). Asked of every names source alike, so a body's place
+    /// (`seam_rules::body_place`) is the one rule over solved names, records and a table view
+    /// (it was `PositionSource`'s own, which the view did not implement).
+    fn member_beginning(self, krate: usize, item: blaze_typeck::ItemKey) -> Result<Option<ItemKey>, crate::seam::PositionGap>;
+
+    /// Question 10j: each item and member of crate `krate` whose body can declare an item (a
+    /// fn, const or static whose body holds items), visited by key. Reading these keys opens no
+    /// text of an unrelated body.
+    fn enclosing_keys(self, krate: usize, visit: impl FnMut(ItemKey) -> Result<(), crate::seam::PositionGap>) -> Result<(), crate::seam::PositionGap>;
+
+    /// Question 10k: the whole text the expansion `call` of crate `krate` made (`None`: not
+    /// served; over records the reason is in the log).
+    fn expansion_text(self, krate: usize, call: ItemKey) -> Option<&'n str>;
+
     /// Question 10e: the text the expansion `call` of crate `krate` made with the mark of each
     /// of its tokens (front2 item_site.rs, token-mark-F1): what an item that call writes resolves
     /// its head's paths by. `Ok(None)`: the text keeps no column by design
@@ -553,6 +570,38 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
 
     fn file_text(self, krate: usize, file: u32) -> Option<&'n str> {
         self.crates().get(krate)?.files.get(file as usize).map(|f| f.text)
+    }
+
+    fn member_beginning(self, krate: usize, item: blaze_typeck::ItemKey) -> Result<Option<ItemKey>, crate::seam::PositionGap> {
+        use crate::seam::PositionGap;
+        let c = self.crates().get(krate).ok_or(PositionGap::NoItem)?;
+        let mut rows = c.tables.members.values().flat_map(|ms| ms.iter())
+            .filter(|m| m.name.is_some() && super::keys::checker_of(m.key) == item);
+        let first = rows.next().map(|m| m.key);
+        if rows.next().is_some() { Err(PositionGap::NoItem) } else { Ok(first) }
+    }
+
+    fn enclosing_keys(self, krate: usize, mut visit: impl FnMut(ItemKey) -> Result<(), crate::seam::PositionGap>) -> Result<(), crate::seam::PositionGap> {
+        use crate::seam::PositionGap;
+        let c = self.crates().get(krate).ok_or(PositionGap::NoItem)?;
+        let holds = |detail| matches!(detail, ItemDetail::Fn { body_holds_items: true }
+            | ItemDetail::Const { body_holds_items: true } | ItemDetail::Static { body_holds_items: true });
+        for (lib, _, place) in self.items(krate) {
+            let (_, outline) = self.outline_at(krate, place.at).ok_or(PositionGap::NoItem)?;
+            if holds(outline.item(place.item).detail) {
+                visit(lib)?;
+            }
+        }
+        for members in c.tables.members.values() {
+            for member in members.iter().filter(|m| holds(m.detail)) {
+                visit(member.key)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn expansion_text(self, krate: usize, call: ItemKey) -> Option<&'n str> {
+        Some(self.outline_at(krate, blaze_scope::resolve::At::Expansion(call))?.0)
     }
 
     fn call_origin(self, krate: usize, call: ItemKey) -> Result<super::expansion_origin::CallOrigin<'n>, super::expansion_origin::Unmapped> {
@@ -1654,6 +1703,57 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     /// [`NamesSource::item_start`] answers from are offsets into.
     fn file_text(self, krate: usize, file: u32) -> Option<&'n str> {
         self.file_now(krate, file)
+    }
+
+    fn member_beginning(self, krate: usize, item: blaze_typeck::ItemKey) -> Result<Option<ItemKey>, crate::seam::PositionGap> {
+        use crate::seam::PositionGap;
+        // A failed item-prefix read invalidates the lookup, even when a
+        // different table has a row beginning with those bytes.
+        if !self.errors().is_empty() {
+            return Err(PositionGap::NoItem);
+        }
+        let record = self.items_record(krate).ok_or(PositionGap::NoItem)?;
+        let get = |i| record.owned_key_at(i).map_err(|_| PositionGap::NoItem);
+        let (mut lo, mut hi) = (0, record.owned_members());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if super::keys::checker_of(get(mid)?.ok_or(PositionGap::NoItem)?) < item {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let first = get(lo)?.filter(|k| super::keys::checker_of(*k) == item);
+        if first.is_some() && get(lo + 1)?.is_some_and(|k| super::keys::checker_of(k) == item) {
+            return Err(PositionGap::NoItem);
+        }
+        Ok(first)
+    }
+
+    fn enclosing_keys(self, krate: usize, mut visit: impl FnMut(ItemKey) -> Result<(), crate::seam::PositionGap>) -> Result<(), crate::seam::PositionGap> {
+        use crate::seam::PositionGap;
+        let record = self.items_record(krate).ok_or(PositionGap::NoItem)?;
+        for i in 0..record.items() {
+            let row = record.item_at(i).map_err(|_| PositionGap::NoItem)?.ok_or(PositionGap::NoItem)?;
+            if row.body_holds_items && matches!(row.kind, ItemKind::Function | ItemKind::Const | ItemKind::Static) {
+                visit(row.key)?;
+            }
+            if matches!(row.kind, ItemKind::Impl | ItemKind::Trait)
+                && let Some(members) = record.members(row.key).map_err(|_| PositionGap::NoItem)?
+            {
+                for member in members.iter() {
+                    let member = member.map_err(|_| PositionGap::NoItem)?;
+                    if member.body_holds_items && matches!(member.kind, ItemKind::Function | ItemKind::Const) {
+                        visit(member.key)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn expansion_text(self, krate: usize, call: ItemKey) -> Option<&'n str> {
+        self.whole_text(krate, blaze_scope::resolve::At::Expansion(call))
     }
 
     fn call_origin(self, krate: usize, call: ItemKey) -> Result<super::expansion_origin::CallOrigin<'n>, super::expansion_origin::Unmapped> {

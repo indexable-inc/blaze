@@ -401,7 +401,10 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
     Ok(out)
 }
 
-fn le32(bytes: &[u8], at: usize) -> u32 {
+// The row helpers of a record read in place: this record's and the `CrateScope` exports
+// record's (crate::scope_record), one home for both (rule 30).
+
+pub(crate) fn le32(bytes: &[u8], at: usize) -> u32 {
     let mut b = [0u8; 4];
     b.copy_from_slice(&bytes[at..at + 4]);
     u32::from_le_bytes(b)
@@ -411,11 +414,32 @@ fn le16(bytes: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([bytes[at], bytes[at + 1]])
 }
 
-fn key_at(bytes: &[u8], at: usize) -> ItemKey {
+pub(crate) fn key_at(bytes: &[u8], at: usize) -> ItemKey {
     let mut k = [0u8; KEY];
     k.copy_from_slice(&bytes[at..at + KEY]);
     ItemKey(ContentId(k))
 }
+
+/// Binary search of `count` fixed-width rows of `width` bytes at `at` of `bytes`, keyed by their
+/// first 32 bytes in strictly increasing order (each reader's `Verified` checked it): the row's
+/// index.
+pub(crate) fn find_row(bytes: &[u8], at: usize, width: usize, count: usize, key: ItemKey) -> Option<usize> {
+    let (mut lo, mut hi) = (0usize, count);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let row = at + mid * width;
+        match bytes[row..row + KEY].cmp(&key.0.0[..]) {
+            core::cmp::Ordering::Less => lo = mid + 1,
+            core::cmp::Ordering::Greater => hi = mid,
+            core::cmp::Ordering::Equal => return Some(mid),
+        }
+    }
+    None
+}
+
+/// A variant row's width: key, name at u32 and length u32 into the strings, record u8, pad. The
+/// `CrateScope` exports record holds the same rows ([`Variants::trusted`]).
+pub(crate) const VARIANT_ROW_WIDTH: usize = VARIANT_ROW;
 
 /// What a record's header says: the sections' places and counts, checked to lie inside it.
 #[derive(Clone, Copy, Debug)]
@@ -636,17 +660,7 @@ impl<'m> NamesRecord<'m> {
 
     /// Binary search of fixed-width rows of `width` bytes at `at`, keyed by their first 32.
     fn find(&self, at: usize, width: usize, count: usize, key: ItemKey) -> Option<usize> {
-        let (mut lo, mut hi) = (0usize, count);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let row = at + mid * width;
-            match self.bytes[row..row + KEY].cmp(&key.0.0[..]) {
-                core::cmp::Ordering::Less => lo = mid + 1,
-                core::cmp::Ordering::Greater => hi = mid,
-                core::cmp::Ordering::Equal => return Some(mid),
-            }
-        }
-        None
+        find_row(self.bytes, at, width, count, key)
     }
 
     /// Every module of the crate by key, in key order: what the cell table
@@ -786,6 +800,19 @@ pub struct Variants<'m> {
 }
 
 impl<'m> Variants<'m> {
+    /// `count` variant rows ([`VARIANT_ROW_WIDTH`] each) at `rows_at` of `bytes`, their names
+    /// ranges of the strings at `strings_at`: another record's run of the same rows (the
+    /// `CrateScope` exports record, crate::scope_record). O(1), nothing read.
+    ///
+    /// # Safety
+    ///
+    /// The maker of the caller's proof checked, in these same immutable `'m` bytes, that every
+    /// one of the rows lies inside `bytes` and that each name's range lies inside `bytes` and is
+    /// UTF-8 (`str::from_utf8` returned `Ok`): what [`Variants::at`]'s unchecked read relies on.
+    pub(crate) unsafe fn trusted(bytes: &'m [u8], strings_at: usize, rows_at: usize, count: usize) -> Variants<'m> {
+        Variants { bytes, strings_at, rows_at, count }
+    }
+
     pub fn len(&self) -> usize {
         self.count
     }
@@ -801,7 +828,7 @@ impl<'m> Variants<'m> {
     }
 
     /// Variant `i` of `0..len()`.
-    fn at(&self, i: usize) -> Variant<&'m str> {
+    pub(crate) fn at(&self, i: usize) -> Variant<&'m str> {
         let row = self.rows_at + i * VARIANT_ROW;
         // SAFETY: `Verified::check` ran `str::from_utf8` on exactly this range of the same
         // immutable `'m` record, and it returned `Ok`.

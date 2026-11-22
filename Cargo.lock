@@ -535,6 +535,7 @@ dependencies = [
  "blaze-json",
  "blaze-keyed",
  "blaze-mem",
+ "blaze-own",
  "blaze-sim",
  "blaze-trace",
  "libc",
@@ -1410,6 +1411,7 @@ dependencies = [
 name = "blaze-manifest"
 version = "0.0.0"
 dependencies = [
+ "blaze-cond",
  "blaze-core",
  "blaze-data",
  "blaze-glob",
@@ -1533,6 +1535,7 @@ dependencies = [
 name = "blaze-native"
 version = "0.0.0"
 dependencies = [
+ "blaze-code",
  "blaze-hash",
  "blaze-own",
 ]
@@ -1848,6 +1851,30 @@ dependencies = [
  "blaze-own",
  "blaze-sim",
 ]
+
+[[package]]
+name = "blaze-rung-tiers"
+version = "0.0.0"
+dependencies = [
+ "blaze-build",
+ "blaze-code",
+ "blaze-emit",
+ "blaze-ids",
+ "blaze-inproc",
+ "blaze-ladder",
+ "blaze-lir",
+ "blaze-own",
+ "blaze-rungs",
+ "blaze-sys",
+ "blaze-tier",
+ "blaze-toolchain",
+ "blaze-typeck",
+ "edition",
+]
+
+[[package]]
+name = "blaze-rungs"
+version = "0.0.0"
 
 [[package]]
 name = "blaze-scope"

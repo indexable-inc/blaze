@@ -104,7 +104,7 @@ pub use asm::{ASM_NORETURN, AsmArch, AsmKind, AsmOperand, AsmPiece, AsmReg};
 pub use path_miss::{MissWhy, PathAnswer, PathMiss, PathPrefix, Refusal};
 /// The fix offered for a name that does not resolve: `Checked::suggests` and `suggest::pick`.
 pub use rules::suggest;
-pub use error::{CheckError, Limit, Malformed, ParamSite, Recorded, Stop};
+pub use error::{CheckError, Limit, Malformed, ParamSite, Recorded, Stop, UndecidedLeaf};
 pub use filed::Filed;
 pub use hash::{ContentHash, StableHasher};
 pub use ids::{

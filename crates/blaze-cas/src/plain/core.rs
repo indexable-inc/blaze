@@ -40,7 +40,7 @@ use std::{
 use blaze_core::{Completion, Done, Effect, Extent, FileName, LockMode, Tag as EffectTag};
 use blaze_ids::{ContentId, crc32c};
 use blaze_keyed::{
-    kind::{Namespace, Tag},
+    kind::{Namespace, ReservedTag, Tag, TagReach, reach_of},
     store::{ALIGN, ENTRY, FOOTER, HEADER, Holder, Put, RowRefused, SEGMENT_MOST, SegmentId, StoreError, StoreFile, TwoValues},
 };
 
@@ -56,34 +56,25 @@ use crate::{Corrupt, Key};
 mod probe;
 pub use probe::{Found, Probe, Probes};
 
-/// The tag of the store's own root records (a root's sorted keys), always under
-/// [`Namespace::LOCAL`]: reserved, no kind of blaze-keyed's takes it.
-pub const ROOT_TAG: Tag = Tag(u16::MAX);
-
-/// The tag of a POINTER: a record whose key is a name and whose payload is the 32-byte key of
-/// another record, its target ([`super::Lent::point`]). The one record a newer commit may
-/// REPLACE: two values under one name are the old and the new, never refused, and the value
-/// in the newest row of the manifest holding the name is the pointer's
-/// ([`Plain::find_newest`]). Every other tag keeps the two-values refusal (rule 21). A pointer
-/// lives in [`Namespace::LOCAL`] only; compaction keeps only its newest value. Reserved: apart
-/// from the roots' ([`ROOT_TAG`]), the startup image's (`u16::MAX - 1`), the drive's records
-/// (blaze-cli `DRIVE_TAG`, `u16::MAX - 2`) and code entries (blaze-cli `CODE_TAG`,
-/// `u16::MAX - 3`).
-pub const POINTER_TAG: Tag = Tag(u16::MAX - 4);
+// The store's own tags are blaze-keyed's reservations ([`ReservedTag`], the one registry):
+// - a root's record ([`ReservedTag::Root`]): a root's sorted keys, always under
+//   [`Namespace::LOCAL`];
+// - a POINTER ([`ReservedTag::Pointer`]): a record whose key is a name and whose payload is the
+//   32-byte key of another record, its target ([`super::Lent::point`]). The one record a newer
+//   commit may REPLACE: two values under one name are the old and the new, never refused, and
+//   the value in the newest row of the manifest holding the name is the pointer's
+//   ([`Plain::find_newest`]). Every other tag keeps the two-values refusal (rule 21). A pointer
+//   lives in [`Namespace::LOCAL`] only; compaction keeps only its newest value;
+// - an INDEX ([`ReservedTag::Index`], [`Plain::index`]): sorted 32-byte keys under
+//   [`Namespace::LOCAL`], keyed by its bytes. It keeps nothing by itself; reached through an
+//   indexed root, it and every key it holds are live. One level: an index naming an index
+//   keeps the inner index's record, not what that holds;
+// - an indexed root's record ([`ReservedTag::IndexedRoot`], [`Plain::root_through`]): sorted
+//   keys, each an index. A slice reads a root's record anyway; what its tag is to reach
+//   ([`reach_of`]) says whether to follow it, and a record followed must be an index by tag.
 
 /// A pointer's payload: its target's key.
 pub const POINTER_LEN: usize = 32;
-
-/// The tag of an INDEX ([`Plain::index`]): a record of sorted 32-byte keys under
-/// [`Namespace::LOCAL`], keyed by its bytes. It keeps nothing by itself; reached through an
-/// indexed root ([`INDEXED_ROOT_TAG`]), it and every key it holds are live. One level: an index
-/// naming an index keeps the inner index's record, not what that holds. Reserved, after the
-/// pointers' ([`POINTER_TAG`]) and blaze-cli's start lists (`START_LIST_TAG`, `u16::MAX - 5`).
-pub const INDEX_TAG: Tag = Tag(u16::MAX - 6);
-
-/// The tag of an indexed root's record ([`Plain::root_through`]): sorted keys, each an index
-/// ([`INDEX_TAG`]). A slice reads a root's record anyway; its tag says whether to follow it.
-pub const INDEXED_ROOT_TAG: Tag = Tag(u16::MAX - 7);
 
 /// The most keys one index holds (128 MiB of keys): a program reaching more is refused by
 /// name ([`StoreError::IndexOver`]), never cut.
@@ -91,6 +82,12 @@ pub const INDEX_KEYS_MOST: usize = 1 << 22;
 
 /// The most indexes one indexed root names.
 pub const ROOT_INDEXES_MOST: usize = 1 << 16;
+
+/// The most records one plain root names directly (as many as an indexed root names indexes):
+/// each is looked for when the root is set (super::driven `Driven::root_names_held`, D200), so
+/// a set past it goes through an index ([`Plain::root_through`]). Over it is refused by name
+/// ([`StoreError::IndexOver`]), never cut.
+pub const ROOT_KEYS_MOST: usize = ROOT_INDEXES_MOST;
 
 /// The tags a store asks with: `tags .. tags + TAGS`.
 pub const TAGS: u64 = 1 << 40;
@@ -511,11 +508,72 @@ const LOG_MOST: u64 = 4 << 20;
 #[cfg(test)]
 const LOG_MOST: u64 = 16 << 10;
 
-/// How long a lock wait sleeps between asks: [`Effect::Lock`] never waits itself.
-const LOCK_STEP: Duration = Duration::from_millis(2);
+/// The flip lock's wait (thoughts2 5.3): [`Effect::Lock`] never waits in the kernel, so a
+/// contended ask is asked again after a timer on the driver's wheel, which is the driver's
+/// deadline wait (blaze-core `wait`, rule 44); the core only says how long. Until 2026-11-21
+/// every step was a fixed 2 ms: a flip holds the lock for tens of microseconds, so a waiter
+/// lost up to 2 ms to a lock let go after 50 us, and waiters that met one hold re-asked in
+/// step with each other. The schedule now ([`lock_step`]): the `k`th contended ask of one flip
+/// waits a jittered `min(FIRST << k, MOST)`: 50 to 100 us first, doubling to the cap after five
+/// asks. The cap is today's 2 ms, so a long hold (a durable flip's syncs) is never asked of
+/// later than it was; the jitter (half the step, drawn from the process's `nonce` and `k`: no
+/// randomness of the core's own, rule 75, and equal under one seed in the simulation) parts
+/// waiters that met one hold. The wait ends by its sum, not its count: past
+/// [`LOCK_WAIT_MOST_NS`] summed over one flip's steps it stops the store, naming the lock.
+const LOCK_STEP_FIRST_NS: u64 = 100_000;
+/// The longest step ([`LOCK_STEP_FIRST_NS`]'s doc): the old fixed step.
+const LOCK_STEP_MOST_NS: u64 = 2_000_000;
+/// How long one flip's lock wait may sum to before it stops the store, naming the lock: 60 s.
+const LOCK_WAIT_MOST_NS: u64 = 60_000_000_000;
 
-/// How many steps a lock wait takes before it stops the store, naming the lock: 60 s.
-const LOCK_STEPS_MOST: u32 = 30_000;
+/// How a flip waits between asks of a contended flip lock ([`PlainConfig::lock_step`]): one
+/// seam, both strategies under the same tests (rule 78). Either one's wait ends at the same
+/// summed bound, [`LOCK_WAIT_MOST_NS`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LockStep {
+    /// The jittered doubling from 100 us to 2 ms ([`lock_step`]): the default.
+    Backoff,
+    /// The old fixed 2 ms step (30,000 asks to the bound): the control a test compares the
+    /// backoff against.
+    Fixed,
+}
+
+impl LockStep {
+    /// The `k`th (from 0) contended ask's wait of a flip in the process whose nonce is `nonce`.
+    pub fn step_ns(self, nonce: u64, k: u32) -> u64 {
+        match self {
+            LockStep::Backoff => lock_step(nonce, k),
+            LockStep::Fixed => LOCK_STEP_MOST_NS,
+        }
+    }
+}
+
+/// The `k`th (from 0) contended ask's wait of a flip in the process whose nonce is `nonce`: a
+/// pure function (sans-IO), in `[base / 2, base]` with `base = min(FIRST << k, MOST)`.
+pub(super) fn lock_step(nonce: u64, k: u32) -> u64 {
+    let base = LOCK_STEP_FIRST_NS.checked_shl(k.min(32)).unwrap_or(u64::MAX).min(LOCK_STEP_MOST_NS);
+    // splitmix64 of the pair: a fixed mix, no hasher's seed (rule 75).
+    let mut z = nonce ^ u64::from(k).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    base / 2 + z % (base / 2 + 1)
+}
+
+/// The sum of a flip's first `asks` waits ([`lock_step`]): the tests' oracle for the running
+/// sum a flip keeps (`Flip::waited_ns`), which the bound is checked against.
+#[cfg(test)]
+pub(super) fn lock_waited_ns(nonce: u64, asks: u32) -> u64 {
+    (0..asks).map(|k| lock_step(nonce, k)).fold(0u64, u64::saturating_add)
+}
+
+/// What this process's flips waited on the flip lock ([`Plain::lock_waited`]): the contended
+/// asks and the steps' summed time, for the command's profile line.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct LockWaited {
+    pub asks: u32,
+    pub ns: u64,
+}
 
 /// What a root's record key is derived under.
 const ROOT_DOMAIN: &str = "blaze plain store root 1";
@@ -580,6 +638,9 @@ pub struct PlainConfig<A: Allocator + Clone> {
     pub reads: Vec<Namespace, A>,
     /// What a compaction slice keeps.
     pub liveness: Liveness,
+    /// How a flip waits on a contended flip lock: [`LockStep::Backoff`] everywhere but a test's
+    /// control.
+    pub lock_step: LockStep,
 }
 
 // By hand: a derive would ask the allocator for `PartialEq` and `Debug`, which a handle lacks.
@@ -596,6 +657,7 @@ impl<A: Allocator + Clone> Clone for PlainConfig<A> {
             writes: self.writes.clone(),
             reads: self.reads.clone(),
             liveness: self.liveness,
+            lock_step: self.lock_step,
         }
     }
 }
@@ -612,6 +674,7 @@ impl<A: Allocator + Clone> PartialEq for PlainConfig<A> {
             && self.writes == other.writes
             && self.reads == other.reads
             && self.liveness == other.liveness
+            && self.lock_step == other.lock_step
     }
 }
 
@@ -630,6 +693,7 @@ impl<A: Allocator + Clone> std::fmt::Debug for PlainConfig<A> {
             .field("writes", &self.writes)
             .field("reads", &self.reads)
             .field("liveness", &self.liveness)
+            .field("lock_step", &self.lock_step)
             .finish()
     }
 }
@@ -931,6 +995,10 @@ pub(crate) enum Plant {
     /// a command did: a namespace still behind with budget left (tests,
     /// `the_tier_oracle_catches_a_cleanup_of_one_namespace`).
     CleanupOneSlice,
+    /// The open after a boot change keeps a root that reaches a lost record (D200's unrooting
+    /// skipped): a reader finds a root with a hole (tests, arena_tests.rs
+    /// `the_oracle_catches_an_open_that_keeps_a_root_with_a_hole`).
+    KeepsHoledRoot,
 }
 
 /// What one slice of the background pass did ([`Plain::scrub_next`]).
@@ -1015,6 +1083,27 @@ impl Batch {
 
     fn payload(&self, entry: &Entry) -> &[u8] {
         &self.bytes[entry.at as usize..(entry.at + u64::from(entry.len)) as usize]
+    }
+}
+
+/// A record lent to a commit's layout where it lies (lent.rs under `Visibility::InArena`: the
+/// shared arena), never copied into a [`Batch`] first: its key, tag and namespace, the CRC made
+/// at its put (while its bytes were in cache, `format::record_crc`), and its bytes, borrowed for
+/// the [`Plain::commit_records`] call alone. The layout copies them once, into the segment's
+/// piece, and hashes them once, in its seal.
+#[derive(Clone, Copy, Debug)]
+pub struct LentRecord<'b> {
+    pub key: Key,
+    pub tag: Tag,
+    pub namespace: Namespace,
+    pub crc: u32,
+    pub bytes: &'b [u8],
+}
+
+impl LentRecord<'_> {
+    /// Its entry as a batch's would be, `at` 0 (the layout places it).
+    fn entry(&self) -> Entry {
+        Entry { key: self.key.0, tag: self.tag, at: 0, len: self.bytes.len() as u32, crc: self.crc }
     }
 }
 
@@ -1239,7 +1328,7 @@ impl<A: Allocator + Clone> Merge<A> {
             let keep = self.keep.keeps(maps, &entry.key, cursor.young);
             // A pointer keeps only its newest value: the one in the newest row holding its
             // name (in this slice or after it); an older value is let go.
-            let newest = entry.tag != POINTER_TAG || store.newest_mapped(self.namespace, &Key(entry.key)).is_some_and(|(at, _)| at == cursor.map as usize);
+            let newest = !ReservedTag::Pointer.is(entry.tag) || store.newest_mapped(self.namespace, &Key(entry.key)).is_some_and(|(at, _)| at == cursor.map as usize);
             if !keep || !newest {
                 self.dropped += 1;
                 continue;
@@ -1479,6 +1568,9 @@ struct Base {
 struct Flip<A: Allocator + Clone> {
     change: Change<A>,
     waits: u32,
+    /// The sum of this flip's lock-wait steps so far ([`lock_step`]), kept as it goes so the
+    /// bound's check is one comparison, not a sum over every earlier ask.
+    waited_ns: u64,
     next: Option<(Slot, Manifest)>,
     /// The head file did not exist: the first flip writes it whole.
     fresh: bool,
@@ -1656,6 +1748,8 @@ pub struct Plain<A: Allocator + Clone> {
     /// The flip lock is held (taken, and its unlock not yet asked): a step that fails under it
     /// lets it go as it stops, so a broken store never holds every other process's commit.
     holds_lock: bool,
+    /// What this process's flips waited on the flip lock ([`Plain::lock_waited`]).
+    lock_waited: LockWaited,
     /// The torn slot a short head showed before this open made it whole length.
     head_torn: Option<usize>,
     /// A torn slot, or a slot whose manifest is not whole, was reported at this open: the next
@@ -1694,6 +1788,8 @@ pub struct Plain<A: Allocator + Clone> {
     indexes_made: Vec<(Key, u64), A>,
     /// The roots this process set and the keys they name ([`Plain::named`]).
     named: Named,
+    /// What this process's commits did on the disk side of the put path ([`Plain::put_path`]).
+    put_path: PutPath,
 }
 
 /// The roots one process set and the keys they name: the command's cleanup line.
@@ -1705,6 +1801,31 @@ pub struct Named {
     pub keys: u64,
     /// Of them, through index records.
     pub indexed: u64,
+}
+
+/// What this process's commits did on the disk side of the put path (rule 16: the measure before
+/// any change of it; rule 67: the floor it is held against, said in [`super::lent::PutTally`]):
+/// counted where each step runs, never estimated.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct PutPath {
+    /// Commits that laid out at least one segment ([`Plain::commit`]).
+    pub laid_commits: u32,
+    /// Bytes copied into a commit's layout ([`Plain::lay_out`]: payloads and their padding).
+    pub laid_bytes: u64,
+    /// Bytes a commit's or a carry's segment digest read ([`format::seal_parts`]: header,
+    /// payloads, index, footer head), on the thread that commits.
+    pub digested_bytes: u64,
+    /// Segments a commit or a carry wrote (bytes already under a named segment write none).
+    pub segments_written: u32,
+    /// Bytes of the segments a compaction's merge streamed (each byte hashed as it is written).
+    pub merged_bytes: u64,
+    /// `Effect::Barrier`s the seal issued, and `Effect::Sync`s of a segment (the seal's of a
+    /// published one, a durable store's of every one).
+    pub barriers: u32,
+    pub syncs: u32,
+    /// Keys a root record names directly, each looked for when the root was set (super::driven
+    /// `Driven::root_names_held`, D200's set-time guard): its cost, visible.
+    pub root_probes: u64,
 }
 
 /// One namespace's held puts, and where each key is in them.
@@ -2004,6 +2125,7 @@ impl<A: Allocator + Clone> Plain<A> {
             head_made: false,
             log_lost: false,
             holds_lock: false,
+            lock_waited: LockWaited::default(),
             head_torn: None,
             torn_stamp: false,
             opened_generation: 0,
@@ -2020,8 +2142,14 @@ impl<A: Allocator + Clone> Plain<A> {
             segments_here: 0,
             indexes_made: Vec::new_in(alloc.clone()),
             named: Named::default(),
+            put_path: PutPath::default(),
             alloc,
         }
+    }
+
+    /// What this process's commits did on the disk side of the put path, so far.
+    pub fn put_path(&self) -> PutPath {
+        self.put_path
     }
 
     /// The allocator the caller handed this store: what it keeps, and what its lists are
@@ -2054,6 +2182,12 @@ impl<A: Allocator + Clone> Plain<A> {
 
     pub fn ready(&self) -> bool {
         matches!(self.phase, Phase::Ready)
+    }
+
+    /// What this process's flips waited on the flip lock so far: contended asks and the summed
+    /// steps they were asked again after (thoughts2 5.3; the command's store line prints it).
+    pub fn lock_waited(&self) -> LockWaited {
+        self.lock_waited
     }
 
     pub fn broken(&self) -> Option<&StoreError> {
@@ -2356,7 +2490,7 @@ impl<A: Allocator + Clone> Plain<A> {
         Ok(Put::Written)
     }
 
-    /// Names `keys` as kept under `name` at the next commit: a [`ROOT_TAG`] record of the
+    /// Names `keys` as kept under `name` at the next commit: a [`ReservedTag::Root`] record of the
     /// sorted keys under [`Namespace::LOCAL`], and the root. Compaction keeps every record a
     /// root names.
     pub fn root(&mut self, name: &str, keys: &[Key]) -> Result<Key, StoreError> {
@@ -2368,8 +2502,11 @@ impl<A: Allocator + Clone> Plain<A> {
     /// more than its life less [`TOUCH_NS`] left is not set again, so a build that changed
     /// nothing flips nothing for it.
     pub fn root_for(&mut self, name: &str, keys: &[Key], life_ns: u64) -> Result<Key, StoreError> {
+        if keys.len() > ROOT_KEYS_MOST {
+            return Err(StoreError::IndexOver { keys: keys.len() as u64, most: ROOT_KEYS_MOST as u64 });
+        }
         let bytes = sorted_keys(keys, self.alloc.clone());
-        let key = self.set_root(name, &bytes, life_ns, ROOT_TAG, ROOT_DOMAIN)?;
+        let key = self.set_root(name, &bytes, life_ns, ReservedTag::Root.tag(), ROOT_DOMAIN)?;
         self.named.roots += 1;
         self.named.keys += (bytes.len() / 32) as u64;
         Ok(key)
@@ -2381,7 +2518,7 @@ impl<A: Allocator + Clone> Plain<A> {
         self.named
     }
 
-    /// An INDEX of `keys` ([`INDEX_TAG`]): one record of their sorted 32-byte keys under
+    /// An INDEX of `keys` ([`ReservedTag::Index`]): one record of their sorted 32-byte keys under
     /// [`Namespace::LOCAL`], keyed by its bytes, so equal sets are one record that many roots
     /// share. It keeps nothing by itself: a root that names it through
     /// [`Plain::root_through`] keeps it and every key it holds (reach follows one level).
@@ -2393,7 +2530,8 @@ impl<A: Allocator + Clone> Plain<A> {
             return Err(StoreError::IndexOver { keys: count, most: INDEX_KEYS_MOST as u64 });
         }
         let key = Key(ContentId::of(INDEX_DOMAIN, &bytes));
-        self.put(key, Namespace::LOCAL, INDEX_TAG, &bytes).map_err(|it| it.into_store(INDEX_TAG))?;
+        let index = ReservedTag::Index.tag();
+        self.put(key, Namespace::LOCAL, index, &bytes).map_err(|it| it.into_store(index))?;
         if !self.indexes_made.iter().any(|(it, _)| *it == key) {
             self.indexes_made.push((key, count));
         }
@@ -2412,7 +2550,8 @@ impl<A: Allocator + Clone> Plain<A> {
             return Err(StoreError::IndexOver { keys: count, most: INDEX_KEYS_MOST as u64 });
         }
         let key = beside_key(owner);
-        self.put(key, Namespace::LOCAL, INDEX_TAG, &bytes).map_err(|it| it.into_store(INDEX_TAG))?;
+        let index = ReservedTag::Index.tag();
+        self.put(key, Namespace::LOCAL, index, &bytes).map_err(|it| it.into_store(index))?;
         if !self.indexes_made.iter().any(|(it, _)| *it == key) {
             self.indexes_made.push((key, count));
         }
@@ -2422,7 +2561,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// [`Plain::root_for`] of INDEXES: the root `name` names the index records `indexes` (each
     /// made by [`Plain::index`], in this process or before), kept for `life_ns`; reach keeps the
     /// root's record, each index and every key each index holds. Its record is filed under
-    /// [`INDEXED_ROOT_TAG`], so a slice tells it from a plain root by the entry it already
+    /// [`ReservedTag::IndexedRoot`], so a slice tells it from a plain root by the entry it already
     /// reads, with no probe of the keys it names. Over [`ROOT_INDEXES_MOST`] indexes is refused
     /// by name.
     pub fn root_through(&mut self, name: &str, indexes: &[Key], life_ns: u64) -> Result<Key, StoreError> {
@@ -2431,7 +2570,7 @@ impl<A: Allocator + Clone> Plain<A> {
         if count > ROOT_INDEXES_MOST as u64 {
             return Err(StoreError::IndexOver { keys: count, most: ROOT_INDEXES_MOST as u64 });
         }
-        let key = self.set_root(name, &bytes, life_ns, INDEXED_ROOT_TAG, INDEXED_ROOT_DOMAIN)?;
+        let key = self.set_root(name, &bytes, life_ns, ReservedTag::IndexedRoot.tag(), INDEXED_ROOT_DOMAIN)?;
         self.named.roots += 1;
         for index in bytes.chunks_exact(32) {
             let index = Key(ContentId(index.try_into().expect("32 bytes")));
@@ -2482,17 +2621,28 @@ impl<A: Allocator + Clone> Plain<A> {
     /// with no lock, then flips the head once to a generation naming them all. The outcome is
     /// [`Plain::take_committed`]'s once the store is ready again.
     pub fn commit(&mut self, batches: &[&Batch], now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
+        self.commit_records(batches, &[], now_ns, effects)
+    }
+
+    /// [`Plain::commit`] with `records` lent where they lie besides the batches (a `Lent`'s
+    /// shared arena, lent.rs `Visibility::InArena`): each laid out by its entry, copied once
+    /// into the segment's piece, its CRC the one made at its put. The same segments as the
+    /// same records put into a batch (arena_tests.rs, the seam's equality).
+    pub fn commit_records(&mut self, batches: &[&Batch], records: &[LentRecord<'_>], now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
         if !self.ready() {
             return Err(StoreError::Busy { phase: self.what() });
         }
         // The layout refuses two values under one key against every committed row: a whole
         // store (rule 21). A commit with nothing to lay out (stamps alone) needs none.
         assert!(
-            self.eager || (!self.holds_uncommitted() && batches.iter().all(|it| it.is_empty())),
+            self.eager || (!self.holds_uncommitted() && batches.iter().all(|it| it.is_empty()) && records.is_empty()),
             "Plain::commit lays out against a whole store: Plain::map_all first"
         );
         if let Some(batch) = batches.iter().find(|it| !self.cfg.writes.contains(&it.namespace)) {
             return Err(StoreError::NotWritable { namespace: batch.namespace });
+        }
+        if let Some(record) = records.iter().find(|it| !self.cfg.writes.contains(&it.namespace)) {
+            return Err(StoreError::NotWritable { namespace: record.namespace });
         }
         // A worker's batch for a shared namespace is scanned as a put is (rule 25), before
         // anything of the commit is laid out.
@@ -2503,11 +2653,16 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
             }
         }
+        for record in records.iter().filter(|it| it.namespace != Namespace::LOCAL) {
+            if let Some((at, needle)) = self.machine_at(record.bytes) {
+                return Err(PutError::Machine { key: record.key, namespace: record.namespace, at, needle }.into_store(record.tag));
+            }
+        }
         // The held batches stay readable while they are written: sealed until the commit ends.
         let mut fresh = Vec::with_capacity_in(self.cfg.writes.len(), self.alloc.clone());
         fresh.extend(self.cfg.writes.iter().map(|it| Held::new(*it)));
         self.sealed = std::mem::replace(&mut self.held, fresh);
-        let laid = self.lay_out(batches);
+        let laid = self.lay_out(batches, records);
         let laid = match laid {
             Ok(laid) => laid,
             Err(why) => {
@@ -2515,6 +2670,11 @@ impl<A: Allocator + Clone> Plain<A> {
                 return Err(why);
             }
         };
+        // The measure (rule 16): what the layout copied, counted once it is made.
+        if !laid.is_empty() {
+            self.put_path.laid_commits += 1;
+        }
+        self.put_path.laid_bytes += laid.iter().flat_map(|it| it.pieces.iter()).map(|(_, bytes)| bytes.len() as u64).sum::<u64>();
         // A request larger than the cap alone can never fit under it: refused by name, as no
         // reclamation could make room for it (a commit is never refused for the cap otherwise:
         // over it, reclamation is owed, and the next slices pay it).
@@ -2570,16 +2730,18 @@ impl<A: Allocator + Clone> Plain<A> {
     /// their threads interleaved. A key in two batches with equal records is laid once (the
     /// workers converge on one record); with other bytes it is [`StoreError::TwoValues`]. The
     /// payloads are copied into one piece, so no batch is kept by the commit.
-    fn lay_out(&self, batches: &[&Batch]) -> Result<Vec<Laid<A>, A>, StoreError> {
+    fn lay_out<'b>(&'b self, batches: &[&'b Batch], records: &[LentRecord<'b>]) -> Result<Vec<Laid<A>, A>, StoreError> {
         let mut out = Vec::with_capacity_in(self.cfg.writes.len(), self.alloc.clone());
         for &namespace in self.cfg.writes.iter() {
             let own = self.sealed.iter().find(|it| it.batch.namespace == namespace).map(|it| &it.batch);
-            // Every record of the namespace, the store's own batch's and each worker's: in the
-            // store's allocator, freed when the commit's layout is made.
+            // Every record of the namespace, the store's own batch's, each worker's and each
+            // lent one's (where it lies: no copy before this layout's one): in the store's
+            // allocator, freed when the commit's layout is made.
             let mut all: Vec<(Entry, &[u8]), A> = Vec::new_in(self.alloc.clone());
             for batch in own.into_iter().chain(batches.iter().copied().filter(|it| it.namespace == namespace)) {
                 all.extend(batch.entries.iter().map(|it| (*it, batch.payload(it))));
             }
+            all.extend(records.iter().filter(|it| it.namespace == namespace).map(|it| (it.entry(), it.bytes)));
             all.sort_unstable_by(|a, b| a.0.key.cmp(&b.0.key));
             let mut entries: Vec<Entry, A> = Vec::with_capacity_in(all.len(), self.alloc.clone());
             // The payloads from [`HEADER`] on, each at a multiple of [`ALIGN`] of the segment:
@@ -2597,14 +2759,14 @@ impl<A: Allocator + Clone> Plain<A> {
                     continue;
                 }
                 last = Some((entry, payload));
-                if entry.tag == POINTER_TAG {
+                if ReservedTag::Pointer.is(entry.tag) {
                     // A pointer replaces, so it is always laid out, even when this process's view
                     // holds its value: that view may be older than another process's commit of
                     // another value, and this commit's row, after every row the generation it
                     // flips on names, must make this value the newest. A key held under another
                     // tag is two values (rule 21).
                     if let Some((mapped, kept)) = self.newest_mapped(namespace, &Key(entry.key))
-                        && kept.tag != POINTER_TAG
+                        && !ReservedTag::Pointer.is(kept.tag)
                     {
                         let kept_payload = self.maps[mapped].payload(&kept);
                         return Err(StoreError::TwoValues(two_values(&Key(entry.key), Holder::Committed, kept.tag, kept_payload, entry.tag, payload)));
@@ -2688,6 +2850,8 @@ impl<A: Allocator + Clone> Plain<A> {
             Some(ok)
         }).all(|it| it), "pieces lie end to end");
         let sealed = format::seal_parts(namespace, &run, index_at, pieces.iter().map(|(_, bytes)| bytes.as_slice()));
+        // The measure: every byte before the digest itself was read by it.
+        self.put_path.digested_bytes += sealed.len.saturating_sub(32);
         self.start_write(sealed, pieces, run, why, effects);
     }
 
@@ -2769,6 +2933,7 @@ impl<A: Allocator + Clone> Plain<A> {
         let namespace = merge.namespace;
         let header = format::header_of(namespace, count, lowest, highest, index_at);
         let len = index_at + u64::from(count) * ENTRY as u64 + FOOTER as u64;
+        self.put_path.merged_bytes += len;
         self.seq += 1;
         let temp = format::id_of(MERGE_TEMP_DOMAIN, &[&self.cfg.nonce.to_le_bytes(), &self.seq.to_le_bytes(), &now_ns.to_le_bytes()]);
         if self.by_id.contains_key(&temp) || self.manifest.segments.iter().any(|it| it.id == temp) || self.manifest.retired.iter().any(|it| it.id == temp && !it.log) {
@@ -2852,6 +3017,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 Synced::for_a_plant(writing)
             }
             Err(writing) => {
+                self.put_path.syncs += 1;
                 effects.push(Effect::Sync { file: writing.file.clone(), tag: self.tag(SEG_SYNC, 0) });
                 self.phase = Phase::SyncingSegment(Box::new(writing), Box::new(why));
                 return;
@@ -2884,6 +3050,7 @@ impl<A: Allocator + Clone> Plain<A> {
             self.segment_written(Synced::already_named(Writing { seg, file, pieces: Vec::new_in(self.alloc.clone()), left: 0, stream: None }), why, effects);
             return;
         }
+        self.put_path.segments_written += 1;
         let mut header = Vec::with_capacity_in(HEADER, Global);
         header.extend_from_slice(&sealed.header);
         let mut footer = Vec::with_capacity_in(FOOTER, Global);
@@ -3129,7 +3296,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.key });
             };
             out.push(RootPlace { key: root.key, map: at as u32, entry });
-            if entry.tag == INDEXED_ROOT_TAG && self.plant() != Plant::IndexNotFollowed {
+            if reach_of(entry.tag) == TagReach::Indexes && self.plant() != Plant::IndexNotFollowed {
                 self.follow(root.key, self.maps[at].payload(&entry), &mut out)?;
             }
         }
@@ -3147,12 +3314,73 @@ impl<A: Allocator + Clone> Plain<A> {
             let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(index)) else {
                 return Err(StoreError::IndexGone { generation: self.manifest.generation, root, index });
             };
-            if entry.tag != INDEX_TAG {
+            if reach_of(entry.tag) != TagReach::IndexKeys {
                 return Err(StoreError::NotAnIndex { root, key: index, tag: entry.tag });
             }
             out.push(RootPlace { key: index, map: at as u32, entry });
         }
         Ok(())
+    }
+
+    /// Whether this generation names a segment an earlier boot wrote and never sealed: the
+    /// tail a power cut may have torn, known from the rows alone, no byte read. Only then can
+    /// an open have lost a segment a root reaches (this boot's writes are in the page cache;
+    /// a sealed row's bytes reached the media before the flip that sealed it), so only then
+    /// does [`super::Driven`]'s open check the tail and walk the roots (D200).
+    pub(crate) fn earlier_tail(&self) -> bool {
+        self.manifest.segments.iter().any(|it| it.local && !it.sealed && it.boot != self.cfg.boot)
+    }
+
+    /// Whether this generation names any root: with none, no root can have a hole, and an
+    /// open keeps its lazy maps whatever its tail ([`super::Driven`]'s open, D200).
+    pub(crate) fn names_a_root(&self) -> bool {
+        !self.manifest.roots.is_empty()
+    }
+
+    /// `keys` more root names looked for when a root was set ([`PutPath::root_probes`]).
+    pub(crate) fn count_root_probes(&mut self, keys: u64) {
+        self.put_path.root_probes += keys;
+    }
+
+    /// [`Plant::KeepsHoledRoot`]: the open's unrooting skipped (a control).
+    pub(crate) fn keeps_holed_root(&self) -> bool {
+        self.plant() == Plant::KeepsHoledRoot
+    }
+
+    /// The roots this generation names (every one, expired too) that reach a record no mapped
+    /// segment holds: the root's own record, an index an indexed root names, or a key a root
+    /// or an index names (looked for in every namespace this store reads). Asked of a whole
+    /// store, after an open that lost a segment: each is dropped by one flip before any reader
+    /// sees it (D200), so a reader finds a root whole or no root, never a root with a hole.
+    /// The walk: one find for each root, each index and each key they name (index pages
+    /// probed; no payload read but the roots' and the indexes' own); nothing when the store
+    /// lost nothing (the caller asks only then).
+    pub(crate) fn holed_roots(&self) -> Vec<String, A> {
+        let reads: &[Namespace] = &self.cfg.reads;
+        let held = |key: &[u8]| self.find_in(reads, &Key(ContentId(key.try_into().expect("32 bytes")))).is_some();
+        let mut out = Vec::new_in(self.alloc.clone());
+        for root in self.manifest.roots.iter() {
+            let whole = match self.find_in(&[Namespace::LOCAL], &Key(root.key)) {
+                None => false,
+                Some((at, entry)) => {
+                    let named = self.maps[at].payload(&entry);
+                    match reach_of(entry.tag) {
+                        TagReach::RootKeys => named.chunks_exact(32).all(held),
+                        TagReach::Indexes => named.chunks_exact(32).all(|index| match self.find_in(&[Namespace::LOCAL], &Key(ContentId(index.try_into().expect("32 bytes")))) {
+                            Some((at, entry)) if reach_of(entry.tag) == TagReach::IndexKeys => self.maps[at].payload(&entry).chunks_exact(32).all(held),
+                            _ => false,
+                        }),
+                        // A root names a root's or an indexed root's record (`root_for`,
+                        // `root_through`): any other is its record alone, held.
+                        TagReach::Opaque | TagReach::IndexKeys | TagReach::Target => true,
+                    }
+                }
+            };
+            if !whole {
+                out.push(root.name.clone());
+            }
+        }
+        out
     }
 
     /// `(live, all)`: the bytes `seg`'s records take (each payload aligned, and its entry),
@@ -3191,7 +3419,7 @@ impl<A: Allocator + Clone> Plain<A> {
             for key in got.bytes.chunks_exact(32) {
                 look(&ContentId(key.try_into().expect("32 bytes")), &mut out);
             }
-            if got.tag != INDEXED_ROOT_TAG || self.plant() == Plant::IndexNotFollowed {
+            if reach_of(got.tag) != TagReach::Indexes || self.plant() == Plant::IndexNotFollowed {
                 continue;
             }
             // An indexed root: what each index holds is named too, one level. An index this
@@ -3206,7 +3434,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 let Some(held) = self.get_in(&[Namespace::LOCAL], &Key(index)) else {
                     return Err(StoreError::IndexGone { generation: self.manifest.generation, root: root.0, index });
                 };
-                if held.tag != INDEX_TAG {
+                if reach_of(held.tag) != TagReach::IndexKeys {
                     return Err(StoreError::NotAnIndex { root: root.0, key: index, tag: held.tag });
                 }
                 for key in held.bytes.chunks_exact(32) {
@@ -3227,7 +3455,7 @@ impl<A: Allocator + Clone> Plain<A> {
             let entry = Entry::read(&run[i * ENTRY..(i + 1) * ENTRY]);
             let bytes = aligned(u64::from(entry.len)) + ENTRY as u64;
             all += bytes;
-            let newest = entry.tag != POINTER_TAG || self.newest_mapped(seg.namespace, &Key(entry.key)).is_some_and(|(it, _)| it == at);
+            let newest = !ReservedTag::Pointer.is(entry.tag) || self.newest_mapped(seg.namespace, &Key(entry.key)).is_some_and(|(it, _)| it == at);
             if newest && reached(roots, &entry.key) {
                 live += bytes;
             }
@@ -3387,6 +3615,7 @@ impl<A: Allocator + Clone> Plain<A> {
         self.phase = Phase::Flipping(Box::new(Flip {
             change,
             waits: 0,
+            waited_ns: 0,
             next: None,
             fresh: false,
             new_log: false,
@@ -3905,7 +4134,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 // Not mapped here any more: nothing to carry from. The typed stop.
                 return self.commit_refused(StoreError::SweptUnder { key, segment }, roots);
             };
-            if entry.tag == POINTER_TAG {
+            if ReservedTag::Pointer.is(entry.tag) {
                 // A pointer's carried value would read as its newest: not carried.
                 return self.commit_refused(StoreError::SweptUnder { key, segment }, roots);
             }
@@ -4155,6 +4384,11 @@ impl<A: Allocator + Clone> Plain<A> {
             // barrier orders writes, not a name's replacement, so a published row (fetched or
             // pushed: few, and off the edit path) is synced.
             let published = self.manifest.segments.iter().any(|it| it.id == *id && it.published);
+            if published {
+                self.put_path.syncs += 1;
+            } else {
+                self.put_path.barriers += 1;
+            }
             effects.push(if published { Effect::Sync { file, tag } } else { Effect::Barrier { file, tag } });
         }
         self.phase = Phase::Sealing { left: ids.len() as u32, ids };
@@ -4667,14 +4901,21 @@ impl<A: Allocator + Clone> Plain<A> {
                     Ok(())
                 }
                 Done::Contended => {
+                    // This flip's earlier asks, then this one's step ([`lock_step`]).
+                    let earlier = flip.waits;
                     flip.waits += 1;
-                    if flip.waits > LOCK_STEPS_MOST {
+                    let nonce = self.cfg.nonce;
+                    if flip.waited_ns >= LOCK_WAIT_MOST_NS {
                         // Another process held it past the bound, and a flip holds it for
                         // milliseconds: it is stuck.
-                        const _: () = assert!(LOCK_STEP.as_millis() * LOCK_STEPS_MOST as u128 == 60_000, "the text below says 60 s");
+                        const _: () = assert!(LOCK_WAIT_MOST_NS == 60_000_000_000, "the text below says 60 s");
                         return Err(StoreError::Stalled { waited_for: "the flip lock, which another process held for 60 s" });
                     }
-                    effects.push(Effect::Timer { after: LOCK_STEP, tag: self.tag(LOCK_WAIT, 0) });
+                    let step = self.cfg.lock_step.step_ns(nonce, earlier);
+                    flip.waited_ns = flip.waited_ns.saturating_add(step);
+                    self.lock_waited.asks = self.lock_waited.asks.saturating_add(1);
+                    self.lock_waited.ns = self.lock_waited.ns.saturating_add(step);
+                    effects.push(Effect::Timer { after: Duration::from_nanos(step), tag: self.tag(LOCK_WAIT, 0) });
                     Ok(())
                 }
                 done => Err(fail("taking the flip lock", &self.flip, &done).unwrap_or_else(|| unexpected("taking the flip lock"))),

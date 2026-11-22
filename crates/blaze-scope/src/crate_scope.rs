@@ -7,52 +7,42 @@
 //! lists, no notes), plus `reaches`: every other crate whose items its scopes name, near or far,
 //! so a dependent asks for all it may walk into in one `Need`.
 //!
-//! The record's bytes (all integers little-endian, every table sorted by key):
-//! `BZCS`, version u32, crate key, root key, edition u8, has-proc u8, two pad bytes, proc key
-//! (zeros without), name (u32 length, bytes); reaches (u32 count, keys); modules (u32 count;
-//! each: key, scope offset u32 and length u32 into the blob, chain u32 count (`u32::MAX`: none),
-//! chain keys); enums (count; each: key, count, each variant: key, record u8, name); macros
-//! (count; each: key, module key, export u8, local-inner u8, body tag u8, name, then the body's
-//! fields); pad to 16; the blob: each module's blaze-surface `ModuleScope` record, each padded
-//! to 16. The tables are parsed once per read into hash maps (cost: one pass over the record's
-//! bytes); the module scopes are read in place by `ScopeView` and turned into their working
-//! form there, borrowing every name from the record.
+//! The record's bytes are crate::scope_record's: a fixed header of section offsets, sorted
+//! fixed-width rows, one strings section and the blob of each module's blaze-surface
+//! `ModuleScope` record. A dependent checks each record once ([`Verified::check`]) and reads it
+//! in place ([`DepRecord`]): nothing is decoded, copied or allocated per dependency, so a
+//! `core` handed to six hundred crates costs its pages once. [`read_record`], the decode into
+//! hash maps this entry read before, is kept as the control form the in-place reads are tested
+//! equal against ([`Form::Heap`], rule 78).
 
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-use blaze_format::cursor::{self, Reader};
 use blaze_format::FormatError;
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ids::producer::{Expander, ProducerId};
 use blaze_own::{AVec, Alloc, Box};
-use blaze_surface::{BuildError, CallShape, Edition, GlobEdge, Namespace, ProcKind, RecordBytes, ScopeBuilder, ScopeView, Unresolved, Visibility};
+use blaze_surface::{BuildError, Edition, GlobEdge, Namespace, RecordBytes, ScopeBuilder, Unresolved, Visibility};
 
 use crate::asked::{Asked, Question, ReadListError, Stale};
 use crate::graph::{CrateGraph, CrateId, GraphCrate, GraphDep, Sysroot};
 use crate::prepares::Prepares;
 use crate::resolve::{Built, CrateInput, CrateNames, NamesError, SourceTexts, resolve_one};
+use crate::scope_record::{DepRecord, Module, Parts, Reaches, ScopeOf, VariantsOf, Verified};
 use crate::task::{First, MacroBody, MacroSrc, Par, Variant};
 
-const MAGIC: [u8; 4] = *b"BZCS";
-// 2: a body block holding a statement-position macro call is a block module
-// (macro-block-modules-1, 2026-11-16): block ordinals and made modules change.
-// 3: a built-in derive is its own macro body (tag 5) with its `attributes(..)` text
-// (names-attr-4); a version-2 record is refused (`NotThisRecord`) and the crate solved again.
-// 4: a written `self`/`super` and `pub(self)`/`pub(super)`/private in a block's module count
-// from the module around the body (super-in-block-1, 2026-11-16): block modules' scopes change.
-const VERSION: u32 = 4;
-const ALIGN: usize = 16;
-const NO_CHAIN: u32 = u32::MAX;
-
-/// A dependency as the resolution reads it: finished in this process, read from its record, or
-/// solved on demand, group by group (E13, cells/lazy_deps.rs): a read of a module it has not
-/// solved yet is noted there and voids the reader's solve, which is asked again once it is.
+/// A dependency as the resolution reads it: finished in this process, read from its record in
+/// place (the default) or decoded (the control form), or solved on demand, group by group (E13,
+/// cells/lazy_deps.rs): a read of a module it has not solved yet is noted there and voids the
+/// reader's solve, which is asked again once it is.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Dep<'a> {
     Whole(&'a CrateNames<'a>),
+    /// A record decoded into hash maps ([`read_record`]): the control form ([`Form::Heap`]).
     Record(&'a DepScope<'a>),
+    /// A record read in place ([`DepRecord`]): the form every entry reads ([`Form::InPlace`]).
+    InPlace(&'a DepRecord<'a>),
     Lazy(&'a crate::cells::LazyDep<'a>),
 }
 
@@ -61,6 +51,7 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.key,
             Dep::Record(d) => d.key,
+            Dep::InPlace(r) => r.key(),
             Dep::Lazy(l) => l.key,
         }
     }
@@ -69,6 +60,7 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.root,
             Dep::Record(d) => d.root,
+            Dep::InPlace(r) => r.root(),
             Dep::Lazy(l) => l.root,
         }
     }
@@ -77,6 +69,7 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.name,
             Dep::Record(d) => d.name,
+            Dep::InPlace(r) => r.name(),
             Dep::Lazy(l) => l.name,
         }
     }
@@ -85,6 +78,7 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.edition,
             Dep::Record(d) => d.edition,
+            Dep::InPlace(r) => r.edition(),
             Dep::Lazy(l) => l.edition,
         }
     }
@@ -93,15 +87,17 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.proc_key,
             Dep::Record(d) => d.proc_key,
+            Dep::InPlace(r) => r.proc_key(),
             Dep::Lazy(l) => l.proc_key,
         }
     }
 
-    pub(crate) fn scope(self, module: ItemKey) -> Option<&'a ScopeBuilder<'a, &'a str>> {
+    pub(crate) fn scope(self, module: ItemKey) -> Option<ScopeOf<'a, &'a str>> {
         match self {
-            Dep::Whole(c) => c.done.get(&module).map(|r| &r.scope),
-            Dep::Record(d) => d.scopes.get(&module),
-            Dep::Lazy(l) => l.scope(module),
+            Dep::Whole(c) => c.done.get(&module).map(|r| ScopeOf::Built(&r.scope)),
+            Dep::Record(d) => d.scopes.get(&module).map(ScopeOf::Built),
+            Dep::InPlace(r) => r.scope(module).map(ScopeOf::Exports),
+            Dep::Lazy(l) => l.scope(module).map(ScopeOf::Built),
         }
     }
 
@@ -109,15 +105,17 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.chains.get(&module).map(|c| c.as_slice()),
             Dep::Record(d) => d.chains.get(&module).map(|c| c.as_slice()),
+            Dep::InPlace(r) => r.chain(module),
             Dep::Lazy(l) => l.chain(module),
         }
     }
 
-    pub(crate) fn enum_of(self, key: ItemKey) -> Option<&'a [Variant<&'a str>]> {
+    pub(crate) fn enum_of(self, key: ItemKey) -> Option<VariantsOf<'a>> {
         match self {
-            Dep::Whole(c) => c.tables.enums.get(&key).map(|v| v.as_slice()),
-            Dep::Record(d) => d.enums.get(&key).map(|v| v.as_slice()),
-            Dep::Lazy(l) => l.enum_of(key),
+            Dep::Whole(c) => c.tables.enums.get(&key).map(|v| VariantsOf::Slice(v.as_slice())),
+            Dep::Record(d) => d.enums.get(&key).map(|v| VariantsOf::Slice(v.as_slice())),
+            Dep::InPlace(r) => r.variants(key).map(VariantsOf::Rows),
+            Dep::Lazy(l) => l.enum_of(key).map(VariantsOf::Slice),
         }
     }
 
@@ -125,19 +123,52 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.tables.macros.get(&key).copied(),
             Dep::Record(d) => d.macros.get(&key).copied(),
+            Dep::InPlace(r) => r.macro_of(key),
             Dep::Lazy(l) => l.macro_of(key),
         }
     }
 
-    pub(crate) fn reaches(self) -> &'a [CrateItemKey] {
+    pub(crate) fn reaches(self) -> Reaches<'a> {
         match self {
-            Dep::Whole(_) | Dep::Lazy(_) => &[],
-            Dep::Record(d) => &d.reaches,
+            Dep::Whole(_) | Dep::Lazy(_) => Reaches::Keys(&[]),
+            Dep::Record(d) => Reaches::Keys(&d.reaches),
+            Dep::InPlace(r) => r.reaches(),
         }
     }
 }
 
-/// A `CrateScope` record's working form, its names borrowed from the record's bytes.
+/// How a handed exports record is read: one seam, both forms tested equal (rule 78,
+/// tests/scope_record.rs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Form {
+    /// Checked once ([`Verified::check`]) and read in place: no allocation and no copy per
+    /// table, module or name. Every entry's form.
+    InPlace,
+    /// Decoded into hash maps of working forms ([`read_record`]): the form before 2026-11-21,
+    /// kept as the control.
+    Heap,
+}
+
+/// The record `bytes` (16-aligned, living as long as `alloc`'s values) as a dependency read in
+/// `form`.
+pub(crate) fn hand<'a>(form: Form, bytes: &'a [u8], alloc: Alloc<'a>) -> Result<Dep<'a>, RecordRead> {
+    Ok(match form {
+        Form::InPlace => Dep::InPlace(Box::leak(Box::new_in(DepRecord::open(Verified::check(bytes)?), alloc))),
+        Form::Heap => Dep::Record(Box::leak(Box::new_in(read_record(bytes, alloc)?, alloc))),
+    })
+}
+
+/// Each of `deps` as [`hand`] reads it, in order.
+fn handed<'a>(form: Form, deps: &[&'a [u8]], alloc: Alloc<'a>) -> Result<AVec<'a, Dep<'a>>, CrateScopeError<'a>> {
+    let mut out = AVec::with_capacity_in(deps.len(), alloc);
+    for (at, bytes) in deps.iter().enumerate() {
+        out.push(hand(form, bytes, alloc).map_err(|error| CrateScopeError::Record { at, error })?);
+    }
+    Ok(out)
+}
+
+/// A `CrateScope` record's working form, its names borrowed from the record's bytes: the
+/// control form ([`Form::Heap`]).
 #[derive(Debug)]
 pub struct DepScope<'a> {
     pub name: &'a str,
@@ -156,19 +187,35 @@ pub struct DepScope<'a> {
     pub errored: bool,
 }
 
-/// Why a `CrateScope` record was not read.
+/// Why a `CrateScope` record was not read ([`Verified::check`]). Each names the table and the
+/// byte offset that broke it (rule 19).
 #[derive(Debug)]
 pub enum RecordRead {
     /// Its bytes do not start on a 16-byte boundary: map or copy them to one.
     Unaligned,
-    /// Not `BZCS` and this version.
+    /// Not `BZCS` and this version (an old home's record: its crate is solved again).
     NotThisRecord,
-    /// A field ran past the end or was not UTF-8.
-    Short(cursor::Error),
-    /// A byte that is no edition, call shape, proc-macro kind or body tag.
+    /// A byte that is no edition, flag, call shape, proc-macro kind or body tag, or a pad or an
+    /// unused field that is not zero.
     BadByte { at: usize, what: &'static str },
+    /// A section, a row or a range named at `at` runs past the end of what holds it.
+    Past { table: &'static str, at: usize },
+    /// The rows of `table` (by its count at `at`) do not end where `next` begins: the count or
+    /// the next section's offset is not the writer's.
+    Layout { table: &'static str, next: &'static str, at: usize },
+    /// A row's run in `table` (named at `at`) does not start where the run before it ends.
+    Misplaced { table: &'static str, at: usize },
+    /// A row of `table` at `at` is not keyed above the row before it, which its search relies on.
+    OutOfOrder { table: &'static str, at: usize },
+    /// A text range of `table` named at `at` is not UTF-8.
+    Utf8 { table: &'static str, at: usize },
     /// A module's `ModuleScope` record.
     Scope { module: ItemKey, error: FormatError },
+    /// A module row's scope is the scope of another module.
+    NotItsScope { module: ItemKey, found: ItemKey },
+    /// An exports record's scope holds a textual scope or a mark, which only an inner record
+    /// may (a dependent reads a module's names, never its `macro_rules!` order).
+    NotExports { module: ItemKey },
 }
 
 /// Why [`resolve_crate`] gave no record.
@@ -210,43 +257,23 @@ pub struct CrateScope<'a> {
     pub(crate) asked: AVec<'a, Question<'a>>,
 }
 
-/// A `CrateScope` record's head read in place: its crate's key and its reach list, the keys'
-/// bytes as the record holds them (32 each), nothing decoded or copied.
-fn head(bytes: &[u8]) -> Result<(CrateItemKey, &[u8]), RecordRead> {
-    let short = RecordRead::Short;
-    let mut r = Reader::starting_at(bytes, 0).map_err(short)?;
-    if *r.array::<4>().map_err(short)? != MAGIC || r.u32().map_err(short)? != VERSION {
-        return Err(RecordRead::NotThisRecord);
-    }
-    let krate = CrateItemKey(ContentId(*r.array::<32>().map_err(short)?));
-    // The root key, edition, has-proc, two pad bytes and the proc key.
-    r.skip(32 + 4 + 32).map_err(short)?;
-    r.str_u32().map_err(short)?;
-    let count = r.u32().map_err(short)? as usize;
-    let rest = r.take_rest();
-    let keys = rest.get(..count.checked_mul(32).ok_or(RecordRead::BadByte { at: bytes.len() - rest.len(), what: "reach count" })?);
-    Ok((krate, keys.ok_or(RecordRead::BadByte { at: bytes.len() - rest.len(), what: "reach count" })?))
-}
-
 /// The crates `deps`' records reach that none of `deps` is, sorted and without repeats: what
 /// [`resolve_crate`] would answer [`CrateScopeError::Need`] for, read from the records' heads
-/// in place before any record is decoded, so a caller asks for them all before its first call
+/// in place before any record is checked, so a caller asks for them all before its first call
 /// (reach lists are closed, near or far, so one round asks for every one).
 pub fn unmet_reaches<'a>(deps: &[&[u8]], alloc: Alloc<'a>) -> Result<AVec<'a, CrateItemKey>, CrateScopeError<'a>> {
     let mut heads = AVec::with_capacity_in(deps.len(), alloc);
     let mut held = AVec::with_capacity_in(deps.len(), alloc);
     for (at, bytes) in deps.iter().enumerate() {
-        let (krate, keys) = head(bytes).map_err(|error| CrateScopeError::Record { at, error })?;
+        let (krate, keys) = crate::scope_record::peek_reaches(bytes).map_err(|error| CrateScopeError::Record { at, error })?;
         heads.push(keys);
         held.push(krate.prefix());
     }
     held.sort_unstable();
     let mut need = AVec::new_in(alloc);
     for keys in heads.iter() {
-        for key in keys.chunks_exact(32) {
-            let mut k = [0u8; 32];
-            k.copy_from_slice(key);
-            let key = CrateItemKey(ContentId(k));
+        for key in keys.iter() {
+            let key = CrateItemKey(ContentId(*key));
             if held.binary_search(&key.prefix()).is_err() {
                 need.push(key);
             }
@@ -257,114 +284,49 @@ pub fn unmet_reaches<'a>(deps: &[&[u8]], alloc: Alloc<'a>) -> Result<AVec<'a, Cr
     Ok(need)
 }
 
-/// Reads a `CrateScope` record (its bytes 16-aligned and living as long as `alloc`'s values).
+/// A `CrateScope` exports record (its bytes 16-aligned and living as long as `alloc`'s values)
+/// checked and DECODED into hash maps of working forms in `alloc`: the control form
+/// ([`Form::Heap`]) the in-place reads are tested equal against. Every entry reads in place.
 pub fn read_record<'a>(bytes: &'a [u8], alloc: Alloc<'a>) -> Result<DepScope<'a>, RecordRead> {
-    if bytes.as_ptr() as usize % ALIGN != 0 {
-        return Err(RecordRead::Unaligned);
-    }
-    let mut r = Reader::starting_at(bytes, 0).map_err(RecordRead::Short)?;
-    let short = RecordRead::Short;
-    let key = |r: &mut Reader<'a>| r.array::<32>().map(|k| ItemKey(ContentId(*k))).map_err(short);
-    if *r.array::<4>().map_err(short)? != MAGIC || r.u32().map_err(short)? != VERSION {
-        return Err(RecordRead::NotThisRecord);
-    }
-    let krate = CrateItemKey(key(&mut r)?.0);
-    let root = key(&mut r)?;
-    let at = bytes.len() - r.take_rest().len();
-    let mut r = Reader::starting_at(bytes, at).map_err(short)?;
-    let edition = Edition::from_byte(r.u8().map_err(short)?).ok_or(RecordRead::BadByte { at, what: "edition" })?;
-    let has_proc = r.u8().map_err(short)?;
-    let at_flag = bytes.len() - r.take_rest().len();
-    let mut r = Reader::starting_at(bytes, at_flag).map_err(short)?;
-    let errored = match r.u8().map_err(short)? {
-        0 => false,
-        ERRORED => true,
-        _ => return Err(RecordRead::BadByte { at: at_flag, what: "errored flag" }),
-    };
-    r.skip(1).map_err(short)?;
-    let proc = CrateItemKey(key(&mut r)?.0);
-    let name = r.str_u32().map_err(short)?;
-    let count = r.u32().map_err(short)? as usize;
-    let mut reaches = AVec::with_capacity_in(count.min(bytes.len() / 32), alloc);
-    for _ in 0..count {
-        reaches.push(CrateItemKey(key(&mut r)?.0));
-    }
-    let count = r.u32().map_err(short)? as usize;
-    let mut places = AVec::with_capacity_in(count.min(bytes.len() / 32), alloc);
-    let mut chains = HashMap::new_in(alloc);
-    for _ in 0..count {
-        let module = key(&mut r)?;
-        let (offset, len) = (r.u32().map_err(short)? as usize, r.u32().map_err(short)? as usize);
-        places.push((module, offset, len));
-        let n = r.u32().map_err(short)?;
-        if n != NO_CHAIN {
-            let mut chain = AVec::with_capacity_in((n as usize).min(bytes.len() / 32), alloc);
-            for _ in 0..n {
-                chain.push(key(&mut r)?);
-            }
-            chains.insert(module, chain);
-        }
-    }
-    let count = r.u32().map_err(short)? as usize;
-    let mut enums = HashMap::new_in(alloc);
-    for _ in 0..count {
-        let owner = key(&mut r)?;
-        let n = r.u32().map_err(short)? as usize;
-        let mut variants = AVec::with_capacity_in(n.min(bytes.len() / 32), alloc);
-        for _ in 0..n {
-            let key = key(&mut r)?;
-            let record = r.u8().map_err(short)? != 0;
-            variants.push(Variant { name: r.str_u32().map_err(short)?, key, record });
-        }
-        enums.insert(owner, variants);
-    }
-    let count = r.u32().map_err(short)? as usize;
-    let mut macros = HashMap::new_in(alloc);
-    for _ in 0..count {
-        let def = key(&mut r)?;
-        let module = key(&mut r)?;
-        let export = r.u8().map_err(short)? != 0;
-        let local_inner = r.u8().map_err(short)? != 0;
-        let at = bytes.len() - r.take_rest().len();
-        let mut rest = Reader::starting_at(bytes, at).map_err(short)?;
-        let tag = rest.u8().map_err(short)?;
-        let name = rest.str_u32().map_err(short)?;
-        let body = match tag {
-            0 => MacroBody::Rules(rest.str_u32().map_err(short)?),
-            1 => {
-                let has = rest.u8().map_err(short)? != 0;
-                let params = rest.str_u32().map_err(short)?;
-                MacroBody::Macro2 { params: has.then_some(params), body: rest.str_u32().map_err(short)? }
-            }
-            2 => MacroBody::BuiltinFn(rest.str_u32().map_err(short)?),
-            3 => MacroBody::BuiltinOther(CallShape::from_byte(rest.u8().map_err(short)?).ok_or(RecordRead::BadByte { at, what: "call shape" })?),
-            4 => {
-                let kind = ProcKind::from_byte(rest.u8().map_err(short)?).ok_or(RecordRead::BadByte { at, what: "proc-macro kind" })?;
-                MacroBody::Proc { kind, helpers: rest.str_u32().map_err(short)? }
-            }
-            5 => MacroBody::BuiltinDerive { helpers: rest.str_u32().map_err(short)? },
-            _ => return Err(RecordRead::BadByte { at, what: "macro body tag" }),
-        };
-        macros.insert(def, MacroSrc { name, body, module, export, local_inner });
-        r = rest;
-    }
-    let at = bytes.len() - r.take_rest().len();
-    let blob = at.next_multiple_of(ALIGN);
+    let record = DepRecord::open(Verified::check(bytes)?);
+    let mut reaches = AVec::with_capacity_in(record.reaches().len(), alloc);
+    reaches.extend(record.reaches().iter());
     let mut scopes = HashMap::new_in(alloc);
-    for (module, offset, len) in places {
-        let start = blob + offset;
-        let Some(part) = bytes.get(start..start + len) else {
-            return Err(RecordRead::Short(cursor::Error { at: start, wanted: cursor::Wanted::Bytes { len, left: bytes.len().saturating_sub(start) } }));
-        };
-        let view = ScopeView::read(part).map_err(|error| RecordRead::Scope { module, error })?;
-        scopes.insert(module, ScopeBuilder::from(&view, alloc));
+    let mut chains = HashMap::new_in(alloc);
+    for module in record.modules() {
+        if let Some(scope) = record.scope(module) {
+            scopes.insert(module, ScopeBuilder::from(&scope.view(), alloc));
+        }
+        if let Some(chain) = record.chain(module) {
+            chains.insert(module, AVec::from_slice_in(chain, alloc));
+        }
     }
-    Ok(DepScope { name, key: krate, root, edition, proc_key: (has_proc != 0).then_some(proc), reaches, scopes, chains, enums, macros, errored })
+    let mut enums = HashMap::new_in(alloc);
+    for owner in record.enums() {
+        if let Some(variants) = record.variants(owner) {
+            enums.insert(owner, AVec::from_iter_in(variants.iter(), alloc));
+        }
+    }
+    let mut macros = HashMap::new_in(alloc);
+    for def in record.macros() {
+        if let Some(m) = record.macro_of(def) {
+            macros.insert(def, m);
+        }
+    }
+    Ok(DepScope {
+        name: record.name(),
+        key: record.key(),
+        root: record.root(),
+        edition: record.edition(),
+        proc_key: record.proc_key(),
+        reaches,
+        scopes,
+        chains,
+        enums,
+        macros,
+        errored: record.errored(),
+    })
 }
-
-/// The first pad byte of an error crate's record (read 0 in every other record, so the layout
-/// and [`VERSION`] stay).
-const ERRORED: u8 = 1;
 
 /// The exports record of a crate that failed this command, so no record of its names exists
 /// (its build script failed, or its own names could not be resolved): its key, its root (an
@@ -376,37 +338,17 @@ const ERRORED: u8 = 1;
 pub fn error_record<'b>(key: CrateItemKey, name: &str, edition: Edition, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, BuildError> {
     let root = crate::task::root_key(key);
     let scope = ScopeBuilder::<'_, &str>::new_in(root, alloc).write(alloc)?;
-    let mut out = Out { bytes: RecordBytes::new_in(alloc) };
-    out.bytes.extend_from_slice(&MAGIC);
-    out.u32(VERSION as usize, "version")?;
-    out.key(key.0);
-    out.key(root.0);
-    out.u8(edition.byte());
-    out.u8(0);
-    out.u8(ERRORED);
-    out.u8(0);
-    out.key(ContentId([0; 32]));
-    out.str(name)?;
-    out.u32(0, "CrateScope reaches")?;
-    out.u32(1, "CrateScope modules")?;
-    out.key(root.0);
-    out.u32(0, "CrateScope blob")?;
-    out.u32(scope.len(), "CrateScope blob")?;
-    out.u32(NO_CHAIN as usize, "CrateScope chain")?;
-    out.u32(0, "CrateScope enums")?;
-    out.u32(0, "CrateScope macros")?;
-    out.pad();
-    out.bytes.extend_from_slice(&scope);
-    Ok(out.bytes)
+    let modules = [Module { key: root, scope: &scope, chain: None }];
+    crate::scope_record::write(
+        &Parts { key, root, edition, proc_key: None, errored: true, name, reaches: &[], modules: &modules, enums: &[], macros: &[] },
+        alloc,
+    )
 }
 
-/// Where the errored flag sits: magic, version, crate key, root key, edition, has-proc.
-const ERRORED_AT: usize = 4 + 4 + 32 + 32 + 1 + 1;
-
-/// Whether `bytes`, a `CrateScope` record of this version, is an [`error_record`]: its head
-/// read in place, nothing decoded. A record of another magic or version is none.
+/// Whether `bytes`, a `CrateScope` record of this version, is an [`error_record`]: one byte of
+/// its head read in place, nothing checked. A record of another magic or version is none.
 pub fn is_error_record(bytes: &[u8]) -> bool {
-    bytes.get(..4) == Some(&MAGIC[..]) && bytes.get(4..8) == Some(&VERSION.to_le_bytes()[..]) && bytes.get(ERRORED_AT) == Some(&ERRORED)
+    crate::scope_record::is_errored(bytes)
 }
 
 /// The crate an [`error_record`] is of, its key and its own name, read in place: what a
@@ -416,14 +358,7 @@ pub fn error_record_crate(bytes: &[u8]) -> Option<(CrateItemKey, &str)> {
     if !is_error_record(bytes) {
         return None;
     }
-    let mut r = Reader::starting_at(bytes, 0).ok()?;
-    // The magic and version, checked above.
-    r.skip(8).ok()?;
-    let krate = CrateItemKey(ContentId(*r.array::<32>().ok()?));
-    // The root key, edition, has-proc, the errored flag and its pad byte, and the proc key.
-    r.skip(32 + 4 + 32).ok()?;
-    let name = r.str_u32().ok()?;
-    Some((krate, name))
+    crate::scope_record::peek_name(bytes)
 }
 
 /// A reporter's reading of a failed import, asked only once a lookup failed, never on the
@@ -437,36 +372,10 @@ pub fn why_reported<'a>(why: Unresolved, inner: &[u8], module: ItemKey, name: &s
     if why != Unresolved::NotFound {
         return Ok(why);
     }
-    let rest = read_record(crate::resolve::aligned(inner, alloc), alloc)?;
-    let bound = rest.scopes.get(&module).is_some_and(|scope| scope.bindings.iter().any(|e| e.name == name));
+    // Only on a failure's report: the inner record checked whole, one module row found, its
+    // bindings scanned in place (no decode).
+    let bound = crate::scope_record::inner_binds(crate::resolve::aligned(inner, alloc), module, name)?;
     Ok(if bound { Unresolved::Private } else { why })
-}
-
-struct Out<'b> {
-    bytes: RecordBytes<'b>,
-}
-
-impl Out<'_> {
-    fn u8(&mut self, v: u8) {
-        self.bytes.push(v);
-    }
-    fn u32(&mut self, v: usize, what: &'static str) -> Result<(), BuildError> {
-        let v = u32::try_from(v).map_err(|_| BuildError::TooLarge { table: what })?;
-        self.bytes.extend_from_slice(&v.to_le_bytes());
-        Ok(())
-    }
-    fn key(&mut self, k: ContentId) {
-        self.bytes.extend_from_slice(&k.0);
-    }
-    fn str(&mut self, s: &str) -> Result<(), BuildError> {
-        self.u32(s.len(), "CrateScope string")?;
-        self.bytes.extend_from_slice(s.as_bytes());
-        Ok(())
-    }
-    fn pad(&mut self) {
-        let to = self.bytes.len().next_multiple_of(ALIGN);
-        self.bytes.resize(to, 0);
-    }
 }
 
 /// What another crate can read of a crate's names: the part every dependent's key covers.
@@ -524,7 +433,7 @@ fn may_shadow<'a>(names: &CrateNames<'_>, built: &Built<'_, 'a>, globs: &[GlobEd
 pub(crate) fn dep_may_shadow(built: &Built<'_, '_>, key: ItemKey, ns: Namespace, name: &str) -> bool {
     let Some(dep) = built.of(key) else { return true };
     if let Some(s) = dep.scope(key) {
-        return !s.globs.is_empty() || s.get(ns, name).is_some();
+        return !s.globs().is_empty() || s.get(ns, name).is_some();
     }
     dep.enum_of(key).is_none_or(|v| v.iter().any(|v| v.name == name))
 }
@@ -634,7 +543,7 @@ pub(crate) fn write_records<'a, 'b>(names: &CrateNames<'a>, built: &Built<'_, 'a
         }
         if let Some(dep) = built.of(key) {
             reach[part as usize].push(dep.key());
-            reach[part as usize].extend_from_slice(dep.reaches());
+            reach[part as usize].extend(dep.reaches().iter());
         }
     };
     let mut exports_scopes = AVec::new_in(alloc);
@@ -663,9 +572,9 @@ pub(crate) fn write_records<'a, 'b>(names: &CrateNames<'a>, built: &Built<'_, 'a
             inner_scopes.push(Some(names.done[m].scope.write(alloc)?));
         }
     }
-    let [mut exports_reach, mut inner_reach] = reach;
-    let exports = write_part(names, &modules, &exports_scopes, &mut exports_reach, &|k| named.contains_key(k), alloc)?;
-    let inner = write_part(names, &modules, &inner_scopes, &mut inner_reach, &|k| !named.contains_key(k), alloc)?;
+    let [exports_reach, inner_reach] = reach;
+    let exports = write_part(names, &modules, &exports_scopes, &exports_reach, &|k| named.contains_key(k), alloc)?;
+    let inner = write_part(names, &modules, &inner_scopes, &inner_reach, &|k| !named.contains_key(k), alloc)?;
     Ok(Records { exports, inner })
 }
 
@@ -677,102 +586,35 @@ enum Part {
 }
 
 /// One record: each of `modules` that has a scope's bytes in `scopes`, the crates it `reaches`,
-/// and the enums and macros `keeps`.
+/// and the enums and macros `keeps`, in crate::scope_record's form.
 fn write_part<'b>(
     names: &CrateNames<'_>,
     modules: &[ItemKey],
     scopes: &[Option<RecordBytes<'b>>],
-    reaches: &mut AVec<'b, CrateItemKey>,
+    reaches: &[CrateItemKey],
     keeps: &dyn Fn(&ItemKey) -> bool,
     alloc: Alloc<'b>,
 ) -> Result<RecordBytes<'b>, BuildError> {
-    reaches.sort_unstable();
-    reaches.dedup();
-
-    let mut out = Out { bytes: RecordBytes::new_in(alloc) };
-    out.bytes.extend_from_slice(&MAGIC);
-    out.u32(VERSION as usize, "version")?;
-    out.key(names.key.0);
-    out.key(names.root.0);
-    out.u8(names.edition.byte());
-    out.u8(u8::from(names.proc_key.is_some()));
-    out.u8(0);
-    out.u8(0);
-    out.key(names.proc_key.map_or(ContentId([0; 32]), |k| k.0));
-    out.str(names.name)?;
-    out.u32(reaches.len(), "CrateScope reaches")?;
-    for k in reaches.iter() {
-        out.key(k.0);
-    }
-    let mut blob = RecordBytes::new_in(alloc);
-    out.u32(scopes.iter().flatten().count(), "CrateScope modules")?;
+    let mut rows = AVec::with_capacity_in(modules.len(), alloc);
     for (m, bytes) in modules.iter().zip(scopes.iter()) {
         let Some(bytes) = bytes else { continue };
-        out.key(m.0);
-        out.u32(blob.len(), "CrateScope blob")?;
-        out.u32(bytes.len(), "CrateScope blob")?;
-        blob.extend_from_slice(&bytes);
-        blob.resize(blob.len().next_multiple_of(ALIGN), 0);
-        match names.chains.get(m) {
-            Some(chain) => {
-                out.u32(chain.len(), "CrateScope chain")?;
-                for k in chain.iter() {
-                    out.key(k.0);
-                }
-            }
-            None => out.u32(NO_CHAIN as usize, "CrateScope chain")?,
-        }
+        rows.push(Module { key: *m, scope: bytes, chain: names.chains.get(m).map(|c| c.as_slice()) });
     }
-    let mut enums = AVec::from_iter_in(names.tables.enums.keys().copied().filter(|k| keeps(k)), alloc);
-    enums.sort_unstable();
-    out.u32(enums.len(), "CrateScope enums")?;
-    for owner in enums.iter() {
-        let variants = &names.tables.enums[owner];
-        out.key(owner.0);
-        out.u32(variants.len(), "CrateScope variants")?;
-        for v in variants.iter() {
-            out.key(v.key.0);
-            out.u8(u8::from(v.record));
-            out.str(v.name)?;
-        }
-    }
-    let mut macros = AVec::from_iter_in(names.tables.macros.keys().copied().filter(|k| keeps(k)), alloc);
-    macros.sort_unstable();
-    out.u32(macros.len(), "CrateScope macros")?;
-    for def in macros.iter() {
-        let m = names.tables.macros[def];
-        out.key(def.0);
-        out.key(m.module.0);
-        out.u8(u8::from(m.export));
-        out.u8(u8::from(m.local_inner));
-        let tag = match m.body {
-            MacroBody::Rules(_) => 0,
-            MacroBody::Macro2 { .. } => 1,
-            MacroBody::BuiltinFn(_) => 2,
-            MacroBody::BuiltinOther(_) => 3,
-            MacroBody::Proc { .. } => 4,
-            MacroBody::BuiltinDerive { .. } => 5,
-        };
-        out.u8(tag);
-        out.str(m.name)?;
-        match m.body {
-            MacroBody::Rules(text) | MacroBody::BuiltinFn(text) => out.str(text)?,
-            MacroBody::Macro2 { params, body } => {
-                out.u8(u8::from(params.is_some()));
-                out.str(params.unwrap_or(""))?;
-                out.str(body)?;
-            }
-            MacroBody::BuiltinOther(shape) => out.u8(shape.byte()),
-            MacroBody::BuiltinDerive { helpers } => out.str(helpers)?,
-            MacroBody::Proc { kind, helpers } => {
-                out.u8(kind.byte());
-                out.str(helpers)?;
-            }
-        }
-    }
-    out.pad();
-    out.bytes.extend_from_slice(&blob);
-    Ok(out.bytes)
+    let enums = AVec::from_iter_in(names.tables.enums.iter().filter(|(k, _)| keeps(k)).map(|(k, v)| (*k, v.as_slice())), alloc);
+    let macros = AVec::from_iter_in(names.tables.macros.iter().filter(|(k, _)| keeps(k)).map(|(k, m)| (*k, *m)), alloc);
+    let parts = Parts {
+        key: names.key,
+        root: names.root,
+        edition: names.edition,
+        proc_key: names.proc_key,
+        errored: false,
+        name: names.name,
+        reaches,
+        modules: &rows,
+        enums: &enums,
+        macros: &macros,
+    };
+    crate::scope_record::write(&parts, alloc)
 }
 
 /// One crate's names against its dependencies' `CrateScope` records, and its own record.
@@ -825,13 +667,14 @@ pub trait ReadyHooks {
         let _ = (krate, worker);
     }
 
-    /// `krate`'s own resolution is done and its exports record is about to be decoded: what is
-    /// allocated from here to [`ReadyHooks::decoded`] is the decoded record.
+    /// `krate`'s own resolution is done and its exports record is about to be checked (read in
+    /// place: [`Verified::check`]; decoded only in the control form): what is allocated from
+    /// here to [`ReadyHooks::decoded`] is the handed record (one small box in place).
     fn decoding(&self, krate: usize) {
         let _ = krate;
     }
 
-    /// `krate`'s exports record (`bytes` long) was decoded into its working form: once a call.
+    /// `krate`'s exports record (`bytes` long) was checked and is handed as it is: once a call.
     fn decoded(&self, krate: usize, bytes: usize) {
         let _ = (krate, bytes);
     }
@@ -966,14 +809,15 @@ pub fn resolve_kept<'a, S: SourceTexts<'a>, P: Par>(
     kept: &dyn Kept,
     alloc: Alloc<'a>,
 ) -> Result<(AVec<'a, Solved<'a>>, usize), (usize, CrateScopeError<'a>)> {
-    resolve_queue(crates, sysroot, sources, par, ready, false, Some(kept), alloc)
+    resolve_queue(crates, sysroot, sources, par, ready, false, Some(kept), Form::InPlace, alloc)
 }
 
 /// The ready queue's state, under one lock: held to take a crate, to read records, and to
 /// publish one; never across a resolution.
 struct Queue<'a> {
-    /// By crate index: its exports record once written, decoded once for the whole call.
-    records: AVec<'a, Option<&'a DepScope<'a>>>,
+    /// By crate index: its exports record once written, checked (or, for the control form,
+    /// decoded) once for the whole call and handed to every reader as it is.
+    records: AVec<'a, Option<Dep<'a>>>,
     /// By crate index: its exports record's digest ([`EXPORTS_DOMAIN`]) once written.
     digests: AVec<'a, Option<ContentId>>,
     out: AVec<'a, Option<Solved<'a>>>,
@@ -1008,7 +852,23 @@ pub(crate) fn resolve_by_records_with<'a, S: SourceTexts<'a>, P: Par>(
     leak_private: bool,
     alloc: Alloc<'a>,
 ) -> Result<(AVec<'a, CrateScope<'a>>, usize), (usize, CrateScopeError<'a>)> {
-    let (solved, needs) = resolve_queue(crates, sysroot, sources, par, ready, leak_private, None, alloc)?;
+    resolve_by_records_in(crates, sysroot, sources, par, ready, leak_private, Form::InPlace, alloc)
+}
+
+/// [`resolve_by_records_with`] with each handed record read in `form`: the seam the two forms
+/// are tested equal at (tests/scope_record.rs).
+#[allow(clippy::too_many_arguments, reason = "the entry's arguments, the planted bug's switch and the form")]
+pub(crate) fn resolve_by_records_in<'a, S: SourceTexts<'a>, P: Par>(
+    crates: &[CrateInput<'a>],
+    sysroot: Sysroot,
+    sources: &S,
+    par: &P,
+    ready: &Ready<'_>,
+    leak_private: bool,
+    form: Form,
+    alloc: Alloc<'a>,
+) -> Result<(AVec<'a, CrateScope<'a>>, usize), (usize, CrateScopeError<'a>)> {
+    let (solved, needs) = resolve_queue(crates, sysroot, sources, par, ready, leak_private, None, form, alloc)?;
     let mut all = AVec::with_capacity_in(solved.len(), alloc);
     for (at, s) in solved.into_iter().enumerate() {
         match s {
@@ -1021,7 +881,7 @@ pub(crate) fn resolve_by_records_with<'a, S: SourceTexts<'a>, P: Par>(
 }
 
 #[allow(clippy::too_many_lines, reason = "one worker's loop: take, find or resolve with its Needs, publish")]
-#[allow(clippy::too_many_arguments, reason = "the entry's arguments, the planted bug's switch and the kept solves")]
+#[allow(clippy::too_many_arguments, reason = "the entry's arguments, the planted bug's switch, the kept solves and the form")]
 fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
     crates: &[CrateInput<'a>],
     sysroot: Sysroot,
@@ -1030,6 +890,7 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
     ready: &Ready<'_>,
     leak_private: bool,
     kept: Option<&dyn Kept>,
+    form: Form,
     alloc: Alloc<'a>,
 ) -> Result<(AVec<'a, Solved<'a>>, usize), (usize, CrateScopeError<'a>)> {
     let graph = crate::resolve::graph_of(crates, sysroot, alloc).map_err(|e| (0, CrateScopeError::Names(e)))?;
@@ -1252,8 +1113,8 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                 }
                 Solved::Solved(done)
             }) };
-            // The crate's exports record, decoded once here, outside the lock, and shared by
-            // every crate that reads it in this call: never once per reader.
+            // The crate's exports record, checked once here (rule 74), outside the lock, and
+            // handed to every crate that reads it in this call as it is: never once per reader.
             let result = result.and_then(|done| {
                 let own: &[u8] = match &done {
                     Solved::Solved(scope) => &scope.record,
@@ -1263,10 +1124,9 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                 par.stage(crate::task::Stage::Decode);
                 ready.hooks.decoding(at);
                 let bytes = crate::resolve::aligned(own, alloc);
-                let decoded = read_record(bytes, alloc).map_err(|error| CrateScopeError::OwnRecord { krate: input.name, error })?;
+                let record = hand(form, bytes, alloc).map_err(|error| CrateScopeError::OwnRecord { krate: input.name, error })?;
                 ready.hooks.decoded(at, bytes.len());
-                let decoded: &'a DepScope<'a> = Box::leak(Box::new_in(decoded, alloc));
-                Ok((done, decoded, digest))
+                Ok((done, record, digest))
             });
             {
                 let mut q = locked(&queue);
@@ -1317,19 +1177,38 @@ pub(crate) fn resolve_crate_with<'a, S: SourceTexts<'a>, P: Par>(
     prepares: &'a Prepares<'a>,
     alloc: Alloc<'a>,
 ) -> Result<CrateScope<'a>, CrateScopeError<'a>> {
-    let mut decoded = AVec::with_capacity_in(deps.len(), alloc);
-    for (at, bytes) in deps.iter().enumerate() {
-        decoded.push(&*Box::leak(Box::new_in(read_record(bytes, alloc).map_err(|error| CrateScopeError::Record { at, error })?, alloc)));
-    }
-    resolve_crate_decoded(input, &decoded, sysroot, sources, source, par, leak_private, prepares, &crate::expansions::KeptExpansions::none(alloc), alloc)
+    let read = handed(Form::InPlace, deps, alloc)?;
+    resolve_crate_decoded(input, &read, sysroot, sources, source, par, leak_private, prepares, &crate::expansions::KeptExpansions::none(alloc), alloc)
 }
 
-/// [`resolve_crate_with`] given its dependencies' records already decoded: the ready queue
-/// decodes each record once for the whole call and gives every reader the same one.
+/// [`resolve_crate`] given its dependencies' exports records already checked, each proof made
+/// once where its bytes entered the process (a wave's mapped record: blaze-cli engine_names)
+/// and handed to every dependent of the request: opening one is O(1) and allocates one small
+/// box, nothing per table, module or name.
+#[allow(clippy::too_many_arguments, reason = "the entry's arguments, each named")]
+pub fn resolve_crate_verified<'a, S: SourceTexts<'a>, P: Par>(
+    input: &CrateInput<'a>,
+    deps: &[Verified<'a>],
+    sysroot: Sysroot,
+    sources: &S,
+    source: usize,
+    par: &P,
+    prepares: &'a Prepares<'a>,
+    alloc: Alloc<'a>,
+) -> Result<CrateScope<'a>, CrateScopeError<'a>> {
+    let mut handed = AVec::with_capacity_in(deps.len(), alloc);
+    for proof in deps {
+        handed.push(Dep::InPlace(Box::leak(Box::new_in(DepRecord::open(*proof), alloc))));
+    }
+    resolve_crate_decoded(input, &handed, sysroot, sources, source, par, false, prepares, &crate::expansions::KeptExpansions::none(alloc), alloc)
+}
+
+/// [`resolve_crate_with`] given its dependencies' records already handed: the ready queue
+/// checks each record once for the whole call and gives every reader the same one.
 #[allow(clippy::too_many_arguments, reason = "the entry's arguments and the planted bug's switch")]
 fn resolve_crate_decoded<'a, S: SourceTexts<'a>, P: Par>(
     input: &CrateInput<'a>,
-    deps: &[&'a DepScope<'a>],
+    deps: &[Dep<'a>],
     sysroot: Sysroot,
     sources: &S,
     source: usize,
@@ -1367,10 +1246,7 @@ pub fn resolve_members<'a, S: SourceTexts<'a>, P: Par>(
     members: crate::cells::Members<'_>,
     alloc: Alloc<'a>,
 ) -> Result<crate::cells::Solved<'a>, CrateScopeError<'a>> {
-    let mut decoded = AVec::with_capacity_in(deps.len(), alloc);
-    for (at, bytes) in deps.iter().enumerate() {
-        decoded.push(&*Box::leak(Box::new_in(read_record(bytes, alloc).map_err(|error| CrateScopeError::Record { at, error })?, alloc)));
-    }
+    let decoded = handed(Form::InPlace, deps, alloc)?;
     let prepares = Prepares::new_in(alloc);
     let par = OfMembers { par, members };
     let kept = crate::expansions::KeptExpansions::none(alloc);
@@ -1506,16 +1382,6 @@ pub fn block_scopes_differential<'a, S: SourceTexts<'a>, P: Par>(
     block_scopes_bodies_side(&modules, input, deps, sysroot, sources, source, par, prepares, alloc)
 }
 
-/// `deps` decoded in `alloc`, each kept as long as it.
-fn decoded_deps<'a>(deps: &[&'a [u8]], alloc: Alloc<'a>) -> Result<AVec<'a, &'a DepScope<'a>>, CrateScopeError<'a>> {
-    let mut decoded = AVec::with_capacity_in(deps.len(), alloc);
-    for (at, bytes) in deps.iter().enumerate() {
-        let record = read_record(bytes, alloc).map_err(|error| CrateScopeError::Record { at, error })?;
-        decoded.push(&*Box::leak(Box::new_in(record, alloc)));
-    }
-    Ok(decoded)
-}
-
 /// The `Modules` half of [`block_scopes_differential`]: the crate solved under
 /// `BlockScopes::Modules` in `alloc`, and what the comparison reads of it (its impl rows, their
 /// modules' chains, its headers) copied into `out` ([`crate::body_scope::ModulesSide`]). The
@@ -1535,7 +1401,7 @@ pub fn block_scopes_modules_side<'a, 'o, S: SourceTexts<'a>, P: Par>(
     use crate::body_scope::{DifferentialError, ModulesSide};
     use crate::surface::BlockScopes;
 
-    let decoded = decoded_deps(deps, alloc).map_err(DifferentialError::Names)?;
+    let decoded = handed(Form::InPlace, deps, alloc).map_err(DifferentialError::Names)?;
     let kept = crate::expansions::KeptExpansions::none(alloc);
     let modules_par = Strategy { par, scopes: BlockScopes::Modules };
     let (side, _) = with_names(input, &decoded, sysroot, sources, source, &modules_par, prepares, &kept, alloc, |names, _| Ok(ModulesSide::of(&names, alloc, out))).map_err(DifferentialError::Names)?;
@@ -1561,7 +1427,7 @@ pub fn block_scopes_bodies_side<'a, 'o: 'a, S: SourceTexts<'a>, P: Par>(
     use crate::body_scope::{BodyScope, BodyScopeRefusal, DifferentialError};
     use crate::surface::BlockScopes;
 
-    let decoded = decoded_deps(deps, alloc).map_err(DifferentialError::Names)?;
+    let decoded = handed(Form::InPlace, deps, alloc).map_err(DifferentialError::Names)?;
     let kept = crate::expansions::KeptExpansions::none(alloc);
     let leak = |names: CrateNames<'a>| -> &'a CrateNames<'a> { Box::leak(Box::new_in(names, alloc)) };
 
@@ -1626,7 +1492,7 @@ pub fn block_scopes_bodies_side<'a, 'o: 'a, S: SourceTexts<'a>, P: Par>(
 #[allow(clippy::too_many_arguments, reason = "the entry's arguments, each named")]
 fn with_names<'a, S: SourceTexts<'a>, P: Par, R>(
     input: &CrateInput<'a>,
-    deps: &[&'a DepScope<'a>],
+    deps: &[Dep<'a>],
     sysroot: Sysroot,
     sources: &S,
     source: usize,
@@ -1640,11 +1506,11 @@ fn with_names<'a, S: SourceTexts<'a>, P: Par, R>(
     let mut by_prefix = HashMap::new_in(alloc);
     let mut graph_crates = AVec::with_capacity_in(deps.len() + 1, alloc);
     for (at, &d) in deps.iter().enumerate() {
-        by_prefix.insert(d.key.prefix(), at);
-        slots.push(Some(Dep::Record(d)));
+        by_prefix.insert(d.key().prefix(), at);
+        slots.push(Some(d));
         graph_crates.push(GraphCrate {
-            name: d.name,
-            edition: d.edition,
+            name: d.name(),
+            edition: d.edition(),
             implicit: input.implicit,
             features: AVec::new_in(alloc),
             cfg: AVec::new_in(alloc),
@@ -1653,7 +1519,7 @@ fn with_names<'a, S: SourceTexts<'a>, P: Par, R>(
     }
     let mut need = AVec::new_in(alloc);
     for d in slots.iter().flatten() {
-        need.extend(d.reaches().iter().filter(|k| !by_prefix.contains_key(&k.prefix())).copied());
+        need.extend(d.reaches().iter().filter(|k| !by_prefix.contains_key(&k.prefix())));
     }
     if !need.is_empty() {
         need.sort_unstable();

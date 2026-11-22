@@ -35,6 +35,17 @@ pub trait ExpandCx {
     /// The call's position, asked only for a call in eager input ([`crate::Inside::EagerInput`]).
     fn place(&self, what: PlaceOf) -> Result<Place<'_>, HostError>;
 
+    /// [`Self::place`] for the call written at byte `call` of the text this host was made for
+    /// (item-relative, rule 71): a host made for a whole body, which holds many calls, is told
+    /// which one by its caller (blaze-lower by_name.rs `BodyCx`, the outermost WRITTEN call of
+    /// the eager input: core `line!`, "the first macro invocation leading up to the
+    /// expansion"). A host made for one call (blaze-scope's item host) already knows it: the
+    /// default is its `place`.
+    fn place_of_call(&self, what: PlaceOf, call: u32) -> Result<Place<'_>, HostError> {
+        let _ = call;
+        self.place(what)
+    }
+
     /// Runs the proc macro `def` on `call`, in its sandbox. Its output tokens come with their
     /// origins, one per token: an index of the input or attribute arguments it passed on, or
     /// made at `Span::call_site` ([`crate::Transparency::Transparent`]), `mixed_site`
@@ -210,6 +221,23 @@ pub enum PlaceOf {
     File,
     /// The path of its module, as `module_path!()` prints it.
     ModulePath,
+}
+
+impl PlaceOf {
+    /// The line or the column (`self` is [`PlaceOf::Line`] or [`PlaceOf::Column`]) of byte `at`
+    /// of `text`, the ONE count a host answers them by: the line from 1, the column from 1 in
+    /// characters past the line's start (core `line!`, `column!`: "1-based ... counted in
+    /// UTF-8 characters"). `None`: `at` is past `text` or inside a character, or `self` is no
+    /// number.
+    pub fn counted(self, text: &str, at: usize) -> Option<u32> {
+        let before = text.get(..at)?;
+        let number = match self {
+            PlaceOf::Line => before.bytes().filter(|b| *b == b'\n').count() + 1,
+            PlaceOf::Column => before[before.rfind('\n').map_or(0, |n| n + 1)..].chars().count() + 1,
+            PlaceOf::File | PlaceOf::ModulePath => return None,
+        };
+        u32::try_from(number).ok()
+    }
 }
 
 /// The answer to a [`PlaceOf`].

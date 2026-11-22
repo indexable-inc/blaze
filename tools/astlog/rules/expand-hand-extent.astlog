@@ -1,0 +1,22 @@
+;; expand-hand-extent: a `','`, `'<'` or `'>'` character literal in blaze-expand's sources outside
+;; extent.rs. That is how a hand walk finds where a field, variant, generic parameter, argument
+;; or meta ends: by counting commas outside groups, or `<` and `>` as if they were delimiters. No
+;; Rust element is delimited so (`HashMap<K, V>`, `f::<A, B>()`, `|a, b| a` and `T = HashMap<K, V>`
+;; each hold a comma and end no element there). Two such walks were today's two bugs:
+;; item.rs `element_end` on reth's `ChainHardforks` (t1545) and builtin.rs `cfg_select!` on a
+;; turbofish (t1800). Every extent comes from crates/blaze-expand/src/extent.rs, the parser's
+;; reading (end-state.md D167(d): one walk per syntax).
+;;
+;; A site that matches one of these characters for another reason says why on an
+;; `astlog-ignore: expand-hand-extent` comment: the macro language's own separators
+;; (`$(..),*`), a token the expansion writes, or a walk not yet moved onto extent.rs, named as
+;; LEFT.
+(rule (expand-hand-extent c)
+  (match rust "(char_literal) @c")
+  (text-match c "^'[,<>]'$")
+  (file-path c p)
+  (text-match p "(^|/)crates/blaze-expand/src/")
+  (not (text-match p "/extent[.]rs$")))
+
+(lint expand-hand-extent error
+  "a `,`, `<` or `>` matched in blaze-expand outside extent.rs: an element's extent is the parser's (crate::extent::Words::extent, Words::list, extent::item); count no commas or angles by hand")

@@ -17,11 +17,18 @@
 //! follows a found record to what it calls. A producer fills them with [`declare`] before the
 //! seal; the tiers' emitters leave them empty (their caller holds the names).
 //!
+//! New in `bzcode08` (the columns blaze-code's `bzcode07` has and this form lacked, so one form
+//! serves the run path: D195): the TRAP ROWS (blaze-code `TrapRow`, with their held values and
+//! subjects), each part's PLACEMENT ALIGNMENT (`code_align`, `relro_align`) and the
+//! SOURCE-POSITION SLOTS (blaze-code `PositionRow`, filled at placement). The number skips
+//! `04`..`07`, blaze-code's, so one number never names two layouts and a `bzcode07` record read
+//! here is refused as an older form.
+//!
 //! Positions are item-relative (rule 71): code offsets from the record's first code byte, spans
 //! as byte ranges in the item's text, values by LIR index. Sorted at the boundary (rule 25), as
 //! each row's documentation says; the seal refuses an unsorted list by name.
 
-use blaze_code::record::{Pad, Symbol, Target, Word};
+use blaze_code::record::{LEAST_CODE_ALIGN, LEAST_RELRO_ALIGN, Pad, PositionRow, Symbol, Target, TrapRow, Word};
 use blaze_code::unwind::{Frame, Row};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_run::InstanceKey;
@@ -36,7 +43,7 @@ mod v1;
 
 pub use declared::{Declare, Declared, DeclaredKind, DeclaredRow, Declares, declare};
 pub use form::{FormError, MAGIC, RecordView, Sealed, encode, read, seal};
-pub use place::{calls, page_offset, place};
+pub use place::{calls, page_offset, place, place_resolved};
 pub use v1::from_v1;
 
 #[cfg(test)]
@@ -173,6 +180,24 @@ pub struct Emitted<'a> {
     /// sorts them by symbol and refuses any that disagree with the targets.
     pub declared: AVec<'a, DeclaredRow>,
     pub text: AVec<'a, u8>,
+    /// log2 of the alignment the code's first byte is placed at: the most the code's own data
+    /// rows ask (each row's offset in `code` a multiple of its alignment), from
+    /// [`LEAST_CODE_ALIGN`] to blaze-code's `MOST_PART_ALIGN`. The placer refuses an address
+    /// that does not honour it (place.rs).
+    pub code_align: u8,
+    /// log2 of the alignment the relro part's first byte is placed at, as `code_align` for its
+    /// rows; at least [`LEAST_RELRO_ALIGN`].
+    pub relro_align: u8,
+    /// Per `unreachable`'s `brk`, the construct it ends (blaze-code record.rs `TrapRow`: its
+    /// item-relative site, where the switched value is held, the enum read): what the run's
+    /// fault report names. In any order; the seal sorts them by offset.
+    pub traps: AVec<'a, TrapRow>,
+    /// Each four-byte SOURCE-POSITION SLOT of the code's or relro part's own data (blaze-code
+    /// record.rs `PositionRow`: `line!()`/`column!()` of an item-relative site, rule 71): zero
+    /// in the record, filled by the placer with the run's answer (place.rs `place_resolved`),
+    /// so no line or column is in a record's bytes or key. In any order; the seal sorts them by
+    /// (part, offset).
+    pub position_slots: AVec<'a, PositionRow>,
 }
 
 impl<'a> Emitted<'a> {
@@ -197,6 +222,10 @@ impl<'a> Emitted<'a> {
             names: Vec::new_in(alloc),
             declared: Vec::new_in(alloc),
             text: Vec::new_in(alloc),
+            code_align: LEAST_CODE_ALIGN,
+            relro_align: LEAST_RELRO_ALIGN,
+            traps: Vec::new_in(alloc),
+            position_slots: Vec::new_in(alloc),
         }
     }
 

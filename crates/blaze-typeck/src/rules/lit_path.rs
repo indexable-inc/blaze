@@ -813,33 +813,17 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         // its answer for "any type" would list every inherent impl whose self type it could
         // not read, and one refused header there made every `T::NAME` a gap.
         let nominal = self.shape(self_ty).filter(|s| !matches!(s, Shape::Param));
-        if let Some(shape) = nominal {
-            let cands = self.reads.inherent(shape, seg.name)?;
-            let mut found: Option<(ItemKey, ItemKey, AssocKind)> = None;
-            let mut count = 0u32;
-            // An item listed twice counts once (a handful of candidates: the scan is short).
-            for (i, cand) in cands.iter().enumerate() {
-                if cands[..i].iter().any(|c| c.item == cand.item) {
-                    continue;
-                }
-                if self.impl_applies(cand.container, self_ty)? {
-                    count += 1;
-                    if found.is_none() {
-                        found = Some((cand.container, cand.item, cand.kind));
-                    }
-                }
-            }
-            if count > 1 {
-                self.diag(DiagCode::AmbiguousMethod, at, About::found_named(self_ty, seg.name));
-                return Ok(self.common.err);
-            }
-            if let Some((imp, item, kind)) = found {
-                let Some(impl_args) = self.impl_args(imp, self_ty, at.cause())? else {
-                    self.diag(DiagCode::NoMethod, at, About::found_named(self_ty, seg.name));
-                    return Ok(self.common.err);
-                };
-                return self.assoc_item_ty(at, cause, item, kind, impl_args, Some(seg));
-            }
+        // rustc's `pick_core` for a path too (probe.rs, `Mode::Path` takes the same `pick`): an
+        // inherent item unstable under a feature this crate does not turn on is left out first,
+        // and taken only when neither an inherent item nor a trait's is picked without it.
+        // turso's `DynVec::try_with_capacity_in(n, alloc)` (`DynVec<T> = Vec<T>`): std's
+        // `#[unstable(feature = "allocator_ext", implied_by = "allocator_api")]` inherent fn is
+        // left out, and the in-scope `TursoVecInExt::try_with_capacity_in` is the pick.
+        let mut left_out = false;
+        if let Some(shape) = nominal
+            && let Some(t) = self.inherent_value(at, cause, self_ty, seg, shape, true, &mut left_out)?
+        {
+            return Ok(t);
         }
         // Trait candidates, in two tiers: the traits of a parameter's bounds come before the
         // rest (the Reference, "Method call expressions": "If `T` is a type parameter, methods
@@ -884,8 +868,62 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 return self.assoc_item_ty(at, cause, item, kind, trait_args, Some(seg));
             }
         }
+        // The second pass ("consider unstable candidates if not found"): only the inherent
+        // items change, and only when the first left one out.
+        if left_out
+            && let Some(shape) = nominal
+            && let Some(t) = self.inherent_value(at, cause, self_ty, seg, shape, false, &mut left_out)?
+        {
+            return Ok(t);
+        }
         self.diag(DiagCode::NoMethod, at, About::found_named(self_ty, seg.name));
         Ok(self.common.err)
+    }
+
+    /// `T::name`'s inherent items (of the nominal `shape`): the one that applies, its type;
+    /// two is E0034 (the error, then `Some`); none, `None`. With `stable_only`, an applicable
+    /// item unstable under a feature this crate does not turn on ([`World::member_unstable`])
+    /// is not counted, and `left_out` is set (rustc's first pass, `consider_candidates`).
+    #[allow(clippy::too_many_arguments)]
+    fn inherent_value(
+        &mut self,
+        at: At,
+        cause: Cause,
+        self_ty: Ty,
+        seg: Segment,
+        shape: Shape,
+        stable_only: bool,
+        left_out: &mut bool,
+    ) -> Result<Option<Ty>, Stop> {
+        let cands = self.reads.inherent(shape, seg.name)?;
+        let mut found: Option<(ItemKey, ItemKey, AssocKind)> = None;
+        let mut count = 0u32;
+        // An item listed twice counts once (a handful of candidates: the scan is short).
+        for (i, cand) in cands.iter().enumerate() {
+            if cands[..i].iter().any(|c| c.item == cand.item) {
+                continue;
+            }
+            if self.impl_applies(cand.container, self_ty)? {
+                if stable_only && self.reads.member_unstable(cand.container, seg.name)? {
+                    *left_out = true;
+                    continue;
+                }
+                count += 1;
+                if found.is_none() {
+                    found = Some((cand.container, cand.item, cand.kind));
+                }
+            }
+        }
+        if count > 1 {
+            self.diag(DiagCode::AmbiguousMethod, at, About::found_named(self_ty, seg.name));
+            return Ok(Some(self.common.err));
+        }
+        let Some((imp, item, kind)) = found else { return Ok(None) };
+        let Some(impl_args) = self.impl_args(imp, self_ty, at.cause())? else {
+            self.diag(DiagCode::NoMethod, at, About::found_named(self_ty, seg.name));
+            return Ok(Some(self.common.err));
+        };
+        self.assoc_item_ty(at, cause, item, kind, impl_args, Some(seg)).map(Some)
     }
 
     /// The variant `seg` of the enum `self_ty` is, as a value at the enum's own arguments

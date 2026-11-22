@@ -48,7 +48,9 @@
 //!
 //! The section sizes do not depend on addresses (every pointer has a fixed width), so
 //! [`eh_room`] measures them before layout by writing them for the functions laid end to end,
-//! and the layout keeps that many bytes between the code and the const region.
+//! and the layout keeps that many bytes between the code and the const region
+//! (`Laid::tables_room`); [`eh_sections`] refuses, in every build, tables that end past it
+//! (`ROOM_SLACK` says why the measure is an upper bound).
 
 use blaze_code::eh::{self, CFA_DEF_CFA, CFA_NOP, CODE_ALIGN, DATA_ALIGN};
 use blaze_code::record::Symbol;
@@ -79,9 +81,20 @@ const DWARF_OFFSET: u32 = 0x00ff_ffff;
 const MODE_MASK: u32 = 0x0f00_0000;
 /// The page a native image's stand-in place is rounded to while the room is measured.
 const NATIVE_PAGE: u64 = 0x4000;
-/// What alignment can add between [`eh_room`]'s measure and the real sections: the start's
-/// 8-alignment after the code (up to 7) and two 4-alignments (up to 3 each), rounded up.
-const ROOM_SLACK: u64 = 16;
+/// The alignment of the first table (`eh_frame`'s entries are 8-byte multiples) after the code.
+const TABLES_ALIGN: u64 = 8;
+/// The alignment of `except_tab` and of the index after the table before each.
+const TABLE_ALIGN: u64 = 4;
+/// What the real sections can take past [`eh_room`]'s measure: only the start's 8-alignment
+/// after the code (up to 7 bytes). The measure and the real tables both start 8-aligned, so the
+/// two 4-alignments inside them ([`TABLE_ALIGN`] divides [`TABLES_ALIGN`]) fall alike and are
+/// already in the measured length; the measure counts every function the layout can place, and
+/// a subset (folded or dropped functions) is never longer: each table's length is a sum over
+/// functions, `except_tab`'s padded tail is taken up by the index's 4-alignment either way, and
+/// the Rust rows reach each other in `__unwind_info` (one entry each, no gap entries between
+/// them). [`eh_sections`] refuses tables past the measure by type ([`ExportError::EhRoom`]).
+const ROOM_SLACK: u64 = TABLES_ALIGN - 1;
+const _: () = assert!(TABLES_ALIGN % TABLE_ALIGN == 0, "the measure's 4-alignments match the real ones only on an 8-aligned start");
 
 /// The tables of one exported file, each at its image offset in the code segment, in this
 /// order: `eh_frame`, `except_tab`, then `unwind_info` (Mach-O) or `eh_frame_hdr` (ELF). The
@@ -247,7 +260,7 @@ fn cie(f: &mut AVec<'_, u8>, personality: Option<u64>, patches: &mut AVec<'_, (u
 }
 
 /// The tables for `covered` (sorted by address), the personality routine at `personality_at`,
-/// the first table at `at` (8-aligned).
+/// the first table at `at` ([`TABLES_ALIGN`]-aligned).
 fn tables<'a>(
     covered: &[Covered<'_>],
     personality_at: Option<u64>,
@@ -332,8 +345,8 @@ fn tables<'a>(
     f.extend_from_slice(&[0; 4]);
 
     let eh_frame_at = at;
-    let except_tab_at = up(eh_frame_at + f.len() as u64, 4);
-    let index_at = up(except_tab_at + except.len() as u64, 4);
+    let except_tab_at = up(eh_frame_at + f.len() as u64, TABLE_ALIGN);
+    let index_at = up(except_tab_at + except.len() as u64, TABLE_ALIGN);
     for &(field, to) in patches.iter() {
         let target = match to {
             PatchTo::Image(image) => image,
@@ -496,11 +509,23 @@ pub fn eh_room_with<'a>(functions: &[Member<'_>], personality: Option<Symbol>, p
         covered.push(Covered { symbol: f.symbol, at, unwind });
         at += u64::from(unwind.code_len());
     }
-    let base = up(at, 8);
+    let base = up(at, TABLES_ALIGN);
     let personality_at = personality.map(|_| 0);
     let standin = natives.map(|image| Outside { image, shift: up(base, NATIVE_PAGE) + NATIVE_PAGE });
     let measured = tables(&covered, personality_at, base, platform, standin.as_ref(), alloc)?;
     Ok(measured.end() - base + ROOM_SLACK)
+}
+
+/// The tables written for `laid` at their place after the code, refused unless they end within
+/// the room [`eh_room`] measured (`laid.tables_room`): the second pass's check, in every build,
+/// against the measure itself rather than the page `lay_out` rounded it up to (which would hide
+/// a measure that came out short by less than the rounding).
+fn within_room<'a>(laid: &Laid<'_, '_>, tables: EhSections<'a>) -> Result<EhSections<'a>, ExportError> {
+    let need = tables.end() - laid.text_end();
+    if need > laid.tables_room || tables.end() > laid.const_at {
+        return Err(ExportError::EhRoom { need, room: laid.tables_room.min(laid.const_at - laid.text_end()) });
+    }
+    Ok(tables)
 }
 
 /// The tables of the laid-out program: one entry per placed function that is not folded (a
@@ -551,12 +576,8 @@ pub fn eh_sections_with<'a>(
         covered.push(Covered { symbol: p.symbol, at: p.at, unwind });
     }
     covered.sort_unstable_by_key(|c| c.at);
-    let at = up(laid.text_end(), 8);
-    let tables = tables(&covered, personality_at, at, platform, outside, alloc)?;
-    if tables.end() > laid.const_at {
-        return Err(ExportError::EhRoom { need: tables.end() - laid.text_end(), room: laid.const_at - laid.text_end() });
-    }
-    Ok(tables)
+    let at = up(laid.text_end(), TABLES_ALIGN);
+    within_room(laid, tables(&covered, personality_at, at, platform, outside, alloc)?)
 }
 
 /// [`eh_room`] over rows already made one `Unwind` each (`(symbol, rows)`, each symbol once, in
@@ -570,7 +591,7 @@ pub fn eh_room_rows<'a>(functions: &[(Symbol, Unwind<'_>)], personality: Option<
         covered.push(Covered { symbol, at, unwind });
         at += u64::from(unwind.code_len());
     }
-    let base = up(at, 8);
+    let base = up(at, TABLES_ALIGN);
     let personality_at = personality.map(|_| 0);
     let measured = tables(&covered, personality_at, base, platform, None, alloc)?;
     Ok(measured.end() - base + ROOM_SLACK)
@@ -608,12 +629,8 @@ pub fn eh_sections_rows<'a>(
         covered.push(Covered { symbol: p.symbol, at: p.at, unwind: functions[by_symbol[k] as usize].1 });
     }
     covered.sort_unstable_by_key(|c| c.at);
-    let at = up(laid.text_end(), 8);
-    let tables = tables(&covered, personality_at, at, platform, None, alloc)?;
-    if tables.end() > laid.const_at {
-        return Err(ExportError::EhRoom { need: tables.end() - laid.text_end(), room: laid.const_at - laid.text_end() });
-    }
-    Ok(tables)
+    let at = up(laid.text_end(), TABLES_ALIGN);
+    within_room(laid, tables(&covered, personality_at, at, platform, None, alloc)?)
 }
 
 #[cfg(test)]

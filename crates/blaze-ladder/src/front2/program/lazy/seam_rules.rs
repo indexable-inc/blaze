@@ -25,6 +25,7 @@ use crate::front2::keys::Keys;
 use crate::front2::program::head_abi::BuildAbi;
 use crate::front2::source::NamesSource;
 use crate::seam::PositionGap;
+use blaze_build::SiteGap;
 
 mod local_position;
 mod position_source;
@@ -187,23 +188,27 @@ pub(in crate::front2::program) fn track_caller_from<'n, S: NamesSource<'n>>(
 /// text and its item-relative byte. The lowering maps an in-body expansion to
 /// its outermost invocation. For a whole generated item placement follows the
 /// item-producing invocation, so the byte within that invocation is zero.
-pub(in crate::front2::program) fn caller_site<'n, S: PositionSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, owner: ItemKey, body: &Body<'_>, expr: ExprId) -> Option<blaze_build::CallerSite<'n>> {
-    let offset = expr_offset(body, expr)?;
+/// Each step that finds no fact is its own [`SiteGap`], named for `owner` (rule 19).
+pub(in crate::front2::program) fn caller_site<'n, S: PositionSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, owner: ItemKey, body: &Body<'_>, expr: ExprId) -> Result<blaze_build::CallerSite<'n>, SiteGap> {
+    let offset = expr_offset(body, expr).ok_or(SiteGap::NoRange { owner, expr })?;
     let point = body_anchor(names, keys, store, owner, offset)?;
-    let (krate, file, first) = point.anchor.placement(names, store.tys.alloc()).ok()?;
+    let (krate, file, first) = point.anchor.placement(names, store.tys.alloc()).map_err(|gap| SiteGap::Placement { item: owner, gap })?;
+    let clash = |_| SiteGap::KeyClash { item: owner };
     let (item, offset) = match (first, point.local) {
-        (Start::Invocation(_) | Start::MemberInvocation(..), _) => (keys.item(point.anchor.lib()).ok()?, 0),
+        (Start::Invocation(_) | Start::MemberInvocation(..), _) => (keys.item(point.anchor.lib()).map_err(clash)?, 0),
         (_, Some((live, relative))) => {
-            let declaration = point.offset.checked_sub(relative)?;
+            let declaration = point.offset.checked_sub(relative).ok_or(SiteGap::BeforeDeclaration { item: owner, offset: point.offset, first: relative })?;
             // The site counts from the declaration's first token (local_position.rs
             // `first_token`: past a doc comment), as `source_position` and the cold reading
             // read it.
-            let (source, first) = local_position::key_at(names, krate, point.anchor, declaration, store.tys.alloc()).ok()?;
-            (keys.file_source_local(source, live).ok()?, point.offset.checked_sub(first)?)
+            let (source, first) = local_position::key_at(names, krate, point.anchor, declaration, store.tys.alloc()).map_err(|gap| SiteGap::Placement { item: owner, gap })?;
+            let local = keys.file_source_local(source, live).map_err(|_| SiteGap::LocalKey { item: owner, declaration })?;
+            (local, point.offset.checked_sub(first).ok_or(SiteGap::BeforeDeclaration { item: owner, offset: point.offset, first })?)
         }
-        (_, None) => (keys.item(point.anchor.lib()).ok()?, point.offset),
+        (_, None) => (keys.item(point.anchor.lib()).map_err(clash)?, point.offset),
     };
-    Some(blaze_build::CallerSite { file: names.file_shown(krate, file)?, item, offset })
+    let file = names.file_shown(krate, file).ok_or(SiteGap::NoShownFile { item: owner, krate, file })?;
+    Ok(blaze_build::CallerSite { file, item, offset })
 }
 
 /// THE DEFINITION-SITE RULE (blaze-build `Adts::def_site`): where fn `item` is defined, in
@@ -215,26 +220,29 @@ pub(in crate::front2::program) fn caller_site<'n, S: PositionSource<'n>>(names: 
 /// `#[doc]`), its visibility included. Counted as [`caller_site`] counts: from the item's
 /// text, or for a written local from its declaration's first token; a fn a macro call writes
 /// whole is placed at the call (byte 0), as [`caller_site`] places its expressions.
-pub(in crate::front2::program) fn def_site<'n, S: PositionSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: ItemKey) -> Option<blaze_build::CallerSite<'n>> {
+pub(in crate::front2::program) fn def_site<'n, S: PositionSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: ItemKey) -> Result<blaze_build::CallerSite<'n>, SiteGap> {
     let point = body_anchor(names, keys, store, item, 0)?;
-    let (krate, file, first) = point.anchor.placement(names, store.tys.alloc()).ok()?;
-    let file = names.file_shown(krate, file)?;
+    let (krate, file, first) = point.anchor.placement(names, store.tys.alloc()).map_err(|gap| SiteGap::Placement { item, gap })?;
+    let file = names.file_shown(krate, file).ok_or(SiteGap::NoShownFile { item, krate, file })?;
+    let clash = |_| SiteGap::KeyClash { item };
     if let Start::Invocation(_) | Start::MemberInvocation(..) = first {
-        return Some(blaze_build::CallerSite { file, item: keys.item(point.anchor.lib()).ok()?, offset: 0 });
+        return Ok(blaze_build::CallerSite { file, item: keys.item(point.anchor.lib()).map_err(clash)?, offset: 0 });
     }
-    let text = point.anchor.text(names)?;
-    let edition = names.edition_of(krate)?;
+    let text = point.anchor.text(names).ok_or(SiteGap::NoText { item })?;
+    let edition = names.edition_of(krate).ok_or(SiteGap::NoEdition { item, krate })?;
     let alloc = store.tys.alloc();
+    let past = SiteGap::PastAttributes { item };
     match point.local {
         None => {
-            let at = past_outer_attributes(text, point.offset, edition, alloc)?;
-            Some(blaze_build::CallerSite { file, item: keys.item(point.anchor.lib()).ok()?, offset: at })
+            let at = past_outer_attributes(text, point.offset, edition, alloc).ok_or(past)?;
+            Ok(blaze_build::CallerSite { file, item: keys.item(point.anchor.lib()).map_err(clash)?, offset: at })
         }
         Some((live, relative)) => {
-            let declaration = point.offset.checked_sub(relative)?;
-            let (source, first) = local_position::key_at(names, krate, point.anchor, declaration, alloc).ok()?;
-            let at = past_outer_attributes(text, first, edition, alloc)?;
-            Some(blaze_build::CallerSite { file, item: keys.file_source_local(source, live).ok()?, offset: at.checked_sub(first)? })
+            let declaration = point.offset.checked_sub(relative).ok_or(SiteGap::BeforeDeclaration { item, offset: point.offset, first: relative })?;
+            let (source, first) = local_position::key_at(names, krate, point.anchor, declaration, alloc).map_err(|gap| SiteGap::Placement { item, gap })?;
+            let at = past_outer_attributes(text, first, edition, alloc).ok_or(past)?;
+            let local = keys.file_source_local(source, live).map_err(|_| SiteGap::LocalKey { item, declaration })?;
+            Ok(blaze_build::CallerSite { file, item: local, offset: at.checked_sub(first).ok_or(SiteGap::BeforeDeclaration { item, offset: at, first })? })
         }
     }
 }
@@ -404,6 +412,9 @@ impl<'n> Anchor<'n> {
         let krate = names.crate_of(self.lib()).ok_or(PositionGap::NoItem)?;
         let mut anchor = self;
         let mut expanded = false;
+        // A call's site in `anchor`'s own text, when the outermost call met so far is written
+        // in a block of `anchor`'s body (`local_position::block_call_site`).
+        let mut invoked: Option<u32> = None;
         let mut copied = AVec::new_in(alloc);
         for _ in 0..=crate::front2::expansion_origin::MOST_LEVELS {
             let (at, start) = match anchor {
@@ -435,6 +446,11 @@ impl<'n> Anchor<'n> {
                         }
                         Start::Copied(first, body)
                     };
+                    if let Some(at) = invoked {
+                        let text = names.file_text(krate, file).ok_or(PositionGap::NoFile)?;
+                        let first = start.byte(names, krate, text, alloc)?;
+                        return Ok((krate, file, Start::Invocation(first.checked_add(at).ok_or(PositionGap::PastText)?)));
+                    }
                     return Ok((krate, file, if expanded { start.invocation() } else { start }));
                 }
                 TextAt::Expansion(call) => call,
@@ -451,17 +467,33 @@ impl<'n> Anchor<'n> {
                 continue;
             } else {
                 let mut call = call;
+                let mut in_body = None;
                 for _ in 0..crate::front2::expansion_origin::MOST_LEVELS {
                     let origin = names.call_origin(krate, call).map_err(|_| PositionGap::NoFile)?;
                     match origin.view.text {
                         TextAt::File(file) => return Ok((krate, file, Start::Invocation(invoked_at(&origin, alloc)?))),
-                        TextAt::Expansion(parent) => call = parent,
+                        // A call written in a block of a body is in the module text of the
+                        // body's blocks, which no call wrote (it has no origins): its site is
+                        // placed in the body's own text, and the body is placed as any item.
+                        TextAt::Expansion(parent) => match local_position::block_call_site(names, krate, parent, origin.text, || invoked_at(&origin, alloc), alloc)? {
+                            Some(site) => {
+                                in_body = Some(site);
+                                break;
+                            }
+                            None => call = parent,
+                        },
                     }
                 }
-                return Err(PositionGap::NoFile);
+                let (body, at) = in_body.ok_or(PositionGap::NoFile)?;
+                anchor = body;
+                invoked = Some(at);
+                copied.clear();
+                continue;
             }
             copied.clear();
             expanded = true;
+            // The calling item is itself written by a call: the outermost call is its site.
+            invoked = None;
         }
         Err(PositionGap::NoFile)
     }
@@ -516,16 +548,22 @@ struct BodySite<'n> {
     local: Option<(ItemKey, u32)>,
 }
 
-fn body_anchor<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, mut owner: ItemKey, mut offset: u32) -> Option<BodySite<'n>> {
+/// Each step that finds no fact is its own [`SiteGap`] (rule 19). The enclosing heads are the
+/// ones the make asks up front (the seam's `site_heads`, fill.rs `site_heads_asked`), so
+/// [`SiteGap::NoEnclosingRow`] is a head that ask could not serve, never one this program
+/// happened not to check before.
+fn body_anchor<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, mut owner: ItemKey, mut offset: u32) -> Result<BodySite<'n>, SiteGap> {
+    let asked = owner;
     let mut leaf = None;
     for _ in 0..=store.locals.kept() {
         if let Some(local) = store.locals.head(owner) {
-            let enclosing = store.fns.get(&local.enclosing)?.text;
+            let enclosing = store.fns.get(&local.enclosing).ok_or(SiteGap::NoEnclosingRow { local: owner, enclosing: local.enclosing })?.text;
             let range = local.range;
-            let written = enclosing.get(range.start as usize..range.end as usize)?;
+            let outside = SiteGap::LocalOutsideEnclosing { local: owner };
+            let written = enclosing.get(range.start as usize..range.end as usize).ok_or(outside)?;
             if written == local.text {
                 leaf.get_or_insert((owner, offset));
-                offset = range.start.checked_add(offset)?;
+                offset = range.start.checked_add(offset).ok_or(outside)?;
             } else {
                 leaf = None;
                 offset = range.start;
@@ -535,19 +573,23 @@ fn body_anchor<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>,
         }
         let anchor = match keys.origin(owner) {
             Some(crate::front2::keys::Origin::Member { .. }) => {
-                let (container, row) = keys.source_member(names, owner, store.fns.get(&owner)?.text)?;
+                let text = store.fns.get(&owner).ok_or(SiteGap::NoRow { item: owner })?.text;
+                let (container, row) = keys.source_member(names, owner, text).ok_or(SiteGap::NoMemberRow { owner })?;
                 Anchor::Member { container, row }
             }
-            _ => Anchor::from_lib(names, keys.library_in(names, owner)?)?,
+            _ => {
+                let lib = keys.library_in(names, owner).ok_or(SiteGap::NoLibrary { owner })?;
+                Anchor::from_lib(names, lib).ok_or(SiteGap::NoAnchor { item: owner })?
+            }
         };
-        return Some(BodySite { anchor, offset, local: leaf });
+        return Ok(BodySite { anchor, offset, local: leaf });
     }
-    None
+    Err(SiteGap::TooDeep { owner: asked, kept: store.locals.kept() })
 }
 
 /// The file of a trap row's body owner. The trap always keeps a body-relative offset.
 pub(in crate::front2::program) fn item_file<'n, S: PositionSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: ItemKey) -> Option<&'n str> {
-    let point = body_anchor(names, keys, store, item, 0)?;
+    let point = body_anchor(names, keys, store, item, 0).ok()?;
     let (krate, file, _) = point.anchor.placement(names, store.tys.alloc()).ok()?;
     names.file_shown(krate, file)
 }
@@ -565,14 +607,14 @@ pub(in crate::front2::program) fn source_position<'n, S: PositionSource<'n>>(nam
         // A written local's source key (`caller_site`): its site counts from the declaration's
         // first token (local_position.rs `first_token`), which the live body's range (from its
         // first doc comment) need not start at.
-        let point = body_anchor(names, keys, store, live, 0).ok_or(PositionGap::NoItem)?;
+        let point = body_anchor(names, keys, store, live, 0).map_err(|_| PositionGap::NoItem)?;
         let (_, relative) = point.local.ok_or(PositionGap::NoItem)?;
         let declaration = point.offset.checked_sub(relative).ok_or(PositionGap::NoItem)?;
         let text = point.anchor.text(names).ok_or(PositionGap::NoItem)?;
         let first = local_position::first_token(text, declaration).ok_or(PositionGap::PastText)?;
         return position_in_file(names, point.anchor, first.checked_add(site).ok_or(PositionGap::PastText)?, store.tys.alloc());
     }
-    let point = body_anchor(names, keys, store, item, site).ok_or(PositionGap::NoItem)?;
+    let point = body_anchor(names, keys, store, item, site).map_err(|_| PositionGap::NoItem)?;
     position_in_file(names, point.anchor, point.offset, store.tys.alloc())
 }
 
@@ -684,6 +726,23 @@ impl<'n> Start<'n> {
             }
         }
     }
+}
+
+/// Where the body of the library item `lib` stands in its file, for `line!()`/`column!()` in
+/// eager input of its calls (front2 body_host.rs `Placed`): its crate, the file's whole text,
+/// the byte its calls count from, and whether EVERY call in it is at that byte. By
+/// [`Anchor::placement`], the rule a `#[track_caller]` `Location` is placed by (one answer in
+/// both): a free fn or a member written in a file, at its first byte, each call at its own
+/// byte after it; an item or a member a macro call wrote (a `macro_rules` call at module level,
+/// a derive, an attribute macro), at the OUTERMOST call's site, every call in it (core `line!`:
+/// "the first macro invocation leading up to the expansion of the `line!` macro"; rustc
+/// `expansion_cause`). Before (tempo a2015, 8590 lines): such a body had no place, and its
+/// `line!()` was refused (`HostError { ask: Place, why: Refused }`).
+pub fn body_place<'n, S: PositionSource<'n>>(names: S, lib: LibKey, alloc: Alloc<'_>) -> Result<(usize, &'n str, u32, bool), PositionGap> {
+    let (krate, file, start) = Anchor::from_lib(names, lib).ok_or(PositionGap::NoItem)?.placement(names, alloc)?;
+    let text = names.file_text(krate, file).ok_or(PositionGap::NoFile)?;
+    let at = start.byte(names, krate, text, alloc)?;
+    Ok((krate, text, at, matches!(start, Start::Invocation(_) | Start::MemberInvocation(..))))
 }
 
 fn position_in_file<'n, S: PositionSource<'n>>(names: S, anchor: Anchor<'n>, site: u32, alloc: Alloc<'_>) -> Result<(u32, u32), PositionGap> {

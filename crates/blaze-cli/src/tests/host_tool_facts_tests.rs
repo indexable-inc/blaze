@@ -391,7 +391,7 @@ exit 1
     fn saved_rows(io: &Io, cells: &ReadList) -> std::vec::Vec<u8> {
         let cx = io.cx(BUDGET, TASK_FRAME).unwrap();
         let mut rows = crate::sweep::Rows::new_in(cx.frame());
-        crate::engine_script_reads::keep_rows(None, cells.iter(), |_| true, &mut rows);
+        crate::engine_script_reads::keep_rows(None, cells.iter().map(|read| (read.kind, read.path.as_str(), read.answer)), |_| true, &mut rows);
         crate::sweep::Leaves::bytes_in(&rows, cx.frame()).unwrap().to_vec()
     }
 

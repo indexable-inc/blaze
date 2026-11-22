@@ -15,6 +15,7 @@
 //!     Soname { len: usize },                              // empty, or holds a NUL byte
 //!     TooLarge { what: &'static str, len: u64 },          // a field of the format too narrow
 //!     Shape { what: &'static str, at: u64 },              // the image breaks a promise of image.rs
+//!     Remeasured { what: &'static str, measured: u64, written: u64 }, // a size the writer named came out other
 //! }
 //! pub fn write<'a>(image: &Image<'a>, soname: &str, out: &mut AVec<'_, u8>, alloc: Alloc<'_>)
 //!     -> Result<(), SoError<'a>>;
@@ -96,6 +97,9 @@ pub enum SoError<'a> {
     TooLarge { what: &'static str, len: u64 },
     /// The image breaks a promise image.rs makes (`what`), at image address `at`.
     Shape { what: &'static str, at: u64 },
+    /// `what` came out at `written` where the writer had measured `measured` and already named
+    /// it in a header or `.dynamic`: a bug of this file's, refused in every build.
+    Remeasured { what: &'static str, measured: u64, written: u64 },
 }
 
 const SHDR: u64 = 64;
@@ -307,7 +311,9 @@ pub fn write<'a, 'b>(image: &Image<'a>, soname: &str, out: &mut AVec<'_, u8>, al
             return Err(shape("a fixup outside the writable file bytes, or not 8-aligned", f.at));
         }
         match f.to {
-            FixTo::Rebase { target } => {
+            FixTo::Rebase { address, high8 } => {
+                // RELATIVE's addend is the whole pointer, its tag included.
+                let target = address.tagged(high8);
                 let addend = i64::try_from(target).map_err(|_| SoError::TooLarge { what: "a rebase target in a 64-bit signed addend", len: target })?;
                 relative.push(Rela { at: f.at, info: R_AARCH64_RELATIVE, addend });
             }
@@ -517,7 +523,10 @@ pub fn write<'a, 'b>(image: &Image<'a>, soname: &str, out: &mut AVec<'_, u8>, al
         let name = intern(&mut shstr, name.as_bytes())?;
         sections.push(Shdr { region: None, name, kind, flags, addr, offset, size, link, info, align, entsize });
     }
-    debug_assert_eq!(sections.len() as u32, dynstr_index + 2);
+    // `.dynstr`'s index was named (in `.dynsym`'s and `.dynamic`'s `sh_link`) before it was pushed.
+    if sections.len() as u64 != u64::from(dynstr_index) + 2 {
+        return Err(SoError::Remeasured { what: "the section count before .shstrtab", measured: u64::from(dynstr_index) + 2, written: sections.len() as u64 });
+    }
     let shstr_index = sections.len();
     let shstr_name = intern(&mut shstr, b".shstrtab")?;
     let shstr_off = dyn_off + dyn_len;
@@ -594,7 +603,11 @@ pub fn write<'a, 'b>(image: &Image<'a>, soname: &str, out: &mut AVec<'_, u8>, al
     for s in sections.iter() {
         shdr(out, s);
     }
-    debug_assert_eq!(out.len() as u64, total);
-    debug_assert_eq!(n_rela as u64 * RELA, rela_len);
+    if out.len() as u64 != total {
+        return Err(SoError::Remeasured { what: "the shared object's bytes", measured: total, written: out.len() as u64 });
+    }
+    if n_rela as u64 * RELA != rela_len {
+        return Err(SoError::Remeasured { what: ".rela.dyn", measured: n_rela as u64 * RELA, written: rela_len });
+    }
     Ok(())
 }

@@ -307,9 +307,9 @@ impl<'d, 'a> Dry<'d, 'a> {
             flags,
             edition,
             expect: id,
-            lints: true,
-            #[cfg(test)]
-            macro_mods: true,
+            // The rule set `check` lints with (lints.rs `of_root`): the outline lists its lint
+            // units keyed for it, as the check's outline does (work.rs `Job::lints`).
+            lints: Some(crate::lints::of_root(cx, self.root, frame)?.rules),
         };
         let made = work::outline_file(cx, self.root, &job, frame, alloc)?;
         let source = crate::engine_tasks::edition_source(id, edition);

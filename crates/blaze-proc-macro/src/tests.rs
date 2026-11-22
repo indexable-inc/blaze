@@ -17,7 +17,7 @@ use blaze_sim::{Broke, Config, Tape};
 
 use crate::{
     host::{CallError, CompiledFinding, Limits, Loaded, Refused, Runtime, Settings},
-    module::{CrateId, Exported, ModuleRecord, Source, lock_closure, module_key, sha256_hex},
+    module::{CrateId, Exported, LockedPackages, ModuleRecord, Source, module_key, sha256_hex},
     record::{DirStore, RecordError, base_key, table},
     sandbox::{Files, PACKAGE, Package, Sandbox},
 };
@@ -599,7 +599,11 @@ fn closure_keys(tape: &Tape, plant: ClosurePlant) -> Result<(), Broke> {
     let (first, second) = (draw(tape), draw(tape));
     let key = |(syn, ident, other): (u8, u8, u8)| -> Result<String, Broke> {
         let deps = match plant {
-            ClosurePlant::None => lock_closure(&small_lock(syn, ident, other), "m", "1.0.0").map_err(|e| harness(&e))?,
+            ClosurePlant::None => {
+                let text = small_lock(syn, ident, other);
+                let lock = blaze_manifest::lock::Lock::read(text.as_bytes(), blaze_own::testing::heap().alloc()).map_err(|e| harness(&e))?;
+                LockedPackages::of(&lock).closure("m", "1.0.0").map_err(|e| harness(&e))?
+            }
             ClosurePlant::ClosureLeftOut => String::new(),
         };
         let id = CrateId { name: "m", version: "1.0.0", source: Source::Registry { checksum: "m0" }, deps: &deps, features: &["default"] };
@@ -627,8 +631,9 @@ fn a_source_correction_row_is_in_the_module_key() {
     let lock = "version = 4\n\n[[package]]\nname = \"asn1-rs-derive\"\nversion = \"0.6.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"a0\"\ndependencies = [\n \"synstructure\",\n]\n\n\
                 [[package]]\nname = \"synstructure\"\nversion = \"0.13.2\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2\"\n";
     let read = |text: &str| Table::read(text, blaze_lex::Cpu::SCALAR, std::alloc::Global).expect("a table");
+    let lock = blaze_manifest::lock::Lock::read(lock.as_bytes(), blaze_own::testing::heap().alloc()).expect("the lock reads");
     let key = |table| {
-        let deps = crate::module::LockedPackages::read_with(lock, table).closure("asn1-rs-derive", "0.6.0").expect("a closure");
+        let deps = crate::module::LockedPackages::of_with(&lock, table).closure("asn1-rs-derive", "0.6.0").expect("a closure");
         module_key(&CrateId { name: "asn1-rs-derive", version: "0.6.0", source: Source::Registry { checksum: "a0" }, deps: &deps, features: &["default"] })
     };
     let none = key(read("{\"rows\": []}"));

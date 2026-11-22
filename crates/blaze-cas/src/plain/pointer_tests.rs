@@ -1,4 +1,4 @@
-//! The keyed pointer ([`POINTER_TAG`], `Lent::point` and `Lent::pointed`) under the
+//! The keyed pointer ([`ReservedTag::Pointer`], `Lent::point` and `Lent::pointed`) under the
 //! simulation. The model: each name maps to the target of the last commit that pointed it.
 //!
 //! - Every cut of a command's commit (process death alone, and a power cut) is followed by a
@@ -21,11 +21,11 @@ use blaze_core::{
     wait::Deadline,
 };
 use blaze_ids::ContentId;
-use blaze_keyed::kind::{Namespace, Tag};
+use blaze_keyed::kind::{Namespace, ReservedTag, Tag};
 use blaze_mem::Frame;
 
 use super::{
-    core::{Batch, POINTER_TAG, Plain, PlainConfig, Plant, TAGS},
+    core::{Batch, Plain, PlainConfig, Plant, TAGS},
     driven::{Cut, Driven},
     lent::{Lent, LentError, LentPlant},
     test_root,
@@ -54,6 +54,7 @@ fn cfg(n: u64, root: &Frame) -> PlainConfig<&Frame> {
         writes,
         reads,
         liveness: super::Liveness::Everything,
+        lock_step: crate::plain::LockStep::Backoff,
     }
 }
 
@@ -180,7 +181,7 @@ impl<'r> Proc<'r> {
     /// `name(0)` pointed at `target(t)` from this process's view, committed and settled.
     fn point(&mut self, sim: &mut Sim, t: u32) {
         let mut batch = Batch::new(Namespace::LOCAL);
-        batch.put(name(0), POINTER_TAG, &target(t).0.0).expect("a pointer laid");
+        batch.put(name(0), ReservedTag::Pointer.tag(),&target(t).0.0).expect("a pointer laid");
         self.store.commit(&[&batch], sim.wall_ns(), &mut self.effects).expect("a commit asked");
         settle(sim, std::slice::from_mut(self));
         assert!(matches!(self.store.take_committed(), Some(Ok(_))), "the commit of name 0 to target {t}");

@@ -330,7 +330,8 @@ impl BodyIds for EveryItem {
 
 /// Run twice: the first run makes every instance over the names records (each body checked
 /// once, one program constructed, none of its bodies checked by construction); the second finds
-/// every record (found = reached), checks no body and constructs no program. Control: the seam's
+/// every record (found = reached) and checks no body, its one program constructed to ask the
+/// found entries' read lists again. Control: the seam's
 /// answers dropped over the SAME full store: every instance is made unkeyed, and the bodies
 /// checked are the reached bodies.
 #[test]
@@ -343,7 +344,9 @@ fn a_second_run_over_names_records_finds_every_record_and_checks_no_body() {
     assert_eq!((first_checks.check_one, first_checks.by_construction, first_checks.constructed), (BODIES, 0, 1), "first run {first_checks:?}");
     let (second, second_checks) = walk(&f, &ids, &mut store);
     assert_eq!((second.reached, second.found, second.made, second.make_calls()), (REACHED, REACHED, 0, 0), "second run {second}");
-    assert_eq!(second_checks, CheckCount::default(), "the second run checked or constructed");
+    // One program constructed, no body checked: every found entry's read list is asked again of
+    // today's program (run/make_one.rs `verify_instance`, F20), which checks no body here.
+    assert_eq!(second_checks, CheckCount { constructed: 1, ..CheckCount::default() }, "the second run checked, or constructed other than the one verifying program");
     let control_ids = TextIds { recorded: false, ..ids_of(&f, true) };
     let (control, control_checks) = walk(&f, &control_ids, &mut store);
     assert_eq!((control.found, control.no_record), (0, REACHED), "control {control}");
@@ -436,7 +439,7 @@ fn tracked_call(f: &Fixture, want: (u32, u32)) -> Tracked {
     let exprs = program.function(i).body.expect("`main`'s body is live until `done`").0.exprs.len() as u32;
     let mut placed = Vec::new();
     for e in 0..exprs {
-        if let Some(site) = program.caller_site(main, ExprId(e)) {
+        if let Ok(site) = program.caller_site(main, ExprId(e)) {
             placed.push((site.offset, site.file.to_string(), program.source_position(main, site.offset)));
         }
     }
@@ -680,7 +683,7 @@ fn walk_async(items: &str, async_owners: &[&str]) -> (Counts, Counts) {
     }
     assert!(program.coroutine_recipe(fn_named(&f, "block_on"), 0).is_none(), "control: `block_on` has no async body");
     let (again, _) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
-    assert_eq!((again.reached, again.found, again.make_calls()), (first.reached, first.reached, 0), "a second walk finds every instance: {again}");
+    assert_eq!((again.reached, again.found, again.make_calls()), (first.reached, first.reached, 0), "a second walk finds every instance: {again}; first moved: {:?}", again.first_moved);
     (first, again)
 }
 
@@ -1118,7 +1121,7 @@ fn a_struct_met_through_a_projection_while_listing_coroutines_is_made_over_names
     assert!(program.adt(item_named(&f, ItemKind::Struct, "Hidden")).is_some(), "`Hidden` has no row after the walk");
     assert!(program.adt(item_named(&f, ItemKind::Struct, "Unreached")).is_none(), "control: `Unreached` has a row");
     let (again, _) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
-    assert_eq!((again.reached, again.found, again.make_calls()), (first.reached, first.reached, 0), "a second walk finds every instance: {again}");
+    assert_eq!((again.reached, again.found, again.make_calls()), (first.reached, first.reached, 0), "a second walk finds every instance: {again}; first moved: {:?}", again.first_moved);
     println!("d106 ADT through a projection over names records: first {first}; again {again}");
 }
 
@@ -2481,6 +2484,134 @@ fn twin_walk(case: &str, f: &Fixture, entry: ItemKey, b: &Builder) -> (Counts, u
     (counts, twin.compared, read_checked)
 }
 
+/// THE RUN'S RECORDS BY KIND as a test sees them (make_one.rs `ByKind`, blaze-cli
+/// engine_body_record.rs `StoreTyped`): the double's records (`Rechecked`), with the kind of
+/// body `run` says the run checks itself, and one key whose record is planted absent.
+struct Kinds<K> {
+    kept: K,
+    run: fn(ItemKey) -> Option<blaze_ladder::front2::program::lazy::typed::RunChecked>,
+    absent: Option<ItemKey>,
+}
+
+impl<K: blaze_ladder::front2::program::lazy::typed::KeptBodies> blaze_ladder::front2::program::lazy::typed::KeptBodies for Kinds<K> {
+    fn source(&mut self, key: ItemKey) -> Result<blaze_ladder::front2::program::lazy::typed::BodySource, blaze_ladder::front2::program::lazy::typed::TypedGap> {
+        use blaze_ladder::front2::program::lazy::typed::{BodySource, TypedGap};
+        if self.absent == Some(key) {
+            return Err(TypedGap::NoRecord { key });
+        }
+        if let Some(kind) = (self.run)(key) {
+            return Ok(BodySource::Run(kind));
+        }
+        self.kept.source(key)
+    }
+}
+
+/// What a walk by kind left: the walk's counts, the entries held equal, the bodies the reading
+/// side's program checked, and the typing's counts.
+type KindWalk = (Counts, usize, u32, blaze_ladder::run::make_one::TypingCounts);
+
+/// One walk of `f`'s program from `entry` with the typing oracle, its reading side
+/// [`blaze_ladder::run::make_one::ByKind`] over [`Kinds`]: `run` the kinds the run checks
+/// itself, `absent` a key whose record is not there. The walk's error, as the run would say it.
+fn kind_walk(case: &str, f: &Fixture, entry: ItemKey, b: &Builder, run: fn(ItemKey) -> Option<blaze_ladder::front2::program::lazy::typed::RunChecked>, absent: Option<ItemKey>) -> Result<KindWalk, String> {
+    use blaze_ladder::run::make_one::{ByKind, FromRecord, Twin};
+    let names = reader(f);
+    let checking = Maker::new(names, Some(entry), b, alloc());
+    let FromRecord(kept) = FromRecord::rechecked(names, Some(entry), alloc()).unwrap_or_else(|e| panic!("{case}: the double's program: {e}"));
+    let reading = Maker::typed(names, Some(entry), ByKind::new(Kinds { kept, run, absent }), b, alloc());
+    let mut twin = Twin::new(checking, reading, alloc());
+    let mut store = MemoryStore::new_in(alloc());
+    let (_, counts) = walk_records(entry, &EveryItem, &mut store, b, &producer(), &mut twin, alloc()).map_err(|e| format!("{e}"))?;
+    assert!(logged(names.records).is_empty(), "{case}: the records filed {:?}", logged(names.records));
+    let read_checked = twin.reading.program().map_or(0, |p| p.counts().checked);
+    Ok((counts, twin.compared, read_checked, twin.reading.typing().counts()))
+}
+
+/// A `#![no_core]` program of `links` fns in a chain, `f0` to `f{links-1}`, each calling the one
+/// before, and `main` calling the last.
+fn chain(links: usize) -> String {
+    let mut text = String::from("#![feature(no_core, lang_items)]\n#![no_core]\n#![no_main]\n\n#[lang = \"sized\"]\ntrait Sized {}\n\n#[lang = \"copy\"]\ntrait Copy {}\n\nfn f0() -> i32 {\n    1\n}\n");
+    for i in 1..links {
+        text.push_str(&format!("\nfn f{i}() -> i32 {{\n    f{}()\n}}\n", i - 1));
+    }
+    text.push_str(&format!("\n#[unsafe(no_mangle)]\npub extern \"C-unwind\" fn main() -> i32 {{\n    f{}()\n}}\n", links - 1));
+    text
+}
+
+const LINKS: usize = 300;
+
+/// D197 ROOT 1 (rule 23): a run reads every body from the record `check` kept, with ZERO checker
+/// rounds, over a chain of [`LINKS`] calls (`main` to `f299` to … `f0`): every entry byte-equal
+/// to the one a second check makes (`Twin`), every body read (the typing's count), none checked
+/// by the run's program. CONTROL, the cause removed: the same walk with every body planted as a
+/// kind the run checks itself (`RunChecked::Unrecorded`): the reading side's program checks every
+/// body, so a reading side that quietly checked would show its count above 0.
+///
+/// Prints: `d106 by kind: chain of 300 <counts>; read 301, checked 0; control: read 0, checked 301`
+#[test]
+fn a_run_reads_a_chain_of_300_bodies_from_their_records_with_no_checker_round() {
+    use blaze_ladder::front2::program::lazy::typed::RunChecked;
+    let f = fixture(&chain(LINKS));
+    let b = builder();
+    let entry = fn_named(&f, "main");
+    let bodies = (LINKS + 1) as u64;
+    let (counts, equal, read_checked, typing) = kind_walk("chain", &f, entry, &b, |_| None, None).unwrap_or_else(|e| panic!("chain: the walk: {e}"));
+    assert!(counts.made > 0, "chain: the walk makes: {counts}");
+    assert_eq!(equal, counts.make_calls(), "chain: every make compared: {counts}");
+    assert_eq!(read_checked, 0, "chain: the reading side ran a checker round");
+    assert_eq!(typing.read, bodies, "chain: every body read from its record: {typing}");
+    assert_eq!(typing.checked_by_run(), 0, "chain: a body checked by the run: {typing}");
+
+    let (_, control_equal, control_checked, control) = kind_walk("chain control", &f, entry, &b, |_| Some(RunChecked::Unrecorded), None).unwrap_or_else(|e| panic!("chain control: the walk: {e}"));
+    assert_eq!(control_equal, counts.make_calls(), "CONTROL: the run's own check makes the same entries");
+    assert_eq!(u64::from(control_checked), bodies, "CONTROL: the planted kind is checked by the run, every body");
+    assert_eq!((control.read, control.checked[RunChecked::Unrecorded.index()]), (0, bodies), "CONTROL: counted by kind: {control}");
+    println!("d106 by kind: chain of {LINKS} {counts}; read {}, checked {read_checked}; control: read {}, checked {control_checked}", typing.read, control.read);
+}
+
+/// TWIN (rule 3): a body of a kind that has records, whose record is not there, is the run's
+/// typed refusal naming the body and the record (`LazyRefusal::Typed`), never a check in its
+/// place. Control: the same walk with the record there reads it (the test above).
+///
+/// Prints: `d106 by kind: an absent record refuses: <the run's words>`
+#[test]
+fn an_absent_record_of_a_kind_that_has_records_is_refused_by_name() {
+    let f = fixture(&chain(3));
+    let entry = fn_named(&f, "main");
+    let absent = fn_named(&f, "f1");
+    let said = match kind_walk("absent", &f, entry, &builder(), |_| None, Some(absent)) {
+        Err(said) => said,
+        Ok((counts, ..)) => panic!("a body with no record was made: {counts}"),
+    };
+    assert!(said.contains("checked columns from the check's record") && said.contains("no typed record"), "the refusal names the record: {said}");
+    assert!(said.contains(&format!("{:032x}", absent.0)), "the refusal names the body: {said}");
+    println!("d106 by kind: an absent record refuses: {said}");
+}
+
+/// THE LOCAL KIND (typed.rs `is_local`): a fn declared in a body (`main`, exported from
+/// `outer`'s body, and `inner` in it) is the run's own check, counted as `local fn`, while the
+/// file's fns are read from their records; the entries equal a second check's. Control: the
+/// file's fn `from_file` has no inner bit, so it is read.
+///
+/// Prints: `d106 by kind: nested entry <counts>; <typing>`
+#[test]
+fn a_fn_declared_in_a_body_is_the_runs_own_check_counted_as_local() {
+    use blaze_ladder::front2::program::lazy::typed::{RunChecked, is_local};
+    let f = fixture(NESTED_ENTRY);
+    let entry = exported_entry(&f);
+    assert!(is_local(entry), "the exported `main` is declared in a body");
+    assert!(!is_local(fn_named(&f, "from_file")), "CONTROL: a fn of the file is not local");
+    let (counts, equal, read_checked, typing) =
+        kind_walk("nested entry", &f, entry, &builder(), |key| is_local(key).then_some(RunChecked::Local), None).unwrap_or_else(|e| panic!("nested entry: the walk: {e}"));
+    assert_eq!(equal, counts.make_calls(), "nested entry: every make compared: {counts}");
+    let local = typing.checked[RunChecked::Local.index()];
+    assert!(local >= 2, "nested entry: `main` and `inner` checked by the run as local fns: {typing}");
+    assert_eq!(typing.checked_by_run(), local, "nested entry: no other kind checked: {typing}");
+    assert!(typing.read >= 1, "nested entry: `from_file` read from its record: {typing}");
+    assert_eq!(u64::from(read_checked), local, "nested entry: the run's program checked the local fns alone");
+    println!("d106 by kind: nested entry {counts}; {typing}");
+}
+
 /// D163 part 2, THE EQUALITY ORACLE of the typing seam: every walking program of this file
 /// (the plain one, async, dyn, statics, fmt, a local fn value, a local union) walked with
 /// [`twin_walk`]: every entry made from the typed record is byte-equal to the entry made by
@@ -2565,4 +2696,194 @@ fn an_instance_at_another_fns_closure_checks_the_closures_owner() {
     let (control, _) = walk_keeping(&after, &ids, ids.entry, &mut MemoryStore::new_in(alloc()), &b);
     assert_eq!((control.found, control.made), (0, control.reached), "(c) control {control}");
     println!("d106 closure owner held by arguments: first {first}; edited {again}, check_one {}; control {control}", checks.check_one);
+}
+
+/// A static an `extern` block declares is a place at its C symbol, never evaluated (the
+/// Reference, "External blocks", "Statics": it is declared with no initializer; its storage is
+/// the foreign object's). Tempo t1855d: secp256k1-sys's `extern "C" { #[cfg_attr(..,
+/// link_name = "rustsecp256k1_v0_10_0_context_no_precomp")] pub static
+/// secp256k1_context_no_precomp: *const Context; }`, read by value in a body, was evaluated as
+/// a Rust static and refused for its missing initializer. The symbols here are POSIX libc's,
+/// in every test process: `optarg` (a `char *`, null until `getopt` runs) and `optind` (an
+/// `int`, 1 until `getopt` runs).
+///
+/// The program `text` walked from `main` over names records, the statics `main`'s entry
+/// declares by key, and its status run whole.
+fn foreign_static_run(text: &str) -> (usize, usize, u8) {
+    use blaze_ladder::code_records::EntryView;
+    let f = fixture(text);
+    let main = fn_named(&f, "main");
+    let mut store = MemoryStore::new_in(alloc());
+    let names = reader(&f);
+    let mut maker = Maker::new(names, Some(main), &builder(), alloc());
+    let (walk, counts) = walk_records(main, &EveryItem, &mut store, &builder(), &producer(), &mut maker, alloc()).unwrap_or_else(|e| {
+        println!("the record walk: {e}; the records filed {:?}", logged(names.records));
+        panic!("the record walk: {e}")
+    });
+    assert!(logged(names.records).is_empty(), "the records filed {:?}", logged(names.records));
+    let entry = store.get(walk.key(0).expect("main is keyed")).expect("the store reads").expect("main's entry is put");
+    let mut declared = Vec::new();
+    EntryView::read(entry).expect("main's entry reads").each_static(|k| declared.push(k));
+    (counts.reached, declared.len(), run_whole(text))
+}
+
+/// (a) The real site's shape: `ffi::secp256k1_context_no_precomp`, a `*const Context` by
+/// `#[link_name]` (here `optarg`), read by value: null, so 42. `main`'s entry declares no
+/// static (the foreign one has no record) and the walk reaches `main` alone.
+/// Prints "d106 foreign static by link_name: reached 1, declared 0, status 42".
+#[test]
+fn a_foreign_static_by_link_name_is_read_at_its_c_symbol() {
+    let text = format!(
+        "{FOREIGN_PRELUDE}
+mod ffi {{
+    pub enum Context {{}}
+    unsafe extern \"C\" {{
+        #[link_name = \"optarg\"]
+        pub static secp256k1_context_no_precomp: *const Context;
+    }}
+}}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    let p = unsafe {{ ffi::secp256k1_context_no_precomp }};
+    if p as usize == 0 {{ 42 }} else {{ 1 }}
+}}
+"
+    );
+    let (reached, declared, status) = foreign_static_run(&text);
+    assert_eq!((reached, declared, status), (1, 0, 42), "reached, declared statics, status");
+    println!("d106 foreign static by link_name: reached {reached}, declared {declared}, status {status}");
+}
+
+/// (b) Twin: by its own name, an `i32` (`optind`, 1), in the crate root: 1 + 41.
+/// Prints "d106 foreign static by name: reached 1, declared 0, status 42".
+#[test]
+fn a_foreign_static_by_name_is_read_at_its_c_symbol() {
+    let text = format!(
+        "{FOREIGN_PRELUDE}
+unsafe extern \"C\" {{
+    static optind: i32;
+}}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    // A statement that begins with a block ends there (the Reference, \"Expression
+    // statements\"): `unsafe {{ optind }} + 41` is a block and then `+ 41`, a syntax error.
+    let read = unsafe {{ optind }};
+    read + 41
+}}
+"
+    );
+    let (reached, declared, status) = foreign_static_run(&text);
+    assert_eq!((reached, declared, status), (1, 0, 42), "reached, declared statics, status");
+    println!("d106 foreign static by name: reached {reached}, declared {declared}, status {status}");
+}
+
+/// (c) Control: a RUST static read the same way is evaluated and is a record of its own:
+/// `main`'s entry declares it, the walk reaches it, 1 + 41.
+/// Prints "d106 rust static control: reached 2, declared 1, status 42".
+#[test]
+fn a_rust_static_read_the_same_way_is_a_record() {
+    let text = format!(
+        "{FOREIGN_PRELUDE}
+static OPTIND: i32 = 1;
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    OPTIND + 41
+}}
+"
+    );
+    let (reached, declared, status) = foreign_static_run(&text);
+    assert_eq!((reached, declared, status), (2, 1, 42), "reached, declared statics, status");
+    println!("d106 rust static control: reached {reached}, declared {declared}, status {status}");
+}
+
+/// Core's `Iterator::for_each` shape (library/core/src/iter/traits/iterator.rs): `each` folds
+/// with an inner `fn call<T>(mut f: impl FnMut(T)) -> impl FnMut((), T)`, called at `T = <I as
+/// Iterator>::Item`. So `fold`'s instance at `each<Three, _>` names `call`'s opaque at arguments
+/// that are a projection until normalized.
+const FOR_EACH: &str = "
+enum Option<T> {
+    None,
+    Some(T),
+}
+
+trait Iterator {
+    type Item;
+    fn next(&mut self) -> Option<Self::Item>;
+    fn fold<B, G: FnMut(B, Self::Item) -> B>(mut self, init: B, mut g: G) -> B
+    where
+        Self: Sized,
+    {
+        let mut acc = init;
+        loop {
+            match self.next() {
+                Option::Some(x) => acc = g(acc, x),
+                Option::None => return acc,
+            }
+        }
+    }
+}
+
+fn each<I: Iterator, F: FnMut(I::Item)>(i: I, f: F) {
+    fn call<T>(mut f: impl FnMut(T)) -> impl FnMut((), T) {
+        move |(), item| f(item)
+    }
+    i.fold((), call(f));
+}
+
+struct Three {
+    at: u8,
+}
+
+impl Iterator for Three {
+    type Item = u8;
+    fn next(&mut self) -> Option<u8> {
+        match self.at {
+            0 => {
+                self.at = 1;
+                Option::Some(4)
+            }
+            1 => {
+                self.at = 2;
+                Option::Some(5)
+            }
+            _ => Option::None,
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let mut last = 0u8;
+    each(Three { at: 0 }, |x: u8| last = x);
+    last as i32
+}
+";
+
+/// [`FOR_EACH`] WALKED over names records (tempo t2115d, about 230 lines): every instance is
+/// made. Before the fix, `fold`'s instance asked `call`'s hidden type at the arguments as mapped
+/// (`[<Three as Iterator>::Item, F]`), with the projection not yet normalized (blaze-build
+/// instance.rs `map_tree` normalizes only the whole tree, at its end). The read list logged that
+/// question, and sealing it (code_reads.rs `ReadLog::seal`, the instance name) refused the make:
+/// "an opaque type's hidden type .. has no instance name: a projection not normalized". A second
+/// walk finds every instance (each read list verifies against today's answers). The run returns
+/// the last item, 5.
+///
+/// Prints: `d106 for_each over names records: first <counts>; again <counts>; run status 5`
+#[test]
+fn an_opaque_at_a_projected_argument_is_named_and_verified_over_names_records() {
+    let text = format!("{BLOCK_MOD_PRELUDE}{FOR_EACH}");
+    let f = fixture(&text);
+    let entry = fn_named(&f, "main");
+    let b = builder();
+    let mut store = MemoryStore::new_in(alloc());
+    let (first, _) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
+    assert!(first.reached > 0 && first.made == first.reached && first.found == 0, "every instance reached is made: {first}");
+    let (again, _) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
+    assert_eq!((again.reached, again.found, again.make_calls()), (first.reached, first.reached, 0), "a second walk finds every instance: {again}; first moved: {:?}", again.first_moved);
+    let status = run_whole(&text);
+    assert_eq!(status, 5, "the run's status is the last item");
+    println!("d106 for_each over names records: first {first}; again {again}; run status {status}");
 }

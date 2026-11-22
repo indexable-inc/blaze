@@ -894,15 +894,15 @@ pub(crate) fn build<A: Allocator + Clone>(
         blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
         other => BuildError::Lir(other),
     };
-    let (func, shape, refs, statics, thread_locals, vtables, names) = {
+    let (func, shape, refs, statics, thread_locals, vtables, names, copy_insts) = {
         let mut w = Walk::new(&view, checked, &mut *subst, adts, alloc.clone());
         w.names = plan.map(|p| super::state_names::Names::new(p.names, p.plant, root, alloc.clone()));
         w.scan_flags()?;
         let shape = w.run_coroutine(block)?;
         // `poll` on a finished state: the library's two panics, when it declares them.
         let panics = w.coroutine_panics()?;
-        let Walk { b, refs, statics, thread_locals, vtables, names, .. } = w;
-        (b.finish().map_err(lir)?, (shape, panics), refs, statics, thread_locals, vtables, names)
+        let Walk { b, refs, statics, thread_locals, vtables, names, copy_insts, .. } = w;
+        (b.finish().map_err(lir)?, (shape, panics), refs, statics, thread_locals, vtables, names, copy_insts)
     };
     let (shape, panics) = shape;
     let split = match (plan, &names) {
@@ -942,7 +942,8 @@ pub(crate) fn build<A: Allocator + Clone>(
         thread_locals: thread_locals.clone(),
         vtables: vtables.clone(),
         traps: Vec::new_in(alloc.clone()),
+        copy_insts,
     };
-    let drop = Built { func: blaze_lir::VerifiedFunc::new(split.drop).map_err(BuildError::Verify)?, refs, statics, thread_locals, vtables, traps: Vec::new_in(alloc) };
+    let drop = Built { func: blaze_lir::VerifiedFunc::new(split.drop).map_err(BuildError::Verify)?, refs, statics, thread_locals, vtables, traps: Vec::new_in(alloc), copy_insts };
     Ok(crate::BuiltCoroutine { poll, resume, drop, state, niche })
 }

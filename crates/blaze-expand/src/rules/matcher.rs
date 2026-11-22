@@ -10,7 +10,7 @@ use parser::PrefixEntryPoint;
 use super::{
     Arm, At, Bound, CallError, DEPTH_BOUND, Engine, Frag, Loc, Msg, NONE, RepKind, SITE, Sep,
     failure::Tracker,
-    input::{Level, View, same_puncts},
+    input::{Joins, Level, View, same_puncts},
 };
 use crate::tokens::{Delim, Raw, TokenKind};
 
@@ -23,6 +23,9 @@ pub(crate) enum Origin {
     Ast,
     /// Put back in an invisible group (`stmt`, `block`).
     Grouped,
+    /// Put back in an invisible group and parentheses: a list that would join with the tokens
+    /// around it ([`super::input::Joins`]: an or-pattern, a type of bounds).
+    Parenthesized,
 }
 
 /// Tokens `at..end` of the view.
@@ -882,23 +885,26 @@ pub(super) fn match_meta_var<'f>(
 ) -> (Fragment, Option<MatchError>) {
     let parsed = |engine: &mut Engine<'_, '_, 'f>, view: &mut View<'_, 'f>, src: &mut Level, entry| {
         let start = src.at;
-        let (end, error) = view.parse_fragment(engine, entry, *src);
+        let (end, error, joins) = view.parse_fragment(engine, entry, *src);
         src.at = end;
         let toks = Toks { at: start, end };
         let error = error.map(|error| match toks.is_empty() {
             false => MatchError::Fragment(error),
             true => MatchError::Built(error),
         });
-        (toks, error)
+        (toks, error, joins)
     };
     let (entry, origin) = match kind {
         Frag::Path => {
-            let (toks, error) = parsed(engine, view, src, PrefixEntryPoint::Path);
+            let (toks, error, _) = parsed(engine, view, src, PrefixEntryPoint::Path);
             return (Fragment::Path(toks), error);
         }
         Frag::Ty => {
-            let (toks, error) = parsed(engine, view, src, PrefixEntryPoint::Ty);
-            return (Fragment::Ty(toks), error);
+            let (toks, error, joins) = parsed(engine, view, src, PrefixEntryPoint::Ty);
+            return match joins {
+                Joins::Yes => (Fragment::Tokens { toks, origin: Origin::Parenthesized }, error),
+                Joins::No => (Fragment::Ty(toks), error),
+            };
         }
         Frag::Expr | Frag::Expr2021 => {
             if !src.is_empty()
@@ -914,7 +920,7 @@ pub(super) fn match_meta_var<'f>(
                     return (Fragment::Empty, Some(MatchError::Built(error)));
                 }
             }
-            let (toks, error) = parsed(engine, view, src, PrefixEntryPoint::Expr);
+            let (toks, error, _) = parsed(engine, view, src, PrefixEntryPoint::Expr);
             return (Fragment::Expr(toks), error);
         }
         Frag::Ident | Frag::Tt | Frag::Lifetime | Frag::Literal => {
@@ -951,7 +957,11 @@ pub(super) fn match_meta_var<'f>(
         Frag::Item => (PrefixEntryPoint::Item, Origin::Ast),
         Frag::Vis => (PrefixEntryPoint::Vis, Origin::Ast),
     };
-    let (toks, error) = parsed(engine, view, src, entry);
+    let (toks, error, joins) = parsed(engine, view, src, entry);
+    let origin = match joins {
+        Joins::Yes => Origin::Parenthesized,
+        Joins::No => origin,
+    };
     (Fragment::Tokens { toks, origin }, error)
 }
 

@@ -491,9 +491,10 @@ impl<'n, S: NamesSource<'n>> LayoutFacts for ConstsWorld<'_, 'n, S> {
         Some(tc::Adt { kind: a.kind, generics: a.generics, variants: &a.variants, fields: &a.fields, types: self.store.tys.view() })
     }
 
-    /// As the row read the ADT's `#[repr(..)]`.
-    fn repr(&self, key: ItemKey) -> ReprAttrs {
-        self.store.adts.get(&key).map_or(ReprAttrs::RUST, |a| a.repr)
+    /// As the row read the ADT's `#[repr(..)]`; no row: `Missing` (the machine's head need, as
+    /// `adt`'s `None`), never a default `repr(Rust)` (D194).
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, LayoutMissing> {
+        self.store.adts.get(&key).map(|a| a.repr).ok_or(LayoutMissing { item: key })
     }
 
     /// From the ADT's row: every variant's value, explicit or implicit (heads.rs `discrs`),
@@ -506,8 +507,8 @@ impl<'n, S: NamesSource<'n>> LayoutFacts for ConstsWorld<'_, 'n, S> {
 
     /// From the ADT's row (heads.rs `AdtRow::valid`), as the run path answers (program.rs
     /// `FrontEnd::valid_range`): a constant and the code agree on every niche.
-    fn valid_range(&self, key: ItemKey) -> ValidRange {
-        self.store.adts.get(&key).map_or(ValidRange::default(), |a| a.valid)
+    fn valid_range(&self, key: ItemKey) -> Result<ValidRange, LayoutMissing> {
+        self.store.adts.get(&key).map(|a| a.valid).ok_or(LayoutMissing { item: key })
     }
 
     /// By the checker's solver over the store (front2/const_project.rs): a field's type
@@ -730,12 +731,15 @@ fn type_name_item<'n, S: NamesSource<'n>>(names: S, lib: LibKey, out: &mut dyn F
 
 /// Where an evaluation starts ([`Consts::value_at`]): `item` at no arguments; a trait's
 /// constant selected for a ground `Self` (a head's qualified path); or `item` at ground
-/// arguments already in the evaluator's own table (an instance's need: const_at.rs).
+/// arguments already in the evaluator's own table (an instance's need: const_at.rs); or a
+/// constant at `at` of `owner`'s body (a `const { .. }` block, a promoted operand) at the
+/// owner's ground `args`, whose body check runs INSIDE the evaluation ([`Consts::body_value`]).
 #[derive(Clone, Copy)]
 enum Root {
     Plain,
     SelfTy(tc::PNode),
     Args(List),
+    Body { owner: ItemKey, at: BodyRoot, args: List },
 }
 
 impl<'n> Consts<'n> {
@@ -778,11 +782,15 @@ impl<'n> Consts<'n> {
     /// [`Consts::value_with_args`] takes it.
     #[allow(clippy::too_many_arguments)]
     pub fn body_value<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, owner: ItemKey, root: BodyRoot, key: ItemKey, from: tc::PTys<'_>, args: &[tc::PTy], build: Option<&crate::run::ClosureTable>, scratch: Alloc<'_>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
-        if !self.bodies.iter().any(|b| b.key == key) {
-            self.check_as(r, prepared, owner, key, Some(root))?;
-        }
+        // The owner's body is checked inside `value_at` (`Root::Body`), never before it: a head
+        // that check makes may name a constant, and only inside the count (`Maps::evaluating`)
+        // is that a need the work list evaluates first. Checked outside it, a caller whose
+        // evaluator is taken (const_at's `Records`, `consts: None`) had check.rs `make` file
+        // the head's anonymous constant as "no constant evaluator" in `anon_failed` for good,
+        // and every later check of a body using that head refused (tempo t2115d: RawVec's
+        // `new_in`, a head's `1 << 0`).
         let list = self.args_in_unit(key, from, args, r.store.tys.alloc(), scratch)?;
-        self.value_at(r, prepared, key, Root::Args(list), build)
+        self.value_at(r, prepared, key, Root::Body { owner, at: root, args: list }, build)
     }
 
     /// The fn instance that key `key` names in a record this evaluator made (each record names
@@ -945,11 +953,19 @@ impl<'n> Consts<'n> {
     /// `self.records`), or the refusal.
     fn value_key<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, root: Root, build: Option<&crate::run::ClosureTable>) -> Result<RecordKey, ConstFail> {
         let alloc = r.store.tys.alloc();
+        // A body's constant: its owner's body checked for this evaluator once, under the
+        // constant's key, before the evaluator's table is taken (a failure that names a
+        // constant to evaluate first goes to `value_listed`'s work list).
+        if let Root::Body { owner, at, .. } = root {
+            if !self.bodies.iter().any(|b| b.key == item) {
+                self.check_as(r, prepared, owner, item, Some(at))?;
+            }
+        }
         let (mut ground, mut layout, mut codes) = self.unit.take().unwrap_or_else(|| (PortableTys::new_in(alloc), Layouts::new_in(alloc), Codes::new_in(alloc)));
         let root = match root {
             Root::Plain => Ok((item, List::EMPTY)),
             Root::SelfTy(node) => self.select_root(r, item, node, &mut ground, alloc),
-            Root::Args(list) => self.select_args(r, item, list, &mut ground, alloc),
+            Root::Args(list) | Root::Body { args: list, .. } => self.select_args(r, item, list, &mut ground, alloc),
         };
         let (item, root_args) = match root {
             Ok(root) => root,

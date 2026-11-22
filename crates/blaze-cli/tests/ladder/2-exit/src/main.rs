@@ -10,6 +10,9 @@ trait Sized {}
 #[lang = "copy"]
 trait Copy {}
 
+// core's own impls (core/src/marker.rs `marker_impls!`): a primitive is `Copy` only by an impl.
+impl Copy for i32 {}
+
 // What a remainder by zero, and a signed remainder of `MIN` by `-1`, call: the checks are in
 // every build (the Reference, "Arithmetic and Logical Binary Operators": integer division by
 // zero panics, and so does an overflowing `%`; the pinned core's `panic_const`); never return.

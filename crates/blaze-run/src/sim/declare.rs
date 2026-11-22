@@ -277,6 +277,12 @@ impl Sim {
                     slot.0
                 )));
             }
+            Down::Bytes { part, .. } => {
+                return Err(Broke::Oracle(format!(
+                    "the parent sent `Bytes` ({} bytes of a record): this simulation's records are named by reference only",
+                    part.len()
+                )));
+            }
             Down::Data { data } => {
                 return Err(Broke::Oracle(format!("the parent sent `Data` with {} statics: this simulation's manifest has no static", data.len())));
             }

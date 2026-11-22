@@ -64,6 +64,7 @@ use blaze_native::image::{FixTo, Image, Placed, Region};
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 
 use crate::bytes;
+use crate::commands::{Command, Commands, CommandsError, Header, Section, Segment};
 use crate::macho::{self, Chain, ChainImport, ChainSeg, ImportRows, PAGE};
 use crate::sign;
 
@@ -89,6 +90,16 @@ pub enum DylibError<'a> {
     TlsRelocs { count: usize },
     /// The image breaks a promise image.rs makes (`what`), at image address `at`.
     Shape { what: &'static str, at: u64 },
+    /// The header and load commands need `need` bytes and the image keeps `room` before its
+    /// first region (`Layout::header_reserve`): many or long install names.
+    HeaderRoom { need: u64, room: u64 },
+}
+
+fn commands_error<'a>(e: CommandsError) -> DylibError<'a> {
+    match e {
+        CommandsError::Room { need, room } => DylibError::HeaderRoom { need, room },
+        CommandsError::Field { what, value } => DylibError::TooLarge { what, len: value },
+    }
 }
 
 /// `BIND_SPECIAL_DYLIB_FLAT_LOOKUP` (-2) in `dyld_chained_import_addend64`'s 16-bit
@@ -115,8 +126,6 @@ const EXPORT_KIND_REGULAR: u64 = 0;
 const EXPORT_KIND_THREAD_LOCAL: u64 = 1;
 /// 1.0.0: the image's own versions, and what it asks of every library but libSystem.
 pub(crate) const DYLIB_VERSION: u32 = 1 << 16;
-/// `dylib_command::name.offset`: the name follows the 24-byte command.
-const DYLIB_NAME_AT: u64 = 24;
 const UUID_DOMAIN: &str = "blaze-export native dylib uuid 1";
 /// The export trie's offsets settle in a few passes (each pass only grows a uleb); more is a bug.
 const TRIE_PASSES: u32 = 32;
@@ -270,7 +279,12 @@ pub fn write<'a, 'b>(image: &Image<'a>, identifier: &str, out: &mut AVec<'_, u8>
     let mut chains: AVec<'_, (u64, Chain)> = Vec::with_capacity_in(image.fixups.len(), alloc);
     for f in image.fixups.iter() {
         let to = match f.to {
-            FixTo::Rebase { target } => Chain::Rebase { target },
+            FixTo::Rebase { address, high8 } => {
+                // The tag rides in `high8`; the address must fit the chain's 36 bits, refused
+                // naming the slot and the pointer as the program holds it (rule 19).
+                let too_far = DylibError::Slot { what: macho::REBASE_TOO_FAR, value: address.tagged(high8), at: f.at };
+                Chain::Rebase { target: macho::Target36::new(address.get()).ok_or(too_far)?, high8 }
+            }
             FixTo::Import { index, addend: 0 } => Chain::Bind { import: index },
             FixTo::Import { index, addend } => match extra.binary_search(&(index, addend)) {
                 Ok(k) => Chain::Bind { import: (n_imports + k) as u32 },
@@ -369,73 +383,47 @@ pub fn write<'a, 'b>(image: &Image<'a>, identifier: &str, out: &mut AVec<'_, u8>
     let link_len = link.len() as u64 + sig_len;
     segs.push(Seg { name: "__LINKEDIT", vm: vm_end, vm_size: up(link_len, PAGE), file: file_end, file_size: link_len, prot: macho::VM_PROT_READ, flags: 0, first: sects.len(), count: 0, fixups: false });
 
-    // The header and load commands.
-    out.clear();
-    out.try_reserve((code_limit + sig_len) as usize).map_err(|_| DylibError::Alloc)?;
-    for _ in 0..8 {
-        bytes::u32(out, 0);
-    }
+    // The load commands, built first as a list (commands.rs): `ncmds` and `sizeofcmds` are the
+    // list's, never a hand count (one short once left LC_CODE_SIGNATURE unread: every image
+    // refused at `dlopen` as "missing code signature"), and the room the image keeps before
+    // `Text` (`Layout::header_reserve`) is checked against the list in every build.
+    let mut cmds = Commands::new(alloc);
     for seg in segs.iter() {
-        macho::segment_command(out, seg.name, seg.vm, seg.vm_size, seg.file, seg.file_size, seg.prot, seg.count as u32, seg.flags);
-        for s in sects[seg.first..seg.first + seg.count].iter() {
-            let offset = if s.zero { 0 } else { s.at };
-            macho::section_command(out, s.name, s.seg, s.at, s.len, offset, s.align, s.flags, 0);
-        }
+        let segment = Segment { name: seg.name, vmaddr: seg.vm, vm_size: seg.vm_size, file: seg.file, file_size: seg.file_size, prot: seg.prot, flags: seg.flags };
+        let sections = sects[seg.first..seg.first + seg.count].iter().map(|s| Section {
+            name: s.name,
+            seg: s.seg,
+            addr: s.at,
+            size: s.len,
+            offset: if s.zero { 0 } else { s.at },
+            align: s.align,
+            flags: s.flags,
+            reserved1: 0,
+        });
+        cmds.segment(segment, sections);
     }
-    dylib_command(out, LC_ID_DYLIB, identifier, 1, DYLIB_VERSION, DYLIB_VERSION);
+    cmds.push(Command::Dylib { cmd: LC_ID_DYLIB, name: identifier, timestamp: 1, current: DYLIB_VERSION, compat: DYLIB_VERSION });
     for (k, path) in paths.iter().enumerate() {
         let (current, compat) = if k == 0 { (macho::LIB_SYSTEM_CURRENT, macho::LIB_SYSTEM_COMPAT) } else { (DYLIB_VERSION, DYLIB_VERSION) };
-        dylib_command(out, macho::LC_LOAD_DYLIB, path.as_str(), 2, current, compat);
+        cmds.push(Command::Dylib { cmd: macho::LC_LOAD_DYLIB, name: path.as_str(), timestamp: 2, current, compat });
     }
-    macho::linkedit_data(out, macho::LC_DYLD_CHAINED_FIXUPS, file_end + fixups_at, blob.len() as u64);
-    macho::linkedit_data(out, LC_DYLD_EXPORTS_TRIE, file_end + trie_at, trie.len() as u64);
-    let n = image.exports.len() as u32;
-    bytes::u32(out, macho::LC_SYMTAB);
-    bytes::u32(out, 24);
-    bytes::u32(out, (file_end + symtab_at) as u32);
-    bytes::u32(out, n);
-    bytes::u32(out, (file_end + strtab_at) as u32);
-    bytes::u32(out, strtab_len as u32);
-    bytes::u32(out, macho::LC_DYSYMTAB);
-    bytes::u32(out, 80);
-    // ilocalsym, nlocalsym, iextdefsym, nextdefsym, iundefsym, nundefsym, tocoff, ntoc,
-    // modtaboff, nmodtab, extrefsymoff, nextrefsyms, indirectsymoff, nindirectsyms, extreloff,
-    // nextrel, locreloff, nlocrel: every symbol an external definition, sorted by name.
-    let dysymtab = [0, 0, 0, n, n, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    for field in dysymtab {
-        bytes::u32(out, field);
-    }
-    bytes::u32(out, macho::LC_UUID);
-    bytes::u32(out, 24);
-    let uuid_at = out.len();
-    out.extend_from_slice(&[0u8; 16]);
-    bytes::u32(out, macho::LC_BUILD_VERSION);
-    bytes::u32(out, 24);
-    bytes::u32(out, macho::PLATFORM_MACOS);
-    bytes::u32(out, MIN_MACOS);
-    bytes::u32(out, 0); // sdk
-    bytes::u32(out, 0); // ntools
-    macho::linkedit_data(out, macho::LC_FUNCTION_STARTS, file_end + starts_at, starts_len);
-    macho::linkedit_data(out, macho::LC_CODE_SIGNATURE, code_limit, sig_len);
-    let header_end = out.len() as u64;
-    if header_end > text.at {
-        return Err(DylibError::TooLarge { what: "the header and load commands past the image's header room", len: header_end });
-    }
-    // Counted from the commands as written, never by hand: dyld reads only `ncmds` of them, and
-    // a hand count one short (LC_FUNCTION_STARTS added, the sum not moved) left the last,
-    // LC_CODE_SIGNATURE, unread: every image refused at `dlopen` as "missing code signature".
-    let ncmds = commands_in(&out[macho::HEADER as usize..]).ok_or(shape("a load command whose cmdsize is not a positive multiple of 8 or runs past the commands", header_end))?;
+    cmds.push(Command::LinkeditData { cmd: macho::LC_DYLD_CHAINED_FIXUPS, off: file_end + fixups_at, size: blob.len() as u64 });
+    cmds.push(Command::LinkeditData { cmd: LC_DYLD_EXPORTS_TRIE, off: file_end + trie_at, size: trie.len() as u64 });
+    let n = image.exports.len() as u64;
+    cmds.push(Command::Symtab { symoff: file_end + symtab_at, nsyms: n, stroff: file_end + strtab_at, strsize: strtab_len });
+    // Every symbol an external definition, sorted by name: iextdefsym 0, nextdefsym n.
+    cmds.push(Command::Dysymtab { fields: [0, 0, 0, n, n, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
+    cmds.push(Command::Uuid);
+    cmds.push(Command::BuildVersion { platform: macho::PLATFORM_MACOS, minos: MIN_MACOS, sdk: 0 });
+    cmds.push(Command::LinkeditData { cmd: macho::LC_FUNCTION_STARTS, off: file_end + starts_at, size: starts_len });
+    cmds.push(Command::LinkeditData { cmd: macho::LC_CODE_SIGNATURE, off: code_limit, size: sig_len });
     let mut flags = MH_DYLDLINK | MH_TWOLEVEL | MH_NO_REEXPORTED_DYLIBS;
     if thread_vars.len > 0 {
         flags |= MH_HAS_TLV_DESCRIPTORS;
     }
-    bytes::set32(out, 0, macho::MH_MAGIC_64);
-    bytes::set32(out, 4, macho::CPU_TYPE_ARM64);
-    bytes::set32(out, 8, 0); // CPU_SUBTYPE_ARM64_ALL
-    bytes::set32(out, 12, MH_DYLIB);
-    bytes::set32(out, 16, ncmds);
-    bytes::set32(out, 20, (header_end - macho::HEADER) as u32);
-    bytes::set32(out, 24, flags);
+    out.clear();
+    out.try_reserve((code_limit + sig_len) as usize).map_err(|_| DylibError::Alloc)?;
+    let uuid_at = cmds.write(out, Header { filetype: MH_DYLIB, flags }, text.at).map_err(commands_error)?.uuid_at;
 
     // The image's bytes at their addresses, the chained slots in them, then `__LINKEDIT`.
     out.resize(image.file_start as usize, 0);
@@ -453,38 +441,6 @@ pub fn write<'a, 'b>(image: &Image<'a>, identifier: &str, out: &mut AVec<'_, u8>
     out[uuid_at..uuid_at + 16].copy_from_slice(&digest[..16]);
     sign::sign(out, identifier, text_size, false);
     Ok(())
-}
-
-/// How many load commands `cmds` holds (each `cmd`, `cmdsize`, then its body, little-endian),
-/// walked by their sizes; `None` when one's size is not a positive multiple of 8 or the last
-/// does not end exactly at the end of `cmds`.
-pub(crate) fn commands_in(cmds: &[u8]) -> Option<u32> {
-    let mut at = 0usize;
-    let mut count = 0u32;
-    while at < cmds.len() {
-        let field: [u8; 4] = cmds.get(at + 4..at + 8)?.try_into().ok()?;
-        let size = u32::from_le_bytes(field) as usize;
-        if size == 0 || !size.is_multiple_of(8) {
-            return None;
-        }
-        at = at.checked_add(size)?;
-        count = count.checked_add(1)?;
-    }
-    (at == cmds.len()).then_some(count)
-}
-
-/// `dylib_command`: the name after the 24-byte command, NUL-padded to 8.
-pub(crate) fn dylib_command(out: &mut AVec<'_, u8>, cmd: u32, name: &str, timestamp: u32, current: u32, compat: u32) {
-    let size = DYLIB_NAME_AT + up(name.len() as u64 + 1, 8);
-    bytes::u32(out, cmd);
-    bytes::u32(out, size as u32);
-    bytes::u32(out, DYLIB_NAME_AT as u32);
-    bytes::u32(out, timestamp);
-    bytes::u32(out, current);
-    bytes::u32(out, compat);
-    let at = out.len();
-    out.extend_from_slice(name.as_bytes());
-    out.resize(at + (size - DYLIB_NAME_AT) as usize, 0);
 }
 
 fn uleb_len(mut value: u64) -> u64 {

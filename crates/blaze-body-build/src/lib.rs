@@ -218,6 +218,8 @@ pub fn build<A: Allocator + Clone>(
         // rows (blaze-code record.rs `TrapSource`), so a fault in them is said by its code alone.
         traps: Vec::new_in(alloc.clone()),
         vtables: Vec::new_in(alloc),
+        // This builder has no `copy` of its own (blaze-build walk.rs): none counted.
+        copy_insts: 0,
     })
 }
 

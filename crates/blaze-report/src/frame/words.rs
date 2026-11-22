@@ -537,6 +537,18 @@ pub const WORDINGS: &[Wording] = &[
         args: 1,
         kind: Kind::Told,
     },
+    // The rustflags (cargo's `build.rustflags` rule) a unit takes that blaze does not apply: each
+    // `--cfg` is in the units' cfg, every other flag is named here, never dropped quietly
+    // (blaze-cli graph.rs `RUSTFLAGS_NOT_APPLIED`, blaze-manifest rustflags.rs `Chosen`).
+    Wording {
+        area: Area::Cli,
+        number: 47,
+        name: "rustflags-not-applied",
+        headline: "{0}",
+        label: "blaze applies a rustflags `--cfg` and no other flag",
+        args: 1,
+        kind: Kind::Told,
+    },
     Wording {
         area: Area::Drive,
         number: 0xC0F6,

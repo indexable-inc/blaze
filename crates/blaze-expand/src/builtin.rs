@@ -16,6 +16,7 @@ use crate::{
     error::{ExpandError, Stream, Unbuilt},
     expand::Out,
     expansion::{Diagnostic, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind, Reads, TokenOrigin},
+    extent::{After, ExtentError, ExtentWhy, Prefix, Words},
     literal::{self, Buf, LitError},
     nested,
     tokens::{Delim, LitKind, Raw, Spacing, TokenKind, TokenStream, Transparency, index},
@@ -102,39 +103,16 @@ impl Args<'_> {
         }
     }
 
-    /// The comma-separated arguments, each without the invisible groups around it; a trailing
-    /// comma ends the list.
-    fn split<'b>(&self, alloc: Alloc<'b>) -> AVec<'b, core::ops::Range<usize>> {
-        self.split_in(0..self.stream.len(), ',', alloc)
-    }
-
-    /// The pieces of the tokens `range` between the `sep`s outside any group, each without
-    /// the invisible groups around it; a trailing `sep` ends the list.
-    fn split_in<'b>(
-        &self,
-        range: core::ops::Range<usize>,
-        sep: char,
-        alloc: Alloc<'b>,
-    ) -> AVec<'b, core::ops::Range<usize>> {
-        let tokens = self.stream.tokens();
-        let mut pieces = Vec::new_in(alloc);
-        let mut depth = 0u32;
-        let mut start = range.start;
-        for at in range.clone() {
-            match tokens[at].kind {
-                TokenKind::Open(_) => depth += 1,
-                TokenKind::Close(_) => depth -= 1,
-                TokenKind::Punct { char, .. } if char == sep && depth == 0 => {
-                    pieces.push(self.unwrap(start..at));
-                    start = at + 1;
-                }
-                _ => {}
-            }
+    /// The `,`-separated arguments, each an expression (rustc's `get_exprs_from_tts`) without
+    /// the invisible groups around it, a trailing `,` taken: the parser's list
+    /// ([`Words::list`]), so `f::<A, B>()` is one argument.
+    fn split<'b>(&self, alloc: Alloc<'b>) -> Result<AVec<'b, core::ops::Range<usize>>, ExtentError> {
+        let words = Words::new(self.stream, alloc);
+        let mut pieces = words.list(Prefix::Expr, 0..self.stream.len(), alloc)?;
+        for piece in pieces.iter_mut() {
+            *piece = self.unwrap(piece.clone());
         }
-        if start < range.end {
-            pieces.push(self.unwrap(start..range.end));
-        }
-        pieces
+        Ok(pieces)
     }
 
     /// The inside of the `[..]` group that is all of `range`.
@@ -158,29 +136,16 @@ impl Args<'_> {
         range
     }
 
-    /// The end of the first argument.
-    fn first_end(&self) -> usize {
-        let mut depth = 0u32;
-        for (at, token) in self.stream.tokens().iter().enumerate() {
-            match token.kind {
-                TokenKind::Open(_) => depth += 1,
-                TokenKind::Close(_) => depth -= 1,
-                TokenKind::Punct { char: ',', .. } if depth == 0 => return at,
-                _ => {}
-            }
-        }
-        self.stream.len()
-    }
-
     /// Where the expression that starts the input ends (rustc's `parse_expr`, as
     /// `expand_assert` reads its condition): a comma in `f::<A, B>()` is in no delimiter but
     /// ends no argument. `None` when the input does not start with an expression, or it is
     /// followed by something other than a `,`.
     fn expr_end(&self, alloc: Alloc<'_>) -> Option<usize> {
-        let end = expr_extent(self.stream, alloc)?;
-        match self.stream.tokens().get(end).map(|t| t.kind) {
-            None | Some(TokenKind::Punct { char: ',', .. }) => Some(end),
-            Some(_) => None,
+        let words = Words::new(self.stream, alloc);
+        let end = words.extent(Prefix::Expr, 0, alloc).ok()?;
+        match words.after(end) {
+            After::End | After::Comma => Some(end),
+            After::Other => None,
         }
     }
 
@@ -245,8 +210,16 @@ fn eager<'a>(
     calls.retain(|it| it.kind == NestedKind::FnLike);
     if matches!(which, BuiltinFn::FormatArgs | BuiltinFn::FormatArgsNl | BuiltinFn::ConstFormatArgs)
     {
-        // Only the template is expanded first (`format_args!(concat!(..), x)`).
-        let first = Args { stream: input, from: None }.first_end();
+        // Only the template is expanded first (`format_args!(concat!(..), x)`): the first
+        // argument, an expression; one that is none is refused here, where it stops.
+        let first = match Words::new(input, alloc).extent(Prefix::Expr, 0, alloc) {
+            Ok(first) => first,
+            Err(error) => {
+                let (message, at) = args_refused(&Args { stream: input, from: None }, error);
+                refuse(out, message, at)?;
+                return Ok(Step::Done);
+            }
+        };
         calls.retain(|it| it.args.end as usize <= first);
     }
     let answers = call.eager.answers;
@@ -323,6 +296,31 @@ fn refuse(
     Ok(())
 }
 
+/// The refusal of arguments that are no `,`-separated list of expressions, and where the
+/// parser stops.
+fn args_refused(args: &Args<'_>, error: ExtentError) -> (&'static str, Option<TokenOrigin>) {
+    let message = match error.why {
+        ExtentWhy::Unseparated => "expected `,` between the arguments",
+        ExtentWhy::Refused | ExtentWhy::Trailing | ExtentWhy::Unbalanced => "an argument is not an expression",
+    };
+    (message, at_token(args, error.token as usize))
+}
+
+/// The builtin's arguments ([`Args::split`]), or `None` with their refusal diagnosed.
+fn arguments<'b>(
+    args: &Args<'_>,
+    out: &mut Out<'_, 'b>,
+) -> Result<Option<AVec<'b, core::ops::Range<usize>>>, ExpandError> {
+    match args.split(out.alloc) {
+        Ok(pieces) => Ok(Some(pieces)),
+        Err(error) => {
+            let (message, at) = args_refused(args, error);
+            refuse(out, message, at)?;
+            Ok(None)
+        }
+    }
+}
+
 /// Where argument token `at` is, or the end of the input.
 fn at_token(args: &Args<'_>, at: usize) -> Option<TokenOrigin> {
     (at < args.stream.len()).then(|| args.origin(at))
@@ -388,7 +386,8 @@ fn concat(
     out: &mut Out<'_, '_>,
 ) -> Result<(), ExpandError> {
     let mut value = Buf::new_in(out.alloc);
-    for range in args.split(out.alloc) {
+    let Some(pieces) = arguments(args, out)? else { return Ok(()) };
+    for range in pieces {
         match args.atom(range) {
             Atom::Lit { kind, text, suffix_len, negative, at } => {
                 if let Err(error) =
@@ -413,9 +412,10 @@ fn concat_bytes(
     out: &mut Out<'_, '_>,
 ) -> Result<(), ExpandError> {
     let mut value = Vec::new_in(out.alloc);
-    for range in args.split(out.alloc) {
-        if let Some(inside) = args.bracketed(&range) {
-            if let Err((message, at)) = bytes_array(args, inside, &mut value, out.alloc) {
+    let Some(pieces) = arguments(args, out)? else { return Ok(()) };
+    for range in pieces {
+        if args.bracketed(&range).is_some() {
+            if let Err((message, at)) = bytes_array(args, range, &mut value, out.alloc) {
                 return refuse(out, message, at);
             }
             continue;
@@ -442,11 +442,12 @@ fn concat_bytes(
     out.made(kind, text.as_str(), MADE)
 }
 
-/// The bytes of a `concat_bytes!` array whose inside is `inside`, appended to `value`; or the
-/// refusal and where.
+/// The bytes of the `concat_bytes!` array `[..]` that is all of `array`, appended to `value`;
+/// or the refusal and where. Its elements are the parser's (`ARRAY_EXPR`'s children), a
+/// repeat `[b; n]` the one with a `;`.
 fn bytes_array(
     args: &Args<'_>,
-    inside: core::ops::Range<usize>,
+    array: core::ops::Range<usize>,
     value: &mut AVec<'_, u8>,
     alloc: Alloc<'_>,
 ) -> Result<(), (&'static str, Option<TokenOrigin>)> {
@@ -465,16 +466,21 @@ fn bytes_array(
             Atom::Bool(_) => Err(("cannot concatenate a boolean literal", None)),
         }
     };
-    let repeat = args.split_in(inside.clone(), ';', alloc);
-    if let [byte, count] = &repeat[..] {
-        let byte = element(byte.clone())?;
+    let tree = Words::new(args.stream, alloc).tree(Prefix::Expr, array.start, alloc).map_err(|e| args_refused(args, e))?;
+    let root = 0;
+    let mut elements = tree.children(root).filter(|&child| !tree.is_token(child)).map(|child| args.unwrap(tree.range(child)));
+    if tree.child(root, parser::SyntaxKind::SEMICOLON).is_some() {
+        let (Some(byte), Some(count)) = (elements.next(), elements.next()) else {
+            return Err(("the repeated array does not parse", at_token(args, array.start)));
+        };
+        let byte = element(byte)?;
         let count = match args.atom(count.clone()) {
             Atom::Lit { kind: LitKind::Integer, text, suffix_len, negative: false, .. } => {
                 literal::integer_of(text, suffix_len)
             }
             _ => None,
         };
-        let too_large = ("the repeated array is too large", at_token(args, inside.start));
+        let too_large = ("the repeated array is too large", at_token(args, array.start + 1));
         let count = count.ok_or(("the repeat count is not an integer literal", None))?;
         let count = usize::try_from(count).map_err(|_| too_large)?;
         // A byte string is kept under `u32::MAX` bytes, as every text of a stream.
@@ -483,7 +489,7 @@ fn bytes_array(
         value.extend(core::iter::repeat_n(byte, count));
         return Ok(());
     }
-    for range in args.split_in(inside, ',', alloc) {
+    for range in elements {
         value.push(element(range)?);
     }
     Ok(())
@@ -501,7 +507,7 @@ fn env(
     rec: &mut Recorder<'_, '_, impl ExpandCx>,
     optional: Optional,
 ) -> Result<(), ExpandError> {
-    let pieces = args.split(out.alloc);
+    let Some(pieces) = arguments(args, out)? else { return Ok(()) };
     let most = if optional == Optional::Yes { 1 } else { 2 };
     if pieces.is_empty() || pieces.len() > most {
         let message = if optional == Optional::Yes {
@@ -534,12 +540,14 @@ fn env(
             crate_path(out, &["option", "Option", if value.is_some() { "Some" } else { "None" }])?;
             punct(out, ':', Spacing::Joint)?;
             punct(out, ':', Spacing::Alone)?;
+            // astlog-ignore: expand-hand-extent (a token the expansion writes)
             punct(out, '<', Spacing::Alone)?;
             // `&` is not joined to the lifetime after it: `&'` is no operator.
             punct(out, '&', Spacing::Alone)?;
             punct(out, '\'', Spacing::Joint)?;
             ident(out, "static")?;
             ident(out, "str")?;
+            // astlog-ignore: expand-hand-extent (a token the expansion writes)
             punct(out, '>', Spacing::Alone)?;
             if let Some(value) = value {
                 out.made(TokenKind::Open(Delim::Paren), "", MADE)?;
@@ -568,7 +576,7 @@ fn include(
     rec: &mut Recorder<'_, '_, impl ExpandCx>,
     inclusion: Inclusion,
 ) -> Result<(), ExpandError> {
-    let pieces = args.split(out.alloc);
+    let Some(pieces) = arguments(args, out)? else { return Ok(()) };
     if pieces.len() != 1 {
         return refuse(out, "expected one string literal: the path", None);
     }
@@ -708,28 +716,6 @@ fn assert(out: &mut Out<'_, '_>) -> Result<(), ExpandError> {
     out.made(TokenKind::Close(Delim::Brace), "", MADE)
 }
 
-/// Where the expression that starts `stream` ends, by the parser's expression entry point
-/// (rustc's `parse_expr`): the index of the first token past it, whatever follows. `None` when
-/// `stream` does not start with an expression. One reading for every builtin that takes an
-/// expression among other tokens (`assert!`'s condition, a `cfg_select!` arm).
-fn expr_extent(stream: &TokenStream<'_>, alloc: Alloc<'_>) -> Option<usize> {
-    let words = crate::body::parser_words(stream, alloc);
-    let output = parser::PrefixEntryPoint::Expr.parse(parser::Tokens::new(&words.words, true));
-    if output.iter().any(|step| matches!(step, parser::Step::Error { .. })) {
-        return None;
-    }
-    let taken = crate::rules::consumed(&output);
-    let len = stream.len();
-    let tokens = stream.tokens();
-    let mut end = (0..len).find(|&at| words.word_at[at] as usize >= taken).unwrap_or(len);
-    // An invisible group's delimiters start no word: the close of a `$e:expr` that held
-    // the expression belongs to it.
-    while tokens.get(end).is_some_and(|t| t.kind == TokenKind::Close(Delim::Invisible)) {
-        end += 1;
-    }
-    Some(end)
-}
-
 /// Whether the expression `range` of `stream` is one that ends a statement with no `;`
 /// (rustc's `classify::expr_is_complete`: a block-like expression, `if`, `match`, `loop`,
 /// `while`, `for`, `unsafe { .. }`, a labeled block), read by its first token and its last
@@ -756,6 +742,7 @@ fn cfg_select(
 ) -> Result<(), ExpandError> {
     let input = out.call.input();
     let tokens = input.tokens();
+    let words = Words::new(input, out.alloc);
     let mut chosen = None;
     let mut at = 0;
     while at < tokens.len() {
@@ -766,11 +753,13 @@ fn cfg_select(
             match token.kind {
                 TokenKind::Open(_) => depth += 1,
                 TokenKind::Close(_) => depth -= 1,
+                // A cfg predicate (`unix`, `any(..)`, `feature = ".."`) holds no `<` or `>`:
+                // the first `=>` outside its groups ends it, exactly.
                 TokenKind::Punct { char: '=', spacing: Spacing::Joint }
                     if depth == 0
                         && matches!(
                             tokens.get(at + 1).map(|it| it.kind),
-                            Some(TokenKind::Punct { char: '>', .. })
+                            Some(TokenKind::Punct { char: '>', .. }) // astlog-ignore: expand-hand-extent (the `=>` after a cfg predicate)
                         ) =>
                 {
                     break Some(at);
@@ -804,22 +793,20 @@ fn cfg_select(
             },
             None => return refuse(out, "expected an arm after `=>` in `cfg_select!`", input_at(arrow)),
             Some(_) => {
-                let rest = input.copy_in(open..tokens.len(), out.alloc)?;
-                let Some(taken) = expr_extent(&rest, out.alloc) else {
+                let Ok(end) = words.extent(Prefix::Expr, open, out.alloc) else {
                     return refuse(out, "expected an expression or a `{ .. }` arm after `=>` in `cfg_select!`", input_at(open));
                 };
-                let end = open + taken;
                 let complete = block_like(input, &(open..end));
-                match tokens.get(end).map(|it| it.kind) {
-                    None | Some(TokenKind::Punct { char: ',', .. }) => {}
-                    Some(_) if complete => {}
-                    Some(_) => return refuse(out, "expected `,` after a `cfg_select!` arm's expression", input_at(end)),
+                match words.after(end) {
+                    After::End | After::Comma => {}
+                    After::Other if complete => {}
+                    After::Other => return refuse(out, "expected `,` after a `cfg_select!` arm's expression", input_at(end)),
                 }
                 at = end;
                 open..end
             }
         };
-        if matches!(tokens.get(at).map(|it| it.kind), Some(TokenKind::Punct { char: ',', .. })) {
+        if words.after(at) == After::Comma {
             at += 1;
         }
         if chosen.is_some() {
@@ -858,7 +845,7 @@ fn compile_error(
     args: &Args<'_>,
     out: &mut Out<'_, '_>,
 ) -> Result<(), ExpandError> {
-    let pieces = args.split(out.alloc);
+    let Some(pieces) = arguments(args, out)? else { return Ok(()) };
     let mut message = Buf::new_in(out.alloc);
     if pieces.len() != 1 {
         return refuse(out, "`compile_error!` takes 1 string literal", None);
@@ -885,8 +872,8 @@ fn format_args(
     newline: Newline,
 ) -> Result<(), ExpandError> {
     let template = if newline == Newline::Yes {
-        let first = args.split(out.alloc).first().cloned();
-        let Some(first) = first else {
+        let Some(pieces) = arguments(args, out)? else { return Ok(()) };
+        let Some(first) = pieces.first().cloned() else {
             return refuse(out, "`format_args_nl!` takes a format string", None);
         };
         match args.atom(first.clone()) {
@@ -1116,6 +1103,7 @@ impl Printed {
         match (self, next) {
             _ if self.punct() == Some('.') && next.punct().is_none() => false,
             (_, Printed::Ident { .. }) if self.punct() == Some('$') => false,
+            // astlog-ignore: expand-hand-extent (stringify's spacing between printed tokens)
             _ if self.punct().is_none() && matches!(next.punct(), Some(',' | ';' | '.')) => false,
             (Printed::Ident { keyword, .. }, Printed::Group { delim: Delim::Paren, .. }) => keyword,
             (_, Printed::Group { delim, .. }) if self.punct() == Some('#') => delim != Delim::Bracket,

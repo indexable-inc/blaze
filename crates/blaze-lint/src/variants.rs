@@ -345,7 +345,69 @@ impl<'a> Variants<'a> {
         Ok(made)
     }
 
-    fn name(&self, e: &EnumFact) -> &[u8] {
+    /// The fact as borrowed columns: `Copy` and `Sync`, so a file's units linted on several
+    /// workers read the one fact gathered for the file ([`VariantsView`]).
+    pub fn view(&self) -> VariantsView<'_> {
+        VariantsView { enums: &self.enums, names: &self.names, sites: &self.sites }
+    }
+
+    /// What this rule's findings in the unit at `base` (its `len` bytes, its `holes`) read of the
+    /// rest of the file, as a digest: each site's item-relative place, value and module with the
+    /// name, count and place of every enum of that count. `None` when no site of the unit has an
+    /// enum of its count: then nothing outside the unit moves its findings. A driver joins it to
+    /// the unit's key.
+    pub fn unit_key(&self, base: u32, len: u32, holes: &[Span]) -> Option<[u8; 32]> {
+        self.view().unit_key(base, len, holes)
+    }
+
+    /// The findings of `variant-count` in `unit`, which starts at `base` of the file this fact
+    /// was gathered from, pushed onto `out`.
+    pub(crate) fn find(&self, unit: &Unit<'_>, base: u32, out: &mut Findings<'_>) -> Result<(), LintError> {
+        self.view().find(unit, base, out)
+    }
+}
+
+/// A unit's place in its file, as [`crate::Units`] plans it: its start, its length and its
+/// children (unit-relative, in order). What `variant-count` finds a unit's sites by when the unit
+/// is linted as its own text ([`crate::Units::own`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Geometry<'h> {
+    pub base: u32,
+    pub len: u32,
+    pub holes: &'h [Span],
+}
+
+/// [`Variants`] borrowed ([`Variants::view`]).
+#[derive(Clone, Copy)]
+pub struct VariantsView<'a> {
+    enums: &'a [EnumFact],
+    names: &'a [u8],
+    sites: &'a [Site],
+}
+
+impl<'a> VariantsView<'a> {
+    /// The digest [`Variants::unit_key`] makes, its sites' places own places ([`crate::own_place`]):
+    /// what a unit linted as its own text reads of the rest of the file, with no child's length.
+    pub fn unit_key_own(&self, at: Geometry<'_>) -> Option<[u8; 32]> {
+        self.key_of(at.base, at.len, at.holes, |range| Span::new(crate::own_place(at.holes, range.start), crate::own_place(at.holes, range.end)))
+    }
+
+    /// The findings of `variant-count` in the unit at `at`, linted as its own text, each placed
+    /// in that text ([`crate::own_place`]), pushed onto `out`.
+    pub(crate) fn find_own(&self, at: Geometry<'_>, out: &mut Findings<'_>) -> Result<(), LintError> {
+        self.find_in(at.base, at.len, at.holes, |range| Span::new(crate::own_place(at.holes, range.start), crate::own_place(at.holes, range.end)), out)
+    }
+
+    fn unit_key(&self, base: u32, len: u32, holes: &[Span]) -> Option<[u8; 32]> {
+        self.key_of(base, len, holes, |range| range)
+    }
+
+    fn find(&self, unit: &Unit<'_>, base: u32, out: &mut Findings<'_>) -> Result<(), LintError> {
+        let len = count(unit.text.len())?;
+        self.find_in(base, len, unit.holes, |range| range, out)
+    }
+
+    fn name(&self, e: &EnumFact) -> &'a [u8] {
         &self.names[e.name.from as usize..e.name.to as usize]
     }
 
@@ -364,14 +426,11 @@ impl<'a> Variants<'a> {
         })
     }
 
-    /// What this rule's findings in the unit at `base` (its `len` bytes, its `holes`) read of the
-    /// rest of the file, as a digest: each site's item-relative place, value and module with the
-    /// name, count and place of every enum of that count. `None` when no site of the unit has an
-    /// enum of its count: then nothing outside the unit moves its findings. A driver joins it to
-    /// the unit's key.
-    pub fn unit_key(&self, base: u32, len: u32, holes: &[Span]) -> Option<[u8; 32]> {
+    /// [`Variants::unit_key`], each site's place made by `place` from its item-relative range.
+    fn key_of(&self, base: u32, len: u32, holes: &[Span], place: impl Fn(Span) -> Span) -> Option<[u8; 32]> {
         let mut hasher: Option<blaze_blake3::Hasher> = None;
         for (range, site) in self.sites_of(base, len, holes) {
+            let range = place(range);
             for e in self.enums.iter().filter(|e| e.count == site.value) {
                 let h = hasher.get_or_insert_with(|| blaze_blake3::Hasher::new_derive_key("blaze-lint variant-count unit 1"));
                 h.update(&range.start.to_le_bytes());
@@ -387,11 +446,11 @@ impl<'a> Variants<'a> {
         hasher.map(|h| h.finalize())
     }
 
-    /// The findings of `variant-count` in `unit`, which starts at `base` of the file this fact
-    /// was gathered from, pushed onto `out`.
-    pub(crate) fn find(&self, unit: &Unit<'_>, base: u32, out: &mut Findings<'_>) -> Result<(), LintError> {
-        let len = count(unit.text.len())?;
-        for (range, site) in self.sites_of(base, len, unit.holes) {
+    /// The findings of `variant-count` in the unit at `base` of `len` bytes with `holes`, each
+    /// placed by `place` from its item-relative range, pushed onto `out`.
+    fn find_in(&self, base: u32, len: u32, holes: &[Span], place: impl Fn(Span) -> Span, out: &mut Findings<'_>) -> Result<(), LintError> {
+        for (range, site) in self.sites_of(base, len, holes) {
+            let range = place(range);
             let mut matching = self.enums.iter().filter(|e| e.count == site.value);
             let Some(first) = matching.next() else { continue };
             let many = matching.next().is_some();

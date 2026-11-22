@@ -379,7 +379,7 @@ pub fn decide_stalled_goals<'n, 'a, S: NamesSource<'n>>(
                 }
             }
             Err(tc::StalledError::Check(error)) => return check(error),
-            Err(tc::StalledError::Ambiguous { trait_, site, storage }) => {
+            Err(tc::StalledError::Ambiguous { trait_, site, storage, undecided }) => {
                 let stored_at = match storage {
                     None => None,
                     Some((block, field)) => {
@@ -396,7 +396,7 @@ pub fn decide_stalled_goals<'n, 'a, S: NamesSource<'n>>(
                         }
                     }
                 };
-                return check(tc::CheckError::FutureWitnessGoal { trait_, at: site, stored_at });
+                return check(tc::CheckError::FutureWitnessGoal { trait_, at: site, stored_at, undecided });
             }
             Err(tc::StalledError::TableNotExtended { .. }) => return check(tc::CheckError::Unported(STALLED_TABLE)),
         };

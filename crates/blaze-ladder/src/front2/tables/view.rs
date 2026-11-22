@@ -396,6 +396,24 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.call_text(krate, call)
     }
 
+    /// WHOLE: the answer is a search of the items record's owned-members index.
+    fn member_beginning(self, krate: usize, item: blaze_typeck::ItemKey) -> Result<Option<ItemKey>, crate::seam::PositionGap> {
+        self.whole(krate, Section::Items);
+        self.records.member_beginning(krate, item)
+    }
+
+    /// WHOLE: every item row of the crate, and each impl's and trait's members, are visited.
+    fn enclosing_keys(self, krate: usize, visit: impl FnMut(ItemKey) -> Result<(), crate::seam::PositionGap>) -> Result<(), crate::seam::PositionGap> {
+        self.whole(krate, Section::Items);
+        self.records.enclosing_keys(krate, visit)
+    }
+
+    /// The expansion's cell: its record holds the text.
+    fn expansion_text(self, krate: usize, call: ItemKey) -> Option<&'n str> {
+        self.cell(NameCell::Expansion { call });
+        self.records.expansion_text(krate, call)
+    }
+
     /// The item's cell alone, for an item of a file and of a macro call's expansion alike: the
     /// answer is its items row's `foreign` field (the block's ABI, written by the names task),
     /// which the `Item` cell's digest covers (blaze-scope names_cells.rs `item_digest`).

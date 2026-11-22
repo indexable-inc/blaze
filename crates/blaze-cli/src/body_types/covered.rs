@@ -435,8 +435,9 @@ impl InBlocksError {
     }
 }
 
-/// Every listed body of crate 0 written in a block's module ([`InBlock`]) but its free fns
-/// (each its body's local fn, checked by that body's check), sorted by (owner, key), each once.
+/// Every listed body of crate 0 written in a block's module ([`InBlock`]) but its free fns,
+/// consts and statics (each its body's local item, checked by that body's check: front2
+/// every_body.rs `each_from`), sorted by (owner, key), each once.
 /// A body is a block's when the walk up from where it is placed (its own place, or its
 /// container's: [`placed_by`]) through the calls that wrote it stops at a listed body's
 /// [`block_key`] ([`block_stops`], [`walk_up`]). A body whose walk ends in a file, or
@@ -453,10 +454,13 @@ pub(crate) fn in_blocks<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>
         // `Said::within`, every_body.rs `each_from`). Listed here too it was checked twice, and
         // its finding printed under two names (`{a block of `main`}::main` beside `{the
         // expansion of `std::main!`}::main::main`, the fn D104's `main!` writes inside the
-        // launcher, 2026-11-21): one body, one check (rule 77). A block's impl and trait
-        // members and its `const` and `static` initializers are no body's locals: here.
+        // launcher, 2026-11-21): one body, one check (rule 77). A block's `const` and `static`
+        // initializers are its body's locals too (front2 every_body.rs `each_from` queues
+        // every local fn, const and static: before, only fns, so a static of a block that is
+        // no module, chainspec's `mainnet::IDENTITY`, was checked by no task, tempo t1935d):
+        // not here either. A block's impl and trait members are no body's locals: here.
         if let BodyRef::Free(key) = l.body
-            && NamesSource::kind_of_item(records, key) == Some(ItemKind::Function)
+            && matches!(NamesSource::kind_of_item(records, key), Some(ItemKind::Function | ItemKind::Const | ItemKind::Static))
         {
             continue;
         }

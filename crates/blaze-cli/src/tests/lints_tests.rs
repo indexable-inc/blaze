@@ -59,10 +59,11 @@ fn a_member_item_trips_a_rule_and_check_prints_it_as_a_warning() {
     assert_eq!(checked.errors, 0, "a lint is advice, never an error:\n{out}");
     let plain = workspace(41, UNLINTED);
     let unlinted = check(&plain);
-    // engine_lints.rs `plan`: one `Lint` task a lint unit of each outline WHATEVER the step's rule
-    // set (a file's marks may add rules the plan cannot see), so no step named still enters the
-    // 7 lint units of `app`'s 3 files; they find nothing.
-    assert_eq!((recursions(&unlinted), unlinted.entered(blaze_engine::Stage::Lints)), (0, 7), "no step, no rule: no finding, and a Lint task each of app's 7 lint units (engine_lints.rs `plan`: whatever the step's rule set):\n{}", unlinted.profile);
+    // engine_lints.rs `plan`: one `Lint` task a FILE of each outline WHATEVER the step's rule set
+    // (a file's marks may add rules the plan cannot see), so no step named still enters the
+    // tasks of `app`'s 3 files (its 7 lint units listed in their records, no row a unit); they
+    // find nothing.
+    assert_eq!((recursions(&unlinted), unlinted.entered(blaze_engine::Stage::Lints)), (0, 3), "no step, no rule: no finding, and a Lint task each of app's 3 files (engine_lints.rs `plan`: whatever the step's rule set):\n{}", unlinted.profile);
     assert_eq!(checked.status, unlinted.status, "a lint leaves the exit status as it was");
     std::println!("lints: one recursion warning at app/src/a.rs:1:8, {} errors, status {:?} as unlinted", checked.errors, checked.status);
 }

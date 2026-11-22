@@ -2138,17 +2138,25 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         // interior as a stalled row; the borrow check lowers each async body once, and the
         // rows are decided on the exact interiors of those lowerings (stalled_goals.rs).
         let mut verdict = self.check_then(body, Stalls::Decide, alloc, |r, lowered, done| {
-            // The checked record (D163 R1), encoded once here where the columns are: only of
-            // clean columns, which the record refuses otherwise (blaze-typeck checked_record.rs).
-            // A body with stalled rows (decided below, after the record) is encoded too, so its
-            // refusal (`NotClean { what: "stalled" }`) reaches tables/task.rs, which counts it.
+            let decided = {
+                let _cost = super::tables::cost::Cost::enter(r.store.cost, super::tables::cost::Part::Borrows);
+                let mut interiors = AsyncInteriors::new_in(done, alloc);
+                borrows = Some(borrows_of(r, lowered, done, &mut reads, &mut interiors, show, plant, alloc));
+                decide_stalled_goals(r, lowered, done, &interiors, &mut reads, alloc)
+            };
+            // The checked record (D163 R1), encoded once here where the columns are, AFTER the
+            // stalled goals are decided (F18): a check whose stalled goals all held on their exact
+            // interiors (`Proved`) keeps the record a clean check keeps; any other decision files
+            // a diagnostic, a gap or a refusal, and the record refuses its stalled rows by name
+            // (`NotClean { what: "stalled" }`, counted by tables/task.rs).
             if done.diags.is_empty() && done.undecided.is_empty() {
-                typed = Some(blaze_typeck::checked_record::encode(done, alloc));
+                typed = Some(if matches!(decided, Decision::Proved) {
+                    blaze_typeck::checked_record::encode_decided(done, alloc)
+                } else {
+                    blaze_typeck::checked_record::encode(done, alloc)
+                });
             }
-            let _cost = super::tables::cost::Cost::enter(r.store.cost, super::tables::cost::Part::Borrows);
-            let mut interiors = AsyncInteriors::new_in(done, alloc);
-            borrows = Some(borrows_of(r, lowered, done, &mut reads, &mut interiors, show, plant, alloc));
-            decision = Some(decide_stalled_goals(r, lowered, done, &interiors, &mut reads, alloc));
+            decision = Some(decided);
         });
         // What the borrow verdict and the decision read, in the body's read list and its
         // digest (rule 21: borrow_reads.rs, stalled_goals.rs).
@@ -2410,5 +2418,101 @@ fn main() {}
             }
             other => panic!("calls_soft_refused is not refused by the callee's name: {other:?}"),
         }
+    }
+}
+
+/// F18 (D197 root 1): a body whose stalled goals all held on their exact interiors keeps its
+/// typed record ([`ProjectWorld::check_borrows`] encodes after `decide_stalled_goals`). tempo's
+/// `main` hands async blocks to spawners: each block's `Send` stalls at the check on its
+/// superset interior and is proved on its witness, so without this the body has no record and
+/// the run checks it again.
+#[cfg(test)]
+mod stalled_record_tests {
+    use super::Stalls;
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+    use blaze_typeck::checked_record::{self, CheckedRecordError};
+
+    const SOURCE: &str = r#"
+use std::rc::Rc;
+fn require_send<T: Send>(_: T) {}
+fn local_send() {
+    require_send(async {
+        let b = 1u8;
+        async {}.await;
+        drop(b);
+    });
+}
+fn local_send_rc() {
+    require_send(async {
+        let r = Rc::new(1u8);
+        async {}.await;
+        drop(r);
+    });
+}
+fn main() {}
+"#;
+
+    /// `local_send` (rustc accepts it: a `u8` and the awaited `async {}` are `Send`) keeps a
+    /// record, and the record round-trips (rule 26). CONTROL, the cause removed (rule 23): the
+    /// same check's columns encoded BEFORE the decision, as `check_borrows_in` did, are refused
+    /// `NotClean { what: "stalled" }`, so the record comes from deciding first. TWIN:
+    /// `local_send_rc` (E0277, an `Rc` held across the `.await`) keeps none (its stalled rows
+    /// were not proved), and its verdict is not clean, so tables/task.rs `keeps_typed` drops it.
+    ///
+    /// Prints: `F18: local_send keeps <n> bytes; control: <refusal>; twin: <typed>`
+    #[test]
+    fn a_body_whose_stalled_goals_were_proved_keeps_its_typed_record() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/f18/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "f18", dir: "/f18/", root: "/f18/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, alloc).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let body = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        let (types, _) = world.check_borrows(body("local_send"), alloc);
+        assert!(types.is_clean(), "local_send: {types:?}");
+        let bytes = match &types.typed {
+            Some(Ok(bytes)) => bytes,
+            other => panic!("local_send keeps no typed record: {other:?}"),
+        };
+        let read = checked_record::decode(bytes, alloc).unwrap_or_else(|e| panic!("local_send's record: {e}"));
+        let again = checked_record::encode(&read, alloc).unwrap_or_else(|e| panic!("local_send's record re-encoded: {e}"));
+        assert_eq!(again.as_slice(), bytes.as_slice(), "local_send's record round-trips");
+
+        // CONTROL: the columns as the check left them, before the decision.
+        let mut stalled = 0;
+        let mut before = None;
+        let _ = world.check_then(body("local_send"), Stalls::Decide, alloc, |_, _, done| {
+            stalled = done.stalled.len();
+            before = Some(checked_record::encode(done, alloc).map(|_| ()));
+        });
+        assert!(stalled > 0, "CONTROL: local_send stalls its `Send` at the check");
+        let control = before.expect("the check finished");
+        assert!(matches!(control, Err(CheckedRecordError::NotClean { what: "stalled", .. })), "CONTROL: encoded before the decision: {control:?}");
+
+        // TWIN: a stalled goal that fails.
+        let (twin, _) = world.check_borrows(body("local_send_rc"), alloc);
+        assert!(!twin.is_clean() && twin.diagnostics.iter().any(|d| d.code == "E0277"), "local_send_rc: {twin:?}");
+        assert!(!matches!(twin.typed, Some(Ok(_))), "local_send_rc keeps a record: {:?}", twin.typed);
+        std::println!("F18: local_send keeps {} bytes; control: {control:?}; twin: {:?}", bytes.len(), twin.typed.as_ref().map(|t| t.as_ref().map(|b| b.len())));
     }
 }

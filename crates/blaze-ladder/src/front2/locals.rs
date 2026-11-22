@@ -324,7 +324,13 @@ pub struct LocalHead<'n> {
     pub names_at: LibKey,
     pub enclosing: ItemKey,
     pub scope: u32,
+    /// Where it is in its enclosing body's text (blaze-lower `View::site`): `text`'s own range
+    /// when written there, else (`copied`) the outermost macro call whose expansion wrote it.
     pub range: Range,
+    /// `text` is a copy of an expansion's words (a macro call in the enclosing body wrote the
+    /// item: tracing's `event!` its callsite `static`), not a slice of the enclosing text at
+    /// `range`: what a `line!()` in it places by (front2 body_host.rs `BodyAt::fixed`).
+    pub copied: bool,
     /// The marks of `text`'s words when a macro wrote the enclosing item (front2 item_site.rs):
     /// the enclosing body's own ([`Enclosing::marks`]), of which `text` is a slice. Its head,
     /// its generics and its own body read every path by them, so a `$crate` the expansion
@@ -366,6 +372,38 @@ pub struct Enclosing<'n> {
     /// The marks of `text`'s words when a macro wrote the body's item (`Site::marks` in
     /// body.rs; `text` is a slice of their text); `None` for a text of a file.
     pub marks: Option<TextMarks<'n>>,
+}
+
+/// The names library's key of the body `owner` whose text is `text`, lowered under `item` (a
+/// member's: its container): `item` when its text is that slice; a MEMBER by its container,
+/// kind and name, a cfg twin told by its text's value (keys.rs `source_member`, the one way a
+/// member is found, as heads.rs `read_const_body`); for an owner the keys file as no member,
+/// the first member of `item` whose text is that slice. `None`: a text the library lists
+/// under `item` as no body (a local item's own, an anonymous constant's rendering). The one
+/// home for body.rs (`body_at`, the body's block modules), [`Locals::keep`] and glob_uses.rs
+/// `PatternBlocks::of`.
+///
+/// A member is never found by the slice: a seeded member's text is borrowed from its head
+/// (tables/head.rs `member_definition`), not the slice `each_member` serves, so the slice
+/// test found none, and a method's body had no place and no block modules (tempo rt-loop
+/// a2210: `line!()` refused in 167 methods; blaze-cli engine_check_tests.rs
+/// `engine_check_checks_a_tracing_event_in_a_method`, `engine_check_reads_a_block_import_in_a_method`).
+pub(super) fn library_item_or_member<'n, S: NamesSource<'n>>(names: S, keys: &Keys, item: LibKey, owner: ItemKey, text: &str) -> Option<LibKey> {
+    let same = |t: &str| core::ptr::eq(t.as_ptr(), text.as_ptr()) && t.len() == text.len();
+    if names.seeded_text_of(item).is_some_and(|it| same(it.text)) {
+        return Some(item);
+    }
+    if let Some(super::keys::Origin::Member { .. }) = keys.origin(owner) {
+        return keys.source_member(names, owner, text).map(|(_, m)| m.key);
+    }
+    // The first member whose text is the body's, in declaration order.
+    let mut found = None;
+    names.each_member(item, &mut |m| {
+        if found.is_none() && same(m.text) {
+            found = Some(m.key);
+        }
+    });
+    found
 }
 
 /// The local items of every body lowered in this command, kept in the command's frame.
@@ -500,7 +538,7 @@ impl<'n> Locals<'n> {
         // or static's own body is the library's item of its block's module when its blocks
         // are written (`Self::library_twin`). None when the library has no such body.
         let nested = blaze_file_items::nested::scan(at.text, alloc);
-        let library_body = self.library_body(names, at.item, at.text);
+        let library_body = self.library_body(names, keys, at.item, at.owner, at.text);
         let modules = match library_body {
             Some(body) if nested.end == blaze_file_items::nested::NestedEnd::Whole => Some(blaze_scope::blocks::block_modules(crate_key, body, &nested, alloc)),
             _ => None,
@@ -538,6 +576,7 @@ impl<'n> Locals<'n> {
                 // slice ([`LocalHead::marks`]); a copy's, made with it from the lowered body's
                 // marks of the expansion words it copies (`View::marks_in`), since no column
                 // reaches from the copy back to a marked text.
+                let copied = view.item_relative(it.range).is_none();
                 let (text, marks): (&'n str, Option<TextMarks<'n>>) = match view.item_relative(it.range) {
                     Some(r) => (at.text.get(r.start as usize..r.end as usize).ok_or_else(|| bad(Why::from(blaze_lower::TextAt::Malformed(it.range))))?, at.marks),
                     None => {
@@ -645,7 +684,7 @@ impl<'n> Locals<'n> {
                         let key = super::nested_exports::local_key(crate_key, parent, kind.tag(), d.name, ordinal);
                         rows.push(Row { scope: s as u32, kind, name: d.name, key, range, path: &[], abs: false, first_mark: None, module: None });
                         let ck = keys.local(key, kind).map_err(HeadError::Key)?;
-                        self.heads.insert(ck, LocalHead { lib: key, kind, text: d.text, module: at.module, names_at, enclosing: at.owner, scope: s as u32, range, marks });
+                        self.heads.insert(ck, LocalHead { lib: key, kind, text: d.text, module: at.module, names_at, enclosing: at.owner, scope: s as u32, range, copied: from.is_none(), marks });
                         self.foreign.insert(ck, LocalForeign { kind: d.kind, abi, safe: d.safe });
                     }
                     continue;
@@ -694,7 +733,7 @@ impl<'n> Locals<'n> {
                 let key = super::nested_exports::local_key(crate_key, parent, kind.tag(), name, ordinal);
                 rows[last].key = key;
                 let ck = keys.local(key, kind).map_err(HeadError::Key)?;
-                self.heads.insert(ck, LocalHead { lib: key, kind, text, module: at.module, names_at, enclosing: at.owner, scope: s as u32, range, marks });
+                self.heads.insert(ck, LocalHead { lib: key, kind, text, module: at.module, names_at, enclosing: at.owner, scope: s as u32, range, copied, marks });
             }
         }
         let rows: &'n [Row<'n>] = frame.alloc_slice_copy(&rows);
@@ -726,7 +765,7 @@ impl<'n> Locals<'n> {
     /// item its block's module declares for it. `None`: a body whose blocks the library made
     /// no modules for. The one answer for every reader of a body's block modules
     /// (`Locals::keep`, glob_uses.rs `PatternBlocks::of`).
-    pub(super) fn library_body<S: NamesSource<'n>>(&self, names: S, item: LibKey, text: &str) -> Option<LibKey> {
+    pub(super) fn library_body<S: NamesSource<'n>>(&self, names: S, keys: &Keys, item: LibKey, owner: ItemKey, text: &str) -> Option<LibKey> {
         let same = |t: &str| core::ptr::eq(t.as_ptr(), text.as_ptr()) && t.len() == text.len();
         if names.seeded_text_of(item).is_some_and(|it| same(it.text)) {
             return Some(item);
@@ -734,14 +773,7 @@ impl<'n> Locals<'n> {
         if let Some(h) = self.heads.get(&checker_of(item)) {
             return self.library_twin(names, h, text);
         }
-        // The first member whose text is the body's, in declaration order.
-        let mut found = None;
-        names.each_member(item, &mut |m| {
-            if found.is_none() && same(m.text) {
-                found = Some(m.key);
-            }
-        });
-        found
+        library_item_or_member(names, keys, item, owner, text)
     }
 
     /// The names library's item for the local `fn`, `const` or `static` `h` whose text is

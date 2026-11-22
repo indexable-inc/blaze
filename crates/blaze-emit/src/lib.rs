@@ -198,6 +198,11 @@ mod record_check;
 /// The soft-float routine table a record's caller hands in, and the routines it calls
 /// (INTRINSICS.md 3.5, P5b).
 mod routines;
+/// Scratch registers as taken and given-back tokens (D193 point 6), for both passes: the Fast
+/// tier's composer today; the Reference tier's cell emitter is ported onto it (T3).
+pub(crate) mod scratch;
+#[cfg(test)]
+mod scratch_tests;
 pub mod table_gen;
 mod tier;
 pub use tier::Reference;

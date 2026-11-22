@@ -385,6 +385,10 @@ impl ExpandCx for Counted<'_, '_> {
         self.cx.place(what)
     }
 
+    fn place_of_call(&self, what: PlaceOf, call: u32) -> Result<Place<'_>, HostError> {
+        self.cx.place_of_call(what, call)
+    }
+
     fn run_proc_macro<'a>(&self, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'a>) -> Result<Produced<'a>, HostError> {
         let krate = match def.kind() {
             blaze_expand::MacroKind::ProcMacro { krate, .. } => self.labels.get(&krate).map_or("?", String::as_str),
@@ -668,6 +672,10 @@ fn main() {
     let runtime = Runtime::new(heap).expect("the runtime");
     let records = expansion_records(&out);
     let mut procs = ProcMacros::new(&runtime, &records, Limits::STANDARD);
+    // The module keys' closures walk the lock blaze-manifest's one reader read (rule 30); the
+    // example's own `read_lock` above is the interim builder's copy, for its distances only.
+    let parsed = blaze_manifest::lock::Lock::read(lock_text.as_bytes(), heap.alloc()).unwrap_or_else(|e| panic!("the checkout's Cargo.lock: {e}"));
+    let locked = blaze_proc_macro::module::LockedPackages::of(&parsed);
     let mut macros = Vec::new();
     let mut labels = HashMap::new();
     let unit_list = std::fs::read_to_string(units).expect("the unit list");
@@ -696,7 +704,7 @@ fn main() {
         } else {
             Source::Registry { checksum: &checksum }
         };
-        let key = procs.add_reached(store, &lock_text, &Reached { name, version, source, features: &features }).unwrap_or_else(|e| panic!("{e}"));
+        let key = procs.add_reached(store, &locked, &Reached { name, version, source, features: &features }).unwrap_or_else(|e| panic!("{e}"));
         // The builder's key and this crate's agree, or the module reads as missing.
         if let Some(at) = built.iter().position(|m| m.name == name && m.version == version) {
             assert_eq!(crate_key(&built.swap_remove(at).key), key, "{name} {version}: the builder's module key is the crate's");

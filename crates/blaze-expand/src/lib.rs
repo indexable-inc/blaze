@@ -85,6 +85,9 @@ mod derive;
 mod error;
 mod expand;
 mod expansion;
+mod extent;
+#[cfg(test)]
+mod extent_tests;
 mod failed;
 mod global_allocator;
 mod item;
@@ -129,6 +132,7 @@ pub use crate::{
     },
     error::{ExpandError, LexError, RulesLimit, Stream, StreamError, Table, Unbuilt},
     failed::Failed,
+    extent::{Extent, ExtentError, ExtentWhy},
     expand::{Prepared, expand, expand_prepared, prepare},
     expansion::{
         Diagnostic, Expanded, Expansion, Held, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind,

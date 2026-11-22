@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use core::alloc::Allocator;
 
 use super::cbor::{Reader, Writer};
-use super::{LONGEST_FRAME, List, Listed, RecordId, WireError, data, id, native, personality, thread_locals, tier, tier_name, variant};
+use super::{LONGEST_FRAME, List, Listed, RecordId, WireError, bytes, data, id, native, personality, thread_locals, tier, tier_name, variant};
 use crate::{Slot, Thread, Tier};
 
 /// The version of the run wire's bodies. A reader of another refuses the message by name
@@ -36,8 +36,11 @@ use crate::{Slot, Thread, Tier};
 /// frame-pointer chain (wire/fault.rs `Callers`). 4: `Down::Positioned` publishes a code
 /// record with this run's source-position values. 5: `Down::Hooks` toggles observe/span stubs
 /// dynamically on a live run and `Down::Promote` carries an optimized record's inlined callee
-/// read list for automatic hook-toggle deoptimization.
-pub const RUN_SCHEMA: u32 = 5;
+/// read list for automatic hook-toggle deoptimization. 6: `Down::Bytes` carries a record's bytes
+/// inline, in parts, before the message that names it (wire/bytes.rs).
+pub const RUN_SCHEMA: u32 = 6;
+
+pub use super::bytes::{BYTES_HELD_MOST, BYTES_PART_MOST, BYTES_RECORD_MOST};
 
 /// What observe stub (or plain execution) [`Down::Hooks`] selects for a slot.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -188,6 +191,11 @@ pub enum Down<'a> {
     /// currently observed, the optimized body is kept ready but `slot` stays on its fast body
     /// until every inlined callee returns to plain.
     Promote { slot: Slot, record: RecordId, inlined: List<'a, Slot>, values: &'a [u8] },
+    /// Bytes `at..at + part.len()` of record `record`, `total` bytes long (wire/bytes.rs): a
+    /// record's parts come consecutively, in order, before the first message naming the record
+    /// (`Data`, `Publish`, `Positioned`, `Promote`), once a run. The program assembles them
+    /// under a bound and checks the whole against `record` before it places a byte.
+    Bytes { record: RecordId, at: u64, total: u64, part: &'a [u8] },
 }
 
 impl Listed<'_> for Declared {
@@ -372,6 +380,7 @@ impl<'a> Down<'a> {
                 to.text("inlined");
                 inlined.write(to);
             }
+            Down::Bytes { record, at, total, part } => bytes::write(to, record, at, total, part),
             Down::Failed { need, why } => {
                 variant(to, "Failed", 2);
                 to.text("why");
@@ -443,6 +452,10 @@ impl<'a> Down<'a> {
                 from.key("inlined")?;
                 let inlined = List::read(&mut from)?;
                 Down::Promote { slot, record, inlined, values }
+            }
+            bytes::NAME => {
+                let (record, at, total, part) = bytes::read(&mut from)?;
+                Down::Bytes { record, at, total, part }
             }
             "Failed" => {
                 from.map(2, "Failed, a map of 2")?;

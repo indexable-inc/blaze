@@ -324,6 +324,8 @@ pub struct Front2Program<'n> {
     /// What the instance questions' worlds could not answer and no fill makes (a refused
     /// candidate impl, by name): `make_asked`'s refusal when no fill is left (rule 19).
     asked_gaps: RefCell<Vec<super::world_items::Gap, Global>>,
+    /// Each crate's `#[define_opaque]` definers, read once per crate (tait.rs `Definers`).
+    definers: super::tait::Definers<'static>,
     /// The walk's steps ([`super::reach::Census::edges`]), sorted, once each: a root's static
     /// reach is read from them (program/suite.rs `Suite::reach_of`).
     edges: Vec<(ItemKey, ItemKey), Global>,
@@ -1222,7 +1224,7 @@ impl<'n> Front2Program<'n> {
         rows.extend(mains.iter().map(|m| (m.owner, by_key.get(&m.owner).copied())));
         // The evaluator is kept, not dropped: the build pulls constants at instances' ground
         // arguments from it (`FrontEnd::const_at`, const_at.rs).
-        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), asked: RefCell::new(Vec::new_in(Global)), asked_gaps: RefCell::new(Vec::new_in(Global)), edges, consts, prepared, start: start2, recipes, reached_by_crate };
+        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), asked: RefCell::new(Vec::new_in(Global)), asked_gaps: RefCell::new(Vec::new_in(Global)), definers: super::tait::Definers::new_in(alloc), edges, consts, prepared, start: start2, recipes, reached_by_crate };
         Ok(Made { program, roots: rows, shapes })
     }
 
@@ -1255,6 +1257,7 @@ impl<'n> Front2Program<'n> {
             traits: scope.traits,
             blocks: scope.blocks,
             path_marks: scope.path_marks,
+            path_ns: scope.path_ns,
             fills: RefCell::new(Vec::new_in(Global)),
             gaps: RefCell::new(Vec::new_in(Global)),
             // Every question here is at an instance's ground arguments, after the body checked
@@ -1460,6 +1463,45 @@ pub(super) fn item_at<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibK
         Some((blaze_scope::resolve::At::Expansion(_), place)) => At { file: 0, place },
         None => At { file: 0, place: 0 },
     }
+}
+
+/// Static `k`'s C symbol when an `extern` block declares it, the ONE rule the eager program
+/// and the lazy one name a foreign static by (statics.rs `static_values`): a module-level
+/// block's by its names row's `extern_abi` ([`head_abi::placed_fn`]), a block in a body's by
+/// `Locals::foreign`; the symbol its `#[link_name]`, else its name, as a foreign fn's row takes
+/// it (lazy/fill.rs `row`). The Reference, "External blocks", "Statics": it is declared with
+/// no initializer, so it has no value to evaluate; its storage is the foreign object's.
+/// `Ok(None)`: no block declares it. `Err`: why it could not be told, in words.
+pub(super) fn foreign_static_symbol<'n, S: super::source::NamesSource<'n>>(names: S, keys: &super::keys::Keys, store: &Store<'n>, k: ItemKey) -> Result<Option<Box<str>>, Box<str>> {
+    let said = |e: Front2Refusal| Box::<str>::from(format!("{e}"));
+    // Whether an `extern` block declares it is asked BEFORE its head is read: a Rust static's
+    // head is made by its evaluation (statics.rs `one_static`: "made by the path's resolution
+    // or by the evaluation's check"), which runs after this, so a program that reads its
+    // bodies (make_one.rs `FromRecord`) holds no head yet. Before (d106_records
+    // `a_run_from_typed_records_makes_the_entries_a_second_check_makes`, 19:41): every Rust
+    // static was refused here, "no static head in the store". A body's own block is its local
+    // head's (`Locals::foreign`); any other is the names' answer of the item's library key.
+    let foreign = match store.locals.foreign(k) {
+        Some(_) => true,
+        None if store.locals.head(k).is_some() => false,
+        None => {
+            let lib = keys.library_in(names, k).ok_or_else(|| Box::<str>::from("no library key: the static is no item the names hold"))?;
+            let (_, block) = placed(names, lib).map_err(|_| Box::<str>::from("the names source did not answer whether an `extern` block declares it (`extern_abi`)"))?;
+            block.is_some()
+        }
+    };
+    if !foreign {
+        return Ok(None);
+    }
+    let Some(head) = store.fns.get(&k) else {
+        return Err(Box::from("no head of the foreign static in the store (heads.rs `Store::fns`)"));
+    };
+    let (lib, text) = (head.lib, head.text);
+    let row_path = super::row_path::RowPath::of(names, keys, store, k).map_err(|no| said(Front2Refusal::NoRowPath(no)))?;
+    let values_at = super::links::values_key(names, store, lib);
+    let symbols = symbols_of(names, lib, values_at, text, row_path.text()).map_err(said)?;
+    let declared = super::panic_entry::local_name(store, k).map_err(|why| Box::<str>::from(why.form()))?;
+    Ok(Some(Box::from(symbols.link_name.as_deref().or(declared).unwrap_or(row_path.ident()))))
 }
 
 /// Where `lib`'s text begins ([`item_at`]) and the abi of the `extern` block declaring it
@@ -1804,6 +1846,13 @@ impl FrontEnd for Front2Program<'_> {
         self.store.opaques.get(&opaque).copied()
     }
 
+    /// [`super::tait::defining_fn`] of the alias's library key.
+    fn alias_definer(&self, alias: ItemKey) -> Result<ItemKey, super::tait::DefinerMiss> {
+        let names = self.front.names;
+        let lib = self.front.keys.library_in(names, alias).ok_or(super::tait::DefinerMiss::NoLibraryKey)?;
+        super::tait::defining_fn(&self.definers, names, lib).map(super::keys::checker_of)
+    }
+
     fn object_trait(&self, t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>> {
         let o = self.objects.get(&t)?;
         Some(blaze_build::vtable::ObjectTrait { supers: &o.supers, super_args: &o.super_args, methods: &o.methods, shape: o.shape })
@@ -1949,14 +1998,15 @@ impl FrontEnd for Front2Program<'_> {
         self.projection_why.borrow_mut().take()
     }
 
-    fn repr(&self, key: ItemKey) -> ReprAttrs {
-        self.store.adts.get(&key).map_or(ReprAttrs::RUST, |a| a.repr)
+    /// The row's `#[repr(..)]`; no row (as `adt`'s `None`): `Missing`, never `repr(Rust)`.
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, blaze_build::layout::Missing> {
+        self.store.adts.get(&key).map(|a| a.repr).ok_or(blaze_build::layout::Missing { item: key })
     }
 
-    /// The row's `rustc_layout_scalar_valid_range_*` bounds (heads.rs `AdtRow::valid`); an ADT
-    /// with no row has no attribute read, and layout asks only after `adt` answered the row.
-    fn valid_range(&self, key: ItemKey) -> blaze_build::layout::ValidRange {
-        self.store.adts.get(&key).map_or(blaze_build::layout::ValidRange::default(), |a| a.valid)
+    /// The row's `rustc_layout_scalar_valid_range_*` bounds (heads.rs `AdtRow::valid`); no row:
+    /// `Missing`, as [`Self::repr`].
+    fn valid_range(&self, key: ItemKey) -> Result<blaze_build::layout::ValidRange, blaze_build::layout::Missing> {
+        self.store.adts.get(&key).map(|a| a.valid).ok_or(blaze_build::layout::Missing { item: key })
     }
 
     /// A `#[rustc_intrinsic]` fn's table entry, read from its name when it was tabled.
@@ -1980,13 +2030,14 @@ impl FrontEnd for Front2Program<'_> {
 
     /// From `owner`'s lowered body (`View::site`: item-relative, or the outermost macro call's
     /// range) and the solved file the item is written in, by its shown name (seam_rules.rs).
-    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Option<blaze_build::CallerSite<'_>> {
-        let row = self.fns.get(*self.by_key.get(&owner)?)?;
-        lazy::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, owner, row.body.as_ref()?, expr)
+    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
+        let not_live = blaze_build::SiteGap::NotLive { owner };
+        let row = self.by_key.get(&owner).and_then(|&i| self.fns.get(i)).ok_or(not_live)?;
+        lazy::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, owner, row.body.as_ref().ok_or(not_live)?, expr)
     }
 
     /// By seam_rules.rs `def_site`, from the item's head and the names source.
-    fn def_site(&self, item: ItemKey) -> Option<blaze_build::CallerSite<'_>> {
+    fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
         lazy::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, item)
     }
 
@@ -2007,14 +2058,20 @@ impl FrontEnd for Front2Program<'_> {
         self.statics.kind(key)
     }
 
+    fn foreign_static(&self, key: ItemKey) -> Option<&str> {
+        self.statics.foreign(key)
+    }
+
     fn static_records(&self) -> &[(ItemKey, DataRecord<Global>)] {
         &self.statics.values
     }
 
     /// A tuple struct's or variant's ctor: its ADT and the variant's index there.
     /// From the ADT's row: every variant's value, explicit or implicit (heads.rs `discrs`).
-    fn discriminant(&self, adt: ItemKey, variant: u32) -> Option<i128> {
-        self.store.adts.get(&adt)?.discrs.get(variant as usize).copied()
+    /// No row: `Missing`, never `None` (which numbers the variants by index).
+    fn discriminant(&self, adt: ItemKey, variant: u32) -> Result<Option<i128>, blaze_build::layout::Missing> {
+        let row = self.store.adts.get(&adt).ok_or(blaze_build::layout::Missing { item: adt })?;
+        Ok(row.discrs.get(variant as usize).copied())
     }
 
     fn ctor_of(&self, key: ItemKey) -> Option<(ItemKey, u32)> {

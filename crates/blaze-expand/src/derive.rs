@@ -154,6 +154,7 @@ pub fn derive_meta<'a>(
         }
         match at == close {
             true => {}
+            // astlog-ignore: expand-hand-extent (the separator after a path `attr_path::path_end` read whole; a derive path holds no `,`)
             false if punct(at, ',') => at += 1,
             false => return None,
         }

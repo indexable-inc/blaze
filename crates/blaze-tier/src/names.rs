@@ -5,6 +5,8 @@ use core::fmt;
 
 use blaze_code::record::Symbol;
 
+use crate::routines::RoutinePlaces;
+
 /// What a function's code or data names outside itself, as the LIR function's reference rows
 /// say it (a system routine is not among them: the record names it by its C name itself).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,4 +55,11 @@ pub enum Named<'n> {
 pub trait Names {
     /// `of`'s name, or `None` where the caller has none (a tier refuses the function by name).
     fn name(&self, of: Outside) -> Option<Named<'_>>;
+
+    /// Where each soft-float routine is among the function references [`Names::name`] answers
+    /// (`Outside::Func(place)`): the routine table, the seam's input for every tier that
+    /// legalizes (D197 root 6, piece (a)). [`RoutinePlaces::NONE`] where the caller binds none:
+    /// an `f128` operation is then refused naming its routine. Required, so no caller hands
+    /// none by default (rule 75).
+    fn routines(&self) -> RoutinePlaces;
 }

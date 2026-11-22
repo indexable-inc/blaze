@@ -42,6 +42,9 @@ fn world() -> World {
     w.intrinsic("add_with_overflow", 1, &[p0, p0], pair, Intrinsic::AddWithOverflow);
     w.intrinsic("rotate_left", 1, &[p0, p0], p0, Intrinsic::RotateLeft);
     w.intrinsic("ctpop", 1, &[p0], p0, Intrinsic::Ctpop);
+    w.intrinsic("ctlz", 1, &[p0], p0, Intrinsic::Ctlz);
+    w.intrinsic("ctlz_nonzero", 1, &[p0], p0, Intrinsic::CtlzNonzero);
+    w.intrinsic("cttz_nonzero", 1, &[p0], p0, Intrinsic::CttzNonzero);
     w.intrinsic("bswap", 1, &[p0], p0, Intrinsic::Bswap);
     w.intrinsic("saturating_sub", 1, &[p0, p0], p0, Intrinsic::SaturatingSub);
     w.panic_fn("panic_display", "&str");
@@ -147,6 +150,22 @@ fn wrapping_and_bit_operations() {
     assert_eq!(int("bool", "add_with_overflow(255u8, 1u8).1"), Ok(1));
     assert_eq!(int("u8", "add_with_overflow(255u8, 2u8).0"), Ok(1));
     assert_eq!(int("u32", "0xF0u32 & 0x3C | 0x01 ^ 0x03"), Ok(0x32));
+}
+
+/// The pinned core (intrinsics/mod.rs): `ctlz_nonzero` and `cttz_nonzero` count as `ctlz`
+/// and `cttz` do (its examples: `ctlz_nonzero(0b0001_1100_u8)` is 3, `cttz_nonzero(0b0011_1000_u8)`
+/// is 3), and on 0 are undefined, which a constant refuses ("`{name}` called on 0", rustc's
+/// interpret/intrinsics.rs). The control: `ctlz(0)` is defined, the width. Before (tempo
+/// t1935d, ruint's `LowerHex`): "ctlz_nonzero is not evaluated yet".
+#[test]
+fn nonzero_bit_counts() {
+    assert_eq!(int("u8", "ctlz_nonzero(0b0001_1100u8)"), Ok(3));
+    assert_eq!(int("u8", "cttz_nonzero(0b0011_1000u8)"), Ok(3));
+    assert_eq!(int("u64", "ctlz_nonzero(1u64)"), Ok(63));
+    assert_eq!(int("u128", "cttz_nonzero(1u128 << 100)"), Ok(100));
+    assert_eq!(refused("u32", "ctlz_nonzero(0u32)"), std::format!("{:?}", Refusal::NonzeroOnZero { name: "ctlz_nonzero" }));
+    assert_eq!(refused("u16", "cttz_nonzero(0u16)"), std::format!("{:?}", Refusal::NonzeroOnZero { name: "cttz_nonzero" }));
+    assert_eq!(int("u32", "ctlz(0u32)"), Ok(32));
 }
 
 /// The Reference, "Arithmetic and Logical Binary Operators": a shift by the width or more,

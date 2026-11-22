@@ -27,17 +27,13 @@ impl Tier for Reference {
         // Feature bits other than LSE permit code this tier never emits: base code runs on any
         // machine that has them.
         let isa = Isa { lse: machine.features & Machine::LSE != 0, os };
-        // The seam's `Tier::emit` hands no routine table yet (its `Names` has no routine
-        // places): an `f128` operation is refused naming its routine. The run path binds the
-        // routines through `emit_record_measured` (blaze-ladder code_records.rs `make_entry`).
-        let (record, _none_called) = emit_record(func, names, &crate::RoutinePlaces::NONE, isa, alloc).map_err(refused)?;
-        if !record.positions.is_empty() {
-            return Err(TierError::Refused {
-                tier: Self::NAME,
-                inst: None,
-                what: "a source position field in a record converted to blaze-tier's form, which has no source field column",
-            });
-        }
+        // The routine table is the seam's input (`Names::routines`, D197 root 6 piece (a)): an
+        // `f128` operation calls its routine where the caller binds it and is refused naming it
+        // where not. Which routines the function calls is in the record's function targets, so
+        // the seam's form needs no `Called` of its own.
+        // Its source-position slots, part alignments and trap rows go into the form's own
+        // columns (`bzcode08`), whole.
+        let (record, _called) = emit_record(func, names, &names.routines(), isa, alloc).map_err(refused)?;
         blaze_tier::record::from_v1(record, alloc).map_err(|error| TierError::Record { tier: Self::NAME, error })
     }
 }
@@ -57,7 +53,7 @@ fn refused(error: RecordEmitError) -> TierError {
         RecordEmitError::Emit(EmitError::Signature { why }) => TierError::Refused { tier: TIER, inst: None, what: why },
         RecordEmitError::Emit(EmitError::Data { row: _, why }) => TierError::Refused { tier: TIER, inst: None, what: why },
         RecordEmitError::Emit(EmitError::Record { why }) => TierError::Refused { tier: TIER, inst: None, what: why },
-        RecordEmitError::Emit(EmitError::Legalize(why)) | RecordEmitError::Legalize(why) => legalize_refused(why),
+        RecordEmitError::Emit(EmitError::Legalize(why)) | RecordEmitError::Legalize(why) => legalize_refused(TIER, why),
         // The seam's refusal holds a static reason only: the line and token stay in the
         // emitter's own error (`EmitError::Asm`'s `Display`).
         RecordEmitError::Emit(EmitError::Asm { inst, line: _, why, token: _ }) => {
@@ -77,20 +73,18 @@ fn refused(error: RecordEmitError) -> TierError {
     }
 }
 
-/// Legalize's refusal (of either form) as the seam's.
-fn legalize_refused(why: blaze_lir::legalize::LegalizeError) -> TierError {
-    const TIER: TierName = TierName::Reference;
+/// Legalize's refusal as the seam's, for the tier `TIER` that ran it (Reference always; Fast for
+/// a function holding an `f128`).
+pub(crate) fn legalize_refused(tier: TierName, why: blaze_lir::legalize::LegalizeError) -> TierError {
     match why {
-        blaze_lir::legalize::LegalizeError::Refused { inst, op: _, what } => {
-            TierError::Refused { tier: TIER, inst: Some(inst as u32), what }
-        }
+        blaze_lir::legalize::LegalizeError::Refused { inst, op: _, what } => TierError::Refused { tier, inst: Some(inst as u32), what },
         blaze_lir::legalize::LegalizeError::NoRoutine(_) => {
-            TierError::Refused { tier: TIER, inst: None, what: "an `f128` operation whose compiler_builtins routine is not bound (INTRINSICS.md P5b)" }
+            TierError::Refused { tier, inst: None, what: "an `f128` operation whose compiler_builtins routine is not bound (INTRINSICS.md P5b)" }
         }
-        blaze_lir::legalize::LegalizeError::Scalable => TierError::Refused { tier: TIER, inst: None, what: "a scalable vector" },
-        blaze_lir::legalize::LegalizeError::Full { table } => TierError::TooLarge { tier: TIER, what: table },
+        blaze_lir::legalize::LegalizeError::Scalable => TierError::Refused { tier, inst: None, what: "a scalable vector" },
+        blaze_lir::legalize::LegalizeError::Full { table } => TierError::TooLarge { tier, what: table },
         blaze_lir::legalize::LegalizeError::Verify(_) => {
-            TierError::Refused { tier: TIER, inst: None, what: "legalize's output does not verify (a bug of blaze-lir's legalize)" }
+            TierError::Refused { tier, inst: None, what: "legalize's output does not verify (a bug of blaze-lir's legalize)" }
         }
     }
 }

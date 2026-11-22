@@ -28,6 +28,7 @@
 
 mod bytes;
 pub mod check;
+mod commands;
 pub mod eh_out;
 pub mod elf;
 pub mod error;

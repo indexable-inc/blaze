@@ -84,7 +84,7 @@ const KEY_DOMAIN: &str = "blaze-ladder test store: the toolchain's world 2";
 pub const STORE_VAR: &str = "BLAZE_TEST_STORE";
 
 /// The tag the test store files its records under: its own, apart from the command's
-/// (`DRIVE_TAG`, `u16::MAX - 2`), the store's root and the startup image.
+/// (blaze-keyed `ReservedTag::Drive`), the store's root and the startup image.
 const TEST_TAG: Tag = Tag(1);
 
 /// How long the by-records solve waits for one crate's dependencies before it stops by name.

@@ -111,6 +111,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         let inert = self.inert()?;
         let env = self.call_env(inert)?;
+        // In a world that stops at holes (`World::stops_at_holes`), a stop met here (each
+        // `Err(Stop::Need)` arm below that would go on) ends the rows: nothing runs past a
+        // missing fact, and the caller (writeback.rs) returns the run's need, as it does for any
+        // holed run.
+        if self.reads.stopped() {
+            return Ok(out);
+        }
         let mut rows = Rows { own, env, memo: HashMap::new_in(alloc) };
         // Each bound row once per call: the call's own, then an impl's where-clause.
         let mut seen: HashMap<(ExprId, ItemKey, List), (), Alloc<'a>> = HashMap::new_in(alloc);
@@ -139,6 +146,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 continue;
             }
             let selected = self.select_row(ex, &mut rows, &ps, (trait_, list, name), e)?;
+            if self.reads.stopped() {
+                return Ok(out);
+            }
             out.push(Projected { expr: e, at: 0, trait_, name, args: list, global_env: rows.env.global, selected });
         }
         self.impl_where_rows(ex, &mut rows, inert, &mut seen, &mut out)?;
@@ -191,6 +201,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             // `try_impl`); one not answered here files no row (never a wait at writeback).
             let wc = match self.reads.predicates(imp) {
                 Ok(wc) => wc,
+                // A world that stops at holes stops here ([`Self::selected_rows`]).
+                Err(Stop::Need(_)) if self.reads.stopped() => return Ok(()),
                 Err(Stop::Need(_)) => continue,
                 Err(Stop::Error(err)) => return Err(err),
             };
@@ -216,6 +228,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     return Err(CheckError::Limit(Limit::Solver));
                 }
                 let selected = self.select_row(ex, rows, &ps, (trait_, list, None), e)?;
+                if self.reads.stopped() {
+                    return Ok(());
+                }
                 out.push(Projected { expr: e, at: 0, trait_, name: None, args: list, global_env: rows.env.global, selected });
                 if matches!(selected, Selected::Impl { .. }) {
                     nest.push((out.len() - 1, depth + 1));

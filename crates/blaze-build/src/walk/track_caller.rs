@@ -108,7 +108,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         if self.tracked(callee) != Some(true) {
             return Ok(None);
         }
-        let refuse = |why| BuildError::TrackCaller { expr: at, item: callee.item, why };
+        let refuse = |why| BuildError::TrackCaller { expr: at, item: callee.item, why, gap: None };
         match self.track {
             Track::Passed(v) => Ok(Some(v)),
             Track::Unsaid => Err(refuse(UNSAID_CALLER)),
@@ -133,7 +133,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
         let owner = self.body.owner;
         let adts = self.adts;
-        let site = adts.def_site(owner).ok_or(BuildError::TrackCaller { expr: None, item: callee.item, why: NO_DEF_SITE })?;
+        let site = adts.def_site(owner).map_err(|gap| BuildError::TrackCaller { expr: None, item: callee.item, why: NO_DEF_SITE, gap: Some(gap) })?;
         let (loc_ty, ret) = self.location_tys(None)?;
         Ok(Some(self.location_row(None, callee.item, Site::Here(site), loc_ty, ret)?))
     }
@@ -151,7 +151,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     pub(super) fn caller_location_site(&mut self, e: ExprId) -> Result<Site<'x>, BuildError> {
         match self.track {
             Track::Passed(v) => Ok(Site::Passed(v)),
-            Track::Unsaid => Err(BuildError::TrackCaller { expr: Some(e), item: self.body.owner, why: UNSAID_OWN }),
+            Track::Unsaid => Err(BuildError::TrackCaller { expr: Some(e), item: self.body.owner, why: UNSAID_OWN, gap: None }),
             Track::No => Ok(Site::Here(self.site_of(e, self.body.owner)?)),
         }
     }
@@ -159,7 +159,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// Where expression `e` of the body is, as the world says.
     fn site_of(&mut self, e: ExprId, item: ItemKey) -> Result<CallerSite<'x>, BuildError> {
         let adts = self.adts;
-        adts.caller_site(self.body.owner, e).ok_or(BuildError::TrackCaller { expr: Some(e), item, why: NO_SITE })
+        adts.caller_site(self.body.owner, e).map_err(|gap| BuildError::TrackCaller { expr: Some(e), item, why: NO_SITE, gap: Some(gap) })
     }
 
     /// The address of a `Location` data row at `here`, by the one maker of such rows
@@ -176,7 +176,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             intrinsics::build(&mut self.b, &call, &mut icx)
         };
         // With no expression the refusal names the tracked fn the row was for.
-        let unplaced = |why| BuildError::TrackCaller { expr: None, item: callee, why };
+        let unplaced = |why| BuildError::TrackCaller { expr: None, item: callee, why, gap: None };
         match (built, at) {
             (Ok(Out::Scalar(v)), _) => Ok(v),
             (Ok(_), _) => Err(malformed("a `Location` row whose address is not one pointer")),
@@ -259,7 +259,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// when it is tracked: a pointer call passes no location (module doc).
     pub(super) fn refuse_tracked_pointer(&mut self, e: ExprId, instance: Instance) -> Result<(), BuildError> {
         if self.tracked(instance) == Some(true) {
-            return Err(BuildError::TrackCaller { expr: Some(e), item: instance.item, why: POINTER });
+            return Err(BuildError::TrackCaller { expr: Some(e), item: instance.item, why: POINTER, gap: None });
         }
         Ok(())
     }
@@ -269,7 +269,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// shim).
     pub(super) fn refuse_tracked_slot(&mut self, e: ExprId, instance: Instance) -> Result<(), BuildError> {
         if self.tracked(instance) == Some(true) {
-            return Err(BuildError::TrackCaller { expr: Some(e), item: instance.item, why: VTABLE });
+            return Err(BuildError::TrackCaller { expr: Some(e), item: instance.item, why: VTABLE, gap: None });
         }
         Ok(())
     }

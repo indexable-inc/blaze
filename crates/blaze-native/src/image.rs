@@ -43,12 +43,49 @@ pub enum Region { Text, Const, EhFrame, UnwindInfo, Got, Data, Words, Inits, Thr
 pub struct Placed { pub region: Region, pub at: u64, pub len: u64, pub align_log2: u8 }
 
 /// What a 64-bit pointer at a fixup's address becomes at load: `Rebase` the image's base plus
-/// `target`; `Import` the address of import `index` (an index of [`Image::imports`]) plus
-/// `addend`; `Word` the function of word `index`. A `Word` cell is the launcher's to write (the
-/// descriptor's pointer rows list it): a dylib writer emits no dynamic fixup for it; an
-/// executable writer (W9) makes it a direct reference to the Rust function.
+/// `address`, with `high8` in its top byte (a tag the program keeps in the pointer, 0 for nearly
+/// every one; dyld's `dyld_chained_ptr_64_rebase.high8`); `Import` the address of import `index`
+/// (an index of [`Image::imports`]) plus `addend`; `Word` the function of word `index`. A `Word`
+/// cell is the launcher's to write (the descriptor's pointer rows list it): a dylib writer emits
+/// no dynamic fixup for it; an executable writer (W9) makes it a direct reference to the Rust
+/// function.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FixTo { Rebase { target: u64 }, Import { index: u32, addend: i64 }, Word { index: u32 } }
+pub enum FixTo { Rebase { address: Addr56, high8: u8 }, Import { index: u32, addend: i64 }, Word { index: u32 } }
+
+/// An image address a rebase names: below 2^56 by construction, so the pointer's top byte is
+/// never part of it ([`Addr56::new`] refuses where the value is made; [`FixTo::rebase`] splits a
+/// tagged pointer into the two fields, and nothing shifts a packed word).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Addr56(u64);
+
+impl Addr56 {
+    /// The bits an address holds: everything below the pointer's top byte.
+    pub const MASK: u64 = (1 << 56) - 1;
+
+    /// `address`, or `None` when it reaches into the top byte.
+    pub const fn new(address: u64) -> Option<Addr56> {
+        if address & !Self::MASK == 0 { Some(Addr56(address)) } else { None }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The 64-bit pointer the program's bytes hold: `high8` in the top byte over the address.
+    pub const fn tagged(self, high8: u8) -> u64 {
+        ((high8 as u64) << 56) | self.0
+    }
+}
+
+impl FixTo {
+    /// The rebase of a 64-bit pointer as the program's bytes hold it: its top byte is the tag
+    /// (`high8`; arm64 non-unique RTTI's bit 63 on a typeinfo's name), the 56 bits below it the
+    /// image address. Total: every pointer splits so; whether the address is an image place is
+    /// the layout's to check (layout.rs `Reach::Rebase`).
+    pub const fn rebase(pointer: u64) -> FixTo {
+        FixTo::Rebase { address: Addr56(pointer & Addr56::MASK), high8: (pointer >> 56) as u8 }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Fixup { pub at: u64, pub to: FixTo } // a 64-bit pointer at image address `at`

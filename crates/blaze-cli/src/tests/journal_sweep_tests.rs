@@ -445,7 +445,7 @@ fn cargos_tag_moves_the_root_listing_and_only_a_tagged_target_is_dropped() {
 /// The profile's line, in D150's form.
 #[test]
 fn the_sweep_line_says_by_events_or_full_and_why() {
-    let counts = |journal, since, streams| SweepCounts { journal, events: 2, statted: 3, leaves: 9, settled: 0, since, streams, replays: Replays::default(), parts: None, status: None, helper: None };
+    let counts = |journal, since, streams| SweepCounts { journal, events: 2, statted: 3, leaves: 9, settled: 0, since, streams, replays: Replays::default(), parts: None, status: None, helper: None, looks: None };
     assert_eq!(
         std::format!("{}", counts(JournalUse::Used, Some(7), 1)),
         "sweep: statted 3 of 9 files (by events since id 7; 2 event(s) in 1 folder(s)); settled classes checked 0"
@@ -463,7 +463,7 @@ fn the_sweep_line_says_by_events_or_full_and_why() {
 #[test]
 fn the_homes_listings_are_counted_apart_and_the_replays_timed() {
     let replays = Replays { units: 1, ns: 21_400_000, most_ns: 21_400_000, longest: bstd::fs::ReplayTimes::default(), place_age_ns: None };
-    let counts = SweepCounts { journal: JournalUse::Used, events: 0, statted: 2, leaves: 9, settled: 0, since: Some(7), streams: 1, replays, parts: None, status: None, helper: None };
+    let counts = SweepCounts { journal: JournalUse::Used, events: 0, statted: 2, leaves: 9, settled: 0, since: Some(7), streams: 1, replays, parts: None, status: None, helper: None, looks: None };
     let parts = SweepParts { home: 2, whole: true, ..SweepParts::default() };
     let apart = counts.clone().with_parts(Some(parts));
     assert_eq!((apart.statted, apart.leaves), (0, 7), "the home's two listings out of both counts");

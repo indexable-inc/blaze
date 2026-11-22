@@ -151,7 +151,7 @@ fn image() -> Image<'static> {
     put64(&mut bytes, 0xC028, 0xC040);
     let mut fixups: AVec<'static, Fixup> = Vec::new_in(a);
     fixups.push(Fixup { at: 0x8000, to: FixTo::Import { index: 0, addend: 0 } });
-    fixups.push(Fixup { at: 0xC038, to: FixTo::Rebase { target: 0x4008 } });
+    fixups.push(Fixup { at: 0xC038, to: FixTo::rebase(0x4008) });
     let mut imports: AVec<'static, Import<'static>> = Vec::new_in(a);
     imports.push(Import { name: b"_puts", weak: false });
     let mut exports: AVec<'static, (&'static [u8], u64)> = Vec::new_in(a);

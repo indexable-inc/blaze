@@ -102,14 +102,53 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
     }
 
-    /// `Expectation::rvalue_hint`: an unsized expected type is only a hint (rustc: `ty::Slice |
-    /// ty::Str | ty::Dynamic` give `ExpectRvalueLikeUnsized`).
-    pub(crate) fn rvalue_hint(&mut self, t: Ty) -> Expectation {
-        match self.view(t) {
+    /// `Expectation::rvalue_hint`: an unsized expected type is only a hint. rustc
+    /// (expectation.rs `rvalue_hint`) matches the type's STRUCT TAIL (`struct_tail_raw`):
+    /// `ty::Slice | ty::Str | ty::Dynamic` give `ExpectRvalueLikeUnsized`. So a struct whose last
+    /// field is unsized is a hint too. turso core/btree_dump.rs:51 is `Ok(Arc::new(RwLock::new(
+    /// cursor)))` returning `Arc<RwLock<dyn InternalVirtualTableCursor>>`. `Arc::new`'s input,
+    /// from the expected output, is `lock_api::RwLock<RawRwLock, dyn ..>`, whose tail (`data:
+    /// UnsafeCell<T>`, `value: T`) is the object. Taken as `HasType`, it bound `T` to it: E0308
+    /// at `RwLock::new(cursor)` and E0277 "`dyn ..: Sized`". As the hint, `T` is
+    /// `RwLock<RawRwLock, BtreeDumpCursor>`, and the `Arc` coerces after (`CoerceUnsized`).
+    pub(crate) fn rvalue_hint(&mut self, t: Ty) -> Result<Expectation, Stop> {
+        let tail = self.struct_tail(t)?;
+        Ok(match self.view(tail) {
             TyView::Str | TyView::Slice(_) | TyView::Dynamic(_) => Expectation::RvalueLikeUnsized(t),
             _ => Expectation::HasType(t),
-        }
+        })
     }
+
+    /// The type's struct tail (rustc's `struct_tail_raw`): a struct's last field at its
+    /// arguments, a tuple's last element, again until neither. An enum, a union, a struct with
+    /// no fields and every other type is its own tail. Bounded: a tail deeper than
+    /// [`Self::TAIL_DEPTH`] structs is refused by name (rustc's recursion limit, E0275's class).
+    pub(crate) fn struct_tail(&mut self, t: Ty) -> Result<Ty, Stop> {
+        let mut t = t;
+        for _ in 0..Self::TAIL_DEPTH {
+            let next = match self.view(t) {
+                TyView::Tuple(l) => match self.ty.list_len(l) {
+                    0 => return Ok(t),
+                    n => self.ty.list_get(l, n - 1),
+                },
+                TyView::Adt(k, args) => {
+                    let Some(adt) = self.reads.adt(k)? else { return Ok(t) };
+                    if adt.kind != crate::world::AdtKind::Struct {
+                        return Ok(t);
+                    }
+                    let Some(v) = adt.variants.first() else { return Ok(t) };
+                    let Some(last) = adt.fields.get(v.fields.range()).and_then(|f| f.last()).copied() else { return Ok(t) };
+                    self.lower(adt.types, last.ty, crate::machine::Lower::Args(args), crate::ty::Cause::Body)?
+                }
+                _ => return Ok(t),
+            };
+            t = self.ty.shallow_resolve(next);
+        }
+        Err(crate::error::CheckError::Unported("a struct tail deeper than 64 structs (rustc's recursion limit)").into())
+    }
+
+    /// How many structs [`Self::struct_tail`] goes through.
+    const TAIL_DEPTH: u32 = 64;
 
     /// `Expectation::adjust_for_branches`: an expected type that is still a variable is no
     /// expectation for the branches.
@@ -155,7 +194,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 // expectation.only_has_type().unwrap_or(formal_input_ty)`).
                 let expect = match self.take_unsized_arg_hint(arg) {
                     Some(t) => Expectation::RvalueLikeUnsized(t),
-                    None => self.rvalue_hint(formal),
+                    None => self.rvalue_hint(formal)?,
                 };
                 self.resume(f, state)?;
                 self.push_expr(arg, expect, Then::Coerce { to: formal, two_phase: true })?;

@@ -37,9 +37,21 @@ pub(crate) fn resolved_shim_self<P: FrontEnd>(
     called: Instance,
     ground: &mut PortableTys<'_>,
 ) -> Result<Instance, ResolveError> {
+    shim_self_resolved_by(adts, called, ground, |item, args, ground| program.resolve(caller, item, args, ground))
+}
+
+/// [`resolved_shim_self`] with the call's resolution asked of `resolve`: the one home of the
+/// rewrite, for a caller that answers the resolution itself (run/make_one.rs `Asking`, which
+/// logs it in the instance's read list).
+pub(crate) fn shim_self_resolved_by<'g>(
+    adts: &dyn Adts,
+    called: Instance,
+    ground: &mut PortableTys<'g>,
+    resolve: impl FnOnce(blaze_typeck::ItemKey, blaze_typeck::List, &mut PortableTys<'g>) -> Result<(blaze_typeck::ItemKey, blaze_typeck::List), ResolveError>,
+) -> Result<Instance, ResolveError> {
     let Some(shim) = crate::fn_shim::fn_shim_of(adts, called, ground) else { return Ok(called) };
     let Some((item, args)) = shim.item else { return Ok(called) };
-    let (runs, runs_args) = program.resolve(caller, item, args, ground)?;
+    let (runs, runs_args) = resolve(item, args, ground)?;
     if runs == item && runs_args == args {
         return Ok(called);
     }

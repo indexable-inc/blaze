@@ -693,11 +693,15 @@ impl<'p, 'd, 'a> Walk<'p, 'd, 'a> {
         while let Some(atom) = atoms.get(end) {
             match *atom {
                 Atom::Punct { ch: ';', .. } => break,
+                // astlog-ignore: expand-hand-extent (LEFT: a macro_rules transcriber's atoms, `$x` among them, which no parser entry reads; the names-demand over-approximation, D158)
                 Atom::Punct { ch: '<', len } => angles += i32::from(len.min(2)),
+                // astlog-ignore: expand-hand-extent (as above)
                 Atom::Punct { ch: '>', len } => angles = (angles - i32::from(len.min(2))).max(0),
                 Atom::Group { delim: Delim::Brace, .. } => {
                     let argument = match end.checked_sub(1).and_then(|prev| atoms.get(prev)) {
+                        // astlog-ignore: expand-hand-extent (as above)
                         Some(Atom::Punct { ch: '<' | '=', len: 1 }) => true,
+                        // astlog-ignore: expand-hand-extent (as above)
                         Some(Atom::Punct { ch: ',', .. }) => angles > 0,
                         _ => false,
                     };
@@ -798,6 +802,7 @@ impl<'p, 'd, 'a> Walk<'p, 'd, 'a> {
             "macro_export" => flags.exported = true,
             "macro_use" => flags.macro_use = true,
             "derive" | "derive_const" => {
+                // astlog-ignore: expand-hand-extent (a derive's paths in a transcriber's atoms; a derive path holds no `,`)
                 for part in group.as_deref().unwrap_or(&[]).split(|a| matches!(a, Atom::Punct { ch: ',', .. })) {
                     if part.iter().any(|a| matches!(a, Atom::Var { .. } | Atom::Made)) {
                         out.set_any(AnyWhy::AttrFromInput);
@@ -810,6 +815,7 @@ impl<'p, 'd, 'a> Walk<'p, 'd, 'a> {
             }
             "cfg_attr" => {
                 let inner = group.as_deref().unwrap_or(&[]);
+                // astlog-ignore: expand-hand-extent (LEFT: cfg_attr's metas in a transcriber's atoms, `$x` among them, by commas; over-approximates names demand, D158)
                 for part in inner.split(|a| matches!(a, Atom::Punct { ch: ',', .. })).skip(1) {
                     if !part.is_empty() {
                         self.attr(part, depth + 1, flags, out);
@@ -914,6 +920,7 @@ impl<'p, 'd, 'a> Walk<'p, 'd, 'a> {
                 },
                 Atom::Made => out.set_any(AnyWhy::Concat),
                 Atom::Punct { ch: '*', .. } => out.set_any(AnyWhy::Glob),
+                // astlog-ignore: expand-hand-extent (a `use` tree's separator in a transcriber's atoms; a use path holds no generics)
                 Atom::Punct { ch: ',', .. } => {
                     self.bind(last.take(), parent, out);
                 }

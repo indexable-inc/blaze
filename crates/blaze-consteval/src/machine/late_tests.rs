@@ -43,7 +43,7 @@ impl LayoutFacts for Withheld<'_> {
         if key == self.adt { None } else { self.w.adt(key) }
     }
 
-    fn repr(&self, key: ItemKey) -> ReprAttrs {
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, blaze_build::layout::Missing> {
         self.w.repr(key)
     }
 
@@ -51,7 +51,7 @@ impl LayoutFacts for Withheld<'_> {
         self.w.discriminant(key, variant)
     }
 
-    fn valid_range(&self, key: ItemKey) -> ValidRange {
+    fn valid_range(&self, key: ItemKey) -> Result<ValidRange, blaze_build::layout::Missing> {
         self.w.valid_range(key)
     }
 }

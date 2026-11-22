@@ -91,6 +91,7 @@ fn cfg(process: u64, boot: u64, root: &Frame) -> PlainConfig<&Frame> {
         writes,
         reads,
         liveness: Liveness::Everything,
+        lock_step: crate::plain::LockStep::Backoff,
     }
 }
 

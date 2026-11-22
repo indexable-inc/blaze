@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use blaze_proc_macro::{
-    module::{CrateId, ModuleRecord, Source, files_digest, lock_closure, package_files, read_module},
+    module::{CrateId, LockedPackages, ModuleRecord, Source, files_digest, package_files, read_module},
     record::{DirStore, native_world},
     sandbox::{Files, Package},
 };
@@ -21,6 +21,9 @@ pub fn modules(store: &Path, checkout: &Path) -> Vec<ModuleRecord> {
     let mut out = Vec::new();
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(store.join("proc-macro/modules")).expect("the module store").flatten().map(|it| it.path()).collect();
     dirs.sort();
+    let lock_text = std::fs::read(checkout.join("Cargo.lock")).expect("the checkout's lock");
+    let lock = blaze_manifest::lock::Lock::read(&lock_text, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the checkout's Cargo.lock: {e}"));
+    let locked = LockedPackages::of(&lock);
     for dir in dirs {
         let identity = std::fs::read_to_string(dir.join("identity")).expect("a module's identity");
         let field = |name: &str| identity.lines().find_map(|line| line.strip_prefix(name).and_then(|it| it.strip_prefix(' '))).unwrap_or("").to_owned();
@@ -43,8 +46,7 @@ pub fn modules(store: &Path, checkout: &Path) -> Vec<ModuleRecord> {
         } else {
             Source::Registry { checksum: &checksum }
         };
-        let lock = std::fs::read_to_string(checkout.join("Cargo.lock")).expect("the checkout's lock");
-        let deps = lock_closure(&lock, &name, &version).expect("the macro crate's closure in the lock");
+        let deps = locked.closure(&name, &version).expect("the macro crate's closure in the lock");
         let id = CrateId { name: &name, version: &version, source, deps: &deps, features: &features };
         match read_module(store, &id) {
             // The identity of a record an older builder keyed otherwise now names another

@@ -22,9 +22,14 @@ use crate::{
     record::{ChunkRoot, Headed, ManifestRoot, MarkRoot, Opaque, Sections, ShapeRoot, StableId, Traced},
 };
 
-/// A kind's number in a record's head and the store's index.
+/// A kind's number in a record's head and the store's index: a kind's ([`TAGS`], from 1) or a
+/// reservation's ([`ReservedTag`], the top of the range).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Tag(pub u16);
+
+/// Every reserved tag, once (the store's own records and the command's).
+mod reserved;
+pub use reserved::{RESERVED_FROM, ReservedTag, TagReach, reach_of};
 
 /// How a record's bytes are read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

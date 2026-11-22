@@ -37,6 +37,7 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
             served: crate::engine_script_reads::Served::Simulated,
             cert_file: None,
             cert_dir: None,
+            rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
             home: Some("/h"),
             cargo_home: None,
             start: Some("/"),
@@ -779,6 +780,580 @@ fn engine_check_checks_the_bodies_a_macro_wrote() {
     }
 }
 
+/// A `static` OR `const` DECLARED IN A BODY IS CHECKED, ONCE (handoff c13; tempo t1935d, 7 tests
+/// NOT RUN "the body ids hold nothing for" chainspec's `mainnet::IDENTITY`, clap's
+/// `augment_args::DEFAULT_VALUE` and `thread_local!`'s static). The Reference, "Block
+/// expressions": an item in a block is an item, so its initializer is checked like a module's.
+/// THE CAUSE (front2 every_body.rs `each_from`): only a body's local FNS were queued, so a local
+/// static's initializer was checked by no task and no task's covers listed it, and a program
+/// that read it found no row. Planted: `true` where a `u8` is written.
+/// - the real shape: a static in an impl method's body. Before: 0 errors (never checked).
+/// - TWIN, one check: a const in a block that is a module (it holds an impl): its body is listed
+///   (covered.rs `in_blocks`) AND it is its body's local. With only `each_from` changed it would
+///   print 2 errors; `in_blocks` leaves it to the local walk, so 1.
+/// - CONTROL: the same static written right: no error.
+#[test]
+fn engine_check_checks_a_static_or_const_declared_in_a_body_once() {
+    let method = "pub struct S;\n\nimpl S {\n    pub fn get() -> u8 {\n        static ONE: u8 = true;\n        ONE\n    }\n}\n";
+    let block = "pub fn outer() -> u8 {\n    struct T;\n    impl T {\n        fn m() {}\n    }\n    const FOUR: u8 = true;\n    FOUR\n}\n";
+    let right = "pub struct S;\n\nimpl S {\n    pub fn get() -> u8 {\n        static ONE: u8 = 1;\n        ONE\n    }\n}\n";
+    for (case, text, errors) in [("a static in a method", method, 1usize), ("a const in a block module", block, 1), ("control: written right", right, 0)] {
+        let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", text);
+        let before = stdout(&io).len();
+        let (_, checked) = engine(&io, 1);
+        let said = stdout(&io).split_off(before);
+        let (notes, clean) = &checked.bodies;
+        println!("engine-check of {case}: {clean} clean, notes {notes:?}\n{said}");
+        assert!(notes.iter().all(|note| !note.contains("not checked")), "{case}: no body left unchecked: {notes:?}");
+        let found = error_lines(&said);
+        assert_eq!(found.len(), errors, "{case}: the planted initializer's error, printed once:\n{said}");
+        assert!(found.iter().all(|line| line.contains("E0308")), "{case}: a mismatched type (E0308):\n{said}");
+        assert_eq!(checked.status.0 == Status::FAILED.0, errors > 0, "{case}: the command's status:\n{said}");
+    }
+}
+
+/// What tracing's callsite statics expand with. The simulated shelf's `core` declares no
+/// builtin macro: the crate declares the three as core does (`#[rustc_builtin_macro]`), and
+/// `__macro_support` re-exports its `concat` as tracing's re-exports `::core::concat` (the
+/// `$crate::__macro_support::concat!` shape kept).
+pub(super) const CALLSITE_SUPPORT: &str = "#![feature(rustc_attrs)]\n\n#[rustc_builtin_macro]\n#[macro_export]\nmacro_rules! concat {\n    ($($t:tt)*) => { /* compiler built-in */ };\n}\n\n#[rustc_builtin_macro]\n#[macro_export]\nmacro_rules! file {\n    () => { /* compiler built-in */ };\n}\n\n#[rustc_builtin_macro]\n#[macro_export]\nmacro_rules! line {\n    () => { /* compiler built-in */ };\n}\n\n#[doc(hidden)]\npub mod __macro_support {\n    pub use crate::concat;\n}\n\n";
+
+/// TRACING'S CALLSITE STATIC CHECKS (tempo rt-loop a2000: 394 items not checked, "HostError
+/// Place, the call of `$crate :: __macro_support :: concat!`" in every workspace body with a
+/// tracing event). `event!` writes, in the user's fn, `static META = .. concat!(file!(), ":",
+/// line!()) ..` through its `$crate::__macro_support` re-export. THE CAUSE: since the test
+/// above, a local static's initializer is a body of its own (every_body.rs), and its host was
+/// placed at the LOCAL key (front2 body.rs `BodyHost::of(.., item, ..)`), which the names do
+/// not place, so `line!()` in that eager input was refused. Now placed at its enclosing fn,
+/// at the outermost call for a static a macro wrote (body.rs `body_at`).
+/// - the real shape: the callsite static an `event!` writes: clean.
+/// - TWIN, planted: the same static with `true` where a `u8` is written: ONE E0308, so the
+///   initializer was checked past its `line!()` (refused, it was "not checked" instead).
+/// - TWIN: the same initializer written by hand in the fn (a written local, its own byte): clean.
+/// - CONTROL: at module level (the item host, never refused): clean.
+#[test]
+fn engine_check_checks_a_callsite_static_with_line_in_eager_input() {
+    let support = CALLSITE_SUPPORT;
+    let event = |init: &str| {
+        std::format!("{support}#[macro_export]\nmacro_rules! event {{\n    () => {{{{\n        static META: (&str, u8) = ($crate::__macro_support::concat!(file!(), \":\", line!()), {init});\n        META.1\n    }}}};\n}}\n\npub fn handle_tip() -> u8 {{\n    event!()\n}}\n")
+    };
+    let real = event("1");
+    let planted = event("true");
+    let by_hand = std::format!("{support}pub fn handle_tip() -> u8 {{\n    static META: (&str, u8) = (crate::__macro_support::concat!(file!(), \":\", line!()), 1);\n    META.1\n}}\n");
+    let module = std::format!("{support}static META: (&str, u8) = (crate::__macro_support::concat!(file!(), \":\", line!()), 1);\n\npub fn handle_tip() -> u8 {{\n    META.1\n}}\n");
+    let cases = [("the callsite static an `event!` writes", &real, 0usize), ("planted: `true` for a `u8`", &planted, 1), ("written by hand in the fn", &by_hand, 0), ("control: at module level", &module, 0)];
+    for (case, text, errors) in cases {
+        let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", text);
+        let before = stdout(&io).len();
+        let (_, checked) = engine(&io, 1);
+        let said = stdout(&io).split_off(before);
+        let (notes, clean) = &checked.bodies;
+        println!("engine-check of {case}: {clean} clean, notes {notes:?}\n{said}");
+        assert!(notes.iter().all(|note| !note.contains("not checked") && !note.contains("HostError")), "{case}: no body left unchecked: {notes:?}");
+        assert!(!said.contains("HostError"), "{case}: `line!()` placed, never refused:\n{said}");
+        let found = error_lines(&said);
+        assert_eq!(found.len(), errors, "{case}: errors printed:\n{said}");
+        assert!(found.iter().all(|line| line.contains("E0308")), "{case}: a mismatched type (E0308):\n{said}");
+    }
+}
+
+/// `line!()` IN A FN A MACRO WROTE AT MODULE LEVEL IS THE CALL'S LINE (tempo a2015 and t2025d:
+/// 8590 lines "HostError { ask: Place, why: Refused }", tracing's `concat!(file!(), ":",
+/// line!())` in items a macro wrote: pin-project's among them). Core `line!`: "the first macro
+/// invocation leading up to the expansion of the `line!` macro". THE CAUSE: a body's place
+/// (body_host.rs `Placed::of`) was its item's first byte in a FILE, and an item a call wrote is
+/// in the call's expansion: no place, `line!()` refused. Now by the rule a `#[track_caller]`
+/// `Location` is placed by (program/lazy seam_rules.rs `body_place`): the outermost call.
+/// The value is asserted through a const: `[0; LINE as usize]` typed `[u8; K]`.
+/// - the real shape: `handler!()` writes `handle_tip` with tracing's callsite static and
+///   `const LINE: u32 = line!()`, K the line of `handler!();`: clean.
+/// - TWIN, planted: K one past that line: ONE E0308, so the value was checked (not refused).
+/// - CONTROL: the same fn written by hand, K the line of its own `line!()`: clean.
+#[test]
+fn engine_check_places_line_in_a_fn_a_macro_wrote_at_its_call() {
+    let line_of = |text: &str, starts: &str| text.lines().position(|l| l.trim_start().starts_with(starts)).expect("the marked line") + 1;
+    let body = |k: &str| {
+        std::format!("pub fn handle_tip() -> u8 {{\n    static META: (&str, u8) = ($crate::__macro_support::concat!(file!(), \":\", line!()), 1);\n    const LINE: u32 = line!();\n    let _at: [u8; {k}] = [0; LINE as usize];\n    META.1\n}}\n")
+    };
+    // `K` written as a placeholder, then replaced by the line found in the whole text.
+    let written = |shift: usize| {
+        let text = std::format!("{CALLSITE_SUPPORT}macro_rules! handler {{\n    () => {{\n{}    }};\n}}\n\nhandler!();\n", body("K"));
+        let at = line_of(&text, "handler!();") + shift;
+        text.replace("[u8; K]", &std::format!("[u8; {at}]"))
+    };
+    let real = written(0);
+    let planted = written(1);
+    let by_hand = {
+        let text = std::format!("{CALLSITE_SUPPORT}{}", body("K").replace("$crate", "crate"));
+        let at = line_of(&text, "const LINE");
+        text.replace("[u8; K]", &std::format!("[u8; {at}]"))
+    };
+    let cases = [("the fn `handler!` writes", &real, 0usize), ("planted: one line past the call", &planted, 1), ("control: written by hand", &by_hand, 0)];
+    for (case, text, errors) in cases {
+        let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", text);
+        let before = stdout(&io).len();
+        let (_, checked) = engine(&io, 1);
+        let said = stdout(&io).split_off(before);
+        let (notes, clean) = &checked.bodies;
+        println!("engine-check of {case}: {clean} clean, notes {notes:?}\n{said}");
+        assert!(notes.iter().all(|note| !note.contains("not checked") && !note.contains("HostError")), "{case}: no body left unchecked: {notes:?}");
+        assert!(!said.contains("HostError"), "{case}: `line!()` placed, never refused:\n{said}");
+        let found = error_lines(&said);
+        assert_eq!(found.len(), errors, "{case}: errors printed:\n{said}");
+        assert!(found.iter().all(|line| line.contains("E0308")), "{case}: a mismatched type (E0308):\n{said}");
+    }
+}
+
+/// tracing-0.1.44's and tracing-core-0.1.36's macros an `event!` with a target and no fields
+/// expands through, VERBATIM, reduced by deleting arms (src/macros.rs `event!` (the target
+/// arm), `callsite2!` (its third arm), `level_enabled!`, `fieldset!` (base and entry),
+/// `valueset_all!` (base and the no-fields entry), `__tracing_log!` (the arm without `log`,
+/// which writes nothing, so `valueset_all!` is never expanded); tracing-core lib.rs
+/// `identify_callsite!`,
+/// `metadata!` (its second arm)). One cut inside an arm: the `if enabled` branch's body, a
+/// closure called, emptied, because the fixture's core declares no `Fn` lang item to call it
+/// by. The types are the smallest that keep each call's shape (`Level` a module of `u8`
+/// consts, so `level_enabled!`'s `<=` is the builtin one the fixture's core has); the builtin
+/// macros are declared as core declares them (as [`CALLSITE_SUPPORT`]).
+const TRACING_LIB: &str = r#"#![feature(rustc_attrs)]
+#![allow(non_snake_case)]
+
+#[rustc_builtin_macro]
+#[macro_export]
+macro_rules! concat {
+    ($($t:tt)*) => { /* compiler built-in */ };
+}
+
+#[rustc_builtin_macro]
+#[macro_export]
+macro_rules! file {
+    () => { /* compiler built-in */ };
+}
+
+#[rustc_builtin_macro]
+#[macro_export]
+macro_rules! line {
+    () => { /* compiler built-in */ };
+}
+
+#[rustc_builtin_macro]
+#[macro_export]
+macro_rules! module_path {
+    () => { /* compiler built-in */ };
+}
+
+#[doc(hidden)]
+pub mod __macro_support {
+    pub use crate::concat;
+    pub use crate::file;
+    pub use crate::line;
+    pub use crate::module_path;
+    pub use crate::callsite::Callsite;
+
+    pub enum Option<T> {
+        None,
+        Some(T),
+    }
+
+    pub fn __is_enabled(_meta: &crate::Metadata<'static>, _interest: crate::callsite::Interest) -> bool {
+        true
+    }
+}
+
+pub mod Level {
+    pub const WARN: u8 = 2;
+}
+
+pub mod level_filters {
+    pub const STATIC_MAX_LEVEL: u8 = 5;
+
+    pub mod LevelFilter {
+        pub fn current() -> u8 {
+            5
+        }
+    }
+}
+
+pub use metadata::Metadata;
+
+pub mod metadata {
+    pub struct Kind(pub u8);
+
+    impl Kind {
+        pub const EVENT: Kind = Kind(1);
+    }
+
+    pub struct Metadata<'a> {
+        pub name: &'static str,
+        pub target: &'a str,
+        pub level: u8,
+        pub file: crate::__macro_support::Option<&'a str>,
+        pub line: crate::__macro_support::Option<u32>,
+        pub module_path: crate::__macro_support::Option<&'a str>,
+        pub fields: crate::field::FieldSet,
+        pub kind: Kind,
+    }
+
+    impl<'a> Metadata<'a> {
+        pub const fn new(
+            name: &'static str,
+            target: &'a str,
+            level: u8,
+            file: crate::__macro_support::Option<&'a str>,
+            line: crate::__macro_support::Option<u32>,
+            module_path: crate::__macro_support::Option<&'a str>,
+            fields: crate::field::FieldSet,
+            kind: Kind,
+        ) -> Self {
+            Metadata { name, target, level, file, line, module_path, fields, kind }
+        }
+    }
+}
+
+pub mod field {
+    pub struct FieldSet {
+        pub names: &'static [&'static str; 0],
+        pub callsite: crate::callsite::Identifier,
+    }
+
+    impl FieldSet {
+        pub const fn new(names: &'static [&'static str; 0], callsite: crate::callsite::Identifier) -> Self {
+            FieldSet { names, callsite }
+        }
+    }
+}
+
+pub mod callsite {
+    pub trait Callsite {
+        fn metadata(&self) -> &crate::Metadata<'static>;
+    }
+
+    pub struct Identifier(pub &'static DefaultCallsite);
+
+    pub struct Interest(pub u8);
+
+    impl Interest {
+        pub fn is_never(&self) -> bool {
+            self.0 == 0
+        }
+    }
+
+    pub struct DefaultCallsite {
+        pub meta: &'static crate::Metadata<'static>,
+    }
+
+    impl DefaultCallsite {
+        pub const fn new(meta: &'static crate::Metadata<'static>) -> Self {
+            DefaultCallsite { meta }
+        }
+
+        pub fn interest(&self) -> Interest {
+            Interest(1)
+        }
+    }
+
+    impl Callsite for DefaultCallsite {
+        fn metadata(&self) -> &crate::Metadata<'static> {
+            self.meta
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! event {
+    // Target.
+    (target: $target:expr, $lvl:expr, { $($fields:tt)* } )=> ({
+        use $crate::__macro_support::Callsite as _;
+        static __CALLSITE: $crate::callsite::DefaultCallsite = $crate::callsite2! {
+            name: $crate::__macro_support::concat!(
+                "event ",
+                $crate::__macro_support::file!(),
+                ":",
+                $crate::__macro_support::line!()
+            ),
+            kind: $crate::metadata::Kind::EVENT,
+            target: $target,
+            level: $lvl,
+            fields: $($fields)*
+        };
+        let enabled = $crate::level_enabled!($lvl) && {
+            let interest = __CALLSITE.interest();
+            !interest.is_never() && $crate::__macro_support::__is_enabled(__CALLSITE.metadata(), interest)
+        };
+        if enabled {
+        } else {
+            $crate::__tracing_log!(
+                $lvl,
+                __CALLSITE,
+                &$crate::valueset_all!(__CALLSITE.metadata().fields(), $($fields)*)
+            );
+        }
+    });
+}
+
+/// Constructs a new static callsite for a span or event.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! callsite2 {
+    (
+        name: $name:expr,
+        kind: $kind:expr,
+        target: $target:expr,
+        level: $lvl:expr,
+        fields: $($fields:tt)*
+    ) => {{
+        static META: $crate::Metadata<'static> = {
+            $crate::metadata! {
+                name: $name,
+                target: $target,
+                level: $lvl,
+                fields: $crate::fieldset!( $($fields)* ),
+                callsite: &__CALLSITE,
+                kind: $kind,
+            }
+        };
+        $crate::callsite::DefaultCallsite::new(&META)
+    }};
+}
+
+#[macro_export]
+// TODO: determine if this ought to be public API?`
+#[doc(hidden)]
+macro_rules! level_enabled {
+    ($lvl:expr) => {
+        $lvl <= $crate::level_filters::STATIC_MAX_LEVEL
+            && $lvl <= $crate::level_filters::LevelFilter::current()
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! fieldset {
+    // == base case ==
+    (@ { $(,)* $($out:expr),* $(,)* } $(,)*) => {
+        &[ $($out),* ]
+    };
+
+    // == entry ==
+    ($($args:tt)*) => {
+        $crate::fieldset!(@ { } $($args)*,)
+    };
+
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! valueset_all {
+
+    // === base case ===
+    (@ { $(,)* $($val:expr),* $(,)* } $(,)*) => {
+        &[ $($val),* ]
+    };
+
+    ($fields:expr,) => {
+        {
+            $fields.value_set_all(&[])
+        }
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tracing_log {
+    ($level:expr, $callsite:expr, $value_set:expr) => {};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! identify_callsite {
+    ($callsite:expr) => {
+        $crate::callsite::Identifier($callsite)
+    };
+}
+
+#[macro_export]
+macro_rules! metadata {
+    (
+        name: $name:expr,
+        target: $target:expr,
+        level: $level:expr,
+        fields: $fields:expr,
+        callsite: $callsite:expr,
+        kind: $kind:expr,
+    ) => {
+        $crate::metadata::Metadata::new(
+            $name,
+            $target,
+            $level,
+            $crate::__macro_support::Option::Some($crate::__macro_support::file!()),
+            $crate::__macro_support::Option::Some($crate::__macro_support::line!()),
+            $crate::__macro_support::Option::Some($crate::__macro_support::module_path!()),
+            $crate::field::FieldSet::new($fields, $crate::identify_callsite!($callsite)),
+            $kind,
+        )
+    };
+}
+"#;
+
+/// A workspace crate's bodies with one tracing event each (`TARGET` replaced by the event's
+/// target): an inherent method (tempo's `async fn handle_tip(&self, tip: FinalizedTip)`,
+/// crates/consensus/src/feed/actor.rs:64, made sync: the fixture's core has no `Future`), a
+/// trait impl's method, and a free fn.
+const CONSENSUS_LIB: &str = r#"pub struct Actor {
+    pub n: u8,
+}
+
+impl Actor {
+    pub fn handle_tip(&self, tip: u8) -> u8 {
+        tracing::event!(target: TARGET, tracing::Level::WARN, {});
+        tip + self.n
+    }
+}
+
+pub trait Handle {
+    fn handle(&self) -> u8;
+}
+
+impl Handle for Actor {
+    fn handle(&self) -> u8 {
+        tracing::event!(target: "consensus::feed", tracing::Level::WARN, {});
+        self.n
+    }
+}
+
+pub fn now_millis(at: u8) -> u8 {
+    tracing::event!(target: "consensus::feed", tracing::Level::WARN, {});
+    at
+}
+"#;
+
+/// TRACING'S EVENT IN A METHOD CHECKS (tempo rt-loop a2210: 167 bodies "lowering refused ..
+/// HostError Place, the call of `$crate :: __macro_support :: concat!`", every one a method;
+/// none of tempo's 124 free fns with an event refused). The event's `static META` is a
+/// copied local two levels in (in `__CALLSITE`'s initializer, in the method), and front2
+/// body.rs `body_at` walks out to the method's key. THE CAUSE (from reading): a member's
+/// library row was found by `library_body`'s same-slice test against the head's text, which
+/// a seeded member's head does not share with the names' slice: no row, no place, `line!()`
+/// refused. Now by keys.rs `source_member` (container, kind, name). The real macros
+/// ([`TRACING_LIB`]) from a path dependency, in a workspace package (`file!()` answered):
+/// - the real shape: an inherent method, a trait impl's method and a free fn: clean, nothing
+///   refused, no body left unchecked.
+/// - TWIN, planted: the method's event's target `7u8` for `&str`: ONE E0308, so META's
+///   initializer was lowered past its `line!()` and checked.
+/// - CONTROL: the free fn alone was placed before the change too (its `library_in` row);
+///   rule 23: with body_at's member arm removed, the real shape refuses the two methods only.
+#[test]
+fn engine_check_checks_a_tracing_event_in_a_method() {
+    let cases = [("an event in a method, a trait method and a free fn", "\"consensus::feed\"", 0usize), ("planted: the method's target `7u8`", "7u8", 1)];
+    for (case, target, errors) in cases {
+        let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"tracing\", \"crates/consensus\"]\nresolver = \"2\"\n");
+        write(&io, "tracing/Cargo.toml", "[package]\nname = \"tracing\"\nversion = \"0.1.44\"\nedition = \"2018\"\n");
+        write(&io, "tracing/src/lib.rs", TRACING_LIB);
+        write(&io, "crates/consensus/Cargo.toml", "[package]\nname = \"consensus\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ntracing = { path = \"../../tracing\" }\n");
+        write(&io, "crates/consensus/src/lib.rs", &CONSENSUS_LIB.replace("TARGET", target));
+        let before = stdout(&io).len();
+        let (_, checked) = engine(&io, 1);
+        let said = stdout(&io).split_off(before);
+        let (notes, clean) = &checked.bodies;
+        println!("engine-check of {case}: {clean} clean, notes {notes:?}\n{said}");
+        assert!(notes.iter().all(|note| !note.contains("not checked") && !note.contains("HostError")), "{case}: no body left unchecked: {notes:?}");
+        assert!(!said.contains("HostError") && !said.contains("could not check"), "{case}: `line!()` placed, never refused:\n{said}");
+        let found = error_lines(&said);
+        assert_eq!(found.len(), errors, "{case}: errors printed:\n{said}");
+        assert!(found.iter().all(|line| line.contains("E0308")), "{case}: a mismatched type (E0308):\n{said}");
+    }
+}
+
+/// A METHOD'S BLOCK IMPORT IS READ (front2 locals.rs `library_item_or_member`). A body's
+/// blocks the names library made modules are found by the library's key of the body: for a
+/// method that key was found by its text's slice, which a seeded member's text is not (the
+/// cause of the test above), so a method's blocks had no modules: a macro its block imports
+/// was not found there, and `Locals::keep` and glob_uses.rs `PatternBlocks::of` read no block
+/// module either. Now one lookup, by container, kind and name, for all three.
+/// - the real shape: an inherent method whose block imports a macro (`use crate::m::seven;`,
+///   a `macro_rules!` of a module, re-exported by `use`) and calls it, and one whose block
+///   globs an enum's variants for a `match`: clean, nothing refused.
+/// - TWIN, planted: the macro's value (`7`) where a `bool` is written: ONE E0308, so the call
+///   was expanded through the block's import and checked.
+/// - CONTROL: the same block in a free fn (its body found by its item before the change too):
+///   clean.
+#[test]
+fn engine_check_reads_a_block_import_in_a_method() {
+    let support = "mod m {\n    macro_rules! seven {\n        () => {\n            7\n        };\n    }\n    pub(crate) use seven;\n}\n\npub enum E {\n    A,\n    B,\n}\n\n";
+    let method = |ty: &str| {
+        std::format!(
+            "{support}pub struct Actor;\n\nimpl Actor {{\n    pub fn get() -> u8 {{\n        let n: {ty} = {{\n            use crate::m::seven;\n            seven!()\n        }};\n        let _ = n;\n        1\n    }}\n\n    pub fn pick() -> u8 {{\n        let e = E::A;\n        {{\n            use crate::E::*;\n            match e {{\n                A => 1,\n                B => 2,\n            }}\n        }}\n    }}\n}}\n"
+        )
+    };
+    let real = method("u8");
+    let planted = method("bool");
+    let free = std::format!("{support}pub fn get() -> u8 {{\n    let n: u8 = {{\n        use crate::m::seven;\n        seven!()\n    }};\n    n\n}}\n");
+    let cases = [("a method's block imports a macro and globs variants", &real, 0usize), ("planted: `bool` for the macro's `7`", &planted, 1), ("control: the block in a free fn", &free, 0)];
+    for (case, text, errors) in cases {
+        let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", text);
+        let before = stdout(&io).len();
+        let (_, checked) = engine(&io, 1);
+        let said = stdout(&io).split_off(before);
+        let (notes, clean) = &checked.bodies;
+        println!("engine-check of {case}: {clean} clean, notes {notes:?}\n{said}");
+        assert!(notes.iter().all(|note| !note.contains("not checked") && !note.contains("refused")), "{case}: no body left unchecked or refused: {notes:?}");
+        assert!(!said.contains("could not check") && !said.contains("lowering refused"), "{case}: every body lowered:\n{said}");
+        let found = error_lines(&said);
+        assert_eq!(found.len(), errors, "{case}: errors printed:\n{said}");
+        assert!(found.iter().all(|line| line.contains("E0308")), "{case}: a mismatched type (E0308):\n{said}");
+    }
+}
+
+/// `include_str!` AND `file!()` IN A MEMBER ARE READ FROM ITS CONTAINER'S FILE (front2
+/// body_host.rs `body_file`). tempo rt-loop a2210: `HostError Include` in four members of
+/// crates/node/tests/it/utils.rs and zones' (`new`, `reference_genesis`, `launch`, the
+/// associated const `TESTNET_REFERENCE_GENESIS`), in none of the same crate's free fns. A
+/// member is placed at its member row (body.rs `body_at`), and the items record has no row
+/// for a member, so it had no file. Now its container's.
+/// - the real shape: a method and an associated const reading `include_str!("../assets/g.json")`,
+///   and a method returning `file!()`: clean, nothing refused.
+/// - TWIN, planted: the method's include typed `u8`: ONE E0308, so the include was read.
+/// - CONTROL: the same include in a free fn: clean.
+#[test]
+fn engine_check_reads_an_include_in_a_member() {
+    let support = "#![feature(rustc_attrs)]\n\n#[rustc_builtin_macro]\nmacro_rules! include_str {\n    ($($t:tt)*) => { /* compiler built-in */ };\n}\n\n#[rustc_builtin_macro]\nmacro_rules! file {\n    () => { /* compiler built-in */ };\n}\n\n";
+    let member = |ty: &str| {
+        std::format!(
+            "{support}pub enum ForkSchedule {{\n    Testnet,\n}}\n\nimpl ForkSchedule {{\n    const TESTNET_REFERENCE_GENESIS: &'static str = include_str!(\"../assets/g.json\");\n\n    pub fn reference_genesis(&self) -> {ty} {{\n        include_str!(\"../assets/g.json\")\n    }}\n\n    pub fn testnet() -> &'static str {{\n        Self::TESTNET_REFERENCE_GENESIS\n    }}\n\n    pub fn at() -> &'static str {{\n        file!()\n    }}\n}}\n"
+        )
+    };
+    let real = member("&'static str");
+    let planted = member("u8");
+    let free = std::format!("{support}pub fn reference_genesis() -> &'static str {{\n    include_str!(\"../assets/g.json\")\n}}\n");
+    let cases = [("a method, an associated const and `file!()` in a method", &real, 0usize), ("planted: the include typed `u8`", &planted, 1), ("control: the include in a free fn", &free, 0)];
+    for (case, text, errors) in cases {
+        let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\"]\nresolver = \"2\"\n");
+        write(&io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        write(&io, "a/src/lib.rs", text);
+        write(&io, "a/assets/g.json", "{\"n\":1}\n");
+        let before = stdout(&io).len();
+        let (_, checked) = engine(&io, 1);
+        let said = stdout(&io).split_off(before);
+        let (notes, clean) = &checked.bodies;
+        println!("engine-check of {case}: {clean} clean, notes {notes:?}\n{said}");
+        assert!(notes.iter().all(|note| !note.contains("not checked") && !note.contains("HostError")), "{case}: no body left unchecked: {notes:?}");
+        assert!(!said.contains("HostError") && !said.contains("could not check"), "{case}: the include and `file!()` read, never refused:\n{said}");
+        let found = error_lines(&said);
+        assert_eq!(found.len(), errors, "{case}: errors printed:\n{said}");
+        assert!(found.iter().all(|line| line.contains("E0308")), "{case}: a mismatched type (E0308):\n{said}");
+    }
+}
+
 #[test]
 fn engine_check_lists_what_check_lists_for_the_outlines() {
     let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
@@ -863,10 +1438,10 @@ fn engine_check_starts_from_its_stored_answer() {
     let (_, statement) = engine_from(&io, 2, false);
     assert_eq!(
         because(&statement),
-        // The body's two rows (D191: its library's and its test build's), and two lint units
-        // whose bytes hold the statement (engine_lints.rs `plan`: the item's own unit, and the
-        // file's unit 0, whose hole for the item moved with its length).
-        [(blaze_engine::Stage::Outlines, "key moved", None, 1), (blaze_engine::Stage::Bodies, "key moved", None, 2), (blaze_engine::Stage::Lints, "key moved", None, 2)],
+        // The body's two rows (D191: its library's and its test build's), and the file's ONE
+        // lint task (engine_lints.rs `plan`: a task a file, its key moved by the item's unit's,
+        // the one unit it relints; the file's unit 0 holds the item as one mark).
+        [(blaze_engine::Stage::Outlines, "key moved", None, 1), (blaze_engine::Stage::Bodies, "key moved", None, 2), (blaze_engine::Stage::Lints, "key moved", None, 1)],
         "a statement enters its outline, its body's two rows (D191) and its lint units alone: {}",
         entries(&statement)
     );

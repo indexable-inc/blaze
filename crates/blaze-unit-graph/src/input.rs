@@ -285,32 +285,7 @@ impl<'a> TargetDesc<'a> {
             Platform::Cfg(predicate) => predicate,
         };
         let expr = blaze_cond::cfg::parse(predicate, alloc)?;
-        let mut stack: AVec<'_, bool> = Vec::new_in(alloc);
-        for op in expr.ops.iter() {
-            use blaze_cond::cfg::Op;
-            let value = match *op {
-                Op::True => true,
-                Op::False => false,
-                Op::Atom(atom) => self.has(atom.name, atom.value),
-                Op::Not => !stack.pop().unwrap_or(false),
-                Op::All(n) => {
-                    let mut all = true;
-                    for _ in 0..n {
-                        all &= stack.pop().unwrap_or(true);
-                    }
-                    all
-                }
-                Op::Any(n) => {
-                    let mut any = false;
-                    for _ in 0..n {
-                        any |= stack.pop().unwrap_or(false);
-                    }
-                    any
-                }
-            };
-            stack.push(value);
-        }
-        Ok(stack.pop().unwrap_or(false))
+        Ok(expr.holds(|atom| self.has(atom.name, atom.value), alloc))
     }
 }
 

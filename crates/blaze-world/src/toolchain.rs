@@ -28,8 +28,16 @@ const PROFILE: &[(&str, Option<&str>)] = &[("debug_assertions", None)];
 /// - line 76 `cargo:rustc-cfg=restricted_std`: a `target_os` outside the list at lines 20..33
 ///   (which holds "linux", line 20, and "macos", line 28); neither target.
 /// - line 80 `cargo:rustc-cfg=backtrace_in_libstd`: always; both targets (the rows below).
-/// - line 82 `cargo:rustc-env=STD_ENV_ARCH=<CARGO_CFG_TARGET_ARCH>`: always, `aarch64` on both;
-///   not carried: a toolchain crate holds no environment, and no item std writes is decided by it.
+/// - line 82 `cargo:rustc-env=STD_ENV_ARCH=<CARGO_CFG_TARGET_ARCH>`: always, `aarch64` on both.
+///   NOT CARRIED, and std reads it: `pub const ARCH: &str = env!("STD_ENV_ARCH");`
+///   (library/std/src/env.rs:1112, `std::env::consts::ARCH`). A toolchain crate's environment
+///   (list.rs, `EnvFacts { package: None, script: None, .. }`) holds no such pair, so
+///   blaze-scope `CrateEnv::get` answers `Ok(None)` and the const's `env!` is refused as "the
+///   variable is not set" (blaze-expand failed.rs): a program reading `consts::ARCH` does not
+///   build (the rung tests/ladder/front2/s7-env-01-consts-arch). The fix, which needs a field
+///   of `EnvFacts` and of the crate list's row (crate_list.rs `ROW`, read back by body jobs
+///   through `env_facts`), is the pair from this table: the pair's value is the target's
+///   `target_arch`, which is in the crate's key through its cfg.
 /// - line 89 `cargo:rustc-cfg=vxworks_lt_25_09`: `target_os == "vxworks"`; neither target.
 const STD_SCRIPT_CFG: &[(&str, &[&str])] = &[
     // build.rs:80 `println!("cargo:rustc-cfg=backtrace_in_libstd");`

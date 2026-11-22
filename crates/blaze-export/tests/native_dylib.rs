@@ -82,10 +82,10 @@ fn image(word_pointer: bool) -> Image<'static> {
     put64(&mut bytes, 0xC018, 0xC038);
     let mut fixups: AVec<'static, Fixup> = Vec::new_in(a);
     fixups.push(Fixup { at: 0x8000, to: FixTo::Import { index: 0, addend: 0 } });
-    let first = if word_pointer { FixTo::Word { index: 0 } } else { FixTo::Rebase { target: 0x4000 } };
+    let first = if word_pointer { FixTo::Word { index: 0 } } else { FixTo::rebase(0x4000) };
     fixups.push(Fixup { at: 0xC020, to: first });
     fixups.push(Fixup { at: 0xC028, to: FixTo::Import { index: 1, addend: 8 } });
-    fixups.push(Fixup { at: 0xC038, to: FixTo::Rebase { target: 0x4004 } });
+    fixups.push(Fixup { at: 0xC038, to: FixTo::rebase(0x4004) });
     let mut imports: AVec<'static, Import<'static>> = Vec::new_in(a);
     imports.push(Import { name: b"_puts", weak: false });
     imports.push(Import { name: b"_weak_hook", weak: true });
@@ -277,6 +277,59 @@ fn every_command_is_counted_and_the_signature_is_read() {
     assert_eq!(walk(ncmds - 1).1, None, "control: one command fewer does not reach the signature");
 }
 
+/// The load commands are a list built first and counted from it (commands.rs), so a dylib with
+/// many `LC_LOAD_DYLIB`s of 300-byte install names lays out and every command reads back by
+/// walking the header: `ncmds` of them end exactly at `sizeofcmds`, each `cmdsize` a multiple of
+/// 8, the install names in order, the signature counted. Twin: ten more names pass the 0x4000
+/// the image keeps before `Text` and are refused by type, in every build, with the need the
+/// list's own size (each added `dylib_command` 24 + 304 bytes).
+#[test]
+fn long_install_names_read_back_by_walking_and_past_the_room_is_refused_by_type() {
+    use blaze_export::native_dylib::DylibError;
+    let long = |k: usize| -> &'static str { Box::leak(format!("/opt/blaze-room/{k:03}/{}", "n".repeat(280)).into_boxed_str()) };
+    let with = |count: usize| {
+        let mut img = image(false);
+        for k in 0..count {
+            img.libraries.push(mac_dylib("z", long(k)));
+        }
+        img
+    };
+    assert_eq!(long(0).len(), 300, "a 300-byte install name");
+    let fits = 40;
+    let file = written(&with(fits));
+    let (ncmds, sizeofcmds) = (u32_at(&file, 16), u32_at(&file, 20) as usize);
+    let (mut at, mut loads, mut signature) = (32usize, Vec::new_in(alloc()), None);
+    for _ in 0..ncmds {
+        let (cmd, size) = (u32_at(&file, at), u32_at(&file, at + 4) as usize);
+        assert!(size > 0 && size.is_multiple_of(8), "cmdsize {size} at {at:#x}");
+        if cmd == 0xc {
+            loads.push(cstr(&file, at + u32_at(&file, at + 8) as usize));
+        }
+        if cmd == 0x1d {
+            signature = Some(u32_at(&file, at + 8) as usize);
+        }
+        at += size;
+    }
+    assert_eq!(at, 32 + sizeofcmds, "ncmds commands end exactly at sizeofcmds");
+    assert!(at <= 0x4000, "the commands fit the image's header room");
+    assert_eq!(loads.len(), 2 + fits, "libSystem, libz, then each long name once");
+    assert_eq!((loads[0], loads[1]), (&b"/usr/lib/libSystem.B.dylib"[..], &b"/usr/lib/libz.1.dylib"[..]));
+    for k in 0..fits {
+        assert_eq!(loads[2 + k], long(k).as_bytes(), "LC_LOAD_DYLIB {k} reads back whole");
+    }
+    assert!(signature.is_some(), "LC_CODE_SIGNATURE is among the counted commands");
+    // Twin: ten more do not fit the room; refused by type, the need the list's own size.
+    let too_many = fits + 10;
+    let mut out: AVec<'static, u8> = Vec::new_in(alloc());
+    match write(&with(too_many), IDENT, &mut out, alloc()) {
+        Err(DylibError::HeaderRoom { need, room }) => {
+            assert_eq!(room, 0x4000, "the room is where Text starts");
+            assert_eq!(need as usize, 32 + sizeofcmds + 10 * (24 + 304), "the need is the list's size");
+        }
+        other => panic!("{too_many} long install names were not refused by the header room: {other:?}"),
+    }
+}
+
 /// `dyld_chained_ptr_64_rebase` keeps a target's top byte in `high8` (bits 36..43; dyld:
 /// header + (high8 << 56 | target)): Apple arm64 non-unique RTTI's typeinfo name pointer, bit
 /// 63 over an image place (tempo's rocksdb), is written so, with its 36-bit target. Bits
@@ -286,14 +339,15 @@ fn every_command_is_counted_and_the_signature_is_read() {
 fn a_rebase_keeps_its_top_byte_and_refuses_bits_36_to_55_by_slot() {
     use blaze_export::native_dylib::DylibError;
     let mut tagged = image(false);
-    tagged.fixups[1] = Fixup { at: 0xC020, to: FixTo::Rebase { target: (1 << 63) | 0x4000 } };
+    tagged.fixups[1] = Fixup { at: 0xC020, to: FixTo::rebase((1 << 63) | 0x4000) };
+    assert!(matches!(tagged.fixups[1].to, FixTo::Rebase { address, high8: 0x80 } if address.get() == 0x4000), "the tag is its own field");
     let file = written(&tagged);
     // The next slot is 0xC028, 8 bytes (two 4-byte strides) on.
     assert_eq!(u64_at(&file, 0xC020), 0x4000 | (0x80 << 36) | (2 << 51), "high8 0x80, target 0x4000");
     assert_eq!(u64_at(&file, 0xC038), 0x4004, "control: the untagged rebase has high8 0");
     for target in [(1u64 << 55) | 0x4000, 1 << 40] {
         let mut far = image(false);
-        far.fixups[1] = Fixup { at: 0xC020, to: FixTo::Rebase { target } };
+        far.fixups[1] = Fixup { at: 0xC020, to: FixTo::rebase(target) };
         let mut out: AVec<'static, u8> = Vec::new_in(alloc());
         match write(&far, IDENT, &mut out, alloc()) {
             Err(DylibError::Slot { at, value, .. }) => assert_eq!((at, value), (0xC020, target)),

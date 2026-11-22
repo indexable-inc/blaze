@@ -510,6 +510,15 @@ fn map_tree(
             PNode::Opaque(key, l) => match settle {
                 Settle::Instance { facts, .. } => {
                     map_list(l, &mut list)?;
+                    // Asked at GROUND arguments, every projection among them normalized first
+                    // (as the whole type is at the end): the question names its arguments, and
+                    // a projection is no instance's argument (core's `for_each` and its inner
+                    // `fn call<T>(..) -> impl FnMut((), T)` at `T = <I as Iterator>::Item`).
+                    if projections {
+                        for t in list.iter_mut() {
+                            *t = crate::normalize::normalize_ground(ground, *t, facts, scratch)?;
+                        }
+                    }
                     mapped[at] = facts.opaque_hidden(key, &list, ground)?;
                     continue;
                 }

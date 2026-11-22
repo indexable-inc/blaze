@@ -18,6 +18,9 @@ doctest = false
 blaze-own.workspace = true
 # `resolve`: the lookup tables (name to definition), blaze-hash's map.
 blaze-hash.workspace = true
+# `layout`: the one A64 `adrp` and low-12 encoders (blaze-code a64.rs), shared with the
+# whole-program layouts and the launcher's thunks (rule 30).
+blaze-code.workspace = true
 
 [dev-dependencies]
 # `Alloc::global()`, the handle the older tests hand every function; `testing::heap()`, the

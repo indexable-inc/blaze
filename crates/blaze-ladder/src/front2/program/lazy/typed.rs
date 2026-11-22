@@ -75,6 +75,84 @@ pub trait TypedRecords {
     fn typed(&mut self, key: ItemKey) -> Result<Checked<'static>, TypedGap>;
 }
 
+/// A KIND OF BODY THE RUN CHECKS ITSELF (the typing seam's third arm, run/make_one.rs `ByKind`):
+/// `check` keeps no typed record for a body of this kind yet, so the run's one check of it is
+/// the only check it gets. Each is named and counted in the run's closing line, and never a
+/// refusal: a body of a kind `check` keeps records for is read from its record, and a gap there
+/// is a refusal. A kind moves to [`BodySource::Read`] once `check` keeps its record (front2
+/// tables/task.rs), and then its variant here goes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RunChecked {
+    /// A toolchain crate's body: `check` checks none (blaze-cli run_ids.rs grains).
+    Toolchain = 0,
+    /// A locked dependency's body: likewise, until the run's check keeps a record under its key.
+    Dependency = 1,
+    /// A fn declared in a workspace body (its key's inner bit, [`is_local`]): `check` checks it
+    /// under its root, and keeps no record under its own key yet.
+    Local = 2,
+    /// A workspace body `check` ran and kept no typed record of. Its facts name none: stalled
+    /// goals decided after the record was written (F18), or columns the record refused.
+    Unrecorded = 3,
+}
+
+impl RunChecked {
+    /// Every kind, in index order ([`RunChecked::index`]).
+    pub const ALL: [RunChecked; 4] = [RunChecked::Toolchain, RunChecked::Dependency, RunChecked::Local, RunChecked::Unrecorded];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The kind as the run's closing line names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            RunChecked::Toolchain => "toolchain",
+            RunChecked::Dependency => "dependency",
+            RunChecked::Local => "local fn",
+            RunChecked::Unrecorded => "no record kept",
+        }
+    }
+}
+
+/// Where one body's checked columns come from: the record `check` kept, read, or the run's own
+/// check, for a body of a kind `check` keeps none for ([`RunChecked`]).
+pub enum BodySource {
+    Read(Checked<'static>),
+    Run(RunChecked),
+}
+
+/// The run's records of checked bodies, kind by kind (run/make_one.rs `ByKind`): for each body,
+/// its columns read from its record, or the kind the run checks itself. A body of a kind that
+/// has records but whose record cannot be read is a [`TypedGap`], which the run refuses by name
+/// (rule 3: never a quiet check in its place).
+pub trait KeptBodies {
+    fn source(&mut self, key: ItemKey) -> Result<BodySource, TypedGap>;
+}
+
+/// Whether checker key `key` is a fn declared in a body: the inner bit of its library key
+/// (byte 8, `LibKey::INNER`; front2 nested_exports.rs sets it), which a checker key keeps in its
+/// first 16 bytes (front2 keys.rs `checker_of`).
+pub fn is_local(key: ItemKey) -> bool {
+    key.0.to_be_bytes()[8] & blaze_id::ItemKey::INNER != 0
+}
+
+/// One body's columns, read before the lowering by [`KeptBodies::source`], handed to
+/// `check_one_typed` for that body alone: a second ask, or an ask for another key, is a gap
+/// named by its key.
+pub(crate) struct Given {
+    pub(crate) key: ItemKey,
+    pub(crate) got: Option<Result<Checked<'static>, TypedGap>>,
+}
+
+impl TypedRecords for Given {
+    fn typed(&mut self, key: ItemKey) -> Result<Checked<'static>, TypedGap> {
+        if key != self.key {
+            return Err(TypedGap::NoBody { key });
+        }
+        self.got.take().unwrap_or(Err(TypedGap::NoRecord { key }))
+    }
+}
+
 /// Why a body's typed record was not read: each names the body (rule 19).
 #[derive(Debug)]
 pub enum TypedGap {
@@ -134,5 +212,12 @@ impl<'n, S: PositionSource<'n>> TypedRecords for Rechecked<'n, S> {
         };
         let bytes = checked_record::encode(&checked, self.alloc).map_err(|why| TypedGap::Record { key, why })?;
         checked_record::decode(&bytes, self.alloc).map_err(|why| TypedGap::Record { key, why })
+    }
+}
+
+/// The double as the run's records: every body read from its record (a record of every kind).
+impl<'n, S: PositionSource<'n>> KeptBodies for Rechecked<'n, S> {
+    fn source(&mut self, key: ItemKey) -> Result<BodySource, TypedGap> {
+        self.typed(key).map(BodySource::Read)
     }
 }

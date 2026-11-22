@@ -88,6 +88,10 @@ pub enum Refusal<'a> {
     TransmuteSize { from: u64, to: u64 },
     /// `unreachable_unchecked` or an uninhabited value reached.
     Unreachable,
+    /// `ctlz_nonzero(0)` or `cttz_nonzero(0)` (`name`): undefined (the pinned core,
+    /// intrinsics/mod.rs: "returns `undef` when given an `x` with value `0`"; rustc's const
+    /// evaluator, interpret/intrinsics.rs, throws "`{name}` called on 0").
+    NonzeroOnZero { name: &'static str },
     /// The constant panicked: the message's parts.
     Panic { parts: Vec<PanicPart<'a>, Alloc<'a>> },
     /// An implicit discriminant one past its `repr` type's largest value.
@@ -169,6 +173,7 @@ impl fmt::Display for ConstError<'_> {
             Refusal::InvalidTag { bits } => write!(f, "{bits:#x} is the tag of no variant"),
             Refusal::TransmuteSize { from, to } => write!(f, "`transmute` from {from} bytes to {to} bytes"),
             Refusal::Unreachable => write!(f, "entered unreachable code"),
+            Refusal::NonzeroOnZero { name } => write!(f, "`{name}` called on 0"),
             Refusal::Panic { parts } => {
                 write!(f, "the constant panicked: ")?;
                 for p in parts.iter() {

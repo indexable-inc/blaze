@@ -455,7 +455,7 @@ impl<N: Name, E: FillEnv<N>> Records<N> for View<'_, '_, N, E> {
     fn held(&self, key: ItemKey) -> Held<'_, N> {
         let chain = || self.fill.chains.get(&key).map(|c| c.as_slice());
         if let Some(r) = self.fill.done.get(&key) {
-            return Held::Scope { scope: &r.scope, krate: self.env.here(), chain: chain() };
+            return Held::Scope { scope: crate::scope_record::ScopeOf::Built(&r.scope), krate: self.env.here(), chain: chain() };
         }
         if self.fill.failed.contains_key(&key) {
             return Held::Failed { krate: self.env.here(), chain: chain() };

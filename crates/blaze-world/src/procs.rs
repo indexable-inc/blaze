@@ -108,7 +108,7 @@ pub fn git_folders(modules: &Path) -> Result<BTreeMap<String, String>, ProcsErro
 /// path package it has no files of (then `PathWithoutFolder`, by name). Called at most once.
 pub fn identify<D: AsRef<str>>(
     lock: &Lock<'_>,
-    locked: &LockedPackages<'_>,
+    locked: &LockedPackages<'_, '_>,
     git_folders: &BTreeMap<String, String>,
     unit: &Unit<'_>,
     path_files: impl FnOnce(LockId) -> Result<Option<D>, ProcsError>,
@@ -191,12 +191,11 @@ pub fn register_macro_crates<'u>(
     procs: &mut ProcMacros<'_>,
     modules: &Path,
     lock: &Lock<'_>,
-    lock_text: &str,
     crates: impl IntoIterator<Item = (usize, &'u Unit<'u>)>,
     path_dir: impl Fn(LockId) -> Option<PathBuf>,
 ) -> Result<Registered, ProcsError> {
     let git_folders = git_folders(modules)?;
-    let locked = LockedPackages::read(lock_text);
+    let locked = LockedPackages::of(lock);
     let mut made = Registered { keys: Vec::new(), unregistered: Vec::new() };
     for (index, unit) in crates {
         // A path package's files as they are now, from the folder `path_dir` gives.
@@ -216,7 +215,7 @@ pub fn register_macro_crates<'u>(
         };
         let added = identity.with_id(|id| {
             let reached = Reached { name: id.name, version: id.version, source: id.source, features: id.features };
-            procs.add_reached(modules, lock_text, &reached)
+            procs.add_reached(modules, &locked, &reached)
         });
         match added {
             Ok(key) => made.keys.push((index, key)),

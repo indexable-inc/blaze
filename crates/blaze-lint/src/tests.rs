@@ -674,8 +674,14 @@ fn process_static() {
         "fn f(x: &'static str) -> &'static str { x }",
         "const C: AtomicU8 = AtomicU8::new(0);",
         "static N: u64 = AtomicU64::new(0).into_inner();",
-        // A type of the crate's own: text cannot see its state (the rule says less).
-        "#[global_allocator]\nstatic A: SpinLock = SpinLock::new();",
+        // A type of the crate's own whose name says no state: text cannot see its state (the
+        // rule says less). This case was `SpinLock`, written when engine.rs's
+        // `global_allocator_above` exempted any static under the attribute; D173 deleted that
+        // exemption for the `ALLOWED_STATICS` table (engine.rs `process_static`'s doc, and
+        // `allowed_statics_by_crate_and_name`: "the allocator's attribute alone allows nothing"),
+        // and a `..Lock` name is state as `stateful` reads it, so `SpinLock` fires by the rule's
+        // doc and the two cases contradicted each other; this one was the stale one.
+        "#[global_allocator]\nstatic A: Spin = Spin::new();",
         "fn f() { let s = \"static mut x; thread_local!\"; }",
         "fn f() {\n    // static mut N: u8 = 0;\n}",
         "#[test]\nfn t() { static N: AtomicU8 = AtomicU8::new(0); }",
@@ -1536,6 +1542,94 @@ fn run_case(tape: &Tape, plant: Plant) -> Result<(), Broke> {
 #[test]
 fn item_alone_equals_item_in_file() {
     blaze_sim::check(Config::cases(300), |tape| run_case(tape, Plant::None));
+}
+
+/// Which place map the own-text property plants (rule 23).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnPlant {
+    None,
+    /// An own range taken as the unit's: no child before it given its length back.
+    Unshifted,
+}
+
+/// The file linted unit by unit over each unit's OWN text (each child one `HOLE_MARK`), as the
+/// Lints stage does (blaze-cli lints.rs), each range given its children's lengths back by
+/// `real_range`; and every place of each unit outside its children through `own_place` and
+/// `real_place` and back to itself.
+fn split_own(text: &str, scope: Scope, plant: OwnPlant) -> Result<StdVec<Abs>, Broke> {
+    let alloc = blaze_own::testing::heap().alloc();
+    let lines = outline(text, Edition::E2024, alloc);
+    let units = Units::plan(lines.items(), text.len(), alloc).map_err(|e| Broke::Harness(format!("the units were refused: {e:?}")))?;
+    let variants = Variants::gather(text, alloc).map_err(|e| Broke::Harness(format!("the file's variants were refused: {e:?}")))?;
+    let mut scopes = vec![scope; units.list.len()];
+    let mut got = StdVec::new();
+    let mut out = Findings::new_in(alloc);
+    for at in 0..units.list.len() {
+        let plan = units.list[at];
+        let holes = units.holes_of(at);
+        for real in 0..=(plan.end - plan.base) {
+            if holes.iter().any(|hole| real > hole.start && real < hole.end) {
+                continue;
+            }
+            let back = crate::real_place(holes.iter().copied(), crate::own_place(holes, real));
+            if back != Some(real) {
+                return Err(Broke::Oracle(format!("unit {at}: place {real} came back as {back:?} through its own text\n{text}")));
+            }
+        }
+        let own = units.own(at, text, alloc).map_err(|e| Broke::Harness(format!("unit {at}'s own text was refused: {e:?}")))?;
+        out.clear();
+        let geometry = crate::Geometry { base: plan.base, len: plan.end - plan.base, holes };
+        let linted = crate::lint_own_in(&RuleSet::ALL, &own, scopes[at], geometry, Some(variants.view()), alloc, &mut out)
+            .map_err(|e| Broke::Harness(format!("lint refused unit {at}'s own text: {e:?}")))?;
+        for (child, given) in units.children_of(at).iter().zip(linted.children.iter()) {
+            scopes[*child as usize] = *given;
+        }
+        for finding in out.list.iter() {
+            let range = match plant {
+                OwnPlant::None => crate::real_range(holes, finding.range)
+                    .ok_or_else(|| Broke::Oracle(format!("unit {at}: own range {:?} has no place in the unit\n{text}", finding.range)))?,
+                OwnPlant::Unshifted => finding.range,
+            };
+            got.push((finding.template, plan.base + range.start, plan.base + range.end));
+        }
+    }
+    got.sort();
+    Ok(got)
+}
+
+/// An impl whose own text has a finding AFTER a child: the `// alloc:` hatch (allocs' `comment`,
+/// a plain comment, so no item's) behind a method's hole. `gen_file`'s findings are nearly all in
+/// leaf units (bodies, consts), where no hole is before them, so without this the own-text
+/// property seldom sees a child given its length back, and its control's plant (a range not
+/// shifted) was missed in 300 cases (c111, 2026-11-21).
+const HATCH_AFTER_CHILD: &str = "impl S {\n    fn hatch(&self) -> u8 {\n        1\n    }\n    // alloc: after a child\n}";
+
+fn run_own_case(tape: &Tape, plant: OwnPlant) -> Result<(), Broke> {
+    let mut text = gen_file(tape);
+    if tape.coin("a finding after a child") {
+        put_lines(&mut text, "", HATCH_AFTER_CHILD);
+    }
+    let scope = Scope::file(TestBits::NONE, tape.coin("bin root"), false);
+    let mut all = whole(&text, scope);
+    all.sort();
+    let own = split_own(&text, scope, plant)?;
+    if all != own {
+        return Err(Broke::Oracle(format!("the units' own texts differ from their file:\nfile {all:?}\nown  {own:?}\nin\n{text}")));
+    }
+    Ok(())
+}
+
+/// Each unit linted over its own text, each child one mark, finds what the file finds, at the
+/// same places once each child before a finding is given its length back (blaze-cli lints.rs
+/// keys a unit by that text alone, so a child that grows moves no other unit's key).
+#[test]
+fn own_texts_find_what_the_file_finds() {
+    blaze_sim::check(Config::cases(300), |tape| run_own_case(tape, OwnPlant::None));
+}
+
+#[test]
+fn control_own_range_unshifted() {
+    blaze_sim::control(Config::cases(300), OwnPlant::None, OwnPlant::Unshifted, "own texts differ from their file", run_own_case);
 }
 
 /// `Units::plan` gives each unit the holes and children the outline's own `children` walk gives.

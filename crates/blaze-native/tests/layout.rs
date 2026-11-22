@@ -207,7 +207,7 @@ fn dso_handle_is_the_header() {
     assert_eq!(page + low, header, "adrp; add make the header's address");
     let pointer = data + 48;
     assert_eq!(dword(&image, pointer), header);
-    assert!(image.fixups.contains(&Fixup { at: pointer, to: FixTo::Rebase { target: header } }));
+    assert!(image.fixups.contains(&Fixup { at: pointer, to: FixTo::rebase(header) }));
     assert_eq!(image.fixups.len(), 1, "the pc-relative pair needs no fixup");
     println!("dso_handle_is_the_header: adrp page {page:#x} add {low:#x}, pointer {:#x} rebased", dword(&image, pointer));
 }
@@ -232,7 +232,7 @@ fn section_bounds_are_the_laid_section() {
     let start = data + 48;
     assert_eq!(dword(&image, start), start);
     assert_eq!(dword(&image, start + 8), start + 0x20);
-    assert!(image.fixups.contains(&Fixup { at: start + 8, to: FixTo::Rebase { target: start + 0x20 } }));
+    assert!(image.fixups.contains(&Fixup { at: start + 8, to: FixTo::rebase(start + 0x20) }));
 }
 
 /// A pointer to a linker name plus an addend (stop 2 of tempo's `run`, aws-lc's shape): the
@@ -245,7 +245,8 @@ fn section_bounds_are_the_laid_section() {
 /// (below the image, wrapped) and bit 55 (`+ 0x0080000000000000`, no tag: rule 3).
 #[test]
 fn a_pointer_to_a_linker_name_with_an_addend_is_rebased_or_refused_by_name() {
-    use blaze_native::layout::{Far, REBASE_ADDRESS, Reach};
+    use blaze_native::image::Addr56;
+    use blaze_native::layout::{Far, Reach};
     let with = |offset: u32, symbol: u32, addend: i64| Reloc { section: 0, offset, kind: RelocKind::Abs64, to: RelocTo::Symbol(symbol), addend };
     let names = || [(&b"___dso_handle"[..], Resolution::Linker), (&b"section$start$__DATA$__data"[..], Resolution::Linker)];
     let symbols = || {
@@ -259,9 +260,10 @@ fn a_pointer_to_a_linker_name_with_an_addend_is_rebased_or_refused_by_name() {
     let image = laid(&p);
     let (data, _) = at(&image, Region::Data);
     let start = data + 48;
-    assert!(image.fixups.contains(&Fixup { at: start, to: FixTo::Rebase { target: 0x10 } }), "the header plus 0x10");
-    assert!(image.fixups.contains(&Fixup { at: start + 8, to: FixTo::Rebase { target: start + 8 } }), "control: the section's start plus 8, untagged");
-    assert!(image.fixups.contains(&Fixup { at: start + 0x10, to: FixTo::Rebase { target: start | 1 << 63 } }), "the RTTI name pointer keeps bit 63");
+    let rebase = |address: u64, high8: u8| FixTo::Rebase { address: Addr56::new(address).expect("an image address"), high8 };
+    assert!(image.fixups.contains(&Fixup { at: start, to: rebase(0x10, 0) }), "the header plus 0x10");
+    assert!(image.fixups.contains(&Fixup { at: start + 8, to: rebase(start + 8, 0) }), "control: the section's start plus 8, untagged");
+    assert!(image.fixups.contains(&Fixup { at: start + 0x10, to: rebase(start, 0x80) }), "the RTTI name pointer keeps bit 63 as its high8");
     for (symbol, addend, name) in [(0u32, -8i64, &b"___dso_handle"[..]), (2, 0x0080_0000_0000_0000, &b"__ZTS1H"[..])] {
         let far = plan(object([section(b"__DATA", b"__data", SectionKind::Data, 3, zeros(8), 0..1)], symbols(), [with(0, symbol, addend)]), names(), [], []);
         let refused = match lay(&far, &inputs(), Layout::MACOS_ARM64, a()) {
@@ -272,7 +274,7 @@ fn a_pointer_to_a_linker_name_with_an_addend_is_rebased_or_refused_by_name() {
             panic!("not refused as a rebase past the image: {refused:?}")
         };
         assert_eq!((named, member, section, offset, said), (name, &b"one.o"[..], &b"__data"[..], 0, addend));
-        assert!(to & REBASE_ADDRESS > end, "{to:#x} is past {end:#x} below its top byte");
+        assert!(to & Addr56::MASK > end, "{to:#x} is past {end:#x} below its top byte");
         println!("a_pointer_to_a_linker_name_with_an_addend_is_rebased_or_refused_by_name: {refused:?}");
     }
 }
@@ -358,7 +360,7 @@ fn init_pointers_land_in_inits_region() {
     let (inits, inits_len) = at(&image, Region::Inits);
     let (data, _) = at(&image, Region::Data);
     assert_eq!((inits_len, image.inits), (8, 1));
-    assert!(image.fixups.contains(&Fixup { at: inits, to: FixTo::Rebase { target: text } }));
+    assert!(image.fixups.contains(&Fixup { at: inits, to: FixTo::rebase(text) }));
     assert_eq!(image.descriptor_at, data, "the descriptor is Data's first item");
     let d = image.descriptor_at;
     // BNL2 (descriptor.rs): tag, words, inits, pointer rows.

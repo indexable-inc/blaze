@@ -355,7 +355,7 @@ mod tests {
         fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
             let n = symbol.0[0];
             Ok(match (1..=3).contains(&n) && symbol.0 == [n; 32] {
-                true => Resolved::Record { key: CodeKey(blaze_ids::ContentId([n; 32])), record: RecordId([n * 10; 32]), declares: &[], data: &[], named: &[] },
+                true => Resolved::Record { key: CodeKey(blaze_ids::ContentId([n; 32])), record: RecordId([n * 10; 32]), declares: &[], data: &[], named: &[], sent: crate::run_bytes::Sent::NONE },
                 false => Resolved::Unknown,
             })
         }

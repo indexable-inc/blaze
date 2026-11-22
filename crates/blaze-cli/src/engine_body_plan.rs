@@ -399,11 +399,14 @@ pub(crate) fn reached(outlined: &[Outlined<'_>], root: Name, g: blaze_own::Alloc
 /// says whether it holds it, [`not_held_cell`]). What the Bodies rows and their setup ask
 /// ([`Reach::walk`], engine_bodies.rs `groups`); the heads' walk stays cfg-blind (engine_heads.rs).
 /// `cuts`: `outlined`'s, made once for every walk over it. A file with no `#[cfg]` is walked as
-/// [`reached`] walks it. In `g`.
-pub(crate) fn reached_under(outlined: &[Outlined<'_>], cuts: &PlanCuts<'_>, root: Name, test: Tri, g: blaze_own::Alloc<'static>) -> Result<Vec<Name, blaze_own::Alloc<'static>>, Unoutlined> {
+/// [`reached`] walks it. `found`: the unit's found files ([`FoundEdge`], [`Reach::found_of`]),
+/// walked from as the root is (each its own `#![cfg]` read, then its file parts): the files its
+/// names read that no `mod` the walk follows names. In `g`.
+pub(crate) fn reached_under(outlined: &[Outlined<'_>], cuts: &PlanCuts<'_>, root: Name, test: Tri, found: &[FoundEdge], g: blaze_own::Alloc<'static>) -> Result<Vec<Name, blaze_own::Alloc<'static>>, Unoutlined> {
     let mut seen: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
     let mut next: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
     next.push(root);
+    next.extend(found.iter().map(|edge| edge.file));
     while let Some(name) = next.pop() {
         let Err(slot) = seen.binary_search(&name) else { continue };
         let at = outlined.binary_search_by(|one| one.name.cmp(&name)).map_err(|_| Unoutlined { file: name, root })?;
@@ -463,6 +466,78 @@ impl fmt::Display for ReachUnknown {
     }
 }
 
+/// A FOUND FILE OF A MEMBER UNIT (D161): `unit`'s names (its `CrateScope` task) read `file`, and
+/// no `mod` the walk follows names it: a module a macro wrote from a computed name
+/// (`macro_rules! m { ($n:ident) => { mod $n; } }`), a data file of a computed path. The unit's
+/// tree holds it because its resolution read it, every cfg on the way decided under the unit's
+/// own cfg: a `#[cfg(test)] mod outer { m!(inner); }` gives the test unit the edge and the lib
+/// unit none, as the plan's cut gives a literal `mod inner;` there. Kept in the answer as the
+/// found flags of the file's place (engine_check.rs [`crate::engine_check::PLACE_FOUND_LIB`]),
+/// read back by [`found_edges`]; sorted by (unit, file), so [`Reach::found_of`] is a slice.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) struct FoundEdge {
+    pub(crate) unit: Name,
+    pub(crate) file: Name,
+}
+
+/// Two member units of one root that are both test builds, or both not: the found flags of a
+/// place say non-test and test (engine_check.rs [`crate::engine_check::found_bit`]), so which of
+/// the two found a file would not be known. Named, never one of them taken (rule 3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct FoundUnitsShare {
+    pub(crate) root: Name,
+    pub(crate) test: bool,
+}
+
+impl fmt::Display for FoundUnitsShare {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = if self.test { "test" } else { "non-test" };
+        write!(f, "two {kind} member units have the root {:?}: a found file's place keeps one flag a kind of unit of its root (engine_check.rs `PLACE_FOUND_LIB`, `PLACE_FOUND_TEST`), so which of them found it would not be known ({RULE} `found_edges`)", self.root)
+    }
+}
+
+/// The member unit of `list` at each (root, test): the one a found flag of a place whose `unit`
+/// is that root names, sorted. Two at one (root, test) are [`FoundUnitsShare`]. In `g`.
+pub(crate) fn found_units(list: &CrateList<'_>, g: blaze_own::Alloc<'static>) -> Result<AVec<'static, (Name, bool, Name)>, FoundUnitsShare> {
+    let mut units: AVec<'static, (Name, bool, Name)> = Vec::new_in(g);
+    for at in (0..CrateGraph::len(list)).filter(|at| list.member(*at)) {
+        units.push((root_file(list, at), list.test(at), blaze_drive::key::crate_scope_name(&list.key(at))));
+    }
+    units.sort_unstable();
+    if let Some(pair) = units.windows(2).find(|pair| (pair[0].0, pair[0].1) == (pair[1].0, pair[1].1)) {
+        return Err(FoundUnitsShare { root: pair[0].0, test: pair[0].1 });
+    }
+    Ok(units)
+}
+
+/// The edges of `unit` in `sorted` (sorted by unit, then file).
+fn edges_of(sorted: &[FoundEdge], unit: Name) -> &[FoundEdge] {
+    let from = sorted.partition_point(|one| one.unit < unit);
+    let rest = &sorted[from..];
+    &rest[..rest.partition_point(|one| one.unit == unit)]
+}
+
+/// The found edges `places` keep (engine_check.rs [`crate::engine_check::PLACE_FOUND`]): each
+/// found flag of a place names the member unit of its root and kind ([`found_units`]); a flag
+/// whose unit `list` no longer has is no edge (its file goes when no names row reads it). Sorted.
+/// In `g`.
+pub(crate) fn found_edges(units: &[(Name, bool, Name)], places: &[(Name, blaze_engine::pages::FilePlace)], g: blaze_own::Alloc<'static>) -> AVec<'static, FoundEdge> {
+    let mut edges: AVec<'static, FoundEdge> = Vec::new_in(g);
+    for (file, place) in places.iter() {
+        for test in [false, true] {
+            if place.flags & crate::engine_check::found_bit(test) == 0 {
+                continue;
+            }
+            if let Ok(at) = units.binary_search_by(|one| (one.0, one.1).cmp(&(place.unit, test))) {
+                edges.push(FoundEdge { unit: units[at].2, file: *file });
+            }
+        }
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    edges
+}
+
 /// WHICH MEMBER UNITS REACH EACH FILE, in rank (D191): what each body's rows are planned from
 /// (engine_bodies.rs `plan_views`, [`task_rows`]) and what the Bodies setup checks each unit it
 /// visits against (engine_bodies.rs `groups`). Made once a request and handed to both (rule 30):
@@ -477,6 +552,9 @@ pub(crate) struct Reach {
     files: AVec<'static, (Name, u32)>,
     /// The units' crates' names, end to end ([`Reacher`]'s spans).
     names: AVec<'static, u8>,
+    /// The member units' found files ([`FoundEdge`]), sorted: what the walk took them from, and
+    /// what the Bodies setup's walk of a unit takes ([`Reach::found_of`], engine_bodies.rs `groups`).
+    found: AVec<'static, FoundEdge>,
 }
 
 impl Reach {
@@ -495,12 +573,22 @@ impl Reach {
         units
     }
 
-    fn of(ranked: &[(usize, Reacher)], mut files: AVec<'static, (Name, u32)>, names: AVec<'static, u8>, g: blaze_own::Alloc<'static>) -> Reach {
+    fn of(ranked: &[(usize, Reacher)], mut files: AVec<'static, (Name, u32)>, names: AVec<'static, u8>, found: &[FoundEdge], g: blaze_own::Alloc<'static>) -> Reach {
         files.sort_unstable();
         files.dedup();
         let mut units: AVec<'static, Reacher> = Vec::with_capacity_in(ranked.len(), g);
         units.extend(ranked.iter().map(|(_, one)| *one));
-        Reach { units, files, names }
+        let mut kept: AVec<'static, FoundEdge> = Vec::with_capacity_in(found.len(), g);
+        kept.extend_from_slice(found);
+        kept.sort_unstable();
+        kept.dedup();
+        Reach { units, files, names, found: kept }
+    }
+
+    /// The found files of the member unit whose `CrateScope` task is `unit` ([`FoundEdge`]): what
+    /// its walk takes beside its root ([`reached_under`]).
+    pub(crate) fn found_of(&self, unit: Name) -> &[FoundEdge] {
+        edges_of(&self.found, unit)
     }
 
     /// How a printed finding names the unit at `rank` (engine_lines.rs `ViewUnit`).
@@ -512,10 +600,16 @@ impl Reach {
 
     /// The phase path's: each member's module tree walked from its root over `outlined` under
     /// what plan time knows of its `test` ([`reached_under`]), each (root, `test`) once (a lib
-    /// with no build script and its test build walk one root twice). In `g`.
-    pub(crate) fn walk(list: &CrateList<'_>, outlined: &[Outlined<'_>], g: blaze_own::Alloc<'static>) -> Result<Reach, Unoutlined> {
+    /// with no build script and its test build walk one root twice, unless their found files
+    /// differ: [`FoundEdge`]). `found`: every member unit's found files. In `g`.
+    pub(crate) fn walk(list: &CrateList<'_>, outlined: &[Outlined<'_>], found: &[FoundEdge], g: blaze_own::Alloc<'static>) -> Result<Reach, Unoutlined> {
         let mut names: AVec<'static, u8> = Vec::new_in(g);
         let ranked = Reach::ranked(list, &mut names, g);
+        let mut sorted: AVec<'static, FoundEdge> = Vec::with_capacity_in(found.len(), g);
+        sorted.extend_from_slice(found);
+        sorted.sort_unstable();
+        sorted.dedup();
+        let found_of = |unit: Name| edges_of(&sorted, unit);
         let mut by_root: AVec<'static, (Name, u8, u32)> = Vec::with_capacity_in(ranked.len(), g);
         for (rank, (at, one)) in ranked.iter().enumerate() {
             by_root.push((root_file(list, *at), one.test_atom as u8, u32::try_from(rank).unwrap_or(u32::MAX)));
@@ -523,22 +617,41 @@ impl Reach {
         by_root.sort_unstable();
         let mut files: AVec<'static, (Name, u32)> = Vec::new_in(g);
         let cuts = PlanCuts::of(outlined, g);
+        let mut seeds: AVec<'static, FoundEdge> = Vec::new_in(g);
         for group in by_root.chunk_by(|a, b| (a.0, a.1) == (b.0, b.1)) {
             let test = ranked.get(group[0].2 as usize).map_or(Tri::Unknown, |(_, one)| one.test_atom);
-            let tree = reached_under(outlined, &cuts, group[0].0, test, g)?;
+            // One walk for the group while its units' found files are the same; else one each.
+            let unit_of = |rank: u32| ranked.get(rank as usize).map(|(_, one)| one.unit);
+            let first = unit_of(group[0].2).map_or(&[][..], found_of);
+            let same = group.iter().all(|(_, _, rank)| {
+                let own = unit_of(*rank).map_or(&[][..], found_of);
+                own.len() == first.len() && own.iter().zip(first.iter()).all(|(a, b)| a.file == b.file)
+            });
+            if same {
+                let tree = reached_under(outlined, &cuts, group[0].0, test, first, g)?;
+                for (_, _, rank) in group.iter() {
+                    files.extend(tree.iter().map(|file| (*file, *rank)));
+                }
+                continue;
+            }
             for (_, _, rank) in group.iter() {
+                seeds.clear();
+                seeds.extend_from_slice(unit_of(*rank).map_or(&[][..], found_of));
+                let tree = reached_under(outlined, &cuts, group[0].0, test, &seeds, g)?;
                 files.extend(tree.iter().map(|file| (*file, *rank)));
             }
         }
-        Ok(Reach::of(&ranked, files, names, g))
+        Ok(Reach::of(&ranked, files, names, &sorted, g))
     }
 
     /// The ready path's: each member's held and reached-not-held files as the last members
     /// record keeps them (engine_members_record.rs `Member`: the walk of its visit, its claims).
     /// A member the record does not hold is [`ReachUnknown`]. The record is the caller's, read
     /// over today's graph; a `mod` the edit moved is caught where the setup walks the unit
-    /// (engine_bodies.rs `groups`, [`Reach::disagrees`]). In `g`.
-    pub(crate) fn of_members(list: &CrateList<'_>, members: &crate::engine_members_record::View<'_>, g: blaze_own::Alloc<'static>) -> Result<Reach, ReachUnknown> {
+    /// (engine_bodies.rs `groups`, [`Reach::disagrees`]). `found`: every member unit's found
+    /// files, kept for the setup's walk ([`Reach::found_of`]); the record's files hold them already
+    /// (the walk of its visit took them). In `g`.
+    pub(crate) fn of_members(list: &CrateList<'_>, members: &crate::engine_members_record::View<'_>, found: &[FoundEdge], g: blaze_own::Alloc<'static>) -> Result<Reach, ReachUnknown> {
         let mut names: AVec<'static, u8> = Vec::new_in(g);
         let ranked = Reach::ranked(list, &mut names, g);
         let mut files: AVec<'static, (Name, u32)> = Vec::new_in(g);
@@ -548,7 +661,7 @@ impl Reach {
             files.extend(kept.held.iter().map(|held| (held.slot, rank)));
             files.extend(kept.not_held.iter().map(|file| (*file, rank)));
         }
-        Ok(Reach::of(&ranked, files, names, g))
+        Ok(Reach::of(&ranked, files, names, found, g))
     }
 
     /// The units that reach `file`: (file, rank) in rank order.

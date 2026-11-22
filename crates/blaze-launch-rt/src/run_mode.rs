@@ -112,8 +112,9 @@ pub const ASK_BOUND: Nanos = Nanos(300_000_000_000);
 /// thread a tick, so its own wait is bounded by this.
 pub const TICK_MS: i32 = 250;
 
-/// Where code records come from: the store the parent wrote them into, read in place. No
-/// record byte crosses the socket.
+/// Where code records come from when the parent files them: the store's folder the parent wrote
+/// them into, read in place (today's control). A run whose parent sends them inline
+/// (`Down::Bytes`) reads none from here (run_mode/received.rs: one run reads one way).
 pub trait RecordSource {
     /// The bytes of record `id`, whole, checked to be that record's (once, when first read).
     fn bytes(&self, id: RecordId) -> Result<&[u8], RunModeError>;
@@ -422,6 +423,9 @@ pub enum RunModeError {
     ThreadKey { errno: i32 },
     /// The thread-local root's offset uses bit 63, which the access sequence clears.
     TlsRoot { offset: u64 },
+    /// The parent's inline bytes for `record` (`Down::Bytes`) are refused, for `why`
+    /// (run_mode/received.rs).
+    Sent { record: RecordId, why: SentRefused },
 }
 
 impl From<WireError> for RunModeError {
@@ -547,6 +551,9 @@ impl fmt::Display for RunModeError {
             RunModeError::TlsRoot { offset } => {
                 write!(f, "the run's thread-local root is at offset {offset:#x}, which bit 63 of the descriptor's root cannot say")
             }
+            RunModeError::Sent { record, why } => {
+                write!(f, "the parent's bytes for record {} (run wire `Bytes`): {why}", Short(&record.0))
+            }
         }
     }
 }
@@ -644,6 +651,9 @@ pub struct RunMode<'a> {
     told: AVec<'a, (CodeSymbol, RecordId)>,
     /// The run's thread-local descriptor and indexes (run_mode/thread_locals.rs).
     thread_locals: thread_locals::ThreadLocals<'a>,
+    /// The records the parent sent inline, assembled, checked and held for the run
+    /// (run_mode/received.rs, which says where they live and when they are freed).
+    received: received::Received<'a>,
     alloc: Alloc<'a>,
 }
 
@@ -684,6 +694,7 @@ impl<'a> RunMode<'a> {
             statics: Vec::new_in(alloc),
             told: Vec::new_in(alloc),
             thread_locals: thread_locals::ThreadLocals::new(),
+            received: received::Received::new(alloc),
             alloc,
         }
     }
@@ -765,7 +776,15 @@ impl<'a> RunMode<'a> {
     }
 
     fn down(&mut self, down: Down<'_>, out: &mut AVec<'_, Act>) -> Result<(), RunModeError> {
+        // A record's parts come together: any other message while one is not whole is the
+        // record cut short (run_mode/received.rs).
+        if !matches!(down, Down::Bytes { .. })
+            && let Some(cut) = self.received.assembling()
+        {
+            return Err(cut);
+        }
         match down {
+            Down::Bytes { record, at, total, part } => self.received.part(record, at, total, part),
             Down::Declare { pairs } => {
                 for Declared { symbol, slot: wire } in pairs.iter() {
                     let (local, new) = self.declare_pair(symbol, wire)?;
@@ -1011,7 +1030,7 @@ impl<'a> RunMode<'a> {
         let mut metas: AVec<'_, (CodeSymbol, RecordId, StaticAt, Room)> = Vec::with_capacity_in(count, self.alloc);
         for i in 0..count {
             let (symbol, record) = self.told[i];
-            let raw = source.read_into(record, &mut scratch[i])?;
+            let raw = self.received.bytes_of(record, source, &mut scratch[i])?;
             let view = DatumView::read(raw).map_err(|why| RunModeError::Datum { record, why })?;
             let index = u32::try_from(self.statics.len()).ok().filter(|&n| n < MOST_STATICS).ok_or(RunModeError::StaticsFull)?;
             // `DatumView::read` checked the length fits a u32, and the alignment a page.
@@ -1030,7 +1049,7 @@ impl<'a> RunMode<'a> {
         }
         self.told.clear();
         for (i, &(symbol, record, row, room)) in metas.iter().enumerate() {
-            let raw = if scratch[i].is_empty() { source.bytes(record)? } else { scratch[i].as_slice() };
+            let raw = self.received.again(record, source, &scratch[i])?;
             let view = DatumView::read(raw).map_err(|why| RunModeError::Datum { record, why })?;
             let mut bytes: AVec<'_, u8> = Vec::from_elem_in(0, view.bytes().len(), self.alloc);
             {
@@ -1107,7 +1126,7 @@ impl<'a> RunMode<'a> {
         }
         let (_, values, inlined) = self.position_inputs.pop_front().expect("the placement at the front was just checked");
         let mut scratch = std::vec::Vec::new();
-        let bytes = source.read_into(record, &mut scratch)?;
+        let bytes = self.received.bytes_of(record, source, &mut scratch)?;
         let view = CodeView::read(bytes).map_err(|why| RunModeError::Decode { record, why })?;
         let unwind = blaze_code::unwind::read(view).map_err(|why| RunModeError::Unwind { record, why })?;
         let code_at = match region {
@@ -2536,6 +2555,7 @@ pub mod bind;
 pub mod fault_report;
 mod native;
 mod personality;
+mod received;
 mod thread_locals;
 
 /// Carries `Act::Native`: the library `mode` was told opened from `source`'s folder and its words
@@ -2572,6 +2592,7 @@ fn load_library<S: RecordFiles, B: Bind>(mode: &mut RunMode<'_>, source: &S, mem
 }
 
 pub use bind::{Bind, BindError, Dlsym, LauncherOwn, ObservedBind, Table, TableError};
+pub use received::SentRefused;
 pub use thread_locals::ThreadKey;
 
 #[cfg(test)]

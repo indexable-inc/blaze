@@ -10,12 +10,9 @@
 //! on APFS, warm, blaze-core `examples/stat_cost.rs`, 870 names); io_uring stamps them as
 //! `statx`es; the simulation stamps them from its disk, as its `Stat` does.
 //!
-//! What a [`Look`] lacks against a [`Meta`]: the device. blaze-core's batched
-//! [`blaze_core::Stamp`] carries no `st_dev`, so a file replaced by one on another mount
-//! that has the same inode number, length and both times looks the same. Whether core's stamp
-//! gains `dev` is a decision (std.md, "End state: efficiency", "Decisions"). Until then
-//! [`Look::same_as`] compares every part a look has and says in its doc that `dev` is not
-//! among them.
+//! A [`Look`] says all a [`Meta`] does: the kind, the length, both times, the inode and the
+//! device (blaze-core's [`blaze_core::Stamp::dev`] since 2026-11-21, each driver's as its
+//! `Meta`'s), so [`Look::same_as`] proves exactly what two stats would.
 //!
 //! **Many folders, sorted paths: [`Dir::facts_of`].** The same looks, one row a path, as
 //! columns in the caller's frame, for paths sorted by their bytes; each FOLDER is either
@@ -46,7 +43,9 @@ pub struct Look {
     pub modified_ns: u64,
     /// The inode's last change (a chmod, a rename, a link).
     pub changed_ns: u64,
+    /// The inode and the device it is on, as [`super::Stamp`]'s.
     pub ino: u64,
+    pub dev: u64,
 }
 
 impl Look {
@@ -58,13 +57,14 @@ impl Look {
             modified_ns: stamp.mtime_ns,
             changed_ns: stamp.ctime_ns,
             ino: stamp.ino,
+            dev: stamp.dev,
         }
     }
 
     /// Whether this look and `meta` (from a [`Dir::stat`] of the same path) describe one
     /// version of one file or directory: the kind (file or directory), the length, both
-    /// times and the inode are equal. The device is NOT compared: a look has none (the
-    /// module's doc). A gone or unknown look is the same as no meta.
+    /// times, the inode and the device are equal. A gone or unknown look is the same as no
+    /// meta.
     pub fn same_as(&self, meta: &Meta) -> bool {
         let dir = match self.kind {
             EntryKind::File => false,
@@ -76,6 +76,7 @@ impl Look {
             && self.modified_ns == meta.stamp.modified_ns
             && self.changed_ns == meta.stamp.changed_ns
             && self.ino == meta.stamp.ino
+            && self.dev == meta.stamp.dev
     }
 }
 

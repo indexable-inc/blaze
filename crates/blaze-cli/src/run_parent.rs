@@ -61,10 +61,10 @@ use blaze_ids::producer::{CodeBuilder, ProducerId};
 use blaze_ladder::body_ids::{self, BodyIds, DeclaredList, Form, How, Make, RowKind, Scratch, Unkeyed, Walk, WalkError};
 use blaze_ladder::code_records::{Builder, CodeKey, CodeRecordError, CodeStore, EntryError, NotEmitting, Settings, StoreError, TierName, content_key};
 use blaze_launch::wire::data::Datum;
-use blaze_ladder::run::make_one::{LoweringCounts, MOST_WALKED, Maker, NamesRecords, SecondCheck};
+use blaze_ladder::run::make_one::{ByKind, LoweringCounts, MOST_WALKED, MakeSizes, MakeWatch, Maker, NamesRecords};
 use blaze_ladder::run::special::{self, Roots, RootsError, SpecialMade, StartHead, make_special, special_of};
 use blaze_ladder::run::{OverflowChecks, RunError};
-use blaze_launch::wire::run::{Declared, Down, Failure, Needed, Symbol, Up};
+use blaze_launch::wire::run::{BYTES_PART_MOST, Declared, Down, Failure, Needed, Symbol, Up};
 use blaze_launch::wire::{List, RecordId, WireError, split};
 use blaze_launch::{Slot, Tier};
 use blaze_own::{AVec, Alloc, Vec};
@@ -75,6 +75,7 @@ use bstd::fs::{Content, Dir, Durable, FsError, ReadWrite};
 use bstd::path::{Path, PathError};
 use bstd::procs::Exit;
 
+use crate::run_bytes::{Kept, Sent, SentWhy};
 use crate::run_ids::{NotRunnable, RunIds, Runnable};
 use crate::start_list::{self, Row, TodayGroup, TodayRows};
 
@@ -233,13 +234,16 @@ pub enum ParentError {
     /// Under [`Codes::Pooled`], a code worker refused the make of the row of `symbol`: the walk's
     /// refusal as it crossed to the command thread (D194, [`CodeRefusal`]).
     CodeRefused { symbol: [u8; 32], why: CodeRefusal },
+    /// Record `record`, sent inline (run_bytes.rs, run wire `Bytes`), or found again for a
+    /// replay or a crash's read: `why`.
+    Sent { record: [u8; 32], why: SentWhy },
 }
 
 /// A make's refusal as it crosses from a code worker to the command thread (D194 piece 2).
 /// `WalkError<RunError>` is not `Send` (rustc, the whole-tree check c94 at test_drive.rs's
 /// `must_overlap`), so the worker keeps of it, typed, what the command thread reads of a
 /// refusal: whose it is and where (decided on the worker by the serial path's own function,
-/// test_drive.rs `refused_instance`, so the two cannot differ), and its words as a test's NOT RUN
+/// test_drive.rs `instance_site` over [`ParentError::scope`], so the two cannot differ), and its words as a test's NOT RUN
 /// and a suite's stop print them ([`ParentError::Walk`]'s, byte for byte). The words are in the
 /// command's heap, handed in.
 #[derive(Debug)]
@@ -252,18 +256,125 @@ pub struct CodeRefusal {
     pub cause: Option<blaze_own::String<blaze_own::SharedAlloc<'static>>>,
     /// The walk's refusal as [`ParentError::Walk`] prints it after the symbol.
     pub walk: blaze_own::String<blaze_own::SharedAlloc<'static>>,
-    /// Whether the words are whole: the command's heap refused part of them (rule 3: said, never
-    /// cut quietly).
+    /// The instance as the maker that refused it shows it (its path and ground arguments, by
+    /// test_drive.rs `InstanceName`, the serial NOT RUN's printer): the command thread's walk
+    /// has no program to show it by (its maker is the worker's). `None`: the worker's maker
+    /// showed none (no program made yet, or the make panicked and its maker was forgotten).
+    pub instance: Option<blaze_own::String<blaze_own::SharedAlloc<'static>>>,
+    /// `at` placed in its file by the worker's maker, for a person only (rule 71: printed,
+    /// never kept); `None`: not placed.
+    pub site: Option<CrossedSite>,
+    /// Whether the words are whole: cut at [`MOST_REFUSAL_WORDS`] or refused in part by the
+    /// command's heap (rule 3: said, never cut quietly).
     pub whole: bool,
 }
+
+/// A crossed refusal's source place: its file as the program observes it (`file!()`), line and
+/// column, in the command's heap.
+#[derive(Debug)]
+pub struct CrossedSite {
+    pub file: blaze_own::String<blaze_own::SharedAlloc<'static>>,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// The most bytes each of a crossed refusal's words is kept at (rule 18): the relay keeps one
+/// refusal a key for every asker, so its size is bounded here (test_drive.rs `crossing`).
+pub const MOST_REFUSAL_WORDS: usize = 4 << 10;
+
+/// What a cut refusal says after its words.
+pub const WORDS_CUT: &str = " (its words were cut: past the cap of run_parent.rs `MOST_REFUSAL_WORDS`, or the command's heap refused the rest)";
 
 impl fmt::Display for CodeRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.walk.as_str())?;
         if !self.whole {
-            f.write_str(" (its words were cut: the command's heap refused the rest, run_parent.rs `CodeRefusal`)")?;
+            f.write_str(WORDS_CUT)?;
         }
         Ok(())
+    }
+}
+
+impl CodeRefusal {
+    /// The same refusal for one more asker of its key: the relay keeps one a key and hands it to
+    /// every asker (code_pool_relay.rs, rule 19: each test prints the cause itself, never a
+    /// pointer to another test's). Its words are copied into the heap they are in (the command's);
+    /// a part that heap refused is said, `whole` cleared (rule 3).
+    pub fn for_asker(&self) -> CodeRefusal {
+        let alloc = *self.walk.allocator();
+        let mut whole = self.whole;
+        let mut copy = |words: &str| match blaze_own::String::try_from_str_in(words, alloc) {
+            Ok(copied) => copied,
+            Err(_) => {
+                whole = false;
+                blaze_own::String::new_in(alloc)
+            }
+        };
+        let cause = self.cause.as_ref().map(|cause| copy(cause.as_str()));
+        let walk = copy(self.walk.as_str());
+        let instance = self.instance.as_ref().map(|instance| copy(instance.as_str()));
+        let site = self.site.as_ref().map(|site| CrossedSite { file: copy(site.file.as_str()), line: site.line, column: site.column });
+        CodeRefusal { at: self.at, cause, walk, instance, site, whole }
+    }
+
+    /// Whose the refusal is, as the worker sorted it (`at`: `None` for the suite's).
+    pub fn scope(&self) -> blaze_ladder::scope::Scope {
+        match self.at {
+            Some(_) => blaze_ladder::scope::Scope::One,
+            None => blaze_ladder::scope::Scope::Suite,
+        }
+    }
+}
+
+impl ParentError {
+    /// Whose this fault is while one test's instance is made (blaze-ladder scope.rs's rule):
+    /// a step of the walk, a crossed refusal and a special record are the scope of what they
+    /// hold; a fn that may not run and a record that lands with no personality routine are
+    /// the instance's; every other (the wire and the protocol of the run, its roots, the names
+    /// records it opened, the store, the relay's own invariants, and the program's builder
+    /// before any instance, `Build`) is the suite's. Before 2026-11-21 those were
+    /// test_drive.rs `refused_instance`'s `_ => return None`.
+    pub fn scope(&self) -> blaze_ladder::scope::Scope {
+        use blaze_ladder::scope::Scope;
+        match self {
+            ParentError::Walk { why, .. } => why.scope(),
+            ParentError::CodeRefused { why, .. } => why.scope(),
+            ParentError::Special { why, .. } => why.scope(),
+            ParentError::NotChecked { .. } | ParentError::NoPersonality { .. } => Scope::One,
+            ParentError::Build(_)
+            | ParentError::Roots(_)
+            | ParentError::BodyIds { .. }
+            | ParentError::Names { .. }
+            | ParentError::Decode { .. }
+            | ParentError::Position { .. }
+            | ParentError::Unwind { .. }
+            | ParentError::ResolvedTwice { .. }
+            | ParentError::SpecialStatic { .. }
+            | ParentError::CDefinedLate { .. }
+            | ParentError::NativeLate { .. }
+            | ParentError::StaticServed { .. }
+            | ParentError::StaticUnsent { .. }
+            | ParentError::NotCleared { .. }
+            | ParentError::Store { .. }
+            | ParentError::NotStored { .. }
+            | ParentError::Entry { .. }
+            | ParentError::NotAarch64
+            | ParentError::Path(_)
+            | ParentError::Fs(_)
+            | ParentError::Home(_)
+            | ParentError::NoHome
+            | ParentError::Wire(_)
+            | ParentError::UndeclaredSlot { .. }
+            | ParentError::Full
+            | ParentError::NotEmitting(_)
+            | ParentError::StartList(_)
+            | ParentError::RecordName { .. }
+            | ParentError::TooFar { .. }
+            | ParentError::NothingAsked
+            | ParentError::TwoAsked { .. }
+            | ParentError::NotReady { .. }
+            | ParentError::Sent { .. } => Scope::Suite,
+        }
     }
 }
 
@@ -336,6 +447,7 @@ impl fmt::Display for ParentError {
             ParentError::NothingAsked => write!(f, "{rule}: a made entry was handed back and no row waits for one (run_parent.rs `Lazy::made`, D194)"),
             ParentError::TwoAsked { symbol, asked } => write!(f, "{rule}: the row of symbol {} was begun while the row of symbol {} waits for its code: one make at a time a child (run_parent.rs `Lazy`, D194)", Hex(symbol), Hex(asked)),
             ParentError::NotReady { symbol } => write!(f, "{rule}: the row of symbol {} was to be served before its code came (run_parent.rs `Lazy::publication`'s ready pass, D194)", Hex(symbol)),
+            ParentError::Sent { record, why } => write!(f, "{rule}: record {}, sent to the program inline (run_bytes.rs, run wire `Bytes`): {why}", Hex(record)),
         }
     }
 }
@@ -432,8 +544,10 @@ pub(crate) enum Resolved<'r> {
     /// `named`: every static the record and those data name, read from their own targets
     /// ([`Front::statics_named`]), sorted, each once: [`Needs::publish`] refuses the record
     /// unless each is on the child before it; the start list keeps them with the record's row
-    /// (start_list.rs version 4), so a replay sends the same.
-    Record { key: CodeKey, record: RecordId, declares: &'r [Symbol], data: &'r [Datum], named: &'r [Symbol] },
+    /// (start_list.rs version 4), so a replay sends the same. `sent`: the records the folder
+    /// sends inline for this answer ([`Folder::take`], run_bytes.rs), which [`Needs::answer`]
+    /// puts on the wire before any frame naming them; [`Sent::NONE`] for the files control.
+    Record { key: CodeKey, record: RecordId, declares: &'r [Symbol], data: &'r [Datum], named: &'r [Symbol], sent: Sent<'r> },
     /// No function of the program by that symbol: the need is answered `Failed` with
     /// `Failure::Unresolved`, naming it.
     Unknown,
@@ -558,7 +672,9 @@ pub(crate) trait Front: Publication {
     type Maker: Make<Error = RunError, Grant = Runnable>;
     fn start(&mut self) -> Result<Self::Start, ParentError>;
     fn ids(&mut self) -> Result<Self::Ids, ParentError>;
-    fn maker(&mut self, start: &Self::Start) -> Result<Self::Maker, ParentError>;
+    /// The maker over the roots `start`, made after the body ids `ids` (whose view a typing
+    /// that reads the check's records reads through: [`RunMaker`]).
+    fn maker(&mut self, start: &Self::Start, ids: &Self::Ids) -> Result<Self::Maker, ParentError>;
     /// How an entry says what it declares: the run path's entry form.
     fn form(&self) -> &dyn Form {
         &body_ids::EntryForm
@@ -628,6 +744,8 @@ fn prepare_publication<F: Front>(
 pub(crate) struct CommandFront<'h, 'c, 'r> {
     names: &'c mut dyn FnMut() -> Result<NamesRecords<'h>, ParentError>,
     ids: &'c mut dyn FnMut() -> Result<RunIds<'h>, ParentError>,
+    /// The typed reader's parts besides the ids (engine_body_record.rs `TypedFrom`).
+    typed: crate::engine_body_record::TypedFrom<'h>,
     kept: Option<NamesRecords<'h>>,
     builder: Builder,
     tables: Alloc<'static>,
@@ -636,6 +754,22 @@ pub(crate) struct CommandFront<'h, 'c, 'r> {
     /// The Rust fns the program's C calls (engine_native.rs `NativeSend::items`): roots of the
     /// walk (blaze-ladder run/special.rs `run_roots`).
     exports: &'c [blaze_id::ItemKey],
+    /// What each maker reports its large or slow makes with ([`command_make_watch`]).
+    make_watch: MakeWatch<'static>,
+}
+
+/// The line of one large or slow make (make_one.rs [`MakeSizes`], printed only past its
+/// `MAKE_REPORT_BYTES` or `MAKE_REPORT_TIME`), to the command's stderr (rule 16).
+fn report_make(sizes: &MakeSizes) {
+    std::eprintln!("{sizes}");
+}
+
+/// The command's make watch: ONE clock, started here at the command's edge where its front or
+/// its code workers are made (rule 75: the makers are handed it, never read one), and
+/// [`report_make`] as where each report goes. make_one.rs reports only a make past its
+/// threshold, so a run of small makes prints nothing.
+pub(crate) fn command_make_watch() -> MakeWatch<'static> {
+    MakeWatch { clock: blaze_core::wait::Monotonic::new(), report: &report_make }
 }
 
 impl<'h, 'c, 'r> CommandFront<'h, 'c, 'r> {
@@ -643,13 +777,15 @@ impl<'h, 'c, 'r> CommandFront<'h, 'c, 'r> {
     pub(crate) fn new(
         names: &'c mut dyn FnMut() -> Result<NamesRecords<'h>, ParentError>,
         ids: &'c mut dyn FnMut() -> Result<RunIds<'h>, ParentError>,
+        typed: crate::engine_body_record::TypedFrom<'h>,
         builder: Builder,
         tables: Alloc<'static>,
         alloc: Alloc<'r>,
         watch: &'c dyn Watch,
         exports: &'c [blaze_id::ItemKey],
+        make_watch: MakeWatch<'static>,
     ) -> CommandFront<'h, 'c, 'r> {
-        CommandFront { names, ids, kept: None, builder, tables, alloc, watch, exports }
+        CommandFront { names, ids, typed, kept: None, builder, tables, alloc, watch, exports, make_watch }
     }
 
     fn names(&mut self) -> Result<NamesRecords<'h>, ParentError> {
@@ -664,10 +800,11 @@ impl<'h, 'c, 'r> CommandFront<'h, 'c, 'r> {
 }
 
 /// THE RUN'S MAKER: handed the run gate's proof ([`Runnable`]), each body's checked columns
-/// from the typing seam (blaze-ladder make_one.rs `Typing`). THE FLIP of D163 part 2 is this
-/// line's [`SecondCheck`] (and the value each `Maker::of_roots` below is handed) becoming
-/// `FromRecord<the check's typed records>`; then `SecondCheck` has no production caller.
-pub(crate) type RunMaker<'h> = Maker<'h, Runnable, SecondCheck>;
+/// from the typing seam (blaze-ladder make_one.rs `Typing`), BY KIND (D163 part 2, D197 root
+/// 1): a body `check` kept a typed record of is read from it, with no checker round; a body
+/// of a kind `check` keeps none for yet is the run's own check, counted by kind in the closing
+/// line (engine_body_record.rs `StoreTyped`).
+pub(crate) type RunMaker<'h> = Maker<'h, Runnable, ByKind<crate::engine_body_record::StoreTyped<'h>>>;
 
 impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
     type Start = Roots<'r>;
@@ -684,10 +821,12 @@ impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
         (self.ids)()
     }
 
-    fn maker(&mut self, start: &Roots<'r>) -> Result<RunMaker<'h>, ParentError> {
+    fn maker(&mut self, start: &Roots<'r>, ids: &RunIds<'h>) -> Result<RunMaker<'h>, ParentError> {
         let names = self.names()?;
         // `run_roots` start by the rule (`MakerStart::ByRule`): what `Maker::new` did.
-        Ok(Maker::of_roots(names, start.maker_entry(), start, SecondCheck, &self.builder, self.tables))
+        let mut maker = Maker::of_roots(names, start.maker_entry(), start, ByKind::new(self.typed.over(*ids)), &self.builder, self.tables);
+        maker.watch(self.make_watch);
+        Ok(maker)
     }
 
     /// From the names records: the checker key's library item (its first 16 bytes,
@@ -786,16 +925,36 @@ impl<'h, 'c, 'r> CommandFront<'h, 'c, 'r> {
     }
 }
 
-/// The records folder the launcher maps from (blaze-launch-rt `run_mode::Folder`): one file a
-/// record, named by the 64 hex digits of its BLAKE3.
+/// HOW THE PROGRAM GETS A RECORD'S BYTES (rule 78: the one seam, each strategy tested equal on
+/// the wire): one file a record named by its BLAKE3's 64 hex digits, which the launcher reads
+/// ([`RecordsDir`], the command's default until the inline tests pass on a clean compile), or
+/// sent inline over descriptor 3 ([`crate::run_bytes::RunBytes`]); each caller picks one at
+/// its one seam line ([`crate::run_bytes::Chosen::of`]). Either way the program verifies the bytes against the id
+/// before it places them (blaze-launch-rt run_mode/received.rs and `RecordSource`).
 pub(crate) trait Folder {
-    /// Whether the file of `record` is there.
-    fn holds(&self, record: &RecordId) -> Result<bool, ParentError>;
-    /// `record` filed (a file already there holds equal bytes and is not written again): its id.
+    /// A publication (or a start-list group) begins: what was queued for the last one and
+    /// never taken is dropped as not sent (its answer failed part way, so no frame carried it).
+    fn begin(&mut self);
+    /// `record` filed (a file already there holds equal bytes and is not written again), or
+    /// queued to be sent inline once a run: its id.
     fn file(&mut self, record: &[u8]) -> Result<RecordId, ParentError>;
+    /// Where `record`'s bytes are kept past this run, told after it was filed: what a replay
+    /// ([`Folder::ahead`]) and a crash's read ([`Folder::read`]) find them by. The files
+    /// control's file is its keeping.
+    fn kept(&mut self, record: RecordId, kept: Kept, store: &mut dyn CodeStore) -> Result<(), ParentError>;
+    /// A start-list record placed ahead: whether its bytes are there to place it (its file; or
+    /// found through the store and queued). `code`: the code row's key; `None` for a datum,
+    /// `symbol` its static's or vtable's.
+    fn ahead<F: Front>(&mut self, symbol: Symbol, record: &RecordId, code: Option<CodeKey>, front: &F, store: &dyn CodeStore) -> Result<bool, ParentError>;
+    /// The records queued since [`Folder::begin`], handed to the one writer, which frames them
+    /// before anything that names them.
+    fn take(&mut self) -> Sent<'_>;
+    /// The bytes of code record `record` into `into` (a crash report reads the record the pc is
+    /// in, run_fault.rs): one not kept is refused by name.
+    fn read<F: Front>(&self, record: &RecordId, front: &F, store: &dyn CodeStore, into: &mut bstd::mem::Bytes<'_>) -> Result<(), ParentError>;
 }
 
-/// The command's [`Folder`]: `<HOME>/` [`RECORDS`].
+/// The files control's [`Folder`]: `<HOME>/` [`RECORDS`].
 #[derive(Clone, Copy)]
 pub(crate) struct RecordsDir<'r> {
     pub cx: &'r Cx,
@@ -810,22 +969,32 @@ fn file_name(id: &[u8; 32], out: &mut [u8; 64]) -> Result<Path, ParentError> {
     Path::new(name).map_err(ParentError::Path)
 }
 
-impl RecordsDir<'_> {
-    /// The bytes of `record`'s file into `into` (a crash report reads the record the pc is in,
-    /// run_fault.rs): a file not there is the store's refusal, named.
-    pub(crate) fn read(&self, record: &RecordId, into: &mut bstd::mem::Bytes<'_>) -> Result<(), ParentError> {
+impl Folder for RecordsDir<'_> {
+    /// Nothing is queued: a record is a file once filed.
+    fn begin(&mut self) {}
+
+    /// Its file is its keeping.
+    fn kept(&mut self, _record: RecordId, _kept: Kept, _store: &mut dyn CodeStore) -> Result<(), ParentError> {
+        Ok(())
+    }
+
+    /// Whether the file of `record` is there.
+    fn ahead<F: Front>(&mut self, _symbol: Symbol, record: &RecordId, _code: Option<CodeKey>, _front: &F, _store: &dyn CodeStore) -> Result<bool, ParentError> {
+        let mut name = [0u8; 64];
+        let path = file_name(&record.0, &mut name)?;
+        Ok(self.dir.stat(self.cx, &path).map_err(ParentError::Fs)?.is_some())
+    }
+
+    fn take(&mut self) -> Sent<'_> {
+        Sent::NONE
+    }
+
+    /// The bytes of `record`'s file: a file not there is the folder's refusal, named.
+    fn read<F: Front>(&self, record: &RecordId, _front: &F, _store: &dyn CodeStore, into: &mut bstd::mem::Bytes<'_>) -> Result<(), ParentError> {
         let mut name = [0u8; 64];
         let path = file_name(&record.0, &mut name)?;
         self.dir.read_all(self.cx, &path, into).map_err(ParentError::Fs)?;
         Ok(())
-    }
-}
-
-impl Folder for RecordsDir<'_> {
-    fn holds(&self, record: &RecordId) -> Result<bool, ParentError> {
-        let mut name = [0u8; 64];
-        let path = file_name(&record.0, &mut name)?;
-        Ok(self.dir.stat(self.cx, &path).map_err(ParentError::Fs)?.is_some())
     }
 
     fn file(&mut self, record: &[u8]) -> Result<RecordId, ParentError> {
@@ -1229,8 +1398,10 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
         self.started.as_ref().and_then(|s| s.heavy.as_ref()).map_or_else(LoweringCounts::default, |heavy| heavy.maker.lowering_counts())
     }
 
-    pub(crate) fn folder(&self) -> &D {
-        &self.folder
+    /// The bytes of code record `record` into `into`, from where the folder keeps them (a crash
+    /// report reads the record the pc is in, run_fault.rs).
+    pub(crate) fn read_record(&self, record: &RecordId, into: &mut bstd::mem::Bytes<'_>) -> Result<(), ParentError> {
+        self.folder.read(record, &self.front, &*self.store, into)
     }
 
     /// What names `symbol` in a crash report (run_fault.rs): the walk's row for it is the
@@ -1317,7 +1488,7 @@ fn heavy<'h, F: Front>(front: &mut F, slot: &'h mut Option<Heavy<F::Ids, F::Make
         Some(heavy) => heavy,
         None => {
             let ids = front.ids()?;
-            let maker = front.maker(start)?;
+            let maker = front.maker(start, &ids)?;
             Heavy { ids, maker }
         }
     };
@@ -1369,7 +1540,7 @@ fn step<F: Front>(
             if let Some(waiting) = asked.as_ref() {
                 return Err(ParentError::TwoAsked { symbol, asked: waiting.symbol });
             }
-            match started.walk.begin::<RunError>(row, &heavy.ids, store, builder, &builder.producer, front.form(), MOST_WALKED, &mut started.scratch).map_err(|why| ParentError::Walk { symbol, why })? {
+            match started.walk.begin(row, &heavy.ids, store, builder, &builder.producer, &mut heavy.maker, front.form(), MOST_WALKED, &mut started.scratch).map_err(|why| ParentError::Walk { symbol, why })? {
                 body_ids::Begun::Stepped(one) => one.stepped,
                 body_ids::Begun::Make(pending) => {
                     *asked = Some(Asked { pending, proof, symbol });
@@ -1548,6 +1719,15 @@ fn listed_key(served: &Served<'_>, entry: &[u8]) -> CodeKey {
     }
 }
 
+/// The key `served`'s entry is stored under (found, or made and put: its content key); `None`
+/// for an unkeyed instance's, never put. What a datum it carries is kept by ([`Folder::kept`]).
+fn stored(served: &Served<'_>) -> Option<CodeKey> {
+    match served {
+        Served::Found(key) | Served::MadeNow(Made::Put(key)) | Served::MadeAhead(Made::Put(key), _) => Some(*key),
+        Served::MadeNow(Made::Unkeyed(_)) | Served::MadeAhead(Made::Unkeyed(_), _) => None,
+    }
+}
+
 impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
     #[cfg(test)]
     fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
@@ -1560,6 +1740,8 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
     fn publication(&mut self, symbol: &Symbol, values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {
         let Lazy { cx, front, folder, store, builder, alloc, started, placed, declares, ahead, told, data, statics, named, tally, built, codes, asked, walked, readying } = self;
         let codes = *codes;
+        // What the last answer queued and the one writer did not take is not on the wire.
+        folder.begin();
         // A row waits for its code: nothing more is stepped until it comes (one make at a time).
         if asked.is_some() {
             return Ok(Resolved::Waiting);
@@ -1624,7 +1806,8 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
                 false => tally.made += 1,
             }
             front.watch().see(Step::Answered(if made.found { Answered::Found } else { Answered::Made }));
-            return Ok(Resolved::Record { key: made.key, record: id, declares: declares.as_slice(), data: &[], named: named.as_slice() });
+            folder.kept(id, Kept::Code(made.key), &mut **store)?;
+            return Ok(Resolved::Record { key: made.key, record: id, declares: declares.as_slice(), data: &[], named: named.as_slice(), sent: folder.take() });
         }
         // Still unreached (the start list's cap broke the chain to it): walk forward from the
         // roots, stepping each row still waiting in walk order, at most `MOST_WALKED`, until the
@@ -1673,6 +1856,7 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
         // The vtables the record names: each a datum the entry carries, filed and sent in this
         // record's `Data` unless this run told it already (its method words' instances are
         // among the entry's declared rows, so their slots go in the `Declare` before it).
+        let vtables = data.len();
         front.each_vtable(symbol.0, entry, &mut |vtable, datum| {
             if let Err(at) = told.binary_search(&vtable.0) {
                 told.insert(at, vtable.0);
@@ -1680,6 +1864,12 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             }
             Ok(())
         })?;
+        // Where the record and its vtables' data are kept: the entry, when it was put.
+        let under = stored(&served);
+        folder.kept(id, Kept::Code(key), &mut **store)?;
+        for datum in &data[vtables..] {
+            folder.kept(datum.record, under.map_or(Kept::Unkept, |under| Kept::Vtable { under }), &mut **store)?;
+        }
         count(tally, &served);
         // The statics the record reaches and this run has not told, each served once and its
         // datum filed; their own callees after them (a static's value names statics, and fns
@@ -1692,14 +1882,16 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             let served = serve(cx, front, started, &mut **store, &builder, codes, ahead, at, ParentError::StaticServed { symbol: static_ })?;
             let entry = entry_of(&served, &**store, &started.scratch, static_)?;
             let datum = front.record_of(entry).map_err(|why| ParentError::Entry { symbol: static_, why })?;
-            data.push(Datum { symbol: Symbol(static_), record: folder.file(datum)? });
+            let filed = folder.file(datum)?;
+            data.push(Datum { symbol: Symbol(static_), record: filed });
             front.statics_named(entry, named).map_err(|why| ParentError::Entry { symbol: static_, why })?;
             callees(&started.walk, at, declares, told, statics);
+            folder.kept(filed, stored(&served).map_or(Kept::Unkept, |under| Kept::Static { under }), &mut **store)?;
             count(tally, &served);
         }
         named.sort_unstable();
         named.dedup();
-        Ok(Resolved::Record { key, record: id, declares: declares.as_slice(), data: data.as_slice(), named: named.as_slice() })
+        Ok(Resolved::Record { key, record: id, declares: declares.as_slice(), data: data.as_slice(), named: named.as_slice(), sent: folder.take() })
     }
 
     fn watch(&self) -> &dyn Watch {
@@ -1711,7 +1903,8 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
 /// first, so no `Publish` precedes it), then today's start list (`today`, the rows under
 /// today's certificate) placed. A first answer's group (start_list.rs: its data, the statics
 /// it names, its code row) is kept WHOLE or left out whole: out when the folder does not hold
-/// its record's file or one of its data's files, or when it names a static that neither a
+/// its record's bytes or one of its data's ([`Folder::ahead`]: a file, or an entry the store
+/// holds, then sent inline before the frames), or when it names a static that neither a
 /// group kept before it nor its own data send (a group left out takes its data with it, so
 /// a later namer of those goes too); the thread-local descriptor is no datum, and the one
 /// writer tells it before the first record naming it. Whatever is left out is resolved at its
@@ -1742,16 +1935,30 @@ pub(crate) fn ahead_of<'b, F: Front, D: Folder, A: Allocator>(
     let mut on: AVec<'_, [u8; 32]> = Vec::new_in(lazy.alloc);
     for group in today.groups() {
         let view = group.view();
-        // A positioned group's values are today's (the certificate is): nothing to hold.
-        let mut whole = true;
-        for datum in view.data() {
-            whole &= lazy.folder().holds(&datum.record)?;
-        }
-        whole &= lazy.folder().holds(&group.code().record)?;
+        // Its names first: a group that does not stand is left out before any of its bytes
+        // is looked for.
         let stands = |symbol: &Symbol| symbol.0 == descriptor || on.binary_search(&symbol.0).is_ok() || view.data().any(|datum| datum.symbol == *symbol);
-        if !whole || !view.named().all(|symbol| stands(&symbol)) {
+        if !view.named().all(|symbol| stands(&symbol)) {
             continue;
         }
+        // A positioned group's values are today's (the certificate is): nothing to hold. Each
+        // record's bytes are looked for through the folder (its file; or the store, queued to
+        // be sent inline), the code row by its key.
+        let Lazy { folder, front, store, .. } = &mut *lazy;
+        folder.begin();
+        let mut whole = true;
+        for datum in view.data() {
+            whole = whole && folder.ahead(datum.symbol, &datum.record, None, &*front, &**store)?;
+        }
+        let code = group.code();
+        whole = whole && folder.ahead(code.symbol, &code.record, Some(code.key), &*front, &**store)?;
+        if !whole {
+            // What this group queued is dropped as not sent.
+            folder.begin();
+            continue;
+        }
+        // The group's bytes on the wire before any frame names them (the one writer's).
+        needs.send(folder.take(), out)?;
         for datum in view.data() {
             if let Err(at) = on.binary_search(&datum.symbol.0) {
                 on.insert(at, datum.symbol.0);
@@ -1944,6 +2151,25 @@ impl<'a> Needs<'a> {
             Some(values) => Down::Positioned { slot, tier: Tier::Zero, record, values: values.as_slice() },
             None => Down::Publish { slot, tier: Tier::Zero, record },
         }.encode(id, out)?;
+        Ok(())
+    }
+
+    /// THE ONE WRITER OF `Bytes` (run schema 6, blaze-launch wire/bytes.rs): each record
+    /// `sent` carries, whole, in consecutive parts of at most `BYTES_PART_MOST`, BEFORE any
+    /// frame that names it (the folder hands them over first: [`Folder::take`]). Each record in
+    /// `sent` is 1 byte to `BYTES_RECORD_MOST` long (run_bytes.rs refuses any other by name), so
+    /// every part has the shape the child's decode takes; the child checks the rest (the order,
+    /// the sum, the digest) and refuses a breach by name.
+    pub(crate) fn send<A: Allocator>(&mut self, sent: Sent<'_>, out: &mut std::vec::Vec<u8, A>) -> Result<(), ParentError> {
+        for (record, bytes) in sent.each() {
+            let total = bytes.len() as u64;
+            let mut at = 0u64;
+            for part in bytes.chunks(BYTES_PART_MOST as usize) {
+                let id = self.id();
+                Down::Bytes { record, at, total, part }.encode(id, out)?;
+                at += part.len() as u64;
+            }
+        }
         Ok(())
     }
 
@@ -2186,7 +2412,9 @@ impl<'a> Needs<'a> {
                         self.settle_unknown(symbol)?;
                         self.failed(need, out).map(|()| true)
                     }
-                    Resolved::Record { key, record, declares, data, named } => {
+                    Resolved::Record { key, record, declares, data, named, sent } => {
+                        // The bytes first: nothing may name a record before its bytes.
+                        self.send(sent, out)?;
                         self.resolved += 1;
                         if !values.is_empty() {
                             self.positioned.insert(record.0, values);
@@ -2224,6 +2452,12 @@ mod tests;
 #[cfg(test)]
 #[path = "run_replay_tests.rs"]
 mod replay_tests;
+
+/// The records sent inline (run_bytes.rs) against the files control, on the wire: the bytes
+/// before every frame naming them, each once, and a replay finding them through the store.
+#[cfg(test)]
+#[path = "run_bytes_tests.rs"]
+mod bytes_tests;
 
 /// Asserts: a positioned record's `Positioned` carries the values one source lookup gave, at
 /// every need of it; its group (its data, its name, its values, its row) is in the list written
@@ -2266,6 +2500,7 @@ fn positioned_groups_are_listed_with_their_values_and_replayed_under_todays_cert
                 declares: &[],
                 data: if *symbol == FUNCTION { &[DATUM] } else { &[] },
                 named: if *symbol == FUNCTION { &[STATIC] } else { &[] },
+                sent: Sent::NONE,
             })
         }
         fn publication(&mut self, symbol: &Symbol, values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {

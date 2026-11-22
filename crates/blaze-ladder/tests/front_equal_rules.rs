@@ -722,7 +722,7 @@ fn check_site(decls: &str, main: &str, owner: &'static str, written: &'static st
             let mut calls = exprs.iter().enumerate().filter(|(_, e)| matches!(e, Expr::Call { .. }));
             let (i, _) = calls.next().expect("a direct call to tracked");
             assert!(calls.next().is_none(), "only the tracked call belongs to this body");
-            let s = front.caller_site(row.key, ExprId(i as u32)).unwrap_or_else(|| panic!("{label}: call in {owner} has no source site"));
+            let s = front.caller_site(row.key, ExprId(i as u32)).unwrap_or_else(|gap| panic!("{label}: call in {owner} has no source site: {gap}"));
             assert!(s.file.ends_with(ROOT), "shown path {}", s.file);
             if written.starts_with("tracked(") {
                 let start = prefix.rfind(owner).expect("written declaration containing the tracked call");

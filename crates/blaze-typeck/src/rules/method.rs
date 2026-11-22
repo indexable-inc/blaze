@@ -24,15 +24,22 @@
 //! any is tried (probe.rs `push_candidate`'s `private_candidates`); only when nothing visible
 //! applies does one that applies make the error E0624.
 //!
+//! An inherent candidate unstable under a library feature the body's crate does not turn on
+//! ([`World::member_unstable`]) is left out of a first pass and taken only by a second when the
+//! first picks nothing (probe.rs `pick_core`, `consider_candidates`). The stability of a TRAIT's
+//! method is not asked yet (std's unstable `Iterator::intersperse` beside itertools'
+//! `Itertools::intersperse` would still be E0034 here, where rustc picks itertools').
+//!
 //! Omitted for now: raw-pointer autoref (`pick_const_ptr_method`), the 2021 `into_iter` array
-//! shadowing, unstable-candidate reporting, and `self: Box<Self>`-style receivers beyond what
+//! shadowing, unstable-candidate reporting (rustc's E0658 and the
+//! `unstable_name_collisions` lint), and `self: Box<Self>`-style receivers beyond what
 //! autoderef reaches.
 
 use blaze_own::{Alloc, Vec};
 
 use crate::body::Segment;
 use crate::columns::AdjustKind;
-use crate::diag::{About, At, DiagCode};
+use crate::diag::{About, At, DiagCode, PendingDiag, PendingGoal};
 use crate::error::Stop;
 use crate::ids::{ExprId, ItemKey, List, Mutbl, Name, ScopeId};
 use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Step, Then};
@@ -56,6 +63,25 @@ struct Cand {
     /// `dyn Error + Send + Sync` brings `Debug::fmt` and `Display::fmt`) matched both at the
     /// `&Report` step, a false E0034 ("found `&Report`, about `fmt`").
     on: Option<Ty>,
+    /// An inherent candidate unstable under a library feature the body's crate does not turn
+    /// on ([`World::member_unstable`]): left out of the first pass ([`Machine::pick_pass`]).
+    denied: bool,
+}
+
+/// Why the probe found no method: the code. For a plain "no method" (`DiagCode::NoMethod`),
+/// also the first inherent candidate whose `self` matched at some step but whose impl's
+/// where-clause cannot hold, with that adjusted receiver (rustc's `NoMatchData::
+/// unsatisfied_predicates`).
+struct Miss {
+    code: DiagCode,
+    unmet: Option<(Cand, Ty)>,
+}
+
+/// One pass's answer ([`Machine::pick_pass`]).
+enum Pass {
+    Picked { cand: Cand, step: usize, autoref: Option<Mutbl>, unsize: bool },
+    Ambiguous,
+    Nothing,
 }
 
 /// The probe's answer.
@@ -112,8 +138,22 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         self.expected_inputs(f.expect, inputs, output, arg_ids)?;
                         self.start_args(f, e, arg_ids, inputs, output, 2, true)
                     }
-                    Err(code) => {
-                        self.diag(code, At::Expr(e), About::found_named(recv, name));
+                    // rustc's E0599 for a method whose bounds fail (method/suggest.rs): "the
+                    // method `get` exists for struct `W<B>`, but its trait bounds were not
+                    // satisfied", at the method's name, naming the bound (rule 19).
+                    Err(Miss { code, unmet }) => {
+                        let goal = match unmet {
+                            Some((c, adjusted)) if code == DiagCode::NoMethod => self.unmet_impl_clause(c, adjusted)?,
+                            _ => None,
+                        };
+                        match goal {
+                            Some(goal) => {
+                                let at = self.body.method_name_range(e).map_or(At::Expr(e), At::Written);
+                                self.errors += 1;
+                                self.diags.push(PendingDiag::unmet(DiagCode::NoMethod, at, Some(recv), goal, None).with_name(Some(name)));
+                            }
+                            None => self.diag(code, At::Expr(e), About::found_named(recv, name)),
+                        }
                         let errs = self.err_list(arg_ids.len())?;
                         self.start_args(f, e, arg_ids, errs, self.common.err, 2, false)
                     }
@@ -135,8 +175,72 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok(self.reads.impl_header(parent.container)?.and_then(|h| h.trait_))
     }
 
+    /// One `pick_all_method` over the steps: at each step by value, `&`, then `&mut`; at each,
+    /// the inherent group before the extension group; two applicable in one group is E0034.
+    /// With `stable_only` (rustc's first pass, `pick_diag_hints.unstable_candidates` some), a
+    /// candidate unstable under a feature this crate does not turn on ([`Cand::denied`]) is
+    /// probed (an unmet bound of it is still noted) but not counted, as `consider_candidates`
+    /// drops it after `consider_probe`.
+    #[allow(clippy::too_many_arguments)]
+    fn pick_pass(
+        &mut self,
+        steps: &[Step],
+        unsize_at: Option<usize>,
+        inh: &[Cand],
+        ext: &[Cand],
+        stable_only: bool,
+        not_method: &mut bool,
+        first_unmet: &mut Option<(Cand, Ty)>,
+    ) -> Result<Pass, Stop> {
+        for i in 0..steps.len() {
+            let step = steps[i];
+            let unsize = unsize_at == Some(i);
+            for autoref in [None, Some(Mutbl::Not), Some(Mutbl::Mut)] {
+                if unsize && autoref.is_none() {
+                    continue;
+                }
+                let adjusted = match autoref {
+                    None => step.ty,
+                    Some(m) => self.mk(TyView::Ref(m, step.ty))?,
+                };
+                for group in 0..2 {
+                    let mut found = None;
+                    let mut count = 0u32;
+                    let cands = if group == 0 { inh } else { ext };
+                    // A trait in scope is tried here even when a bound candidate names the same
+                    // item: that one's `Self` is its own step's type, this one's the receiver's.
+                    for &c in cands.iter() {
+                        if !c.is_method {
+                            *not_method = true;
+                            continue;
+                        }
+                        let mut unmet = false;
+                        if self.probe(|m| m.instantiate_method(c, adjusted, None, &mut unmet))?.is_some() {
+                            if stable_only && c.denied {
+                                continue;
+                            }
+                            count += 1;
+                            if found.is_none() {
+                                found = Some(c);
+                            }
+                        } else if unmet && first_unmet.is_none() {
+                            *first_unmet = Some((c, adjusted));
+                        }
+                    }
+                    if count > 1 {
+                        return Ok(Pass::Ambiguous);
+                    }
+                    if let Some(cand) = found {
+                        return Ok(Pass::Picked { cand, step: i, autoref, unsize });
+                    }
+                }
+            }
+        }
+        Ok(Pass::Nothing)
+    }
+
     /// `probe_op` in `Mode::MethodCall`: the pick, or the code of the error.
-    fn probe_method(&mut self, recv: Ty, name: Name, scope: ScopeId) -> Result<Result<Pick<'a>, DiagCode>, Stop> {
+    fn probe_method(&mut self, recv: Ty, name: Name, scope: ScopeId) -> Result<Result<Pick<'a>, Miss>, Stop> {
         let (mut steps, limit) = self.autoderef(recv, false)?;
         let mut unsize_at = None;
         if let Some(last) = steps.last().copied() {
@@ -151,7 +255,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         for &tr in self.reads.traits_in_scope(scope)? {
             if let Some(it) = self.reads.assoc_item(tr, name)? {
                 if let AssocKind::Fn { self_param } = it.kind {
-                    ext.push(Cand { container: tr, item: it.item, trait_: Some(tr), is_method: self_param, on: None });
+                    ext.push(Cand { container: tr, item: it.item, trait_: Some(tr), is_method: self_param, on: None, denied: false });
                 }
             }
         }
@@ -164,7 +268,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             && let Some(it) = self.reads.assoc_item(tr, name)?
             && let AssocKind::Fn { self_param } = it.kind
         {
-            ext.push(Cand { container: tr, item: it.item, trait_: Some(tr), is_method: self_param, on: None });
+            ext.push(Cand { container: tr, item: it.item, trait_: Some(tr), is_method: self_param, on: None, denied: false });
         }
         // The inherent candidates of every step, assembled once before any is tried
         // (`assemble_inherent_candidates` over all steps, as Relax's `assemble_probe_candidates`):
@@ -181,17 +285,20 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         // another crate. Only when nothing visible applies is it E0624.
         let mut private: Vec<Cand, Alloc<'a>> = Vec::new_in(self.alloc);
         let mut bounds: Vec<ItemKey, Alloc<'a>> = Vec::new_in(self.alloc);
+        // The first inherent candidate dropped only by its impl's where-clause ([`Miss`]).
+        let mut first_unmet: Option<(Cand, Ty)> = None;
         for i in 0..steps.len() {
             let step = steps[i];
             if let Some(shape) = self.shape(step.ty) {
                 for it in self.reads.inherent(shape, name)? {
                     if let AssocKind::Fn { self_param } = it.kind {
-                        let c = Cand { container: it.container, item: it.item, trait_: None, is_method: self_param, on: None };
+                        let c = Cand { container: it.container, item: it.item, trait_: None, is_method: self_param, on: None, denied: false };
                         if inh.iter().chain(private.iter()).any(|x| x.item == c.item) {
                             continue;
                         }
                         if self.reads.member_visible(it.container, name)? {
-                            inh.push(c);
+                            let denied = self.reads.member_unstable(it.container, name)?;
+                            inh.push(Cand { denied, ..c });
                         } else {
                             private.push(c);
                         }
@@ -219,7 +326,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 for &tr in bounds.iter() {
                     if let Some(it) = self.reads.assoc_item(tr, name)? {
                         if let AssocKind::Fn { self_param } = it.kind {
-                            let c = Cand { container: tr, item: it.item, trait_: Some(tr), is_method: self_param, on: Some(step.ty) };
+                            let c = Cand { container: tr, item: it.item, trait_: Some(tr), is_method: self_param, on: Some(step.ty), denied: false };
                             if !inh.iter().any(|x| x.item == c.item && x.on == c.on) {
                                 inh.push(c);
                             }
@@ -228,43 +335,22 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
             }
         }
-        for i in 0..steps.len() {
-            let step = steps[i];
-            let unsize = unsize_at == Some(i);
-            for autoref in [None, Some(Mutbl::Not), Some(Mutbl::Mut)] {
-                if unsize && autoref.is_none() {
-                    continue;
-                }
-                let adjusted = match autoref {
-                    None => step.ty,
-                    Some(m) => self.mk(TyView::Ref(m, step.ty))?,
-                };
-                for group in 0..2 {
-                    let mut found = None;
-                    let mut count = 0u32;
-                    let cands = if group == 0 { &inh } else { &ext };
-                    // A trait in scope is tried here even when a bound candidate names the same
-                    // item: that one's `Self` is its own step's type, this one's the receiver's.
-                    for &c in cands.iter() {
-                        if !c.is_method {
-                            not_method = true;
-                            continue;
-                        }
-                        if self.probe(|m| m.instantiate_method(c, adjusted, None))?.is_some() {
-                            count += 1;
-                            if found.is_none() {
-                                found = Some(c);
-                            }
-                        }
-                    }
-                    if count > 1 {
-                        return Ok(Err(DiagCode::AmbiguousMethod));
-                    }
-                    if let Some(cand) = found {
-                        return Ok(Ok(Pick { cand, steps, step: i, autoref, unsize }));
-                    }
-                }
-            }
+        // rustc_hir_typeck method/probe.rs `pick_core`: "Pick stable methods only first, and
+        // consider unstable candidates if not found." The second pass runs only when the first
+        // left a candidate out (work once), and its unmet bounds go to a throwaway list ("no
+        // need to duplicate ourselves in the unsatisifed predicates list"). turso's
+        // `spill_state.distinct_key_places[i].try_insert(hash, place)?` on a `HashMap`: std's
+        // `#[unstable(feature = "map_try_insert")]` inherent `try_insert` is left out, and the
+        // in-scope `TursoHashMapExt::try_insert` is the pick.
+        let any_denied = inh.iter().any(|c| c.denied);
+        let mut pass = self.pick_pass(&steps, unsize_at, &inh, &ext, any_denied, &mut not_method, &mut first_unmet)?;
+        if any_denied && matches!(pass, Pass::Nothing) {
+            pass = self.pick_pass(&steps, unsize_at, &inh, &ext, false, &mut not_method, &mut None)?;
+        }
+        match pass {
+            Pass::Picked { cand, step, autoref, unsize } => return Ok(Ok(Pick { cand, steps, step, autoref, unsize })),
+            Pass::Ambiguous => return Ok(Err(Miss { code: DiagCode::AmbiguousMethod, unmet: None })),
+            Pass::Nothing => {}
         }
         // Nothing visible applies: a set-aside candidate that applies at some step makes it
         // E0624 (rustc's `MethodError::PrivateMatch`), not "no method".
@@ -280,18 +366,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     Some(m) => self.mk(TyView::Ref(m, step.ty))?,
                 };
                 for &c in private.iter() {
-                    if c.is_method && self.probe(|m| m.instantiate_method(c, adjusted, None))?.is_some() {
-                        return Ok(Err(DiagCode::PrivateMethod));
+                    if c.is_method && self.probe(|m| m.instantiate_method(c, adjusted, None, &mut false))?.is_some() {
+                        return Ok(Err(Miss { code: DiagCode::PrivateMethod, unmet: None }));
                     }
                 }
             }
         }
         Ok(Err(if not_method {
-            DiagCode::NotAMethod
+            Miss { code: DiagCode::NotAMethod, unmet: None }
         } else if limit {
-            DiagCode::RecursionLimit
+            Miss { code: DiagCode::RecursionLimit, unmet: None }
         } else {
-            DiagCode::NoMethod
+            Miss { code: DiagCode::NoMethod, unmet: first_unmet }
         }))
     }
 
@@ -315,6 +401,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         c: Cand,
         adjusted: Ty,
         seg: Option<(At, Segment)>,
+        unmet: &mut bool,
     ) -> Result<Option<(TyList, TyList)>, Stop> {
         // A bound candidate's `Self` is the step it was found at (`Cand::on`).
         let self_ty = match c.on {
@@ -346,6 +433,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 return Ok(None);
             }
         } else if !self.impl_clauses_may_hold(c.container, parent, cause)? {
+            *unmet = true;
             return Ok(None);
         }
         Ok(Some((parent, args)))
@@ -388,6 +476,38 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok(true)
     }
 
+    /// The first where-clause of inherent candidate `c`'s impl that cannot hold, with its
+    /// `self` matched to `adjusted`. These are the probe's `unsatisfied_predicates`, which
+    /// rustc's E0599 lists: "the method `get` exists for struct `W<B>`, but its trait bounds
+    /// were not satisfied". It runs outside a probe, so the goal's terms stay in the table
+    /// for writeback. It is asked only after the probe found nothing, for the candidate it
+    /// dropped by this clause.
+    fn unmet_impl_clause(&mut self, c: Cand, adjusted: Ty) -> Result<Option<PendingGoal>, Stop> {
+        let self_ty = self.fresh()?;
+        let Some(parent) = self.impl_args(c.container, self_ty, Cause::Body)? else { return Ok(None) };
+        let Some(sig) = self.reads.fn_sig(c.item)? else { return Ok(None) };
+        let own = self.fresh_generic_args(c.item, sig.parent_count, sig.own_count)?;
+        let args = self.concat(parent, own)?;
+        let Some(&first) = sig.inputs.first() else { return Ok(None) };
+        let self_in = self.lower(sig.types, first, Lower::Args(args), Cause::Body)?;
+        if !self.unify(self_in, adjusted)? {
+            return Ok(None);
+        }
+        let wc = self.reads.predicates(c.container)?;
+        for &clause in wc.clauses.iter() {
+            let Some(goal) = self.clause_goal(wc.types, clause, parent, Cause::Body)? else { continue };
+            if !self.ty.may_hold(goal, &mut self.reads)? {
+                return Ok(match goal {
+                    Goal::Trait { trait_, args } => Some(PendingGoal::Trait { trait_, args }),
+                    Goal::Projection { trait_, args, name, term } => Some(PendingGoal::Projection { trait_, args, name, term }),
+                    // A well-formedness or `where const` clause: no trait goal to name.
+                    Goal::WellFormed(_) | Goal::ConstHolds { .. } => None,
+                });
+            }
+        }
+        Ok(None)
+    }
+
     /// `ConfirmContext::confirm`: the inputs after `self` and the output.
     fn confirm(&mut self, e: ExprId, receiver: ExprId, pick: &Pick<'a>, seg: Segment) -> Result<Option<(TyList, Ty)>, Stop> {
         let step_ty = pick.steps[pick.step].ty;
@@ -395,7 +515,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             None => step_ty,
             Some(m) => self.mk(TyView::Ref(m, step_ty))?,
         };
-        let Some((parent, args)) = self.instantiate_method(pick.cand, adjusted, Some((At::Expr(e), seg)))? else {
+        let Some((parent, args)) = self.instantiate_method(pick.cand, adjusted, Some((At::Expr(e), seg)), &mut false)? else {
             return Ok(None);
         };
         // The receiver's adjustments: derefs to the step (to the array before an unsize), the

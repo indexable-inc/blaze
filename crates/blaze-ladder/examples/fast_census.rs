@@ -53,12 +53,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use blaze_code::record::Symbol;
 use blaze_emit::table_gen::EncodedTable;
 use blaze_emit::{Fast, Isa, Os, RoutinePlaces, emit_record_measured};
-use blaze_ladder::code_records::{Builder, Callee, InstanceNames, LirSeen, MemoryStore, RecordRun, Settings};
+use blaze_ladder::code_records::{Builder, Callee, InstanceNames, LirSeen, MemoryStore, RecordRun, SeenInstance, Settings};
 use blaze_ladder::refusal::SourceFile;
 use blaze_ladder::run::{NewFront, RunError, build_records_new};
 use blaze_lir::body::{Bodies, BodyId};
 use blaze_lir::func::{RefId, RefKind};
-use blaze_lir::{Verified, VerifiedFunc, View};
+use blaze_lir::{VerifiedFunc, View};
 use blaze_own::Alloc;
 use blaze_tier::{ARM64, Machine, Table, TableError, Tier, TierError};
 
@@ -120,7 +120,8 @@ struct Collect {
 }
 
 impl LirSeen for Collect {
-    fn seen(&mut self, function: &str, symbol: Symbol, func: Verified<'_>, names: &InstanceNames<'_>) {
+    fn seen(&mut self, instance: SeenInstance<'_>) {
+        let SeenInstance { function, symbol, func, names, .. } = instance;
         let mut funcs = Vec::with_capacity_in(names.funcs.len(), Global);
         funcs.extend(names.funcs.iter().map(|c| match *c {
             Callee::Symbol(s) => Owned::Symbol(s),

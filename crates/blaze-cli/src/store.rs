@@ -1,6 +1,6 @@
 //! Records by key (drive.md, "The system side", "Store"; "D114 rulings", "The store under the
 //! command"): ONE store a user, blaze-cas's plain store at `<home>/.blaze/`
-//! [`plain_place::STORE_DIR`] (`v2/store/f5s2`: its forms name its folder, D160), read and
+//! [`plain_place::STORE_DIR`] (`v2/store/f5s3`: its forms name its folder, D160), read and
 //! written by every checkout and worktree, records read IN PLACE ([`plain_place`]). A get is
 //! a probe of the segments the head names, each mapped at its first probe; the request's first
 //! pool task maps the rest ([`Store::map_all`]); a put is copied once into the command's arena;
@@ -108,7 +108,7 @@ pub trait Store<'m> {
     /// joined first: the bytes go to the store from where their writer made them.
     fn put_parts(&mut self, cx: &Cx, key: Key, parts: &[&[u8]]) -> Result<(), CliError>;
     /// A record a task made beside its own (an expansion record: `tag`
-    /// [`plain_place::EXPANSION_TAG`]), keyed by its bytes and put beside its owner's record
+    /// [`blaze_keyed::kind::ReservedTag::Expansion`]), keyed by its bytes and put beside its owner's record
     /// (right after it on the engine's path, right before it on the machine's: work.rs
     /// `PendingExtras`), whose parts are `owner` (as [`Store::put_parts`] took them): it goes to the
     /// namespace its owner goes to. Equal bytes already held under `key` are
@@ -186,7 +186,7 @@ pub struct StoreKept {
 }
 
 /// blaze's folder in the user's home, made by the first file made in it.
-const HOME_FOLDER: &str = ".blaze";
+pub(crate) const HOME_FOLDER: &str = ".blaze";
 
 /// The stand-in's folders under blaze's folder in the home: an old home when either is there.
 pub(crate) const OLD_HOME: [&str; 2] = ["v2/shared", "v2/own"];
@@ -809,6 +809,16 @@ pub(crate) fn boot_fact(boot: &blaze_core::Boot) -> u64 {
 pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool, clock: &Clock, err: &Out) -> Result<roots::CleanupLine, CliError> {
     let ns = |clock: &Clock| u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
     let answered = ns(clock);
+    // The whole stretch after the answer at the after-answer class (plain_place
+    // `AFTER_ANSWER_QOS`): the commit and the sweep below, given back at the return. The
+    // commit's own scope then finds the thread there already and changes nothing.
+    #[cfg(target_os = "macos")]
+    let _held = match plain_place::AFTER_ANSWER_QOS {
+        plain_place::AfterAnswerQos::Scoped => Some(
+            blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?,
+        ),
+        plain_place::AfterAnswerQos::AsCalled => None,
+    };
     let after = plain_place::after_answer(cx, &lent, AFTER_ANSWER_SLICES)?;
     let commit_ns = ns(clock).saturating_sub(answered);
     drop(lent);
@@ -864,13 +874,15 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
         Ok(self.place.root(name)?.map(|held| held.bytes))
     }
 
-    /// What is put so far written now, one segment a namespace and one flip, and every arena
-    /// chunk no get lent from freed (blaze-cas `Lent::commit`): the engine's phase loop asks it
-    /// after each phase's puts, so no record stays in the heap past its phase (rule 51). A crash
-    /// after it keeps these records, valid by their keys; the answer's pointer is still written
-    /// last, by the commit after the answer.
+    /// A phase boundary (plain_place.rs `PlainPlace::checkpoint`, by the put path's seam
+    /// `VISIBILITY`). Under `AfterCommit`: what is put so far written now, one segment a
+    /// namespace and one flip, and every arena chunk no get lent from freed (blaze-cas
+    /// `Lent::commit`), so the next phase reads these records from a segment. Under `InArena`:
+    /// a commit only past `COMMIT_BYTES` or `CHECKPOINT_AGE_NS`; the next phase reads them in
+    /// place from the shared arena. A crash after a commit keeps its records, valid by their
+    /// keys; the answer's pointer is still written last, by the commit after the answer.
     pub fn commit_puts(&mut self) -> Result<(), CliError> {
-        self.place.commit()?;
+        self.place.checkpoint()?;
         Ok(())
     }
 
@@ -878,8 +890,9 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
     /// plain/snapshot.rs), its list of segments in `alloc`: the engine's phase loop takes one
     /// after [`CommandStore::commit_puts`], hands `&Snapshot` to the stage's pool workers (who
     /// read records by key with it, in place, with no lock), and drops it at the stage's end.
-    /// Not in it: this command's puts since the last commit, and any record an origin would
-    /// serve (a snapshot reads the local segments alone, never fetches).
+    /// Not in it: this command's puts since the last commit under `Visibility::AfterCommit`
+    /// (under `InArena` they are, from the shared arena), and any record an origin would serve
+    /// (a snapshot reads the local segments and the arena alone, never fetches).
     pub fn snapshot_in<B: Allocator>(&self, alloc: B) -> Result<Snapshot<B>, CliError> {
         Ok(self.place.snapshot_in(alloc)?)
     }

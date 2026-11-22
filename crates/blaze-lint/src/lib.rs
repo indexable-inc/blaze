@@ -65,8 +65,8 @@ pub use fix::{FixError, apply, apply_all};
 pub use allowed::{ALLOWED_STATICS, Allowed, AllowedStatic, statics_of_path};
 pub use marks::{OwnHeads, RootMarks};
 pub use message::show_message;
-pub use units::{UnitLinted, UnitPlan, Units};
-pub use variants::Variants;
+pub use units::{ChildHoles, HOLE_MARK, HOLE_MARK_LEN, OwnUnit, UnitLinted, UnitPlan, Units, holes_in, own_place, own_text, real_place, real_range};
+pub use variants::{Geometry, Variants, VariantsView};
 
 /// A byte range of an item's text, relative to the item's first byte (rule 71).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -185,9 +185,9 @@ pub enum Rule {
     UnsafeOpInUnsafeFn = 19,
     /// State the process keeps with no owner (D170 C3): `thread_local!`, `static mut`, and a
     /// `static` whose type holds interior state (a cell, a lock, an atomic, a once or lazy
-    /// value). A `#[global_allocator]` static is not reported; the profile ring and the signal
-    /// handler, C3's other two, are (text cannot tell them from others), so the crates that hold
-    /// them do not deny the lint. The lint `blaze::process_static` ([`Rule::lint`]).
+    /// value). C3's three (the foreign heap, the profile ring, the signal handler) are not
+    /// reported in their crates, by name ([`ALLOWED_STATICS`], D173); a `#[global_allocator]`
+    /// attribute alone allows nothing. The lint `blaze::process_static` ([`Rule::lint`]).
     ProcessStatic = 20,
     /// In a sans-IO core (a crate or module whose root says `#![blaze::sans_io]`, which its
     /// [`Scope::sans_io`] carries): a path to the file system, the network, a process, the OS,
@@ -848,6 +848,15 @@ impl Scope {
         Scope { own_heads, statics, ..self }
     }
 
+    /// Whether a pass of `rules` in this scope (or a scope it gives a child: a child's
+    /// `sans_io` is its parent's) reads [`Scope::own_heads`]: only `sans-io-core` does, in a
+    /// core (engine.rs `sans_io_word`). A driver that would lex a whole file for
+    /// [`OwnHeads::read`] only to fill a fact no rule reads skips it (rule 77); the one reader
+    /// is named here, beside the fact, so a second one is added here too.
+    pub const fn reads_own_heads(&self, rules: &RuleSet) -> bool {
+        self.sans_io && rules.runs(Rule::SansIoCore)
+    }
+
     /// Everything in the scope as one integer, for the record's key: two scopes with one key
     /// are equal.
     pub const fn key(&self) -> u64 {
@@ -1177,6 +1186,9 @@ pub enum LintError {
     TooMany,
     /// A file's table would pass its cap (rule 18): what it counts, and the cap.
     Capped { what: &'static str, cap: u32 },
+    /// A rule runs that reads a fact of the whole file its driver did not gather (the driver
+    /// gathers it exactly when the rule runs: [`lint_own_in`]).
+    NoFact { rule: Rule },
 }
 
 #[inline]
@@ -1212,6 +1224,32 @@ pub fn lint_in<'a>(
         // One probe of the file's fact a unit.
         linted.cost.add(Rule::VariantCount);
         variants.find(unit, base, out)?;
+        linted.findings.to = count(out.list.len())?;
+    }
+    Ok(linted)
+}
+
+/// Lints one unit of a file as its OWN text ([`Units::own`]: each child one [`HOLE_MARK`]):
+/// [`lint_in`]'s one pass over `own` in `scope`, then `variant-count` from the file's fact by the
+/// unit's place `at` in its file. Every finding and fix is placed in the own text, so no child's
+/// length is in any of them (rule 71); a printer gives them back ([`real_range`]). `variants` is
+/// the file's fact, which a driver gathers (a whole-file lex) only when `variant-count` runs: a
+/// set that runs it with none given is refused ([`LintError::NoFact`]), never linted without.
+pub fn lint_own_in<'a>(
+    rules: &RuleSet,
+    own: &OwnUnit<'_>,
+    scope: Scope,
+    at: Geometry<'_>,
+    variants: Option<VariantsView<'_>>,
+    alloc: Alloc<'a>,
+    out: &mut Findings<'a>,
+) -> Result<Linted<'a>, LintError> {
+    let mut linted = engine::run(rules, &own.unit(scope), alloc, out)?;
+    if rules.runs(Rule::VariantCount) {
+        let variants = variants.ok_or(LintError::NoFact { rule: Rule::VariantCount })?;
+        // One probe of the file's fact a unit.
+        linted.cost.add(Rule::VariantCount);
+        variants.find_own(at, out)?;
         linted.findings.to = count(out.list.len())?;
     }
     Ok(linted)

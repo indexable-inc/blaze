@@ -70,6 +70,15 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         // item's name at its definition's module, `$crate` as its mark's crate, every other
         // path (a `macro_rules!` item name too) at the call, the body's module.
         let Some(&mark) = self.path_marks.get(p.0 as usize) else { return self.gap(Gap::Site { path: p.0, why: None }) };
+        // The namespace the path's site resolves it in, parallel to its mark (blaze-lower
+        // `TypeckBody::path_ns`): a struct expression's or pattern's path is a type's
+        // (rustc `PathSource::Struct`), so `libc::flock { .. }` is `struct flock` beside
+        // `fn flock`.
+        let Some(&ns) = self.path_ns.get(p.0 as usize) else { return self.gap(Gap::Site { path: p.0, why: None }) };
+        let ns = match ns {
+            blaze_lower::typeck::PathNs::Type => Ns::Type,
+            blaze_lower::typeck::PathNs::Value => Ns::Value,
+        };
         let site = match super::item_site::site_in(self.names, mark, first, first == "{{root}}", self.module) {
             Ok(site) => site,
             Err(why) => return self.gap(Gap::Site { path: p.0, why: Some(why) }),
@@ -181,17 +190,32 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
             (None, Some(_)) => None,
             (None, None) => site.dollar_crate,
         };
-        let target = match self.resolver().path_with(at_module, dollar, abs, rest, Ns::Value) {
+        let target = match self.resolver().path_with(at_module, dollar, abs, rest, ns) {
             Ok(t) => t,
             // A block's item the body's lowering listed, which the name solver does not find
             // under its block's module (a later segment it cannot read): never "the program
             // names nothing" for a name that is declared.
-            Err(ResolveError::Path(e)) => match local_type {
-                Some(row) if written.len() == 1 => return self.gap(Gap::Local(LocalGap { item: row.key, form: row.kind.unplaced(), range: row.range })),
-                // The program names nothing: the checker's own diagnostic, naming the segment
-                // the library stopped at (world_path_miss.rs).
-                _ => return self.path_miss(at_module, dollar, abs, rest, lead, shift, e),
-            },
+            Err(ResolveError::Path(e)) => {
+                // rustc_resolve late.rs `resolve_qpath`: a path of two or more segments that
+                // fails, whose first segment is a builtin type's name, is that builtin type
+                // with the rest unresolved ("The same fallback is used when `a` resolves to
+                // nothing"). turso's `value.map(str::to_owned)` beside `use std::str;` is
+                // `<str>::to_owned`. Only for the path as written (no block `use` or glob
+                // standing for its first segment, no `::` root).
+                if shift == 0
+                    && !abs
+                    && rest.len() > 1
+                    && let Some(p) = builtin_first(rest)
+                {
+                    return Ok(Ok(PathRes { def: Def::Prim(p), consumed: lead + 1 }));
+                }
+                match local_type {
+                    Some(row) if written.len() == 1 => return self.gap(Gap::Local(LocalGap { item: row.key, form: row.kind.unplaced(), range: row.range })),
+                    // The program names nothing: the checker's own diagnostic, naming the segment
+                    // the library stopped at (world_path_miss.rs).
+                    _ => return self.path_miss(at_module, dollar, abs, rest, lead, shift, e),
+                }
+            }
             Err(e @ ResolveError::NoText { .. }) => return self.gap(Gap::Resolve(e)),
         };
         // Counted in the segments as written (a `use`'s path stands for its one binding). A
@@ -481,4 +505,10 @@ fn prim_of(n: PNode) -> Option<Prim> {
         PNode::Float(f) => Some(Prim::Float(f)),
         _ => None,
     }
+}
+
+/// The builtin type `rest`'s first segment names (`super::types::PRIMS`), if any.
+fn builtin_first(rest: &[&str]) -> Option<Prim> {
+    let first = *rest.first()?;
+    super::types::PRIMS.iter().find(|(p, _)| *p == first).and_then(|(_, n)| prim_of(*n))
 }

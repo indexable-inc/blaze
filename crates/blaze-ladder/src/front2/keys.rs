@@ -181,6 +181,15 @@ pub fn opaque_key(fn_: ItemKey, index: u32) -> ItemKey {
     ItemKey(u128::from_be_bytes(first))
 }
 
+/// The opaque type an owner row `(owner, index)` names (the inverse of the seam's
+/// `opaque_of`): [`opaque_key`] of `owner` at `index` without tait.rs's `ALIAS_OPAQUE` bit,
+/// which an alias's row sets over the same numbering (tait.rs `alias_opaque_preds`). A code
+/// entry's read list names an opaque's question by its row (code_reads.rs
+/// `ReadKind::OpaqueHidden`).
+pub fn opaque_of_row(owner: ItemKey, index: u32) -> ItemKey {
+    opaque_key(owner, index & !super::tait::ALIAS_OPAQUE)
+}
+
 impl Keys {
     fn file(&self, k: ItemKey, origin: Origin) -> Result<ItemKey, KeyClash> {
         self.file_with_body(k, origin, None)

@@ -1,7 +1,7 @@
 //! The `bzcode03` declared-instances section (D106): a round trip, the bytes equal for two
 //! orders of insertion, every truncation and a seeded sample of bit flips of a sealed record
-//! refused by a typed error (a record is shared: its bytes are untrusted), a `bzcode02` head
-//! refused naming both numbers, and the seal refusing BY NAME a row no target uses and a target
+//! refused by a typed error (a record is shared: its bytes are untrusted), a `bzcode03` and a
+//! `bzcode07` head refused naming both numbers, and the seal refusing BY NAME a row no target uses and a target
 //! with no row (so a walk trusts the section: rule 74). Each test prints the line its doc names.
 //!
 //! Never compiled by its writer (rule 0c): the BUILDER INTEGRATOR runs it.
@@ -94,7 +94,7 @@ fn declared_section_round_trips_and_is_canonical() {
     let first = bytes_of(record(&[0, 1, 2, 3, 4, 5], alloc), alloc);
     let second = bytes_of(record(&[5, 4, 3, 2, 1, 0, 0, 2], alloc), alloc);
     assert_eq!(&first[..], &second[..], "the order of insertion (and a repeated target) does not reach the bytes");
-    assert_eq!(first[..8], MAGIC, "the head is bzcode03's");
+    assert_eq!(first[..8], MAGIC, "the head is the form's");
     let view = match read(&first) {
         Ok(view) => view,
         Err(error) => panic!("a sealed record reads back: {error}"),
@@ -141,17 +141,20 @@ fn truncations_and_bit_flips_are_refused() {
     println!("bzcode03: every truncation and 4096 seeded bit flips are refused by a typed error");
 }
 
-/// Prints `bzcode03: a bzcode02 record is refused naming 2 and 3`. Fails if an old record is
-/// misread or refused without saying which form it is (rule 26: reported and rebuilt).
+/// Prints `bzcode08: a bzcode03 and a bzcode07 record are refused naming both numbers`. Fails
+/// if an old record (this form's last, or blaze-code's) is misread or refused without saying
+/// which form it is (rule 26: reported and rebuilt).
 #[test]
 fn an_old_form_is_refused_by_both_numbers() {
     let alloc = blaze_own::testing::heap().alloc();
     let mut bytes = bytes_of(record(&[0, 1, 2, 3, 4, 5], alloc), alloc);
-    bytes[..8].copy_from_slice(b"bzcode02");
-    assert_eq!(read(&bytes).err(), Some(FormError::OtherForm { found: 2, reads: 3 }));
+    bytes[..8].copy_from_slice(b"bzcode03");
+    assert_eq!(read(&bytes).err(), Some(FormError::OtherForm { found: 3, reads: 8 }));
+    bytes[..8].copy_from_slice(b"bzcode07");
+    assert_eq!(read(&bytes).err(), Some(FormError::OtherForm { found: 7, reads: 8 }));
     bytes[..8].copy_from_slice(b"notacode");
     assert_eq!(read(&bytes).err(), Some(FormError::Magic));
-    println!("bzcode03: a bzcode02 record is refused naming 2 and 3");
+    println!("bzcode08: a bzcode03 and a bzcode07 record are refused naming both numbers");
 }
 
 /// Prints `bzcode03: the seal refuses an unused row and an undeclared target by symbol`. Fails

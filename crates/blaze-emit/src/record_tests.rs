@@ -44,6 +44,10 @@ impl Names for ByPlace {
     fn name(&self, of: Outside) -> Option<Named<'_>> {
         Some(Named::Symbol(symbol(of)))
     }
+
+    fn routines(&self) -> crate::RoutinePlaces {
+        crate::RoutinePlaces::NONE
+    }
 }
 
 /// No reference has a name.
@@ -53,6 +57,10 @@ impl Names for Nameless {
     fn name(&self, _: Outside) -> Option<Named<'_>> {
         None
     }
+
+    fn routines(&self) -> crate::RoutinePlaces {
+        crate::RoutinePlaces::NONE
+    }
 }
 
 /// Every reference is the C name `callee_c`.
@@ -61,6 +69,10 @@ struct AllC;
 impl Names for AllC {
     fn name(&self, _: Outside) -> Option<Named<'_>> {
         Some(Named::C("callee_c"))
+    }
+
+    fn routines(&self) -> crate::RoutinePlaces {
+        crate::RoutinePlaces::NONE
     }
 }
 

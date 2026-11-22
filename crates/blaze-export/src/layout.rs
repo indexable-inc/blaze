@@ -115,6 +115,9 @@ pub struct Laid<'a, 'r> {
     pub entry: u64,
     /// In placement order.
     pub placed: AVec<'a, Placed>,
+    /// The bytes kept after the code for the unwind tables: what eh_out.rs `eh_room` measured
+    /// (the layout's `tail`). `eh_sections` refuses tables past it in every build.
+    pub tables_room: u64,
 }
 
 impl Laid<'_, '_> {
@@ -549,5 +552,6 @@ pub fn lay_out<'a, 'r>(
         fixups,
         entry: entry_at,
         placed,
+        tables_room: tail,
     })
 }

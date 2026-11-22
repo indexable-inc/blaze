@@ -243,8 +243,9 @@ impl Reader {
         let at = Path::new(path).ok()?;
         let mut bytes = Bytes::new_in(self.frame, "the names step's files");
         self.root.read_all(self.cx, &at, &mut bytes).ok()?;
-        // Held to the end of the command, in the names frame.
-        let held: &'static Bytes<'static> = std::boxed::Box::leak(std::boxed::Box::new(bytes));
+        // Held to the end of the command, in the names frame: the bytes and their header both
+        // (the header was a box of the global heap until 2026-11-21).
+        let held: &'static Bytes<'static> = blaze_own::Box::leak(blaze_own::Box::new_in(bytes, self.frame));
         Some(held.as_slice())
     }
 }

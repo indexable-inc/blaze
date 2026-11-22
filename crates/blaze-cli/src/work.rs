@@ -763,14 +763,11 @@ pub(crate) struct Job<'a> {
     /// The content id the sweep gave the file, which the task's key holds: the bytes read are
     /// compared with it before any parse (`blaze_drive::verified`).
     pub(crate) expect: ContentId,
-    /// Whether the command runs any lint rule (`Facts::lints`): then the file's outline
-    /// lists its lint units as parts (lints.rs `parts_in`). In the `FileItems` kind's tool.
-    pub(crate) lints: bool,
-    /// Whether the outline plans the `mod NAME;` a macro call's tokens hold ([`macro_module_files`]):
-    /// always, but in the control that removes the cause (engine_check.rs
-    /// `without_macro_mods`, engine_macro_mods_tests.rs).
-    #[cfg(test)]
-    pub(crate) macro_mods: bool,
+    /// The rule set the command runs (lints.rs `of_root`), when it lints: then the file's outline
+    /// lists its lint units as parts, keyed for that set (lints.rs `parts_in`: `variant-count`'s
+    /// whole-file fact gathered only when it runs) and its file's one `Lint` part over them.
+    /// `None`: no lint part. The set is in the `FileItems` kind's tool (home.rs `tools`).
+    pub(crate) lints: Option<blaze_lint::RuleSet>,
 }
 
 /// A file's outline as its `FileItems` record, worked in `scratch` and built in `into`: the
@@ -832,8 +829,8 @@ pub(crate) fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, 
                     ItemDetail::Mod { inline: false, path: attr } => {
                         let Some(name) = item.name else { continue };
                         let child = match attr {
-                            None => module_file(path, owns_dir, text, &outline, item, &[], Segment::Slot(item.text(text, name)), scratch),
-                            Some(attr) => module_file(path, owns_dir, text, &outline, item, &[], Segment::Attr(item.text(text, attr)), scratch),
+                            None => module_file(path, owns_dir, text, &outline, item, Segment::Slot(item.text(text, name)), scratch),
+                            Some(attr) => module_file(path, owns_dir, text, &outline, item, Segment::Attr(item.text(text, attr)), scratch),
                         };
                         // A `#[path]` names its file: it alone is opened, with no `x/mod.rs` beside it.
                         (child, attr.is_none())
@@ -861,35 +858,10 @@ pub(crate) fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, 
                 path_bytes.extend_from_slice(&child);
                 paths.push((Name::file(&child), at, path_bytes.len() as u32, slot));
             }
-            // Each `mod NAME;` written LITERALLY in the tokens of an item-position macro call
-            // (blaze-file-items macro_mods.rs): a module the call's expansion may declare, in the
-            // module the call stands in (rustc_expand module.rs `mod_file_path` from the
-            // expansion's module dir; blaze-scope resolve.rs `make_modules`), so its file is
-            // planned as the `mod` written there would be. turso_core's `core/io/mod.rs`:
-            // `cfg_block! { #[cfg(..unix..)] { mod unix; .. } }` stopped `check` on
-            // `core/io/unix.rs`, read by the names and never outlined (2026-11-21). A superset:
-            // every cfg arm, each slot a probe and a file there one outline (the module docs
-            // say what an unread one costs). A path this text cannot name (a `#[path]` out of
-            // the checkout) or one already a part plans nothing more: the names step, which
-            // alone knows what the expansion wrote, names a read the plan missed (engine_names.rs
-            // `finish`, `UnseenFile`), so nothing is dropped quietly.
-            #[cfg(test)]
-            let planned = job.macro_mods;
-            #[cfg(not(test))]
-            let planned = true;
-            if planned {
-                macro_module_files(path, owns_dir, text, &outline, erased.handle(), scratch, &mut |child, slot, place| {
-                    let name = Name::file(&child);
-                    // One part a file: a `mod` the file also writes plainly, or one in two arms.
-                    if parts.iter().any(|part: &Part| part.name == name) {
-                        return;
-                    }
-                    parts.push(Part { name, locate: Locate::File { edition: job.edition }, place });
-                    let at = path_bytes.len() as u32;
-                    path_bytes.extend_from_slice(&child);
-                    paths.push((name, at, path_bytes.len() as u32, slot));
-                });
-            }
+            // A `mod` a macro call's expansion writes (`cfg_if!`, `cfg_block!`, `mod $n;`) is no
+            // part here: only expansion knows it, under the unit's cfg. The crate's names read
+            // its file, outline it on their worker with this code (engine_check.rs
+            // `outline_found`), and it is filed after them (engine_check.rs `serve_found`, D161).
             // Each file a literal `include_str!` / `include_bytes!` of this text reads (core's:
             // "located relative to the current file"), and each a literal `include!` in a body
             // reads (one expression, data_include.rs; an item-position one is a module part
@@ -951,14 +923,17 @@ pub(crate) fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, 
                     parts.push(Part { name, locate: Locate::Source(crate::engine_heads::outline_head_source(&outline, at, text)), place: item.range.start });
                 }
             }
-            // Each lint unit its own part (lints.rs), when the step runs a rule: keyed by its
-            // own bytes, holes and scope, so an edit relints only the units whose key it moved.
-            if job.lints
+            // Each lint unit its own part (lints.rs), when the command lints: keyed by its
+            // own text (each child one mark, no child's offset or length) and scope
+            // (lints.rs `Keyed`), so an edit relints only the unit it is in; then the file's one
+            // `Lint` part, the file's task, over them (lints.rs `file_part`). Sorted by name
+            // below: engine_lints.rs `part_place` searches them so.
+            if let Some(rules) = job.lints.as_ref()
                 // The file stands as its own crate root: this record is keyed by the file's bytes
                 // alone (rule 21), and no crate root's text reaches a `Job`; engine_lints.rs reads
                 // the same marks, so the two keys agree.
                 && let Err(what) =
-                    crate::lints::parts_in(&outline, text, path, file.subject(), crate::lints::marks_of(text, text), erased.handle(), &mut parts)
+                    crate::lints::parts_in(&outline, text, path, file.subject(), crate::lints::marks_of(text, text), rules, erased.handle(), &mut parts)
             {
                 return Ok(Err(Why::Refused { what, rule: "blaze-cli lints.rs, parts" }));
             }
@@ -1086,8 +1061,20 @@ const CHAIN_DOMAIN: &str = "blaze-cli item chain 2";
 pub(crate) fn item_chain(outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item, text: &str) -> u64 {
     // The one chain (blaze-file-items chain.rs, with an unnamed entry's head), under this
     // record's own domain and cut to the 64 bits a placed finding holds.
+    chain_word(blaze_file_items::item_chain(outline, item, text))
+}
+
+/// [`item_chain`] of a STORED outline's entry `at` (signature.rs `stored_chain`: the same chain
+/// over the record's columns): what a lint job reads, handed its planner's outline record and
+/// never outlining the file again (engine_lints.rs `lint_text`).
+pub(crate) fn stored_item_chain(view: blaze_surface::FileItemsView<'_>, at: blaze_surface::ItemIndex) -> u64 {
+    chain_word(crate::signature::stored_chain(view, at))
+}
+
+/// A chain under this record's domain, cut to the 64 bits a placed finding holds.
+fn chain_word(chain: blaze_ids::ContentId) -> u64 {
     let mut h = blaze_ids::Hasher::new(CHAIN_DOMAIN);
-    h.update(&blaze_file_items::item_chain(outline, item, text).0);
+    h.update(&chain.0);
     let digest = h.finish();
     u64::from_le_bytes(digest.0[..8].try_into().expect("a digest holds 8 bytes"))
 }
@@ -1187,19 +1174,12 @@ enum Segment<'t> {
 /// enclosing modules make. A slot answers `name.rs`: the drive opens it as a module
 /// (`PathOf { module: true }`), and the sweep probes `name.rs` and `name/mod.rs` (sweep.rs); a
 /// `#[path]` answers the one file it names. The error says what is refused.
-///
-/// `inner`: the inline modules written around the `mod` INSIDE a macro call's tokens, outermost
-/// first (blaze-file-items macro_mods.rs), when `item` is that call: each adds its name or its
-/// `#[path]` after the outline's own enclosing modules, as an expansion's inline module adds its
-/// directory where the call stands (blaze-scope resolve.rs `make_modules`). Empty for a `mod`
-/// the file's own items hold.
 fn module_file<'f, 't>(
     path: &str,
     owns_dir: bool,
     text: &'t str,
     outline: &blaze_file_items::Outline<'_>,
     item: &blaze_surface::Item,
-    inner: &[Segment<'t>],
     segment: Segment<'t>,
     frame: &'f Frame,
 ) -> Result<Vec<u8, &'f Frame>, &'static str> {
@@ -1224,11 +1204,11 @@ fn module_file<'f, 't>(
     }
     let mut out = Vec::new_in(frame);
     out.extend_from_slice(dir.as_bytes());
-    let file_relative = chain.is_empty() && inner.is_empty() && matches!(segment, Segment::Attr(_));
+    let file_relative = chain.is_empty() && matches!(segment, Segment::Attr(_));
     if !owns_dir && !file_relative {
         push_segment(&mut out, stem.strip_suffix(".rs").unwrap_or(stem));
     }
-    for segment in chain.iter().rev().chain(inner.iter()) {
+    for segment in chain.iter().rev() {
         match *segment {
             Segment::Slot(name) => push_segment(&mut out, name),
             Segment::Attr(literal) => join(&mut out, &path_literal(literal, frame)?)?,
@@ -1256,49 +1236,6 @@ fn in_modules(outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Ite
         parent = entry.parent;
     }
     true
-}
-
-/// Each file a `mod NAME;` written literally in the tokens of an item-position macro call of the
-/// file at `path` names (blaze-file-items macro_mods.rs `token_mods`), handed to `each` with
-/// whether it is a slot (`name.rs` probed with `name/mod.rs`; `false` for a `#[path]`) and the
-/// call's place. The file is [`module_file`]'s for that `mod` with the call as its item: the
-/// call's enclosing inline modules, then those in the tokens. `include!` is not scanned (its
-/// file is [`included_file`]'s); a call inside a body, an impl or a trait is not either (its
-/// `mod` would be in a block, whose files rustc does not take from the directory). A `mod`
-/// whose file this text cannot name (a `#[path]` literal refused by [`path_literal`]) is
-/// planned as nothing: only expansion says whether that `mod` is written, and a read of it the
-/// plan lacks stops the names with the file named (engine_names.rs `finish`, `UnseenFile`).
-/// The scratch it takes is `frame`'s and `alloc`'s, freed with the task.
-fn macro_module_files<'f>(
-    path: &str,
-    owns_dir: bool,
-    text: &str,
-    outline: &blaze_file_items::Outline<'_>,
-    alloc: blaze_own::Alloc<'_>,
-    frame: &'f Frame,
-    each: &mut dyn FnMut(Vec<u8, &'f Frame>, bool, u32),
-) {
-    use blaze_file_items::macro_mods::{TokenSegment, may_hold_mods, token_mods};
-    for item in outline.items() {
-        let ItemDetail::MacroCall { path: Some(call), input: Some(input) } = item.detail else { continue };
-        let input = item.text(text, input);
-        if is_include(item.text(text, call)) || !may_hold_mods(input) || !in_modules(outline, item) {
-            continue;
-        }
-        let found = token_mods(input, alloc);
-        let of = move |range: blaze_surface::Range| &input[range.start as usize..range.end as usize];
-        let segment = |one: &TokenSegment| match one.path {
-            Some(attr) => Segment::Attr(of(attr)),
-            None => Segment::Slot(of(one.name)),
-        };
-        for one in found.mods.iter() {
-            let mut inner: Vec<Segment<'_>, &Frame> = Vec::new_in(frame);
-            inner.extend(found.chain(one).iter().map(segment));
-            if let Ok(child) = module_file(path, owns_dir, text, outline, item, &inner, segment(&one.leaf), frame) {
-                each(child, one.leaf.path.is_none(), item.range.start);
-            }
-        }
-    }
 }
 
 /// Whether a macro call's path as written (`include`, `::core::include`) is core's `include!`,
@@ -1467,7 +1404,7 @@ mod tests {
                 None => Segment::Slot(item.text(text, name)),
                 Some(attr) => Segment::Attr(item.text(text, attr)),
             };
-            let file = module_file(path, owns_dir, text, &outline, item, &[], segment, frame);
+            let file = module_file(path, owns_dir, text, &outline, item, segment, frame);
             out.push(file.map(|file| std::string::String::from_utf8(file.as_slice().to_vec()).expect("UTF-8")));
         }
         out
@@ -1497,42 +1434,5 @@ mod tests {
         let found = named("src/lib.rs", true, "#[path = \"../../z.rs\"] mod z;\n#[path = \"/etc/z.rs\"] mod w;\n");
         assert!(found[0].as_ref().is_err_and(|e| e.contains("climbs out")), "{found:?}");
         assert!(found[1].as_ref().is_err_and(|e| e.contains("absolute")), "{found:?}");
-    }
-
-    /// Each file [`macro_module_files`] plans for `text` at `path`, with whether it is a slot.
-    fn macro_named(path: &str, owns_dir: bool, text: &str) -> std::vec::Vec<(std::string::String, bool)> {
-        let io = Io::simulated(SimWorld::new(1, Limits::USUAL));
-        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
-        let frame = cx.frame();
-        let erased = blaze_own::Erased::new(frame);
-        let outline = blaze_file_items::outline(text, Edition::E2024, erased.handle());
-        let mut out = std::vec::Vec::new();
-        macro_module_files(path, owns_dir, text, &outline, erased.handle(), frame, &mut |file, slot, _| {
-            out.push((std::string::String::from_utf8(file.as_slice().to_vec()).expect("UTF-8"), slot));
-        });
-        out
-    }
-
-    /// A `mod` a macro call's tokens hold is at the file a `mod` written where the call stands
-    /// would be (rustc_expand module.rs: the expansion's module directory and ownership): beside
-    /// a crate root, in `x/` for an `x.rs` module, under the call's enclosing inline modules and
-    /// then those in the tokens, a `#[path]` relative to the file's directory when no inline module
-    /// encloses it. Not planned: an `include!` (its file is the include's), a call in a body, a
-    /// `#[path]` out of the checkout, a computed name.
-    #[test]
-    fn a_macro_call_s_mods_name_the_files_its_expansion_reads() {
-        let root = "cfg_block! {\n    #[cfg(unix)] { mod unix; }\n    #[cfg(windows)] { mod windows; }\n}\n\
-                    mod inl { m! { mod c; mod t { #[path = \"q.rs\"] mod d; } } }\n\
-                    m!(#[path = \"p.rs\"] mod e;);\nm! { #[path = \"../../out.rs\"] mod z; mod $n; }\n\
-                    include!(\"mod_g.rs\");\nfn f() { m! { mod in_body; } }\n";
-        let want = [("src/unix.rs", true), ("src/windows.rs", true), ("src/inl/c.rs", true), ("src/inl/t/q.rs", false), ("src/p.rs", false)];
-        let found = macro_named("src/lib.rs", true, root);
-        assert_eq!(found.iter().map(|(f, s)| (f.as_str(), *s)).collect::<std::vec::Vec<_>>(), want);
-
-        let found = macro_named("src/io.rs", false, "cfg_if! { if #[cfg(unix)] { mod unix; } else { #[path = \"w.rs\"] mod win; } }\n");
-        assert_eq!(found.iter().map(|(f, s)| (f.as_str(), *s)).collect::<std::vec::Vec<_>>(), [("src/io/unix.rs", true), ("src/w.rs", false)]);
-
-        let found = macro_named("core/io/mod.rs", true, "cfg_block! { #[cfg(all(target_family = \"unix\", not(miri)))] { mod unix; pub use unix::UnixIO; } }\n");
-        assert_eq!(found.iter().map(|(f, s)| (f.as_str(), *s)).collect::<std::vec::Vec<_>>(), [("core/io/unix.rs", true)]);
     }
 }

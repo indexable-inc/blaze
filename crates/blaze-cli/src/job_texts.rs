@@ -9,7 +9,8 @@ use std::alloc::Global;
 
 use blaze_fetch::pack::PackView;
 use blaze_scope::crate_env::CrateEnv;
-use blaze_scope::resolve::SourceTexts;
+use blaze_scope::resolve::{Found, SourceTexts, Unread};
+use bstd::fs::FsKind;
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::{Bytes, Frame};
@@ -70,10 +71,17 @@ pub(crate) struct JobTexts<'n> {
     /// Each checkout path asked (tree 0, after `/0/`), in the order first asked, with its text
     /// or `None` when there is no such file.
     pub(crate) read: RefCell<std::vec::Vec<(&'n str, Option<&'n str>), Global>>,
+    /// Each checkout path [`SourceTexts::source`] answered `Unknown` (there, and not read as
+    /// module text: not UTF-8, or the file system's error), with its cause, in the order asked.
+    /// A read of the file all the same: the job's answer, a failure too, lists it as a read
+    /// file (names/scope.rs), so the file's next content asks the job again.
+    pub(crate) unread: RefCell<blaze_own::Vec<(&'n str, Unread<'n>), &'n Frame>>,
     /// Each checkout path read as DATA (`include_str!`, `include_bytes!`; tree 0, after `/0/`),
     /// with the checkout file whose call read it, in the order asked: no module, so never in
-    /// `read` (a reader wants its bytes' digest, never its `Surface`: data_include.rs).
-    pub(crate) data: RefCell<std::vec::Vec<(&'n str, &'n str), Global>>,
+    /// `read` (a reader wants its bytes' digest, never its `Surface`: data_include.rs). Each
+    /// with what the reader was handed ([`SourceTexts::read_data`]), `None` when it had nothing:
+    /// the body digests it in the domain of the cell it reads (engine_bodies.rs `data_read`).
+    pub(crate) data: RefCell<std::vec::Vec<(&'n str, &'n str, Option<&'n [u8]>), Global>>,
     /// Each include told to have left its own package inside the workspace (D111), in the order
     /// told: filed as warning findings at their calls (names/include_outside.rs).
     pub(crate) left: RefCell<std::vec::Vec<crate::names::include_outside::Left<'n>, Global>>,
@@ -223,6 +231,31 @@ impl<'n> JobTexts<'n> {
         core::str::from_utf8(self.checkout_bytes(inner)?).ok()
     }
 
+    /// The checkout file `inner` as [`SourceTexts::source`] answers: its bytes, `Absent` when no
+    /// file is there (a path with `.` or `..`, one no `Path` names, not found, a directory),
+    /// `Unknown` with the file system's error for any other failure (a permission, a read that
+    /// moved, the driver), which [`JobTexts::checkout_bytes`] reads as absent. The bytes and
+    /// the error are held in the job's frame (`self.frame`, `'n`: freed with the job), as the
+    /// seam's lifetime asks.
+    fn checkout_found(&self, inner: &str) -> Found<&'n [u8], Unread<'n>> {
+        if inner.split('/').any(|part| part == ".." || part == ".") {
+            return Found::Absent;
+        }
+        let Ok(at) = Path::new(inner) else { return Found::Absent };
+        let mut bytes = Bytes::new_in(self.frame, "a pool job's checkout files");
+        if let Err(error) = self.root.read_all(self.cx, &at, &mut bytes) {
+            return match error.kind {
+                FsKind::NotFound | FsKind::IsADirectory | FsKind::NotADirectory => Found::Absent,
+                _ => {
+                    let why: &'n bstd::fs::FsError = blaze_own::Box::leak(blaze_own::Box::new_in(error, self.frame));
+                    Found::Unknown(Unread { path: held_str(inner, self.frame), why })
+                }
+            };
+        }
+        let held: &'n Bytes<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(bytes, self.frame));
+        Found::Known(held.as_slice())
+    }
+
     fn checkout_bytes(&self, inner: &str) -> Option<&'n [u8]> {
         if inner.split('/').any(|part| part == ".." || part == ".") {
             return None;
@@ -254,6 +287,43 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         text
     }
 
+    /// [`SourceTexts::read`]'s answer with an unread checkout file kept apart from an absent
+    /// one: `Unknown` names the file and the error, and is not listed in `read` (a listed
+    /// absence would be kept as a fact of the crate; an unread file is none). A file that is
+    /// not UTF-8 is `Unknown` with its UTF-8 error: it is there, and is no module text.
+    fn source(&self, krate: usize, path: &str) -> Found<&'n str, Unread<'n>> {
+        let Some(rest) = path.strip_prefix('/') else { return Found::Absent };
+        let Some((tree, inner)) = rest.split_once('/') else { return Found::Absent };
+        let Ok(tree) = tree.parse::<usize>() else { return Found::Absent };
+        if tree != 0 || self.corrected.iter().any(|(t, p, _)| *t as usize == tree && *p == inner) {
+            // A pack's file or a corrected text: tables, read in memory.
+            return Found::of_table(self.read(krate, path));
+        }
+        if let Some((_, text)) = self.read.borrow().iter().find(|(p, _)| *p == inner) {
+            return Found::of_table(*text);
+        }
+        if let Some((_, unread)) = self.unread.borrow().iter().find(|(p, _)| *p == inner) {
+            return Found::Unknown(*unread);
+        }
+        let unknown = |unread: Unread<'n>| {
+            self.unread.borrow_mut().push((unread.path, unread));
+            Found::Unknown(unread)
+        };
+        let text = match self.checkout_found(inner) {
+            Found::Known(bytes) => match core::str::from_utf8(bytes) {
+                Ok(text) => Some(text),
+                Err(error) => {
+                    let why: &'n core::str::Utf8Error = blaze_own::Box::leak(blaze_own::Box::new_in(error, self.frame));
+                    return unknown(Unread { path: held_str(inner, self.frame), why });
+                }
+            },
+            Found::Absent => None,
+            Found::Unknown(unread) => return unknown(unread),
+        };
+        self.read.borrow_mut().push((held_str(inner, self.frame), text));
+        Found::of_table(text)
+    }
+
     /// A file read as data: its bytes (any bytes: `include_bytes!` of a binary file), from the
     /// pack or the checkout as [`SourceTexts::read`] reads a text. A checkout file is listed in
     /// `data` with the calling file `from`, found or not (a missing one is read absent, so
@@ -269,7 +339,9 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         }
         let bytes = self.checkout_bytes(inner);
         let from = from.strip_prefix("/0/").unwrap_or(from);
-        self.data.borrow_mut().push((held_str(inner, self.frame), held_str(from, self.frame)));
+        // What the reader was handed, the one read (rule 77: never read twice), so a body's row
+        // holds the digest of what it read whichever cell defines the file.
+        self.data.borrow_mut().push((held_str(inner, self.frame), held_str(from, self.frame), bytes));
         bytes
     }
 
@@ -385,6 +457,7 @@ mod tests {
             env: None,
             envs: None,
             read: RefCell::new(std::vec::Vec::new()),
+            unread: RefCell::new(blaze_own::Vec::new_in(cx.frame())),
             data: RefCell::new(std::vec::Vec::new()),
             left: RefCell::new(std::vec::Vec::new()),
             procs,

@@ -550,6 +550,8 @@ pub(crate) struct RunOut<'a> {
     /// The most a body's scratch frame held when its body ended ([`BODY_SCRATCH`]): one body's
     /// alone when the scratch is reset per body, all the run's when it is not (the plant).
     scratch_most: u64,
+    /// What the run's scratch and stretch frames held committed ([`FramesHeld`]).
+    frames: FramesHeld,
     /// The run's clean bodies' typed records ([`BodyResult::typed`]): a slice's are its own, and
     /// [`join_slices`] carries every slice's into its entry's run.
     typed: SVec<'a, TypedPut<'a>>,
@@ -560,11 +562,15 @@ pub(crate) struct RunOut<'a> {
     /// The call census's totals over the run's stretches (feature `call-census`; [`Census`]:
     /// nothing without).
     census: Census,
+    /// Each checkout file a body of the run read as data through its `Given` cell ([`data_read`],
+    /// `DataCell::Followed`), its path and the answer the body saw: the leaf rows the request
+    /// saves so the sweep follows them ([`BodiesStage::data_files`]).
+    data_files: SVec<'a, (blaze_own::String<SharedAlloc<'a>>, ContentId)>,
 }
 
 impl<'a> RunOut<'a> {
     fn new(alloc: SharedAlloc<'a>) -> RunOut<'a> {
-        RunOut { found: SVec::new_in(alloc), messages: SVec::new_in(alloc), notes: SVec::new_in(alloc), locals: SVec::new_in(alloc), clean: 0, items: 0, item_tasks: 0, outs: SVec::new_in(alloc), scratch_most: 0, typed: SVec::new_in(alloc), untyped_clean: 0, setup: StretchSetup::default(), census: Census::NONE }
+        RunOut { found: SVec::new_in(alloc), messages: SVec::new_in(alloc), notes: SVec::new_in(alloc), locals: SVec::new_in(alloc), clean: 0, items: 0, item_tasks: 0, outs: SVec::new_in(alloc), scratch_most: 0, frames: FramesHeld::default(), typed: SVec::new_in(alloc), untyped_clean: 0, setup: StretchSetup::default(), census: Census::NONE, data_files: SVec::new_in(alloc) }
     }
 }
 
@@ -625,6 +631,33 @@ const _: () = assert!(core::mem::size_of::<RunOut<'static>>() <= 4 << 10);
 /// it with its cells, so 1 GiB leaves a body several times that; a body past it panics in its
 /// own job (rule 20: the alloc-error hook) and is said as such.
 const BODY_SCRATCH: usize = 1 << 30;
+
+/// What a run's scratch keeps committed between two bodies: a reset keeps every block a body
+/// grew it to (blaze-mem `Frame::reset`), so a run's scratch held its largest body's high-water
+/// until the run's last body ended, once a worker. Past this the blocks ahead of the cursor go
+/// back to the kernel as the next body begins (`Frame::trim`): a worker holds at most this
+/// between bodies, and a large body pays its own page faults. 32 MiB holds the scratch of every
+/// body of the ladder's projects whose profile line names one (the recorder's cells for about
+/// 200,000 reads).
+const SCRATCH_KEEP: usize = 32 << 20;
+
+/// What the runs' frames held committed (rule 16): the scratch's most at a body's end, the
+/// stretch frame's most at a stretch's end, and how many times a scratch was trimmed back to
+/// [`SCRATCH_KEEP`]. The floor a worker: one body's scratch and one stretch's records, together.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FramesHeld {
+    scratch_committed_most: u64,
+    stretch_committed_most: u64,
+    scratch_trims: u64,
+}
+
+impl FramesHeld {
+    fn fold(&mut self, other: FramesHeld) {
+        self.scratch_committed_most = self.scratch_committed_most.max(other.scratch_committed_most);
+        self.stretch_committed_most = self.stretch_committed_most.max(other.stretch_committed_most);
+        self.scratch_trims = self.scratch_trims.saturating_add(other.scratch_trims);
+    }
+}
 
 /// One body's memory as its task ends (lane BD3; rule 16): what it leaves in the request's
 /// arena (its row, to the request's end) and what its check took in its scratch (freed as it
@@ -1221,6 +1254,9 @@ pub(crate) enum BodyFault {
     MissingFact,
     OweMissingFact,
     DropMissingFactRead,
+    /// The control of a computed data include: its read's leaf row is not kept, so no task
+    /// defines its `Given` cell.
+    DropDataLeaf,
 }
 
 /// The memory plants of lane BD3 as the coordinator read them ([`PLANT_ROW_AT_RECORDED`],
@@ -1965,6 +2001,9 @@ pub(crate) struct BodiesStage<'f> {
     pub(crate) ran: Vec<Ran<'f>, Global>,
     /// All runs append in order. The frame reserves space for a phase's findings in one go.
     findings: Option<Vec<BodyFinding<'f>, &'f Frame>>,
+    /// Each checkout file a body read as data through its `Given` cell, with the answer it saw
+    /// (`RunOut::data_files`), over every run: [`BodiesStage::data_files`]. `None`: none.
+    data_files: Option<Vec<(&'f str, ContentId), &'f Frame>>,
     /// Rows with no note or findings (including rows the plan left outside).
     clean: u32,
     /// Item bodies checked and tasks with at least one item body.
@@ -1988,6 +2027,8 @@ pub(crate) struct BodiesStage<'f> {
     groups_found: bool,
     /// The most a body's scratch frame held when its body ended, over every run ([`RunOut`]).
     scratch_most: u64,
+    /// What every run's scratch and stretch frames held committed ([`FramesHeld`]).
+    frames: FramesHeld,
     /// The bodies checked from the request's frozen heads, refused at a seed, and their rounds
     /// (engine_seeds.rs `SeedTally`), summed over every run.
     pub(crate) seeds: crate::engine_seeds::SeedTally,
@@ -2534,6 +2575,7 @@ impl<'f> BodiesStage<'f> {
             shelf: ImplShelf::new(ImplShelfOpts {}),
             ran: Vec::new_in(Global),
             findings: None,
+            data_files: None,
             clean: 0,
             items: 0,
             item_tasks: 0,
@@ -2545,6 +2587,7 @@ impl<'f> BodiesStage<'f> {
             uncovered_note: None,
             groups_found: false,
             scratch_most: 0,
+            frames: FramesHeld::default(),
             seeds: crate::engine_seeds::SeedTally::default(),
             heads_failed: crate::engine_head_notes::Failed::new(),
             outside: crate::engine_body_plan::Outside::new(),
@@ -2633,6 +2676,9 @@ impl<'f> BodiesStage<'f> {
         graph: Option<Input>,
         list: Option<&blaze_world::crate_list::CrateList<'_>>,
         outlined: &[Outlined<'_>],
+        // Every member unit's found files (engine_body_plan.rs `FoundEdge`): its walk's beside
+        // its root, and the setup's walk of it (`groups`).
+        found: &[crate::engine_body_plan::FoundEdge],
         from: ReachFrom,
         g: blaze_own::Alloc<'static>,
     ) -> Result<Option<&Reach>, CliError> {
@@ -2640,7 +2686,7 @@ impl<'f> BodiesStage<'f> {
         self.reach = None;
         let Some(list) = list else { return Ok(None) };
         let reach = match from {
-            ReachFrom::Walk => Reach::walk(list, outlined, g).map_err(EngineCheckError::Unoutlined)?,
+            ReachFrom::Walk => Reach::walk(list, outlined, found, g).map_err(EngineCheckError::Unoutlined)?,
             ReachFrom::MembersRecord => {
                 let refused = |unit: Option<Name>| EngineCheckError::ReadyRefused(ReadyRefused::Members { unit });
                 let Some(graph) = graph else { return Err(refused(None).into()) };
@@ -2652,7 +2698,7 @@ impl<'f> BodiesStage<'f> {
                     Some(Ok(view)) if view.header.graph_out == graph.out => view,
                     _ => return Err(refused(None).into()),
                 };
-                Reach::of_members(list, &view, g).map_err(|unknown| refused(Some(unknown.unit)))?
+                Reach::of_members(list, &view, found, g).map_err(|unknown| refused(Some(unknown.unit)))?
             }
         };
         self.reach = Some(reach);
@@ -2811,6 +2857,14 @@ impl<'f> BodiesStage<'f> {
     /// The keys of the typed records this request put, sorted, each once: records the answer's
     /// root must name beside the member rows (engine_check.rs `kept_beside`), or `blaze run`
     /// finds none after the store's sweep and checks each body again.
+    /// Each checkout file a body read as data through its `Given` cell this request (a computed
+    /// include, [`data_read`]), as a script's `file:` read: the leaf rows engine_check.rs hook H2
+    /// keeps beside the scripts' (`ScriptsStage::script_rows`), so the next request follows the
+    /// file and plans its `Given` task.
+    pub(crate) fn data_files(&self) -> impl Iterator<Item = (crate::engine_script_reads::ReadKind, &str, ContentId)> + '_ {
+        self.data_files.iter().flatten().map(|&(path, answer)| (crate::engine_script_reads::ReadKind::File, path, answer))
+    }
+
     pub(crate) fn typed_record_keys(&mut self) -> &[Key] {
         match self.typed.as_mut() {
             Some(keys) => {
@@ -3381,6 +3435,10 @@ impl<'f> BodiesStage<'f> {
                 ran[row].note = Some(frame.alloc(BodyNote { said, head_failed }));
             }
             self.clean += run_out.clean;
+            if !run_out.data_files.is_empty() {
+                let kept = self.data_files.get_or_insert_with(|| Vec::new_in(frame));
+                kept.extend(run_out.data_files.iter().map(|(path, answer)| (crate::work::held_str(path.as_str(), frame), *answer)));
+            }
             // Each clean body's typed record, put under the key of its bytes (rule 21: a clean
             // body's verdict digest does not move with every column the record holds, so a key
             // of (check, out) met other bytes on the second command; engine_body_record.rs, THE
@@ -3403,6 +3461,7 @@ impl<'f> BodiesStage<'f> {
             // One copy of the run's messages. Each row addresses its contiguous findings in
             // the request's list, including after the rows are sorted by name.
             self.scratch_most = self.scratch_most.max(run_out.scratch_most);
+            self.frames.fold(run_out.frames);
             let messages: &'f [u8] = frame.alloc_slice_copy(&run_out.messages);
             let mut from = 0usize;
             for &(body, rule, at, end) in &run_out.found {
@@ -3737,7 +3796,9 @@ impl<'f> BodiesStage<'f> {
             // atom is the plan's (engine_plan_cfg.rs `test_atom`), not the script run's answer
             // this stage has: the walk must be the plan's reach (below).
             let cuts = plan_cuts.get_or_insert_with(|| crate::engine_plan_cfg::PlanCuts::of(handles.outlined, g));
-            let reach = crate::engine_body_plan::reached_under(handles.outlined, cuts, crate::engine_body_plan::root_file(&list, member), crate::engine_plan_cfg::test_atom(&list, member), g).map_err(EngineCheckError::Unoutlined)?;
+            // Its found files beside its root (engine_body_plan.rs `FoundEdge`), as the plan's walk took them.
+            let found = plan_reach.map_or(&[][..], |plan| plan.found_of(own_name));
+            let reach = crate::engine_body_plan::reached_under(handles.outlined, cuts, crate::engine_body_plan::root_file(&list, member), crate::engine_plan_cfg::test_atom(&list, member), found, g).map_err(EngineCheckError::Unoutlined)?;
             // The plan named this unit's rows from its reach (engine_body_plan.rs `Reach`): the
             // walk today must be that reach, or a row would be planned for a file it does not
             // reach, or none for one it does (the ready plan's reach is the last members
@@ -4689,6 +4750,19 @@ impl<'f> BodiesStage<'f> {
             held.mean(held.words),
             self.scratch_most
         );
+        // What the runs' frames held committed (rule 16, rule 67): a scratch's floor is the most
+        // one body used, so the ratio is committed over used; a reset keeps up to
+        // `SCRATCH_KEEP` and a trim gives the rest back as the next body begins.
+        let frames = self.frames;
+        let _ = writeln!(
+            into,
+            "bodies: frames committed: a run's scratch at most {} bytes (floor {} used, {:.2}x; kept {SCRATCH_KEEP} between bodies, trimmed {} times); a stretch's frame at most {} bytes at its end (given back with it)",
+            frames.scratch_committed_most,
+            self.scratch_most,
+            frames.scratch_committed_most as f64 / self.scratch_most.max(1) as f64,
+            frames.scratch_trims,
+            frames.stretch_committed_most
+        );
         // What the plan left to no unit (engine_body_plan.rs): entries, and files, counted; and
         // the rows entered by view (D191): a row is called checked only when its own check ran
         // to a verdict ([`BodiesStage::not_checked`] is false), a view row by its own unit.
@@ -5138,7 +5212,13 @@ fn run_bodies<'a, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 'a, 
             return;
         }
         let took = match Frame::with_reserve(BODIES_FRAME, bstd::mem::Tag::Infer) {
-            Ok(stretch) => run_stretch(cx, shared, rest, &stretch, &mut scratch, clock, out, ran, run_out, tally, alloc),
+            Ok(stretch) => {
+                let took = run_stretch(cx, shared, rest, &stretch, &mut scratch, clock, out, ran, run_out, tally, alloc);
+                // Its records' pages go as the stretch ends, not the run (the frame's drop: what
+                // its thread's shelf has no room for goes back, blaze-mem frame.rs `give_span`).
+                run_out.frames.stretch_committed_most = run_out.frames.stretch_committed_most.max(stretch.committed() as u64);
+                took
+            }
             Err(_) => refuse::<R>(rest, "the frame of its run's stretch could not be reserved (engine_bodies.rs `BODIES_FRAME`)", None, out, ran, run_out, alloc),
         };
         at += took.max(1);
@@ -5198,6 +5278,7 @@ fn join_slices<'a, 'f>(
             stretch = ran[0].stretch;
         }
         joined.scratch_most = joined.scratch_most.max(run_out.scratch_most);
+        joined.frames.fold(run_out.frames);
         reads.extend_from_slice(&out.done[0].reads);
         joined.locals.extend(run_out.locals.iter().map(|local| (0, local.1)));
         // Each slice's bodies' typed records are their own (keyed by each body's check name and
@@ -5206,6 +5287,8 @@ fn join_slices<'a, 'f>(
         joined.untyped_clean = joined.untyped_clean.saturating_add(run_out.untyped_clean);
         joined.setup.add(run_out.setup);
         joined.census.absorb(&mut run_out.census);
+        // Its data files followed as its reads are joined: each slice's up to a stopped one.
+        joined.data_files.append(&mut run_out.data_files);
         buffer.made.append(&mut out.made);
         // Not checked: `run_stretch` counts a slice's items only when it was.
         if run_out.items == 0 {
@@ -5454,8 +5537,15 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
         taken += 1;
         // The body's scratch starts empty (rule 11): the last body's findings and words were
         // copied out as it ended. Kept only under the plant (the answers must not change).
+        run_out.frames.scratch_committed_most = run_out.frames.scratch_committed_most.max(scratch.committed() as u64);
         if !shared.keep_scratch {
             scratch.reset();
+            // A reset keeps every block the last body grew it to: past `SCRATCH_KEEP` they go
+            // back now, so a large body's high-water is not held through the run's rest.
+            if scratch.committed() > SCRATCH_KEEP {
+                scratch.trim(SCRATCH_KEEP);
+                run_out.frames.scratch_trims += 1;
+            }
         }
         #[cfg(test)]
         let small = shared.plants.fault.is_some_and(|(item, _)| item == one.label).then(|| {
@@ -5581,7 +5671,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                         return Ok(body);
                     }
                     let log = opened.sources.0.data.borrow();
-                    let (path, _) = log.get(data_at).expect("the missing-fact fixture must read its include");
+                    let (path, _, _) = log.get(data_at).expect("the missing-fact fixture must read its include");
                     let data = CellId { of: Name::file(path.as_bytes()), cell: WHOLE };
                     let key = blaze_typeck::ItemKey(u128::from_be_bytes(shared.reads.cell(&data).0[..16].try_into().expect("a digest prefix")));
                     let keys = blaze_ladder::front2::keys::Keys::new();
@@ -5785,24 +5875,32 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                     }
                 }
             }
-            // AN INCLUDED DATA FILE IS A READ of the body that included it (rule 21): its file's
-            // `WHOLE` cell with today's digest, so an edit of the file enters the body again. A file
-            // with no available FileItems record still has a name: its WHOLE cell reads ABSENT.
+            // AN INCLUDED DATA FILE IS A READ of the body that included it (rule 21), with the
+            // digest of what the body was handed (job_texts.rs `read_data`), so an edit of the
+            // file enters the body again: through its `FileItems` record when today's plan has one
+            // (a literal include), else through its checkout-read `Given` cell, the one a build
+            // script's `file:` read of it has, followed from the next request on ([`data_read`]).
             mem.allocating = "the included data-file read list";
             let mut data_reads = blaze_own::AVec::new_in(w);
-            let mut data_refused: Option<&'static str> = None;
-            for &(path, _) in &opened.sources.0.data.borrow()[data_at..] {
-                let id = CellId { of: Name::file(path.as_bytes()), cell: WHOLE };
-                data_reads.push(id);
-                if data_refused.is_none() {
-                    data_refused = shared.missing_data(one.label, path, id);
+            let mut data_seen = blaze_own::AVec::new_in(w);
+            let mut data_unnamed = false;
+            for &(path, _, bytes) in &opened.sources.0.data.borrow()[data_at..] {
+                let read = data_read(shared.reads, path, bytes);
+                data_reads.push(read.id);
+                data_seen.push((read.id, read.seen));
+                match read.cell {
+                    DataCell::Planned => {}
+                    DataCell::Followed => {
+                        // PLANTED CONTROL, tests only (rule 23): the leaf is never kept, so no
+                        // task defines the cell and an edit of the file is missed.
+                        #[cfg(test)]
+                        if mem.fault == Some(BodyFault::DropDataLeaf) {
+                            continue;
+                        }
+                        run_out.data_files.push((blaze_own::String::from_str_in(path, alloc), read.seen));
+                    }
+                    DataCell::Unnamed => data_unnamed = true,
                 }
-            }
-            if let Some(words) = data_refused && !matches!(said, Some(Said::Panicked)) {
-                // The checker saw bytes with no digest. Only the unavailable-file refusal
-                // is justified until the first such file acquires a record.
-                said = Some(Said::Refused(words));
-                seed_refused = false;
             }
             // D111, A BODY'S CALL THAT READ OUTSIDE ITS PACKAGE (inside the workspace): a warning
             // finding of this body at the call, with the words names/include_outside.rs gives the
@@ -5914,6 +6012,8 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                     let row = row_of(wide, one.held, &data_reads, shared, &mut mem, sc, alloc);
                     Outcome::failed(&one.task, row, alloc)
                 };
+                let (mut done, stands) = (done, data_stands(stands, data_unnamed));
+                saw_data(&mut done.reads, &data_seen);
                 #[cfg(test)]
                 let (done, stands) = match mem.fault {
                     Some(BodyFault::OweMissingFact) => (done, Stands::OwedNextRequest),
@@ -5953,6 +6053,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                 defines.push((blaze_ladder::front2::tables::task::VERDICT_CELL, out_id));
             }
             let mut done = Outcome::made(&one.task, out_id, defines, row_of(wide, one.held, &data_reads, shared, &mut mem, sc, alloc), findings, failed);
+            saw_data(&mut done.reads, &data_seen);
             // A head it read has no frozen head: the body fails by that read (rule 3), naming the
             // head and quoting why (engine_head_notes.rs), its reads kept so the head's repair
             // enters it again.
@@ -5993,7 +6094,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                     Said::BorrowsUnchecked(words)
                 }
             });
-            Ok(BodyResult { done, note: said.map(|said| (said, None)), found, locals, typed, untyped_clean, checked: true, stands: Stands::ByReads })
+            Ok(BodyResult { done, note: said.map(|said| (said, None)), found, locals, typed, untyped_clean, checked: true, stands: data_stands(Stands::ByReads, data_unnamed) })
         };
         #[cfg(test)]
         let outcome = if shared.plants.check_only_guard {
@@ -6048,12 +6149,21 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                         let mut said = Said::FrameUsedUp { used: used as u64, reserve: reserve as u64, what, offers: mem.body_offers, kept: mem.recorded, kinds: mem.kinds.top(), stands };
                         let done = if stands == Stands::ByReads {
                             let log = opened.sources.0.data.borrow();
-                            let data = log[data_at..].iter().map(|(path, _)| {
-                                let id = CellId { of: Name::file(path.as_bytes()), cell: WHOLE };
-                                if matches!(said, Said::FrameUsedUp { .. }) && let Some(words) = shared.missing_data(one.label, path, id) {
-                                    said = Said::Refused(words);
+                            // Each data read as the checked body's ([`data_read`]): a computed
+                            // include's file followed too, so its `Given` task's first answer
+                            // enters the refused body again; one no cell names refused by name.
+                            let data = log[data_at..].iter().map(|&(path, _, bytes)| {
+                                let read = data_read(shared.reads, path, bytes);
+                                match read.cell {
+                                    DataCell::Planned => {}
+                                    DataCell::Followed => run_out.data_files.push((blaze_own::String::from_str_in(path, alloc), read.seen)),
+                                    DataCell::Unnamed => {
+                                        if matches!(said, Said::FrameUsedUp { .. }) && let Some(words) = shared.missing_data(one.label, path, read.id) {
+                                            said = Said::Refused(words);
+                                        }
+                                    }
                                 }
-                                id
+                                read.id
                             });
                             let done = shared.refused_scope(one, group, data, alloc);
                             mem.count_scope(&done);
@@ -6501,6 +6611,75 @@ fn row_of<'a, R: ?Sized + CellDigests>(mut wide: DistinctIds<'_>, held: &[CellId
     row.extend(ids.iter().map(|id| (*id, shared.reads.cell(id))));
     mem.count_row(&row);
     row
+}
+
+/// Which cell a body's read of an included data file is ([`data_read`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DataCell {
+    /// The file's `FileItems` record's `WHOLE`: today's plan lists the file (a literal include,
+    /// data_include.rs), its digest the record's out (`data_out`, or `absent_out`).
+    Planned,
+    /// Its checkout-read `Given` cell (engine_script_reads.rs `file_read`): no `FileItems` task
+    /// defines the file (a computed include), so the read is kept as a leaf row, followed by the
+    /// sweep and planned as its `Given` task from the next request on, as a build script's
+    /// `file:` read of it is. Its digest is the sandbox's answer of what the body was handed.
+    Followed,
+    /// No cell names it (no checkout-relative path): the row is owed ([`data_stands`]).
+    Unnamed,
+}
+
+/// One body's read of an included data file: its cell, what it saw there, and which cell it is.
+struct DataRead {
+    id: CellId,
+    seen: ContentId,
+    cell: DataCell,
+}
+
+/// The cell a body's read of the data file `path` is, given what it was handed (`bytes`, job_texts.rs
+/// `read_data`). A plan that lists the file makes it [`DataCell::Planned`]; else the read is the
+/// file's `Given` cell, whose leaf the request keeps (`RunOut::data_files`). The digest the row
+/// keeps is what the body saw, so a file edited between the read and the next request's sweep
+/// enters the body when its `Given` task defines the cell with the new answer: the first
+/// request needs no owing, and the next enters no body when nothing moved.
+fn data_read<R: ?Sized + CellDigests>(reads: &R, path: &str, bytes: Option<&[u8]>) -> DataRead {
+    let file = CellId { of: Name::file(path.as_bytes()), cell: WHOLE };
+    let planned = || bytes.map_or_else(crate::data_include::absent_out, crate::data_include::data_out);
+    if reads.row_failed(file.of) == Some(false) {
+        return DataRead { id: file, seen: planned(), cell: DataCell::Planned };
+    }
+    match crate::engine_script_reads::file_read(path, bytes) {
+        Some((given, answer)) => DataRead { id: CellId { of: given, cell: WHOLE }, seen: answer, cell: DataCell::Followed },
+        None => DataRead { id: file, seen: planned(), cell: DataCell::Unnamed },
+    }
+}
+
+/// How a body's row stands when one of its data reads has no cell at all (`unnamed`): owed to
+/// the next request, whatever its reads say, since nothing moves for that file when it is
+/// edited (blaze-engine invariants 4 and 13); else as `stands`.
+fn data_stands(stands: Stands, unnamed: bool) -> Stands {
+    match unnamed {
+        true => Stands::OwedNextRequest,
+        false => stands,
+    }
+}
+
+/// Each included data file's read in `row` holds the digest the body saw (job_texts.rs
+/// `read_data`), not today's cell: equal while the file's `FileItems` record ran on the same
+/// bytes, and the bytes it read when the file moved under the request or no record defines it,
+/// so the row is entered again exactly when its cell holds another digest. `row` is sorted by
+/// cell ([`row_of`], `Shared::refused_scope`), and each holds every data read: an empty row is
+/// a row on no read (a panic), owed whatever it read.
+fn saw_data(row: &mut SVec<'_, (CellId, ContentId)>, seen: &[(CellId, ContentId)]) {
+    if row.is_empty() {
+        return;
+    }
+    for &(id, digest) in seen {
+        // Placed as it is by both (`BodyMem::place` inserts the id itself): a miss is this
+        // file's bug, failing the one body (rule 20).
+        let at = row.binary_search_by_key(&id, |(cell, _)| *cell)
+            .unwrap_or_else(|_| unreachable!("a body's row lost its read of the data file {id:?} (engine_bodies.rs `row_of`)"));
+        row[at].1 = digest;
+    }
 }
 
 /// `more` added into `into`, part by part.

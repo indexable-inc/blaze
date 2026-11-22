@@ -606,6 +606,10 @@ pub enum StoreError {
     NotAnIndex { root: ContentId, key: ContentId, tag: Tag },
     /// An index of `keys` keys (or an indexed root of `keys` indexes), past the most one holds.
     IndexOver { keys: u64, most: u64 },
+    /// The root `root` was asked to name `key`, which no one put: not this command's put, not
+    /// held, not committed in a namespace read (blaze-cas `Driven::root_names_held`, D200's
+    /// set-time guard). A writer's bug, refused when the root is set, on every boot.
+    RootNamesUnheld { root: String, key: ContentId },
     /// A bucket object (`object`: its name in the bucket) was refused or failed: `what`, with
     /// the bucket's status (0 when it gave none).
     RemoteObject { what: &'static str, object: String, status: u32 },
@@ -696,6 +700,9 @@ impl fmt::Display for StoreError {
             }
             StoreError::IndexOver { keys, most } => {
                 write!(f, "an index of {keys} keys is past the most one holds, {most}: refused, never cut")
+            }
+            StoreError::RootNamesUnheld { root, key } => {
+                write!(f, "the root `{root}` names {key:?}, which was never put (not this command's put, not held, not committed): a writer's bug, refused when the root is set")
             }
             StoreError::RemoteObject { what, object, status } => {
                 write!(f, "the remote cache: {what} for `{object}` ({status})")

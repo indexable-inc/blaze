@@ -60,7 +60,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         let PNode::Adt(key, l) = view.node(t).map_err(|_| refuse(Refusal::Malformed("a type past the ground table")))? else {
             return Ok(None);
         };
-        if !facts.repr(key).simd {
+        if !facts.repr(key).map_err(|m| refuse(m.head()))?.simd {
             return Ok(None);
         }
         let adt = facts.adt(key).ok_or(refuse(Refusal::NoAdt(key)))?;

@@ -115,6 +115,8 @@ pub mod cow;
 pub mod deque;
 mod error;
 pub mod fixed;
+// A lookup's answer across a crate: Known, Absent or Unknown (D193 point 5).
+pub mod found;
 pub mod heap4;
 pub mod lists;
 pub mod make;

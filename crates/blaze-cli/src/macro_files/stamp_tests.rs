@@ -2,7 +2,8 @@
 //! and 77), on bstd's simulated file system with a model of the file times.
 //!
 //! The crate `mac` (`Cargo.toml`, `src/lib.rs`, `src/expand/mod.rs`, with `target/` and `.git/`
-//! beneath it that the files digest leaves out, beside `app/src/main.rs` outside it) is read once
+//! beneath it that the files digest leaves out and `.data/` and `src/target/` that it walks,
+//! beside `app/src/main.rs` outside it) is read once
 //! as the layout reads it ([`read_row`]): one `MacroFolder` row a folder, one `MacroFile` row a
 //! file, and the `MacroFiles` row whose id is `blaze_proc_macro::module::files_digest` of them.
 //! Then one step, the clock past the stamps' granularity, and the sweep (`Follow::follow`). The
@@ -11,8 +12,8 @@
 //! again, as main.rs reads it (`units::lay` calls [`read_row`]).
 //!
 //! The oracle of a digest is `files_digest` over the model's content: every file under `mac/`
-//! by its crate-relative path, but those under a folder named `target` or starting with `.`
-//! (blaze-proc-macro `package_files`).
+//! by its crate-relative path, but those under the crate's root `target` or under a `.git`
+//! (the one package rule, blaze-build-script `served::in_package`).
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap as StdMap;
@@ -31,12 +32,15 @@ const TICK: u64 = 1_000;
 /// Past the granularity: every stamp written before is settled.
 const SETTLE: u64 = 3 * TICK;
 const LIB: &str = "mac/src/lib.rs";
-const FILES: [(&str, &[u8]); 6] = [
+const FILES: [(&str, &[u8]); 8] = [
     ("mac/Cargo.toml", b"[package]\nname = \"mac\"\n[lib]\nproc-macro = true\n"),
     (LIB, b"mod expand;\n#[proc_macro]\npub fn same(input: TokenStream) -> TokenStream { input }\n"),
     ("mac/src/expand/mod.rs", b"pub fn nothing() {}\n"),
-    ("mac/target/debug/junk", b"left out: a folder named target"),
-    ("mac/.git/HEAD", b"left out: a folder starting with a dot"),
+    ("mac/target/debug/junk", b"left out: a folder named target at the crate's root"),
+    ("mac/.git/HEAD", b"left out: a version-control folder"),
+    // The twins: walked, an input of the key (the one package rule, served.rs `in_package`).
+    ("mac/.data/table.txt", b"walked: a dot-folder that is no VCS's"),
+    ("mac/src/target/mod.rs", b"walked: a folder named target beneath the root"),
     ("app/src/main.rs", b"fn main() {}\n"),
 ];
 
@@ -90,8 +94,9 @@ fn oracle(content: &StdMap<String, std::vec::Vec<u8>>) -> String {
     let mut files: std::vec::Vec<(String, std::vec::Vec<u8>)> = std::vec::Vec::new();
     for (path, bytes) in content.iter() {
         let Some(rel) = path.strip_prefix("mac/") else { continue };
+        // Written out, not asked of `in_package`: the crate's root `target`, and any `.git`.
         let folders = rel.split('/').collect::<std::vec::Vec<_>>();
-        let left_out = folders[..folders.len() - 1].iter().any(|name| *name == "target" || name.starts_with('.'));
+        let left_out = (folders.len() > 1 && folders[0] == "target") || folders[..folders.len() - 1].contains(&".git");
         if !left_out {
             files.push((rel.to_string(), bytes.clone()));
         }

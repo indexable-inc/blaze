@@ -1,6 +1,6 @@
 //! Code records kept across commands: blaze-ladder's `CodeStore` over the ONE store a user, the
 //! plain store the command already opens at `<home>/.blaze/` plain_place.rs `STORE_DIR`, the
-//! folder of this blaze's forms (`v2/store/f5s2`, D160) (store.rs,
+//! folder of this blaze's forms (`v2/store/f5s3`, D160) (store.rs,
 //! `open_for_command`), so an entry made by one `blaze run` is found by the next one by its key,
 //! read in place, and never emitted again (AGENTS.md, "The design": everything kept is a record,
 //! keyed from text before the work, written once, read in place; a command answers and exits).
@@ -14,7 +14,7 @@
 //! (rule 25); other bytes are the store's `TwoValues`, answered as
 //! `StoreError::TwoValues`: the alarm that the key missed an input (rule 21), never overwritten.
 //!
-//! Every entry is filed under [`CODE_TAG`], apart from the drive's records (`DRIVE_TAG`), and in
+//! Every entry is filed under [`ReservedTag::Code`], apart from the drive's records (`ReservedTag::Drive`), and in
 //! `Namespace::LOCAL` only: an entry is the machine code of the program's own bodies, which never
 //! leaves the machine unless an organisation opts in (the code review's "Trust" rule). A
 //! toolchain-only entry made by a trusted builder for the shared namespace is later work.
@@ -22,23 +22,22 @@
 //! The key holds the code builder's identity, the edition and the emitting tier, and an
 //! instance's entry carries its read list (blaze-ladder code_reads.rs), checked when the entry is
 //! found. An entry is put under its CONTENT key, and its code key is a POINTER to it
-//! (`Lent::point`, the plain store's `POINTER_TAG` record: the newest commit's value wins, a
+//! (`Lent::point`, the plain store's `ReservedTag::Pointer` record: the newest commit's value wins, a
 //! stale entry's rebuild replaces it), committed with the entry it names.
 
 use core::cell::RefCell;
 
 use blaze_cas::Key as CasKey;
-use blaze_cas::plain::{INDEX_KEYS_MOST, Lent, LentError, Namespace, Tag};
+use blaze_cas::plain::{INDEX_KEYS_MOST, Lent, LentError, Namespace};
 use blaze_core::Driver;
+use blaze_keyed::kind::ReservedTag;
 use blaze_ladder::code_records::{CodeClass, CodeKey, CodeStore, StoreError};
 
 use crate::store::plain_place::{COMMIT_BYTES, StoreAlloc};
 
-/// The tag every code entry is filed under in the plain store's index: its own number, apart
-/// from the store's roots (`u16::MAX`), the startup image (`u16::MAX - 1`) and the drive's
-/// records (`DRIVE_TAG`, `u16::MAX - 2`). A record under a code key with another tag is refused
-/// by name, never read as code.
-pub(crate) const CODE_TAG: Tag = Tag(u16::MAX - 3);
+// Every code entry is filed under [`ReservedTag::Code`] in the plain store's index (blaze-keyed's
+// registry of reserved tags). A record under a code key with another tag is refused by name,
+// never read as code.
 
 /// The code index over the command's store (the module doc). `'m` is the borrow of the
 /// command's [`Lent`]; every byte a get returns lives as long.
@@ -123,11 +122,12 @@ fn refused(key: CodeKey, error: &LentError) -> StoreError {
         LentError::TwoValues { .. } => StoreError::TwoValues { key },
         LentError::Store { doing, .. } => StoreError::Failed { key, what: *doing },
         LentError::Arena { .. } => StoreError::Failed { key, what: "the store's arena could not take the entry: its allocator refused" },
+        LentError::ArenaReserve { .. } => StoreError::Failed { key, what: "the store's shared arena could not take the entry: its reservation was used up" },
         LentError::NotWritable { .. } => StoreError::Failed { key, what: "the local namespace is not writable by this store" },
         LentError::PointerTag { .. } => StoreError::Failed { key, what: "a code key holds a record where a pointer was asked, or a pointer where an entry was" },
         LentError::PointsAtNothing { .. } => StoreError::Failed { key, what: "a code key was pointed at an entry the store does not hold" },
         LentError::TargetGone { .. } => StoreError::Failed { key, what: "a code key's pointer names an entry the store no longer holds" },
-        LentError::TargetTag { .. } => StoreError::Failed { key, what: "a code key's pointer names a record filed under another tag than CODE_TAG" },
+        LentError::TargetTag { .. } => StoreError::Failed { key, what: "a code key's pointer names a record filed under another tag than ReservedTag::Code" },
         LentError::PointerForm { .. } => StoreError::Failed { key, what: "a code key's pointer record does not hold one key" },
     }
 }
@@ -136,11 +136,11 @@ impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
     fn get(&self, key: CodeKey) -> Result<Option<&[u8]>, StoreError> {
         match self.lent.get(&CasKey(key.0)) {
             Ok(None) => Ok(None),
-            Ok(Some(lend)) if lend.tag == CODE_TAG => {
+            Ok(Some(lend)) if ReservedTag::Code.is(lend.tag) => {
                 self.reach(key, &[CasKey(key.0)])?;
                 Ok(Some(lend.bytes))
             }
-            Ok(Some(_)) => Err(StoreError::Failed { key, what: "a record under a code key is filed under another tag than CODE_TAG: not a code entry" }),
+            Ok(Some(_)) => Err(StoreError::Failed { key, what: "a record under a code key is filed under another tag than ReservedTag::Code: not a code entry" }),
             // A code key held as a pointer has no entry under it: its entry is the pointer's
             // target, read through `pointed` (`entry_of` asks it first).
             Err(LentError::PointerTag { .. }) => Ok(None),
@@ -153,17 +153,17 @@ impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
             self.lent.commit().map_err(|error| refused(key, &error))?;
             self.commits += 1;
         }
-        self.lent.put(&CasKey(key.0), Namespace::LOCAL, CODE_TAG, bytes).map_err(|error| refused(key, &error))?;
+        self.lent.put(&CasKey(key.0), Namespace::LOCAL, ReservedTag::Code.tag(), bytes).map_err(|error| refused(key, &error))?;
         self.wrote(class, key, &[CasKey(key.0)])
     }
 
     /// The content key the code key `key` points at (`Lent::pointed`, the newest commit's
-    /// value), its target an entry under [`CODE_TAG`]. A target compaction let go of (a
+    /// value), its target an entry under [`ReservedTag::Code`]. A target compaction let go of (a
     /// program root that expired, store/roots.rs) is the cache's miss: the instance is built again, put, and `key` pointed anew; that is the
     /// path every miss takes, not another route.
     fn pointed(&self, key: CodeKey) -> Result<Option<CodeKey>, StoreError> {
-        match self.lent.pointed(CODE_TAG, &CasKey(key.0)) {
-            // A pointer is kept by naming its name AND its target (blaze-cas `POINTER_TAG`: reach
+        match self.lent.pointed(ReservedTag::Code.tag(),&CasKey(key.0)) {
+            // A pointer is kept by naming its name AND its target (blaze-keyed `ReservedTag::Pointer`: reach
             // does not follow a pointer), so both are this run's.
             Ok(Some(target)) => {
                 self.reach(key, &[CasKey(key.0), target])?;
@@ -186,7 +186,7 @@ impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
             self.lent.commit().map_err(|error| refused(key, &error))?;
             self.commits += 1;
         }
-        self.lent.point(CODE_TAG, &CasKey(key.0), &CasKey(content.0)).map_err(|error| refused(key, &error))?;
+        self.lent.point(ReservedTag::Code.tag(),&CasKey(key.0), &CasKey(content.0)).map_err(|error| refused(key, &error))?;
         self.wrote(class, key, &[CasKey(key.0), CasKey(content.0)])
     }
 }

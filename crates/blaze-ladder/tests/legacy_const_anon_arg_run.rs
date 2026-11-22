@@ -73,6 +73,28 @@ pub extern \"C\" fn main() -> i32 {
     assert_eq!(got, Ok(51), "`12 - $r` at `$r` = 4 is the constant 8");
 }
 
+/// The macro-written twin that NAMES an item: `BASE - $r` has a path, so its marks keep
+/// placing `BASE` where the macro wrote it (front2 body.rs `body_anon`): 1 + 55.
+#[test]
+fn a_macro_written_legacy_const_argument_naming_a_constant_runs() {
+    let got = run("
+const BASE: u32 = 12;
+
+macro_rules! shr_by {
+    ($v:expr, $r:literal) => {
+        shr($v, BASE - $r)
+    };
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    (shr_by!(256, 4) + 55) as i32
+}
+");
+    println!("MACRO-WRITTEN NAMING LEGACY ARGUMENT: {got:?}");
+    assert_eq!(got, Ok(56), "`BASE - $r` at `$r` = 4 is the constant 8");
+}
+
 /// The twin: a block at the listed position, `{ 4 + 4 }`: 1 + 60.
 #[test]
 fn a_block_legacy_const_argument_is_its_anonymous_constant() {

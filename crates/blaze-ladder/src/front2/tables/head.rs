@@ -797,6 +797,9 @@ pub fn file_frozen<'n, N: NamesSource<'n>>(names: N, cell: Want, frozen: FrozenH
     }
     let members = members_of(names, cell, scratch);
     let mut text_of = |at: HeadAt| fn_text(names, cell, &members, at);
+    // Where the store's type table stands before the import: the nodes past it are this
+    // record's ([`file_named_items`]).
+    let tys_before = store.tys.view().len_now();
     let heads = match crate::front2::project::head_digest::import_with_opaque_origins(names, keys, store, &frozen, &mut text_of, scratch, scratch) {
         Ok(heads) => heads,
         // A record of another form (an old home): its regions read as `RecordForm` while the
@@ -811,6 +814,7 @@ pub fn file_frozen<'n, N: NamesSource<'n>>(names: N, cell: Want, frozen: FrozenH
         }
     };
     file_keys(cell, &members, &heads, keys)?;
+    file_named_items(names, cell, store, keys, tys_before)?;
     // Each head's recorded regions (form 11) against its record: laid exactly when the record
     // holds the section, and none only for a kind that holds none.
     for ((at, head), e) in heads.iter().zip(frozen.heads()) {
@@ -896,6 +900,34 @@ pub(crate) fn member_definition<'n, N: NamesSource<'n>>(names: N, keys: &Keys, i
 /// (heads.rs `keys.member`): a struct's or union's constructor; a trait's fns, associated
 /// types and constants; an impl's fns and constants. A member the heads do not name (one its
 /// crate's cfg leaves out) is not filed.
+/// The library key of each ADT and fn an imported record's types name (the store's type nodes
+/// past `from`, which the import added), filed in the body's `keys` as lowering the head would
+/// have filed it when it resolved the path that names it. Found through the IMPORT's names
+/// (the seed's), so the body's read list gets no `Names(Beginning)` row per item named: the
+/// key's library key is a function of the head's record, whose fact the body reads already
+/// (its bytes name the item by checker key; a second key of those 16 bytes is refused as
+/// `KeysBeginAlike` wherever it is met). Without it a body over frozen heads asked
+/// `Keys::library_in` of each such item through its own recorded view (buckets.rs
+/// `coherence_wants` and `inherent_crates`, `facts.library`): 41 reads more than the lowering
+/// store on a 40-link method chain (front2 tables/enter_once_tests.rs, 2026-11-21).
+fn file_named_items<'n, N: NamesSource<'n>>(names: N, cell: Want, store: &Store<'n>, keys: &Keys, from: usize) -> Result<(), FreezeError> {
+    let view = store.tys.view();
+    for node in view.nodes().skip(from) {
+        let k = match *node {
+            blaze_typeck::PNode::Adt(k, _) | blaze_typeck::PNode::FnDef(k, _) => k,
+            _ => continue,
+        };
+        if keys.origin(k).is_some() {
+            continue;
+        }
+        // A key no item row begins with (a body-local item, a member) stays unfiled: its
+        // origin is the body's, filed where it is lowered.
+        let Some(lib) = names.key_beginning(k.0.to_be_bytes()) else { continue };
+        keys.item(lib).map_err(|error| FreezeError::Head { want: cell, error: HeadError::Key(error) })?;
+    }
+    Ok(())
+}
+
 fn file_keys(cell: Want, members: &[MemberText<'_>], heads: &[(HeadAt, Head<'_>)], keys: &Keys) -> Result<(), FreezeError> {
     let container = checker_of(cell.key());
     let clash = |error| FreezeError::Head { want: cell, error: HeadError::Key(error) };

@@ -1,6 +1,6 @@
 //! Stores of other forms beside this blaze's (D160: a store's format is part of its place).
 //!
-//! The one store of this blaze is `<home>/.blaze/`[`STORE_DIR`] (`v2/store/f5s2`). Beside it,
+//! The one store of this blaze is `<home>/.blaze/`[`STORE_DIR`] (`v2/store/f5s3`). Beside it,
 //! under [`STORE_ROOT`], a home may hold stores this blaze does not read:
 //!
 //! - THE LEGACY LAYOUT: a store of format 4 or before, whose files (`head`, `flip`, `seg-*`,

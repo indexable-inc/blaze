@@ -1,0 +1,17 @@
+[package]
+name = "blaze-rungs"
+description = "The ladder's programs as data (D197 root 6, piece (c)): each rung's source files, manifest and expected status and output, read at compile time from crates/blaze-cli/tests/ladder; a leaf with no dependency, so tests below and above blaze-ladder read the same rungs without a cycle"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true

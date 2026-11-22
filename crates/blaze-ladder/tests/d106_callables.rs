@@ -1484,6 +1484,13 @@ pub extern \"C-unwind\" fn main() -> i32 {{
 }
 
 /// The closure twin: a `move` closure holding a `Count`, cloned, then called: `41 + 1` = 42.
+/// The closure names `a` whole (`read(&a)`), so it captures `a: Count` by value (the
+/// Reference, "Closure expressions", capture modes: a `move` closure captures each place it
+/// uses by value), and is `Clone` because `Count` is ("Closure types", `Clone`: when every
+/// captured value is). The fixture before read `a.0`, which captures the place `a.0: u8`
+/// alone; `u8: Clone` is core's impl, which this `no_core` text has none of, so the check's
+/// E0277 (19:22 run) was Rust's answer, and with such an impl the clone would not have been
+/// `Count`'s (`40 + 1`).
 #[test]
 fn a_closure_cloned_field_wise() {
     row(
@@ -1493,9 +1500,13 @@ fn a_closure_cloned_field_wise() {
 #[unsafe(no_mangle)]
 pub extern \"C-unwind\" fn main() -> i32 {{
     let a = Count(40);
-    let f = move || a.0;
+    let f = move || read(&a);
     let g = Clone::clone(&f);
     (call_none(g) + 1) as i32
+}}
+
+fn read(c: &Count) -> u8 {{
+    c.0
 }}
 
 fn call_none<F: Fn() -> u8>(f: F) -> u8 {{

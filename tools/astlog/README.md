@@ -85,6 +85,7 @@ A comment containing `astlog-ignore` suppresses findings on its own line or the 
 
 `rules/` holds blaze's rules files, run by blaze.yaml's workspace check after `blaze check --workspace`:
 
+- `expand-hand-extent.astlog`: a `','`, `'<'` or `'>'` character literal in crates/blaze-expand/src outside extent.rs, which is how a hand walk finds an element's end; every extent there is the parser's (extent.rs). Its fixtures name the path they are placed at (`rules/tests/expand-hand-extent/path`), since the rule is scoped by `file-path`.
 - `rust-locks.astlog` (from ix): the same lock taken twice in one statement while the first temporary guard still lives, which deadlocks.
 
 Lints that need types (the locks, channels and hashers ports: `blaze::std_lock`, `blaze::std_mpsc`, `blaze::fx_hash`) are blaze-lints', with machine-applicable fixes that `blaze check --fix` applies, not astlog rules: syntax alone cannot tell a parking_lot lock from another.
@@ -99,7 +100,7 @@ PYTHONPATH=tools/typed-input/src python3 tools/astlog/scan.py \
 
 With `"fix": true` it applies the rules' rewrites instead, file by file, and lists the files it changed.
 
-A rule's fixtures are `rules/tests/<rules file>/`: `bad.fixture`, the findings it must report in `bad.expected` (`line:column rule`, in scan order), `good.fixture`, which is `bad.fixture` fixed (or the same rules' clean case when they have no rewrites), and any other `good*.fixture`, which must report nothing and need no fix. `core/tests/rules.rs` checks them, and a new rules file needs a test there.
+A rule's fixtures are `rules/tests/<rules file>/`: `bad.fixture`, the findings it must report in `bad.expected` (`line:column rule`, in scan order), `good.fixture`, which is `bad.fixture` fixed (or the same rules' clean case when they have no rewrites), and any other `good*.fixture`, which must report nothing and need no fix. A `path` file there names the relative path every fixture is placed at (default `fixture.rs`), for a rule scoped by `file-path`. `core/tests/rules.rs` checks them, and a new rules file needs a test there.
 
 ## Prior art
 

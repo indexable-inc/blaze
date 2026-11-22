@@ -43,16 +43,16 @@ impl LayoutFacts for World {
         None
     }
 
-    fn repr(&self, _: ItemKey) -> ReprAttrs {
-        ReprAttrs::RUST
+    fn repr(&self, _: ItemKey) -> Result<ReprAttrs, Missing> {
+        Ok(ReprAttrs::RUST)
     }
 
     fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> {
         Ok(None)
     }
 
-    fn valid_range(&self, _: ItemKey) -> ValidRange {
-        ValidRange::default()
+    fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> {
+        Ok(ValidRange::default())
     }
 
     fn coroutine(&self, owner: ItemKey, ordinal: u32) -> Option<CoroutineFacts<'_>> {
@@ -215,16 +215,16 @@ impl LayoutFacts for NicheWorld {
         })
     }
 
-    fn repr(&self, _: ItemKey) -> ReprAttrs {
-        ReprAttrs::RUST
+    fn repr(&self, _: ItemKey) -> Result<ReprAttrs, Missing> {
+        Ok(ReprAttrs::RUST)
     }
 
     fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> {
         Ok(None)
     }
 
-    fn valid_range(&self, _: ItemKey) -> ValidRange {
-        ValidRange::default()
+    fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> {
+        Ok(ValidRange::default())
     }
 
     fn coroutine(&self, owner: ItemKey, ordinal: u32) -> Option<CoroutineFacts<'_>> {

@@ -25,7 +25,8 @@ use blaze_ids::{Domain, Hasher};
 use blaze_own::{AVec, Alloc, Box};
 use blaze_surface::{Binding, BindingState, Def, DefKind, Edition, Namespace, Visibility};
 
-use crate::crate_scope::{Dep, DepScope};
+use crate::crate_scope::Dep;
+use crate::scope_record::Reaches;
 use crate::read::{NameAnswer, Read};
 use crate::resolve::Built;
 use crate::task::{Held, MacroBody, MacroSrc, Own, Records, answer};
@@ -320,7 +321,7 @@ pub(crate) struct CrateFacts<'a> {
     pub(crate) edition: Edition,
     pub(crate) proc_key: Option<CrateItemKey>,
     /// A set: digested sorted and once each, whatever order it is held in.
-    pub(crate) reaches: &'a [CrateItemKey],
+    pub(crate) reaches: Reaches<'a>,
 }
 
 /// The digest of a [`Kind::Crate`] answer: key, root, name, edition, proc key, then `reaches`
@@ -334,19 +335,19 @@ pub(crate) fn facts_digest(facts: CrateFacts<'_>, alloc: Alloc<'_>) -> ContentId
         None => h.update(&[0]),
         Some(k) => h.update(&[1]).id(&k.0),
     };
-    let feed = |h: &mut Hasher, keys: &[CrateItemKey]| {
+    let feed = |h: &mut Hasher, keys: Reaches<'_>| {
         h.update(&count(keys.len()).to_le_bytes());
-        for k in keys {
+        for k in keys.iter() {
             h.id(&k.0);
         }
     };
-    if reaches.windows(2).all(|w| w[0] < w[1]) {
+    if (1..reaches.len()).all(|i| reaches.get(i - 1) < reaches.get(i)) {
         feed(&mut h, reaches);
     } else {
-        let mut set = AVec::from_slice_in(reaches, alloc);
+        let mut set = AVec::from_iter_in(reaches.iter(), alloc);
         set.sort_unstable();
         set.dedup();
-        feed(&mut h, set.as_slice());
+        feed(&mut h, Reaches::Keys(set.as_slice()));
     }
     h.finish()
 }
@@ -421,8 +422,8 @@ pub enum Stale<'s> {
     Answer { krate: usize, kind: Kind, module: ItemKey, name: &'s str },
 }
 
-/// A handed crate as this call has it: its index, exports digest and decoded record.
-pub type Now<'a> = (usize, ContentId, &'a DepScope<'a>);
+/// A handed crate as this call has it: its index, exports digest and record (read in place).
+pub(crate) type Now<'a> = (usize, ContentId, Dep<'a>);
 
 struct Bytes<'s> {
     bytes: &'s [u8],
@@ -451,7 +452,7 @@ impl<'s> Bytes<'s> {
 /// Whether the read list `bytes` holds against this call's records (`now`, by crate key):
 /// `None` when it holds. A crate whose exports digest is the one it was handed costs nothing
 /// more; each question of a crate whose digest moved is answered again from its record.
-pub fn check<'a>(bytes: &'a [u8], now: &dyn Fn(CrateItemKey) -> Option<Option<Now<'a>>>, alloc: Alloc<'a>) -> Result<Option<Stale<'a>>, ReadListError> {
+pub(crate) fn check<'a>(bytes: &'a [u8], now: &dyn Fn(CrateItemKey) -> Option<Option<Now<'a>>>, alloc: Alloc<'a>) -> Result<Option<Stale<'a>>, ReadListError> {
     let mut r = Bytes { bytes, at: 0 };
     if r.take(4, "the magic")? != MAGIC || r.u32("the version")? != VERSION as usize {
         return Err(ReadListError::NotThisRecord);
@@ -468,7 +469,7 @@ pub fn check<'a>(bytes: &'a [u8], now: &dyn Fn(CrateItemKey) -> Option<Option<No
         let Some(found) = now(key) else { return Ok(Some(Stale::NotInGraph(key))) };
         let Some((g, digest, record)) = found else { return Ok(Some(Stale::NotWritten(key))) };
         by_prefix.insert(key.prefix(), slots.len());
-        slots.push(Some(Dep::Record(record)));
+        slots.push(Some(record));
         index.push(g);
         if digest != was {
             moved.push(key.prefix());
@@ -537,7 +538,7 @@ impl<'a> Records<&'a str> for Check<'_, '_, 'a> {
             return Held::Scope { scope, krate: other.key(), chain: other.chain(key) };
         }
         if let Some(v) = other.enum_of(key) {
-            return Held::Variants { variants: AVec::from_slice_in(v, self.alloc), krate: other.key() };
+            return Held::Variants { variants: AVec::from_iter_in(v.iter(), self.alloc), krate: other.key() };
         }
         Held::Failed { krate: other.key(), chain: None }
     }

@@ -48,6 +48,10 @@ impl Names for Nameless {
     fn name(&self, _: Outside) -> Option<Named<'_>> {
         None
     }
+
+    fn routines(&self) -> crate::RoutinePlaces {
+        crate::RoutinePlaces::NONE
+    }
 }
 
 /// `f() = ret`, with one stack slot of `slot` bytes aligned to `1 << align` and nothing else:

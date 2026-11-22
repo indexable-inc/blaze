@@ -840,7 +840,7 @@ lane); they keep the rule above: a stub's runtime call queues and never stores a
 The control thread places a known record without the parent: `Welcome` carries, for each slot
 whose fast record the manifest names and the store has, its key. Only a slot with no record
 crosses the socket. The warm start is the startup image (blaze-cas `plain::image`): the code
-records the last run of this manifest placed before `main`, in order, under `IMAGE_TAG` keyed by
+records the last run of this manifest placed before `main`, in order, under `ReservedTag::Image` keyed by
 `StartupImage::key_for(manifest)`. Before the start the driver looks it up and hands it to
 `Parent::warm(Some(rows) | None)`; every row's slot is looked up in that one call, the driver
 reads them in one pass in the store's `read_order` and places them before the child's first ask,

@@ -573,7 +573,7 @@ impl fmt::Display for NoTables {
 
 /// Why a question could not be filed from the impl tables: a fault of the TABLES (or of the
 /// crate list they are asked over), so every question that reads them meets it; a run stops
-/// on it (blaze-cli test_drive.rs `front_stops_suite`). A fault of one question is an
+/// on it (blaze-ladder scope.rs `CheckFail::scope`). A fault of one question is an
 /// [`ImplQuestionError`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TablesReadError {

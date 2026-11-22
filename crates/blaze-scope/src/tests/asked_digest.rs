@@ -12,6 +12,7 @@ use blaze_surface::{
 
 use crate::asked::{CrateFacts, facts_digest, lookup_digest, macro_digest, name_digest, shadow_digest};
 use crate::read::NameAnswer;
+use crate::scope_record::Reaches;
 use crate::task::{MacroBody, MacroSrc};
 
 fn k(n: u8) -> ItemKey {
@@ -46,7 +47,7 @@ fn mac(f: impl FnOnce(&mut MacroSrc<'static>)) -> Option<MacroSrc<'static>> {
 }
 
 fn facts(f: impl FnOnce(&mut CrateFacts<'static>)) -> CrateFacts<'static> {
-    let mut c = CrateFacts { key: ck(1), root: k(1), name: "c", edition: Edition::E2021, proc_key: None, reaches: &[] };
+    let mut c = CrateFacts { key: ck(1), root: k(1), name: "c", edition: Edition::E2021, proc_key: None, reaches: Reaches::Keys(&[]) };
     f(&mut c);
     c
 }
@@ -114,9 +115,9 @@ fn answer_digests_differ_in_every_field_and_every_variant() {
         facts_digest(facts(|c| c.edition = Edition::E2024), g),
         facts_digest(facts(|c| c.proc_key = Some(ck(1))), g),
         facts_digest(facts(|c| c.proc_key = Some(ck(2))), g),
-        facts_digest(facts(|c| c.reaches = base_reaches), g),
-        facts_digest(facts(|c| c.reaches = &base_reaches[..1]), g),
-        facts_digest(facts(|c| c.reaches = &base_reaches[1..]), g),
+        facts_digest(facts(|c| c.reaches = Reaches::Keys(base_reaches)), g),
+        facts_digest(facts(|c| c.reaches = Reaches::Keys(&base_reaches[..1])), g),
+        facts_digest(facts(|c| c.reaches = Reaches::Keys(&base_reaches[1..])), g),
     ];
     for (i, a) in digests.iter().enumerate() {
         for (j, b) in digests.iter().enumerate().skip(i + 1) {
@@ -128,9 +129,12 @@ fn answer_digests_differ_in_every_field_and_every_variant() {
     let shuffled: &'static [CrateItemKey] = &[CrateItemKey(ContentId([3; 32])), CrateItemKey(ContentId([2; 32]))];
     let repeated: &'static [CrateItemKey] =
         &[CrateItemKey(ContentId([3; 32])), CrateItemKey(ContentId([2; 32])), CrateItemKey(ContentId([3; 32]))];
-    let sorted = facts_digest(facts(|c| c.reaches = base_reaches), g);
-    assert_eq!(facts_digest(facts(|c| c.reaches = shuffled), g), sorted, "reaches in another order digests otherwise");
-    assert_eq!(facts_digest(facts(|c| c.reaches = repeated), g), sorted, "reaches with a repeat digests otherwise");
+    let sorted = facts_digest(facts(|c| c.reaches = Reaches::Keys(base_reaches)), g);
+    assert_eq!(facts_digest(facts(|c| c.reaches = Reaches::Keys(shuffled)), g), sorted, "reaches in another order digests otherwise");
+    assert_eq!(facts_digest(facts(|c| c.reaches = Reaches::Keys(repeated)), g), sorted, "reaches with a repeat digests otherwise");
+    // The record's form (32-byte words read in place) digests as the working form's keys.
+    let words: &'static [[u8; 32]] = &[[3; 32], [2; 32]];
+    assert_eq!(facts_digest(facts(|c| c.reaches = Reaches::Words(words)), g), sorted, "reaches read in place digest otherwise");
     // Equal answers built apart digest equal (no address or arena enters the digest).
     assert_eq!(name_digest(&found(|_, _, _, o| *o = Origin::Import)), digests[13]);
     assert_eq!(macro_digest(mac(|m| m.body = MacroBody::Rules(core::str::from_utf8(b"b").unwrap_or("")))), digests[27]);

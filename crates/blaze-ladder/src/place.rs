@@ -35,12 +35,22 @@ pub enum Target {
     Stop,
 }
 
+/// Where one `Static` reference place of a body is.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum StaticAt {
+    /// A Rust static: found in the placed static image, by key.
+    Image(ItemKey),
+    /// A static an `extern` block declares (the seam's `foreign_static`): the address of the
+    /// outside symbol, by name, in this process, as an outside function's is.
+    Symbol(Box<str, Global>),
+}
+
 /// One function to place: its code and, by literal place, what each word is filled with.
 pub struct Body {
     pub code: Code<Global>,
     pub targets: Vec<Target, Global>,
-    /// By `Static` reference place: the static, found in the placed static image.
-    pub statics: Vec<ItemKey, Global>,
+    /// By `Static` reference place: the static ([`StaticAt`]).
+    pub statics: Vec<StaticAt, Global>,
     /// By `Tls` reference place: the thread-local's index in the run's thread-local table
     /// (crate::tls_index).
     pub tls: Vec<u32, Global>,
@@ -424,16 +434,23 @@ impl Records for Table<'_> {
                         }
                     }
                 }
-                RelocTo::Static(p) => {
-                    let found = body.statics.get(p as usize).and_then(|&key| {
-                        let (image, base) = self.image?;
-                        Some(base + u64::from(image.static_at(key)?))
-                    });
-                    match found {
-                        Some(address) => address,
-                        None => return Err(format!("slot {slot}: static reference {p} is in no placed static image")),
+                RelocTo::Static(p) => match body.statics.get(p as usize) {
+                    Some(StaticAt::Image(key)) => {
+                        let found = self.image.and_then(|(image, base)| Some(base + u64::from(image.static_at(*key)?)));
+                        match found {
+                            Some(address) => address,
+                            None => return Err(format!("slot {slot}: static reference {p} is in no placed static image")),
+                        }
                     }
-                }
+                    Some(StaticAt::Symbol(name)) => match symbol(name) {
+                        Some(at) => at,
+                        None => {
+                            self.missing = Some(name.clone());
+                            return Err(format!("the outside static `{name}` is not in this process"));
+                        }
+                    },
+                    None => return Err(format!("slot {slot}: static reference {p} is not in the body's table")),
+                },
                 // The code builder's `Built::vtables` names the (type, principal) table at each
                 // place; run.rs made each program table once (`Body::vtables`).
                 RelocTo::Vtable(p) => match body.vtables.get(p as usize) {

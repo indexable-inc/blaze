@@ -7,7 +7,8 @@
 //!
 //! **Its life** (rule 70: a helper has an expiry and holds only what the journal rebuilds):
 //! the stream started and caught up, the core made with its first place issued behind a flush,
-//! then the socket (`.blaze/v2/journal/helper.sock`, in a folder made the user's alone) bound:
+//! then the socket (`<HOME>/.blaze/v2/journal/<16 hex of the checkout's key>.sock`, in a
+//! folder made the user's alone: blaze-watch helper.rs `SOCKET_FOLDER`, `socket_path`) bound:
 //! a command that connects finds a helper that can answer. Then, one connection at a time
 //! (an ask is one flush; commands of one checkout seldom overlap, and one waiting is bounded
 //! by its own `ASK_DEADLINE`): hello, the ask, the core's step (a flush when it says), the
@@ -92,8 +93,8 @@ pub(crate) enum HelperError {
     Memory(MemError),
     /// The stream did not start (Linux keeps no journal yet: `NoJournal`).
     Stream(JournalError),
-    /// The socket's path does not fit a socket's address under this checkout (journal_ask.rs
-    /// `SocketFits`): checked from the root's text before the stream starts.
+    /// The socket's path does not fit a socket's address under this home (journal_ask.rs
+    /// `SocketFits`): checked from the home's text before the stream starts.
     SocketTooLong(SocketFits),
     /// Its own executable could not be looked at, at its start ([`OwnExe::open`]).
     OwnExe { exe: Arc<str>, why: OwnExeWhy },
@@ -112,12 +113,12 @@ impl fmt::Display for HelperError {
         match self {
             HelperError::Usage => f.write_str("`blaze journal-helper` takes one folder, the checkout's, or none"),
             HelperError::Root(error) => write!(f, "the journal helper: the checkout's root: {error} ({at})"),
-            HelperError::Folder(error) => write!(f, "the journal helper: its socket's folder {}: {error} ({at})", helper::SOCKET_FOLDER),
+            HelperError::Folder(error) => write!(f, "the journal helper: its socket's folder, the home's {}/{}: {error} ({at})", crate::store::HOME_FOLDER, helper::SOCKET_FOLDER),
             HelperError::Memory(error) => write!(f, "the journal helper: its frames: {error} ({at})"),
             HelperError::Stream(error) => write!(f, "the journal helper: the checkout's stream did not start: {error} ({at}; bstd `Dir::hold_changes`)"),
             HelperError::SocketTooLong(fits) => write!(f, "the journal helper: {fits}: nothing bound ({at})"),
             HelperError::OwnExe { exe, why } => write!(f, "the journal helper: its own executable {exe}, watched for a replacement: {why} ({at} `OwnExe::open`)"),
-            HelperError::Listen(error) => write!(f, "the journal helper: {} not bound (another helper answers there): {error} ({at})", helper::SOCKET),
+            HelperError::Listen(error) => write!(f, "the journal helper: its socket in the home's {}/{} not bound (another helper answers there): {error} ({at})", crate::store::HOME_FOLDER, helper::SOCKET_FOLDER),
             HelperError::Accept(error) => write!(f, "the journal helper: accepting an ask: {error} ({at})"),
             HelperError::Core(error) => write!(f, "the journal helper: its core refused a call, the driver's bug: {error} ({at}; blaze-watch helper.rs)"),
             HelperError::Loop { asks } => write!(f, "the journal helper: after {asks} ask(s), its core asked flushes past {FLUSHES_MOST} in a row or kept an answer: the driver's bug ({at})"),
@@ -144,11 +145,16 @@ pub(crate) fn run(cx: &Cx, io: &Io, args: &Args, out: &Out) -> Result<Status, Cl
     let located = crate::run_package::locate(cx, &fs, &checkout, frame)?;
     let build = io.need_host()?.build_id()?;
     let served = crate::engine_script_reads::Served::at_edge(io, located.at, frame).map_err(HelperError::Root)?;
-    let me = Me::of(&build, served.root_text(), frame);
+    // `HOME` as the program's start read it (rule 75): the socket is under blaze's folder in
+    // it, as a command's ask reaches it (journal_ask.rs `Me::of`, engine_check.rs).
+    let env = io.env();
+    let home_text = env.as_ref().and_then(|env| env.get(&bstd::env::VarName::new("HOME").ok()?).ok().flatten());
+    let home = crate::store::Home::of(cx, &fs, home_text)?;
+    let me = Me::of(&build, served.root_text(), home_text, frame);
+    let socket_text = core::str::from_utf8(&me.socket_path).unwrap_or("");
     if let SocketFits::TooLong { .. } = me.socket {
-        // The whole path named on its own line: the error says the counts and the name under
-        // the root.
-        out.line(cx, format_args!("journal helper: {}/{} cannot be a socket's path", served.root_text().unwrap_or(""), helper::SOCKET))?;
+        // The whole path named on its own line: the error says the counts and the limit.
+        out.line(cx, format_args!("journal helper: {}/{}/{socket_text} cannot be a socket's path", home_text.unwrap_or(""), crate::store::HOME_FOLDER))?;
         return Err(HelperError::SocketTooLong(me.socket).into());
     }
     // Its own executable, looked at on each tick: a replaced build ends it.
@@ -157,21 +163,22 @@ pub(crate) fn run(cx: &Cx, io: &Io, args: &Args, out: &Out) -> Result<Status, Cl
     // A new instance per start: a place another helper issued is refused by it (since.rs
     // `CannotVouch::OtherInstance`).
     let instance = io.need_rng()?.next_u64();
-    let paths = (Path::new(helper::SOCKET_FOLDER)?, Path::new(helper::SOCKET)?);
-    let death = serve(cx, &located.root, &clock, me, instance, (&paths.0, &paths.1), &mut own, out)?;
+    let paths = (Path::new(helper::SOCKET_FOLDER)?, me.socket_beneath_home()?);
+    let death = serve(cx, &located.root, home.dir(), &clock, me, instance, (&paths.0, &paths.1), &mut own, out)?;
     out.line(cx, format_args!("journal helper: ended: {death}"))?;
     Ok(Status::OK)
 }
 
-/// The helper's life, from its stream's start to its core's [`Death`].
+/// The helper's life, from its stream's start to its core's [`Death`]: the stream of the
+/// checkout at `root`, the socket in blaze's folder in the home, `home`.
 fn serve(
-    cx: &Cx, root: &Dir<ReadWrite>, clock: &Clock, me: Me, instance: u64, (folder, socket): (&Path, &Path), own: &mut OwnExe, out: &Out,
+    cx: &Cx, root: &Dir<ReadWrite>, home: &Dir<ReadWrite>, clock: &Clock, me: Me, instance: u64, (folder, socket): (&Path, &Path), own: &mut OwnExe, out: &Out,
 ) -> Result<Death, CliError> {
     let cx = cx.span("journal helper: its life");
     let born = clock.now();
     // The folder is checked (made, or found the user's alone) before anything is bound in it;
-    // the socket is bound through the checkout's root, beneath it.
-    let _folder = root.make_private(&cx, folder).map_err(HelperError::Folder)?;
+    // the socket is bound through blaze's folder in the home, beneath it.
+    let _folder = home.make_private(&cx, folder).map_err(HelperError::Folder)?;
     let mut held = root.hold_changes(&cx.until(clock.after(START_WAIT))).map_err(HelperError::Stream)?;
     let tables = Frame::new(Tag::Other).map_err(HelperError::Memory)?;
     let mut conns = Frame::new(Tag::Other).map_err(HelperError::Memory)?;
@@ -182,7 +189,7 @@ fn serve(
     let lived = match first {
         Ok(Some(death)) => Ok(death),
         Err(error) => Err(error),
-        Ok(None) => match Local::beneath(root).listen(&cx, socket) {
+        Ok(None) => match Local::beneath(home).listen(&cx, socket) {
             Err(error) => Err(HelperError::Listen(error).into()),
             Ok(mut listener) => {
                 // The listener is linear: its life is one call that returns, and it is closed
@@ -193,7 +200,7 @@ fn serve(
                     listener.close(&cx.until(clock.after(END_WAIT)))
                 };
                 if let Err(error) = closed {
-                    out.line(&cx, format_args!("journal helper: closing {}: {error}", helper::SOCKET))?;
+                    out.line(&cx, format_args!("journal helper: closing the home's {}/{}: {error}", crate::store::HOME_FOLDER, socket.as_str()))?;
                 }
                 lived
             }
@@ -217,7 +224,7 @@ fn live(
     cx: &Cx, listener: &mut Listener, driver: &mut Driver<'_, '_>, core: &mut Helper<&Frame>, conns: &mut Frame, instance: u64, own: &mut OwnExe,
     out: &Out,
 ) -> Result<Death, CliError> {
-    out.line(cx, format_args!("journal helper: answering on {} (instance {instance:016x})", helper::SOCKET))?;
+    out.line(cx, format_args!("journal helper: answering in the home's {}/{} (instance {instance:016x})", crate::store::HOME_FOLDER, helper::SOCKET_FOLDER))?;
     loop {
         let told = driver.take(cx, core)?;
         if let Some(death) = driver.steps(cx, core, told)? {

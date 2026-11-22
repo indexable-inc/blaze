@@ -2,17 +2,32 @@
 //! units are blaze-lint's ([`blaze_lint::Units`]): unit 0 the file, its top-level items left out
 //! as holes; unit `i + 1` the outline's entry `i`, its children left out. Each is a `Lint` part
 //! of its file's `FileItems` record ([`parts_in`]), named by its file and its entry's chain
-//! ([`unit_name`]) and located by its own bytes, its holes and the scope its parent's text gives
-//! it ([`unit_source`]); its kind's tool holds the rule set's id (home.rs `tools`). So its key is
-//! computed before the work from what its findings are a function of, and the task reads nothing:
-//! an edit of one item that keeps its length relints that item alone; one that moves its length
-//! relints its parent too (the parent's holes moved).
+//! ([`unit_name`]) and located by what the unit IS ([`UnitKey`], [`Structural`]): its OWN text
+//! (blaze-lint `Units::own`: its bytes with each child one `HOLE_MARK`, never a child's offset
+//! or length), the scope its parent's text gives it and what `variant-count` reads of the file;
+//! its kind's tool holds the rule set's id (home.rs `tools`). So its key is computed before the
+//! work from exactly what its pass reads, and the task reads nothing: an edit inside one item
+//! relints that item alone, whatever it does to the item's length; a child added or removed
+//! relints its parent (a mark more or less), never its siblings.
 //!
-//! A unit's record ([`lint_units_in`]): one drive finding a lint finding, numbered [`LINT_BASE`] plus
-//! its rule's id, its range item-relative (rule 71), its message the engine's words
+//! A unit is NOT a task (rule 77, sparse rows): the file is ([`file_lints_name`], [`file_part`],
+//! one row a file), its record listing every unit's name and key and the findings of the units
+//! that have any (engine_lints.rs `file_record`). A unit listed with its key and no findings is
+//! clean and valid by its key: no row of its own, nothing entered for it on a replay; an
+//! entered file relints only the units whose key its last record does not list.
+//!
+//! A unit's record ([`lint_batch`], [`record`]): one drive finding a lint finding, numbered [`LINT_BASE`]
+//! plus its rule's id, its range a range of the unit's OWN text (rule 71: no child's length is
+//! in it, so a child that grows moves no stored place; the printer gives each child before it
+//! its length again from today's outline, [`own_to_item`]), its message the engine's words
 //! ([`blaze_lint::show_message`]); its payload the engine's findings with their fixes, for
-//! `--fix` ([`payload`]). No level is stored (rule 81): print.rs gives each the level the step's
-//! [`blaze_lint::Levels`] say, at print time.
+//! `--fix` ([`payload`]), their ranges own ranges too. No level is stored (rule 81): print.rs
+//! gives each the level the step's [`blaze_lint::Levels`] say, at print time.
+//!
+//! The Lints stage reads of a file only what its asked units need ([`lint_units_in`]): each asked
+//! unit's own text, and its ancestors' own texts walked with no rule for the scope each gives its
+//! child; `OwnHeads` and `variant-count`'s whole-file lexes only when a rule of the set reads
+//! them. What it did is counted ([`LintCounts`]) and printed in the profile.
 //!
 //! Which rules run is what the root `Cargo.toml` names under `[workspace.metadata.blaze]`
 //! ([`lints_of`]): the step (`lints = "rust" | "suggest" | "edition" | "strict"`; none named is
@@ -21,7 +36,7 @@
 
 use blaze_drive::{Kind, Locate, Name, Part, Why};
 use blaze_ids::{ContentId, Hasher};
-use blaze_lint::{Findings, Level, OwnHeads, RootMarks, Rule, RuleSet, Scope, Step, TestBits, Units, Variants, statics_of_path};
+use blaze_lint::{Findings, Geometry, Level, OwnHeads, OwnUnit, RootMarks, Rule, RuleSet, Scope, Span, Step, TestBits, UnitPlan, Units, Variants, VariantsView, statics_of_path};
 use blaze_own::{AVec, Alloc, Vec};
 use std::alloc::Global;
 
@@ -32,8 +47,16 @@ use crate::work::Record;
 pub const LINT_BASE: u16 = 0x4C00;
 
 const UNIT_NAME_DOMAIN: &str = "blaze-cli lint unit name 1";
-const UNIT_SOURCE_DOMAIN: &str = "blaze-cli lint unit source 1";
-const UNIT_OUT_DOMAIN: &str = "blaze-cli lint unit out 1";
+/// 3: `variant-count`'s read is in a unit's source only when the rule runs ([`parts_in`]: the
+/// outline is handed the rule set); 2 held it whatever the rules; 2: a unit's source is its own
+/// text ([`Structural`]); 1 hashed its children's offsets.
+const UNIT_SOURCE_DOMAIN: &str = "blaze-cli lint unit source 3";
+/// The name of a file's ONE `Lint` task ([`file_lints_name`]).
+const FILE_LINTS_NAME_DOMAIN: &str = "blaze-cli lint file name 1";
+/// The source of a file's `Lint` part ([`file_part`]): its units' names and keys.
+const FILE_LINTS_SOURCE_DOMAIN: &str = "blaze-cli lint file source 1";
+/// 2: a record's ranges are ranges of the unit's own text; in 1 they held its children's lengths.
+const UNIT_OUT_DOMAIN: &str = "blaze-cli lint unit out 2";
 
 /// The finding number of lint `rule`: the one derivation, for a typed rule's findings that the
 /// body check files (body_types.rs, `args-inline`) as for the token pass's.
@@ -184,11 +207,23 @@ pub(crate) fn of_root(cx: &bstd::Cx, root: &bstd::fs::Dir<bstd::fs::ReadWrite>, 
 /// would say so, which is a read of another item).
 /// The scope a file's units are linted in: its path's ([`file_scope`]), in a core where its
 /// marks say so, with the facts of its own text and crate (blaze-lint `Scope::with_file_facts`):
-/// the IO module names the file makes its own (`OwnHeads::read`) and its crate's rows of the
-/// allowed statics (`statics_of_path`, by `path` relative to the workspace's root). All of it is
-/// in the scope's key, so it is in every unit's [`unit_source`].
+/// the IO module names the file makes its own (`OwnHeads::read`, only where a rule reads them:
+/// [`reads_own_heads`]) and its crate's rows of the allowed statics (`statics_of_path`, by
+/// `path` relative to the workspace's root). All of it is in the scope's key, so it is in every
+/// unit's source ([`UnitKey`]).
 pub(crate) fn file_scope_in(marks: RootMarks, path: &str, text: &str) -> Scope {
-    marks.scope(file_scope(path)).with_file_facts(OwnHeads::read(text), statics_of_path(path))
+    let heads = if reads_own_heads(marks, path) { OwnHeads::read(text) } else { OwnHeads::NONE };
+    marks.scope(file_scope(path)).with_file_facts(heads, statics_of_path(path))
+}
+
+/// Whether a file's passes read the IO module names its text makes its own (`OwnHeads::read`,
+/// a lex of the whole file): only in a sans-IO core, where its marks run `sans-io-core` whatever
+/// the step (blaze-lint `RootMarks::rules`), the one rule that reads them
+/// (`Scope::reads_own_heads`). Elsewhere the fact is `OwnHeads::NONE` in the key and the pass
+/// alike, and no lex is made for it (rule 77). The one decision, for the outline's keys (work.rs
+/// `outline_file`) and the Lints stage.
+pub(crate) fn reads_own_heads(marks: RootMarks, path: &str) -> bool {
+    marks.scope(file_scope(path)).reads_own_heads(&marks.rules(RuleSet::only(&[])))
 }
 
 pub(crate) fn file_scope(path: &str) -> Scope {
@@ -215,35 +250,119 @@ pub(crate) fn file_scope(path: &str) -> Scope {
 /// for an item, its entry's chain (work.rs
 /// `item_chain`), so it stands while other items move and its own text changes.
 pub(crate) fn unit_name(file: ContentId, outline: &blaze_file_items::Outline<'_>, at: usize, text: &str) -> Name {
+    unit_name_of(file, at.checked_sub(1).and_then(|i| outline.items().get(i)).map(|item| crate::work::item_chain(outline, item, text)))
+}
+
+/// A unit's name from its item's chain (work.rs `item_chain`; `None`: the file's unit): the one
+/// derivation, for an outline ([`unit_name`]) and for a stored outline (engine_lints.rs).
+pub(crate) fn unit_name_of(file: ContentId, chain: Option<u64>) -> Name {
     let mut h = Hasher::new(UNIT_NAME_DOMAIN);
     h.id(&file);
-    match at.checked_sub(1).and_then(|i| outline.items().get(i)) {
+    match chain {
         None => h.update(b"file"),
-        Some(item) => h.update(b"item").update(&crate::work::item_chain(outline, item, text).to_le_bytes()),
+        Some(chain) => h.update(b"item").update(&chain.to_le_bytes()),
     };
     Name::new(Kind::Lint, h.finish())
 }
 
-/// Unit `at`'s source: what its findings are a function of, but the rule set: its own bytes,
-/// its holes (item-relative, rule 71), its scope's key, and what `variant-count` reads of the
-/// rest of its file (the enums of its literals' counts, [`Variants::unit_key`]; nothing when none),
-/// and its file's marks ([`RootMarks::key`]: the rules a crate's deny or core mark adds to the
-/// workspace's set are a function of them, and the workspace's set alone is in the task's key).
-pub(crate) fn unit_source(units: &Units<'_>, at: usize, text: &str, scope: Scope, marks: RootMarks, variants: &Variants<'_>) -> ContentId {
+/// The name of file `file`'s ONE `Lint` task (engine_lints.rs `plan`): its units are not tasks,
+/// they are listed with their keys in the file's `FileItems` record (each a `Lint` part) and in
+/// its lint record, and a clean one has no row (rule 77: valid by its key).
+pub(crate) fn file_lints_name(file: ContentId) -> Name {
+    let mut h = Hasher::new(FILE_LINTS_NAME_DOMAIN);
+    h.id(&file);
+    Name::new(Kind::Lint, h.finish())
+}
+
+/// File `file`'s `Lint` part over its unit parts `units` (as [`parts_with`] pushed them, in unit
+/// order): named [`file_lints_name`], located by every unit's name and key in that order, so it
+/// moves exactly when one unit's key does, or a unit comes or goes (the forward wake wakes it by
+/// its source, engine_ready_edit.rs `keyed`). At place 0, as the file's unit.
+pub(crate) fn file_part(file: ContentId, units: &[Part]) -> Part {
+    let mut h = Hasher::new(FILE_LINTS_SOURCE_DOMAIN);
+    h.update(&(units.len() as u32).to_le_bytes());
+    for unit in units.iter() {
+        h.update(&unit.name.subject.0);
+        match unit.locate {
+            Locate::Source(key) => h.update(&[1]).update(&key.0),
+            Locate::File { .. } | Locate::Key(_) => h.update(&[0]),
+        };
+    }
+    Part { name: file_lints_name(file), locate: Locate::Source(h.finish()), place: 0 }
+}
+
+/// What a unit's key (its `Lint` part's source) reads of it: the one seam where how a unit is
+/// keyed is chosen (rule 78). [`Keyed`] is the build's; [`ByOffsets`], the key before it, is the
+/// planted control of the tests (rule 23). A source is what the unit's findings are a function
+/// of, but the rule set (in the task's tool): the unit, its scope's key, its file's marks
+/// ([`RootMarks::key`]: the rules a crate's deny or core mark adds to the workspace's set are a
+/// function of them) and what `variant-count` reads of the rest of its file (the enums of its
+/// literals' counts; nothing when none, or when the rule does not run: `variants` is `None`).
+pub(crate) trait UnitKey {
+    /// Unit `at` of `text` (`units` planned from it), whose own text is `own`, in `scope`.
+    fn source(units: &Units<'_>, at: usize, text: &str, own: &OwnUnit<'_>, scope: Scope, marks: RootMarks, variants: Option<&Variants<'_>>) -> ContentId;
+}
+
+/// The unit as its pass reads it ([`OwnUnit`]): its own text, each child one mark, with the
+/// marks' places in it; `variant-count`'s read at its own places (blaze-lint
+/// `VariantsView::unit_key_own`). No child's offset or length is in it: an edit inside a child
+/// moves that child's key alone, whatever it does to the child's length, and a child added or
+/// removed moves its parent's (a mark more or less), never a sibling's.
+pub(crate) struct Structural;
+
+impl UnitKey for Structural {
+    fn source(units: &Units<'_>, at: usize, _text: &str, own: &OwnUnit<'_>, scope: Scope, marks: RootMarks, variants: Option<&Variants<'_>>) -> ContentId {
+        let read = variants.and_then(|variants| variants.view().unit_key_own(geometry(units, at)));
+        let mut h = Hasher::new(UNIT_SOURCE_DOMAIN);
+        h.update(&(own.text.len() as u32).to_le_bytes()).update(&scope.key().to_le_bytes()).update(&marks.key().to_le_bytes());
+        match read {
+            Some(read) => h.update(&[1]).update(&read),
+            None => h.update(&[0]),
+        };
+        // The marks' places: a literal `{}` of the unit's text is not a child's mark.
+        h.update(&(own.holes.len() as u32).to_le_bytes());
+        for mark in own.holes.iter() {
+            h.update(&mark.start.to_le_bytes());
+        }
+        h.update(own.text.as_bytes());
+        h.finish()
+    }
+}
+
+/// The key before [`Structural`], kept as the tests' planted control (rule 23): the unit's
+/// whole range, each child's bytes left out but its unit-relative start and end hashed, the
+/// unit's length, and `variant-count`'s read at unit-relative places. A child that grows moves
+/// its parent's key and every ancestor's (their holes moved).
+#[cfg(test)]
+pub(crate) struct ByOffsets;
+
+#[cfg(test)]
+impl UnitKey for ByOffsets {
+    fn source(units: &Units<'_>, at: usize, text: &str, _own: &OwnUnit<'_>, scope: Scope, marks: RootMarks, variants: Option<&Variants<'_>>) -> ContentId {
+        let plan = units.list[at];
+        let own = &text.as_bytes()[plan.base as usize..plan.end as usize];
+        let mut h = Hasher::new("blaze-cli lint unit source 1");
+        h.update(&(own.len() as u32).to_le_bytes()).update(&scope.key().to_le_bytes()).update(&marks.key().to_le_bytes());
+        if let Some(read) = variants.and_then(|variants| variants.unit_key(plan.base, plan.end - plan.base, units.holes_of(at))) {
+            h.update(b"variant-count").update(&read);
+        }
+        let mut from = 0;
+        for hole in units.holes_of(at) {
+            h.update(&own[from..hole.start as usize]).update(&hole.start.to_le_bytes()).update(&hole.end.to_le_bytes());
+            from = hole.end as usize;
+        }
+        h.update(&own[from..]);
+        h.finish()
+    }
+}
+
+/// THE SWITCH of how a unit is keyed ([`UnitKey`]).
+pub(crate) type Keyed = Structural;
+
+/// Unit `at`'s place in its file, as `variant-count` finds its sites by.
+fn geometry<'u>(units: &'u Units<'_>, at: usize) -> Geometry<'u> {
     let plan = units.list[at];
-    let own = &text.as_bytes()[plan.base as usize..plan.end as usize];
-    let mut h = Hasher::new(UNIT_SOURCE_DOMAIN);
-    h.update(&(own.len() as u32).to_le_bytes()).update(&scope.key().to_le_bytes()).update(&marks.key().to_le_bytes());
-    if let Some(read) = variants.unit_key(plan.base, plan.end - plan.base, units.holes_of(at)) {
-        h.update(b"variant-count").update(&read);
-    }
-    let mut from = 0;
-    for hole in units.holes_of(at) {
-        h.update(&own[from..hole.start as usize]).update(&hole.start.to_le_bytes()).update(&hole.end.to_le_bytes());
-        from = hole.end as usize;
-    }
-    h.update(&own[from..]);
-    h.finish()
+    Geometry { base: plan.base, len: plan.end - plan.base, holes: units.holes_of(at) }
 }
 
 /// Why a file's units could not be planned or linted: blaze-lint's refusal, named.
@@ -251,92 +370,349 @@ const UNPLANNED: &str = "a file's outline is not one of lint units (blaze-lint `
 const UNLINTED: &str = "a lint unit could not be linted (blaze-lint `lint`)";
 const UNGATHERED: &str = "a file's `variant-count` fact could not be gathered (blaze-lint `Variants::gather`)";
 
-/// Each unit of `text` as a `Lint` part, pushed on `parts`: the scopes walked in pre-order by a
-/// pass of no rule (one lex of the file; what a scope is does not depend on the rules) from the
-/// file's scope as `marks` make it (in a core or not), each unit's place its start in the file.
-/// Scratch in `alloc`.
+/// Each unit of `text` as a `Lint` part, pushed on `parts`, keyed by [`Keyed`] ([`parts_with`]),
+/// then the file's own `Lint` part over them ([`file_part`]): the file's one task.
+#[expect(clippy::too_many_arguments, reason = "one file's facts, each named; its one caller is the outline job")]
 pub(crate) fn parts_in<A: core::alloc::Allocator + Copy>(
     outline: &blaze_file_items::Outline<'_>,
     text: &str,
     path: &str,
     file: ContentId,
     marks: RootMarks,
+    rules: &RuleSet,
+    alloc: Alloc<'_>,
+    parts: &mut Vec<Part, A>,
+) -> Result<(), &'static str> {
+    let from = parts.len();
+    parts_with::<Keyed, A>(outline, text, path, file, marks, rules, alloc, parts)?;
+    let whole = file_part(file, &parts[from..]);
+    parts.push(whole);
+    Ok(())
+}
+
+/// Each unit of `text` as a `Lint` part keyed by `K`, pushed on `parts` in unit order: each
+/// unit's own text walked in pre-order by a pass of no rule for the scope it gives each child
+/// (what a scope is does not depend on the rules; the units' own texts together are the file
+/// once), from the file's scope as `marks` make it (in a core or not); each unit's place its
+/// start in the file. `variant-count`'s whole-file fact (a lex of the file) gathered only when
+/// `rules` with what `marks` add run it, as the Lints stage gathers it (rule 77). Scratch in
+/// `alloc`.
+#[expect(clippy::too_many_arguments, reason = "one file's facts, each named")]
+pub(crate) fn parts_with<K: UnitKey, A: core::alloc::Allocator + Copy>(
+    outline: &blaze_file_items::Outline<'_>,
+    text: &str,
+    path: &str,
+    file: ContentId,
+    marks: RootMarks,
+    rules: &RuleSet,
     alloc: Alloc<'_>,
     parts: &mut Vec<Part, A>,
 ) -> Result<(), &'static str> {
     let units = Units::plan(outline.items(), text.len(), alloc).map_err(|_| UNPLANNED)?;
     let none = RuleSet::only(&[]);
+    let count = units.list.len();
+    let mut scopes: AVec<'_, Scope> = AVec::with_capacity_in(count, alloc);
+    scopes.resize(count, file_scope_in(marks, path, text));
+    let variants = match marks.rules(*rules).runs(Rule::VariantCount) {
+        true => Some(Variants::gather(text, alloc).map_err(|_| UNGATHERED)?),
+        false => None,
+    };
     let mut findings = Findings::new_in(alloc);
-    let mut scopes: AVec<'_, Scope> = AVec::new_in(alloc);
-    units.lint_all(&none, text, file_scope_in(marks, path, text), alloc, &mut findings, &mut scopes, |_| {}).map_err(|_| UNLINTED)?;
-    // Gathered whatever the rules, as `lint_units_in` does: the keys of both must agree.
-    let variants = Variants::gather(text, alloc).map_err(|_| UNGATHERED)?;
-    for at in 0..units.list.len() {
-        let place = units.list[at].base;
-        let source = unit_source(&units, at, text, scopes[at], marks, &variants);
-        parts.push(Part { name: unit_name(file, outline, at, text), locate: Locate::Source(source), place });
+    for at in 0..count {
+        let own = units.own(at, text, alloc).map_err(|_| UNLINTED)?;
+        let scope = scopes[at];
+        findings.clear();
+        let linted = blaze_lint::lint_own_in(&none, &own, scope, geometry(&units, at), None, alloc, &mut findings).map_err(|_| UNLINTED)?;
+        for (child, given) in units.children_of(at).iter().zip(linted.children.iter()) {
+            scopes[*child as usize] = *given;
+        }
+        let source = K::source(&units, at, text, &own, scope, marks, variants.as_ref());
+        parts.push(Part { name: unit_name(file, outline, at, text), locate: Locate::Source(source), place: units.list[at].base });
     }
     Ok(())
 }
 
-/// The asked units of one file (each a `Lint` task's name and source), linted by `rules` and
-/// what `marks` add to them (each rule whose lint the crate denies, `sans-io-core` in a core):
-/// each its record, or why it failed, pushed on `did` in the order asked. Every unit is walked in
-/// pre-order for its children's scopes; only an asked one runs the rules. A source that is not
-/// the unit's today fails that task by name (no relint under another key, rule 3).
+const UNSCOPED: &str = "a lint unit's parent was not walked before it (blaze-cli lints.rs `lint_units_in`)";
+const UNPOOLED: &str = "a batch of a file's lint units failed on the pool (a panic or a stop: its task's error names it)";
+
+/// One asked `Lint` task of a file: its name (its unit's: the part's) and its unit's first byte
+/// in the file (the part's `place`), by which its unit is found and then checked by its name.
+pub(crate) type AskedUnit = (Name, u32);
+
+/// What the Lints stage did, counted per file job and summed for the profile
+/// (engine_lints.rs `profile`). The floor of an edit inside one function (rule 67): its file
+/// read 1 (the outline job's read is the other, owed: the outline keeps no text), outlined 0
+/// (the planner's outline, handed over), units linted 1, units walked = its ancestors (no rule: the scope each
+/// gives its child), bytes lexed = their own texts and its own (each byte of the file once at
+/// most), the whole-file facts 0 but where a rule of the set reads them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LintCounts {
+    /// Files read (each checked against its outline's id).
+    pub(crate) files_read: u64,
+    /// Files the lint job outlined again: none since the job is handed its planner's outline
+    /// record (its entries and chains read in place, engine_lints.rs `lint_text`); kept as the
+    /// count that shows it.
+    pub(crate) files_outlined: u64,
+    /// Ancestors of asked units walked with no rule, for the scopes they give.
+    pub(crate) units_walked: u64,
+    /// Asked units linted by the rules: each its record.
+    pub(crate) units_linted: u64,
+    /// The own bytes of every unit walked or linted: what the passes lexed.
+    pub(crate) bytes_lexed: u64,
+    /// Whole-file `variant-count` facts gathered (a lex of the file each).
+    pub(crate) variants_gathered: u64,
+    /// Whole-file `OwnHeads` read (a lex of the file each).
+    pub(crate) heads_read: u64,
+    /// Pool tasks a file's asked units were split into ([`Split`]); 0 when linted in the file's
+    /// own task.
+    pub(crate) batches: u64,
+}
+
+impl LintCounts {
+    /// The counts as one row, in the order the fields are written: the one list a sum reads.
+    pub(crate) const fn row(&self) -> [u64; 8] {
+        [self.files_read, self.files_outlined, self.units_walked, self.units_linted, self.bytes_lexed, self.variants_gathered, self.heads_read, self.batches]
+    }
+
+    /// [`LintCounts::row`]'s inverse.
+    pub(crate) const fn of_row(row: [u64; 8]) -> LintCounts {
+        let [files_read, files_outlined, units_walked, units_linted, bytes_lexed, variants_gathered, heads_read, batches] = row;
+        LintCounts { files_read, files_outlined, units_walked, units_linted, bytes_lexed, variants_gathered, heads_read, batches }
+    }
+}
+
+/// How a file's asked units are spread over the workers: the one seam (rule 78), [`Splitting`]
+/// the build's. Either way each unit's record is a function of its own inputs alone, and the
+/// records are merged in unit order, so both answer the same bytes (lint_holes_tests.rs).
+pub(crate) trait Split {
+    /// The most asked units one pool task lints; `None`: every one in its file's own task.
+    const BATCH: Option<usize>;
+}
+
+/// Every asked unit of a file in the file's own task: the control.
+pub(crate) struct Serial;
+
+impl Split for Serial {
+    const BATCH: Option<usize> = None;
+}
+
+/// A file with more asked units than [`UNITS_A_BATCH`] split into pool tasks of that many, so
+/// one huge file (a cold check of a generated file of thousands of items) is not one worker's.
+pub(crate) struct Batched;
+
+impl Split for Batched {
+    const BATCH: Option<usize> = Some(UNITS_A_BATCH);
+}
+
+/// THE SWITCH of how a file's asked units are spread ([`Split`]).
+pub(crate) type Splitting = Batched;
+
+/// The asked units one pool task lints: a few milliseconds of passes (a function's unit is tens
+/// of microseconds), far above a task's cost, and small enough that a file of 10,000 items is
+/// 157 tasks for the pool's workers.
+const UNITS_A_BATCH: usize = 64;
+
+/// A batch's frame: its units' own texts and findings (each unit's at most its file's bytes).
+const BATCH_FRAME: usize = 1 << 26;
+
+/// One asked unit as a batch lints it: plain values a worker can take.
+#[derive(Clone, Copy)]
+struct Lone {
+    name: Name,
+    plan: UnitPlan,
+    scope: Scope,
+}
+
+/// What every batch of a file reads: plain borrows a worker can take.
+#[derive(Clone, Copy)]
+struct Shared<'s> {
+    text: &'s str,
+    /// Every unit's holes ([`Units::holes`]).
+    holes: &'s [Span],
+    rules: &'s RuleSet,
+    variants: Option<VariantsView<'s>>,
+}
+
+/// The asked units of one file, linted by `rules` and what `marks` add to them (each rule whose
+/// lint the crate denies, `sans-io-core` in a core): each its unit's number and record, or why
+/// it failed, pushed on `did` in the order asked. Only what the asked units need is read
+/// ([`LintCounts`]): each asked unit found by its place and checked by its name; its ancestors'
+/// own texts walked once each with no rule for the scope each gives its child; the asked units'
+/// own texts linted, split by `S` ([`Split`]); `variant-count`'s and `OwnHeads`' whole-file
+/// facts only where a rule of the set reads them. A unit's source is not computed again: the
+/// file's text was checked against the id the outline's keys were made from (rule 74).
+/// `items` are the outline's entries (an outline's, or its stored record's: the planner's,
+/// handed over, never outlined again); `chain_of` entry `i`'s chain (work.rs `item_chain`), by
+/// which an asked unit is checked by its name.
 #[expect(clippy::too_many_arguments, reason = "one file's facts, each named; a struct would be built at its one caller")]
-pub(crate) fn lint_units_in(
-    outline: &blaze_file_items::Outline<'_>,
+pub(crate) fn lint_units_in<S: Split>(
+    cx: &bstd::cx::Cx,
+    items: &[blaze_surface::Item],
+    chain_of: &dyn Fn(usize) -> u64,
     text: &str,
     path: &str,
     file: ContentId,
-    asked: &[(Name, Name, ContentId)],
+    asked: &[AskedUnit],
     rules: &RuleSet,
     marks: RootMarks,
     alloc: Alloc<'_>,
-    did: &mut Vec<Option<Result<Record<Global>, Why>>, Global>,
+    counts: &mut LintCounts,
+    did: &mut Vec<Result<(usize, Record<Global>), Why>, Global>,
 ) -> Result<(), &'static str> {
     let marked = marks.rules(*rules);
     let rules = &marked;
-    let units = Units::plan(outline.items(), text.len(), alloc).map_err(|_| UNPLANNED)?;
-    let none = RuleSet::only(&[]);
+    let units = Units::plan(items, text.len(), alloc).map_err(|_| UNPLANNED)?;
     let count = units.list.len();
-    // Which asked task each unit is, by its name: one search a unit.
-    let mut wanted: AVec<'_, Option<usize>> = AVec::with_capacity_in(count, alloc);
-    for at in 0..count {
-        let name = unit_name(file, outline, at, text);
-        wanted.push(asked.iter().position(|(_, base, _)| *base == name));
-    }
-    let mut made: AVec<'_, Option<Result<Record<Global>, Why>>> = AVec::with_capacity_in(asked.len(), alloc);
-    for _ in 0..asked.len() {
-        made.push(None);
-    }
-    let mut scopes: AVec<'_, Scope> = AVec::with_capacity_in(count, alloc);
-    scopes.resize(count, file_scope_in(marks, path, text));
-    let mut findings = Findings::new_in(alloc);
-    let variants = Variants::gather(text, alloc).map_err(|_| UNGATHERED)?;
-    for at in 0..count {
-        let scope = scopes[at];
-        let run = match wanted[at] {
-            Some(_) => rules,
-            None => &none,
-        };
-        let unit = units.unit(at, text, scope);
-        let linted = blaze_lint::lint_in(run, &unit, &variants, units.list[at].base, alloc, &mut findings).map_err(|_| UNLINTED)?;
-        for (child, given) in units.children_of(at).iter().zip(linted.children.iter()) {
-            scopes[*child as usize] = *given;
+    // 1. Each asked task's unit, in unit order: (unit, task).
+    let mut jobs: AVec<'_, (usize, usize)> = AVec::with_capacity_in(asked.len(), alloc);
+    for (task, (name, place)) in asked.iter().enumerate() {
+        if let Some(unit) = unit_at(items, chain_of, file, *name, *place) {
+            jobs.push((unit, task));
         }
-        let Some(task) = wanted[at] else { continue };
-        let (name, _, source) = asked[task];
-        made[task] = Some(match unit_source(&units, at, text, scope, marks, &variants) == source {
-            true => Ok(record(name, rules, unit.text, &findings, &linted)),
-            false => Err(Why::Refused { what: "a `Lint` unit whose text or scope is not the one its key was made from", rule: "blaze-cli lints.rs, lint_units_in" }),
-        });
     }
-    for slot in made.iter_mut() {
-        did.push(Some(slot.take().unwrap_or(Err(Why::Refused { what: "a `Lint` part whose file holds no unit of its name", rule: "blaze-cli lints.rs, lint_units_in" }))));
+    jobs.sort_unstable();
+    // 2. Each asked unit's scope: its ancestors walked outermost first, each once, no rule.
+    let mut scopes: AVec<'_, Option<Scope>> = AVec::with_capacity_in(count, alloc);
+    scopes.resize(count, None);
+    scopes[0] = Some(file_scope_in(marks, path, text));
+    if reads_own_heads(marks, path) {
+        counts.heads_read += 1;
+    }
+    let mut walked: AVec<'_, bool> = AVec::with_capacity_in(count, alloc);
+    walked.resize(count, false);
+    let none = RuleSet::only(&[]);
+    let mut findings = Findings::new_in(alloc);
+    let mut stack: AVec<'_, usize> = AVec::new_in(alloc);
+    for &(unit, _) in jobs.iter() {
+        stack.clear();
+        let mut up = Units::parent_of(items, unit);
+        // Bounded: one turn an ancestor.
+        while let Some(parent) = up {
+            if walked[parent] {
+                break;
+            }
+            stack.push(parent);
+            up = Units::parent_of(items, parent);
+        }
+        while let Some(parent) = stack.pop() {
+            let scope = scopes[parent].ok_or(UNSCOPED)?;
+            let own = units.own(parent, text, alloc).map_err(|_| UNLINTED)?;
+            findings.clear();
+            let linted = blaze_lint::lint_own_in(&none, &own, scope, geometry(&units, parent), None, alloc, &mut findings).map_err(|_| UNLINTED)?;
+            for (child, given) in units.children_of(parent).iter().zip(linted.children.iter()) {
+                scopes[*child as usize] = Some(*given);
+            }
+            walked[parent] = true;
+            counts.units_walked += 1;
+            counts.bytes_lexed += own.text.len() as u64;
+        }
+    }
+    // 3. The file's facts the rules read.
+    let variants = match rules.runs(Rule::VariantCount) {
+        true => {
+            counts.variants_gathered += 1;
+            Some(Variants::gather(text, alloc).map_err(|_| UNGATHERED)?)
+        }
+        false => None,
+    };
+    let mut lone: AVec<'_, Lone> = AVec::with_capacity_in(jobs.len(), alloc);
+    for &(unit, task) in jobs.iter() {
+        lone.push(Lone { name: asked[task].0, plan: units.list[unit], scope: scopes[unit].ok_or(UNSCOPED)? });
+    }
+    let shared = Shared { text, holes: &units.holes, rules, variants: variants.as_ref().map(Variants::view) };
+    // 4. The asked units linted, merged in unit order.
+    let mut made: Vec<Record<Global>, Global> = Vec::with_capacity_in(lone.len(), Global);
+    match S::BATCH {
+        Some(batch) if lone.len() > batch => {
+            let scope = cx.scope();
+            let mut running = Vec::with_capacity_in(lone.len().div_ceil(batch), Global);
+            for chunk in lone.chunks(batch) {
+                running.push(scope.may_overlap("lint units, a batch of a file's", BATCH_FRAME, move |cx: &bstd::cx::Cx| {
+                    let erased = blaze_own::Erased::new(cx.frame());
+                    Ok::<_, core::convert::Infallible>(lint_batch(shared, chunk, erased.handle()))
+                }));
+            }
+            counts.batches += running.len() as u64;
+            let mut ran = Vec::with_capacity_in(running.len(), Global);
+            for handle in running.into_iter() {
+                ran.push(handle.join(cx).ok());
+            }
+            scope.join(cx).map_err(|_| UNPOOLED)?;
+            for one in ran.into_iter() {
+                let (records, bytes) = one.ok_or(UNPOOLED)??;
+                made.extend(records);
+                counts.bytes_lexed += bytes;
+            }
+        }
+        _ => {
+            let (records, bytes) = lint_batch(shared, &lone, alloc)?;
+            made.extend(records);
+            counts.bytes_lexed += bytes;
+        }
+    }
+    counts.units_linted += made.len() as u64;
+    // 5. Each answer in the order asked.
+    let mut answers: AVec<'_, Option<(usize, Record<Global>)>> = AVec::with_capacity_in(asked.len(), alloc);
+    answers.resize_with(asked.len(), || None);
+    for (&(unit, task), record) in jobs.iter().zip(made) {
+        answers[task] = Some((unit, record));
+    }
+    for answer in answers.iter_mut() {
+        did.push(answer.take().ok_or(Why::Refused { what: "a `Lint` part whose file holds no unit of its name at its place", rule: "blaze-cli lints.rs, lint_units_in" }));
     }
     Ok(())
+}
+
+/// The unit of `items` whose `Lint` part is `name` at `place`: the entry starting there (an
+/// outline's entries start in pre-order, so their starts rise), or the file's unit at 0,
+/// checked by its name ([`unit_name_of`], each entry's chain by `chain_of`). `None`: no unit of
+/// that name starts there (its task fails by name).
+fn unit_at(items: &[blaze_surface::Item], chain_of: &dyn Fn(usize) -> u64, file: ContentId, name: Name, place: u32) -> Option<usize> {
+    let from = items.partition_point(|item| item.range.start < place);
+    let entries = items[from..].iter().take_while(|item| item.range.start == place).enumerate().map(|(k, _)| from + k + 1);
+    entries.chain((place == 0).then_some(0)).find(|&at| unit_name_of(file, at.checked_sub(1).map(chain_of)) == name)
+}
+
+/// The units `lone` linted by `shared.rules` in `alloc`: each one's record, in order, and the
+/// own bytes lexed. A function of its inputs alone, so a batch on a worker answers what the
+/// file's own task would ([`Split`]).
+fn lint_batch(shared: Shared<'_>, lone: &[Lone], alloc: Alloc<'_>) -> Result<(Vec<Record<Global>, Global>, u64), &'static str> {
+    let mut records = Vec::with_capacity_in(lone.len(), Global);
+    let mut bytes = 0u64;
+    let mut findings = Findings::new_in(alloc);
+    for one in lone {
+        let holes = blaze_lint::holes_in(one.plan, shared.holes);
+        let own = blaze_lint::own_text(one.plan, holes, shared.text, alloc).map_err(|_| UNLINTED)?;
+        findings.clear();
+        let at = Geometry { base: one.plan.base, len: one.plan.end - one.plan.base, holes };
+        let linted = blaze_lint::lint_own_in(shared.rules, &own, one.scope, at, shared.variants, alloc, &mut findings).map_err(|_| UNLINTED)?;
+        bytes += own.text.len() as u64;
+        records.push(record(one.name, shared.rules, own.text.as_str(), &findings, &linted));
+    }
+    Ok((records, bytes))
+}
+
+/// A stored own range of a unit's record placed in its file as it is today: the unit found at
+/// `start` (its item's start, the item found by its chain; `None`: the file's unit), and each of
+/// its children's lengths given back to the places after it (blaze-lint `real_place`, walking
+/// today's outline: rule 71). The unit's start and the range from it, as print.rs places a
+/// finding; `None` when no entry starts there or its children do not walk (it is listed
+/// unplaced, as a finding whose item is gone).
+pub(crate) fn own_to_item(outline: &blaze_file_items::Outline<'_>, start: Option<u32>, own: (u32, u32)) -> Option<(u32, (u32, u32))> {
+    let items = outline.items();
+    let (unit, base) = match start {
+        None => (0, 0),
+        Some(start) => {
+            let at = items.partition_point(|item| item.range.start < start);
+            (items.get(at).filter(|item| item.range.start == start).map(|_| at + 1)?, start)
+        }
+    };
+    let place = |own: u32| {
+        let mut holes = blaze_lint::ChildHoles::of(items, unit);
+        let real = blaze_lint::real_place(holes.by_ref().map(|(_, hole)| hole), own);
+        real.filter(|_| holes.bad.is_none())
+    };
+    Some((base, (place(own.0)?, place(own.1)?)))
 }
 
 /// One unit's record, named `name`: each finding of the pass `linted` (in `findings`) a drive
@@ -381,10 +757,18 @@ pub(crate) fn cost_of(payload: &[u8]) -> Option<(u32, blaze_lint::Cost)> {
     Some((word(0), cost))
 }
 
+/// A unit record's findings in the engine's form ([`payload`]), its `payload` before the cost:
+/// what its file's lint record keeps of it (engine_lints.rs `file_record`). `None` for a
+/// payload shorter than a cost.
+pub(crate) fn fixes_of(payload: &[u8]) -> Option<&[u8]> {
+    payload.len().checked_sub(COST_BYTES).map(|at| &payload[..at])
+}
+
 /// The engine's findings `list` as bytes (each little-endian): their count; then each finding's
-/// template, range and fixes, each fix its edits, each edit its range and replacement text. What
-/// `--fix` reads back to apply a fix (blaze-lint `apply`); the drive's findings hold only the
-/// words.
+/// template, range and fixes, each fix its edits, each edit its range and replacement text, every
+/// range one of the unit's OWN text (a reader places it as [`own_to_item`] does). What `--fix`
+/// is to read back to apply a fix (blaze-lint `apply`; nothing reads it yet); the drive's
+/// findings hold only the words.
 fn payload(findings: &Findings<'_>, list: &[blaze_lint::Finding], out: &mut Vec<u8, Global>) {
     let word = |out: &mut Vec<u8, Global>, value: u32| out.extend_from_slice(&value.to_le_bytes());
     word(out, list.len() as u32);
@@ -458,9 +842,13 @@ mod tests {
         // A core's files are in the core, and the core's rule runs there.
         assert!(marks.scope(file_scope("crates/c/src/m.rs")).sans_io);
         assert!(file_scope_in(marks, "crates/c/src/m.rs", module).sans_io);
-        // The file's own facts reach its scope: a declared `mod io` and its crate's statics.
+        // The file's own facts reach its scope: its crate's statics, and in a core (the one place
+        // a rule reads it) a declared `mod io`. Outside a core no lex is made for it.
         let facts = file_scope_in(RootMarks::NONE, "crates/blaze-trace/src/record.rs", "mod io;\n");
-        assert!(facts.own_heads != OwnHeads::NONE && facts.statics != 0);
+        assert!(facts.own_heads == OwnHeads::NONE && facts.statics != 0);
+        assert!(!reads_own_heads(RootMarks::NONE, "crates/blaze-trace/src/record.rs"));
+        let core = file_scope_in(marks_of(root, "mod io;\n"), "crates/c/src/m.rs", "mod io;\n");
+        assert!(core.own_heads != OwnHeads::NONE, "a core's file reads its own heads");
         assert!(marks.rules(Step::Rust.rules()).runs(Rule::SansIoCore));
         // The marks are in the key: a unit of a marked file is not the unmarked one's.
         assert_ne!(marks.key(), marks_of("", module).key());

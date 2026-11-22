@@ -482,7 +482,7 @@ impl<'q, 'r, 'a> World<&'a str> for ValueWorld<'q, 'r, 'a> {
         if self.own(owner) {
             return Some(variant_in(self.own.tables.enums.get(&owner)?.as_slice(), name));
         }
-        Some(variant_in(self.built.of(owner)?.enum_of(owner)?, name))
+        Some(self.built.of(owner)?.enum_of(owner)?.find(name))
     }
 
     fn no_implicit_prelude(&self, module: ItemKey) -> bool {

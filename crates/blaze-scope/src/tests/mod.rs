@@ -95,6 +95,7 @@ mod refused;
 mod refused_rows;
 mod rendered_int_dot;
 mod rules;
+mod scope_record;
 mod statement_origins;
 mod tests_record;
 mod waits_on;

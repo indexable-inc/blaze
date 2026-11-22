@@ -296,13 +296,13 @@ impl<'r> ProcMacros<'r> {
 
     /// Registers the macro crate `reached` names, its module read from `store` (the module
     /// store's root: `proc-macro/modules/<key>` under it) by the identity the bootstrap builder
-    /// keys it by: its source, its dependency closure in `lock` (the workspace's `Cargo.lock`
-    /// text) and its host features. Gives the crate key its definitions must carry. A missing
-    /// module is registered all the same (one finding at its first call); a crate the lock
-    /// does not hold, or a module that cannot be read, is an error naming it.
-    pub fn add_reached(&mut self, store: &std::path::Path, lock: &str, reached: &Reached<'_>) -> Result<CrateItemKey, AddError> {
+    /// keys it by: its source, its dependency closure in `locked` (the workspace's `Cargo.lock`,
+    /// read once) and its host features. Gives the crate key its definitions must carry. A
+    /// missing module is registered all the same (one finding at its first call); a crate the
+    /// lock does not hold, or a module that cannot be read, is an error naming it.
+    pub fn add_reached(&mut self, store: &std::path::Path, locked: &crate::module::LockedPackages<'_, '_>, reached: &Reached<'_>) -> Result<CrateItemKey, AddError> {
         let named = |why| AddError { name: reached.name.to_owned(), version: reached.version.to_owned(), why };
-        let deps = crate::module::lock_closure(lock, reached.name, reached.version).map_err(|e| named(AddWhy::Closure(e)))?;
+        let deps = locked.closure(reached.name, reached.version).map_err(|e| named(AddWhy::Closure(e)))?;
         let id = crate::module::CrateId { name: reached.name, version: reached.version, source: reached.source, deps: &deps, features: reached.features };
         let key = crate_key(&crate::module::module_key(&id));
         match crate::module::read_module(store, &id) {
@@ -529,6 +529,12 @@ impl<C: ExpandCx> ExpandCx for ProcCx<'_, '_, C> {
 
     fn place(&self, what: PlaceOf) -> Result<Place<'_>, HostError> {
         self.inner.place(what)
+    }
+
+    // A wrapper answers what its inner host answers, for a told call too (the default would
+    // ask the inner `place` and lose the call).
+    fn place_of_call(&self, what: PlaceOf, call: u32) -> Result<Place<'_>, HostError> {
+        self.inner.place_of_call(what, call)
     }
 
     fn run_proc_macro<'a>(&self, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'a>) -> Result<Produced<'a>, HostError> {

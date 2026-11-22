@@ -160,8 +160,10 @@ impl<A: Allocator + Clone> Needs<A> {
         self.rows.iter().map(|&(need, start, len)| (need, &self.args[start as usize..(start + len) as usize]))
     }
 
-    /// Files `need` at `args` unless it is filed already.
-    fn push(&mut self, need: ConstNeed, args: &[PTy]) -> Result<(), BuildError> {
+    /// Files `need` at `args` unless it is filed already. Public for the code record's read
+    /// list (run/make_one.rs `verify_instance`): a found entry's constant rows are pulled at
+    /// their arguments before they are asked again, with no body checked.
+    pub fn push(&mut self, need: ConstNeed, args: &[PTy]) -> Result<(), BuildError> {
         if self.iter().any(|(n, a)| n == need && a == args) {
             return Ok(());
         }
@@ -251,6 +253,33 @@ pub fn needs_of<A: Allocator + Clone>(
     }
     for &borrow in done.promoted.iter() {
         out.push(ConstNeed::Promoted { owner: view.owner, borrow }, args)?;
+    }
+    Ok(())
+}
+
+/// Every constant `done` reads at NO arguments (a path or a pattern whose check recorded no
+/// arguments for it: those [`needs_of`] leaves to the program's own record), filed into `out`
+/// beside what is there. The code-record walk pulls these too (run/make_one.rs
+/// `pull_constants`), so every constant its builds read is answered from this table and its
+/// verifier, which pulls a read list's `Const` rows here (`verify_instance`), asks the same
+/// table: one answer per constant, never the program's record at the build and this table's at
+/// the check (rule 30).
+pub fn plain_needs_of<A: Allocator + Clone>(done: &Checked<'_>, out: &mut Needs<A>) -> Result<(), BuildError> {
+    let at_args = done.const_args.column::<0>();
+    for (e, d) in done.expr_defs.column::<0>().iter().zip(done.expr_defs.column::<1>().iter()) {
+        if let &Def::Const(item) = d
+            && at_args.binary_search(e).is_err()
+        {
+            out.push(ConstNeed::Item(item), &[])?;
+        }
+    }
+    let pat_at_args = done.pat_const_args.column::<0>();
+    for (p, d) in done.pat_defs.column::<0>().iter().zip(done.pat_defs.column::<1>().iter()) {
+        if let &Def::Const(item) = d
+            && pat_at_args.binary_search(p).is_err()
+        {
+            out.push(ConstNeed::Item(item), &[])?;
+        }
     }
     Ok(())
 }

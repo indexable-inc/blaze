@@ -166,10 +166,16 @@ pub struct Stamp {
     pub mtime_ns: u64,
     /// The inode's change time (NTFS: `ChangeTime`): moves on a chmod, a rename or a link too.
     pub ctime_ns: u64,
+    /// The device the inode is on, as [`crate::Meta::dev`] of the same driver says it
+    /// (`st_dev`; Linux `makedev(stx_dev_major, stx_dev_minor)`; macOS `ATTR_CMN_DEVID`, an
+    /// `i32` widened as `st_dev` is; 0 where the driver's `Meta` says 0: Windows and WASI): a
+    /// file on another mount with the same inode number is another file. A batched stamp
+    /// proves exactly what a stat's `Meta` does (blaze-cli sweep.rs, "batched looks").
+    pub dev: u64,
     pub mode: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<Stamp>() == 40);
+const _: () = assert!(std::mem::size_of::<Stamp>() == 48);
 
 pub const S_IFMT: u32 = 0o170000;
 pub const S_IFDIR: u32 = 0o040000;
@@ -178,7 +184,7 @@ pub const S_IFLNK: u32 = 0o120000;
 
 impl Stamp {
     /// Of a name with nothing there.
-    pub const GONE: Stamp = Stamp { ino: 0, size: 0, mtime_ns: 0, ctime_ns: 0, mode: 0 };
+    pub const GONE: Stamp = Stamp { ino: 0, size: 0, mtime_ns: 0, ctime_ns: 0, dev: 0, mode: 0 };
 
     /// Of a name the system would not say anything of (no permission, an I/O error): moved
     /// from any stamp a file had, so the asker looks at it and meets the error itself.
@@ -187,6 +193,7 @@ impl Stamp {
         size: u64::MAX,
         mtime_ns: u64::MAX,
         ctime_ns: u64::MAX,
+        dev: u64::MAX,
         mode: u32::MAX,
     };
 
@@ -195,7 +202,7 @@ impl Stamp {
     }
 
     /// Bytes of one in [`Stamp::encode`].
-    pub const BYTES: usize = 36;
+    pub const BYTES: usize = 44;
 
     pub fn is_gone(&self) -> bool {
         self.mode == 0
@@ -229,6 +236,7 @@ impl Stamp {
         out.extend_from_slice(&self.size.to_le_bytes());
         out.extend_from_slice(&self.mtime_ns.to_le_bytes());
         out.extend_from_slice(&self.ctime_ns.to_le_bytes());
+        out.extend_from_slice(&self.dev.to_le_bytes());
         out.extend_from_slice(&self.mode.to_le_bytes());
     }
 
@@ -241,7 +249,8 @@ impl Stamp {
             size: word(8),
             mtime_ns: word(16),
             ctime_ns: word(24),
-            mode: u32::from_le_bytes(bytes[32..36].try_into().expect("4 bytes")),
+            dev: word(32),
+            mode: u32::from_le_bytes(bytes[40..44].try_into().expect("4 bytes")),
         })
     }
 }
@@ -465,7 +474,7 @@ mod tests {
     #[test]
     fn stamps_and_cursors_round_trip() {
         let stamp =
-            Stamp { ino: 7, size: 1 << 40, mtime_ns: 3, ctime_ns: u64::MAX, mode: 0o100755 };
+            Stamp { ino: 7, size: 1 << 40, mtime_ns: 3, ctime_ns: u64::MAX, dev: 0x5155, mode: 0o100755 };
         let mut bytes = Vec::new();
         stamp.encode(&mut bytes);
         assert_eq!(bytes.len(), Stamp::BYTES);

@@ -31,7 +31,8 @@ use bstd::mem::TASK_FRAME;
 use bstd::path::Path;
 use bstd::test::BUDGET;
 
-use super::plain_place::{DRIVE_TAG, PlainPlace};
+use super::plain_place::PlainPlace;
+use blaze_keyed::kind::ReservedTag;
 use super::published::folder::{self, Order, Plan};
 use super::published::{self, PublishedError};
 use super::{CommandLent, CommandStore, Facts, FolderOrigin, Home, NamedOrigin, Store};
@@ -94,7 +95,7 @@ pub(super) fn plant(io: &Io, cx: &Cx, home: &str, records: &Planted, reversed: b
         }
         let mut made: std::vec::Vec<CasKey> = std::vec::Vec::new();
         for (public, (key, bytes)) in all {
-            place.put_record(Key(*key), public, DRIVE_TAG, bytes).expect("a put");
+            place.put_record(Key(*key), public, ReservedTag::Drive.tag(), bytes).expect("a put");
             made.push(CasKey(*key));
         }
         made.sort_unstable();
@@ -200,7 +201,7 @@ fn only_the_published_class_leaves_and_a_second_home_reads_each_record_once() {
     store.commit_puts().expect("B's commit");
     for (key, _) in &records.public {
         let lend = lent_b.get(&CasKey(*key)).expect("a get").expect("kept");
-        assert_eq!((lend.tag, lend.namespace), (DRIVE_TAG, Namespace::LOCAL), "kept as B's own record, under its own tag");
+        assert_eq!((lend.tag, lend.namespace), (ReservedTag::Drive.tag(), Namespace::LOCAL), "kept as B's own record, under its own tag");
     }
     assert_eq!(published::floor(&lent_b, &set.id()).expect("the floor"), 1, "B's floor is the generation it took");
 }

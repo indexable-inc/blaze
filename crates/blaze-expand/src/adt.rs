@@ -1,18 +1,23 @@
 //! The struct, enum or union a builtin derive is of, read from the item's tokens: its name,
-//! generic parameters, `where` predicates, variants and fields, and the `T::Assoc` paths of its
-//! field types, each as indices into the item's stream. Nothing is parsed into a tree and
-//! nothing is copied: the derive writer copies the tokens it names.
+//! generic parameters, `where` predicates, variants and fields, and the `T::Assoc` path types of
+//! its field types, each as indices into the item's stream. Nothing is copied: the derive
+//! writer copies the tokens it names.
 //!
-//! The reader knows only what a derive needs. A comma ends a parameter, a predicate, a field or
-//! a variant only outside every group and every `<..>` (a `->`'s `>` closes none); in a
-//! variant's discriminant or a field's default, after a lone `=`, `<` and `>` are operators and
-//! count for nothing.
+//! Every element is the parser's (extent.rs [`crate::extent::item`], one parse of the item):
+//! a field, variant, parameter or predicate ends where the grammar ends it, never at a comma
+//! counted outside `<..>`, so `T = HashMap<K, V>`, `f: u8 = g::<A, B>()` and `A = 1 << 2` are
+//! each one element. Malformed input is a typed refusal ([`NotAnAdt::Syntax`]) naming the
+//! element, never a silent cut.
 
 use core::ops::Range;
 
 use blaze_own::{AVec, Alloc, Vec};
+use parser::SyntaxKind;
 
-use crate::tokens::{Delim, Raw, Spacing, Token, TokenKind, TokenStream};
+use crate::{
+    extent::{ExtentError, Tree},
+    tokens::{Delim, Raw, Spacing, TokenKind, TokenStream},
+};
 
 /// What a derive is of.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,8 +98,9 @@ pub(crate) struct Adt<'a> {
     pub(crate) params: AVec<'a, Param>,
     /// Each `where` predicate, without its comma.
     pub(crate) predicates: AVec<'a, Range<usize>>,
-    /// Each `T::Assoc` path type of a field, `T` a type or const parameter: what rustc's
-    /// derives bound by the trait too (`find_type_parameters`), in the order written.
+    /// Each path type of a field's type with two segments or more whose first is a type
+    /// parameter (`T::Assoc`, `T::A::B`): what rustc's derives bound by the trait too
+    /// (rustc_builtin_macros `find_type_parameters`), in preorder.
     pub(crate) assoc: AVec<'a, Range<usize>>,
     /// `#[repr(packed)]` (`packed(N)` too) or `#[blaze::bits]`: the fields may have no
     /// address of their own, so they are copied out to be used.
@@ -120,10 +126,12 @@ impl Adt<'_> {
 pub(crate) enum NotAnAdt {
     /// The item is not a struct, an enum or a union.
     WrongKind,
-    /// The item has no name after its keyword.
+    /// The item, or a variant of it, has no name.
     NoName,
-    /// The item's tokens are not those of a struct, an enum or a union.
+    /// A field, variant or parameter the parser took has a part missing.
     Malformed,
+    /// The item does not parse: the element and token it stops at.
+    Syntax(ExtentError),
 }
 
 impl NotAnAdt {
@@ -132,41 +140,23 @@ impl NotAnAdt {
             NotAnAdt::WrongKind => "expected struct, enum or union",
             NotAnAdt::NoName => "missing name",
             NotAnAdt::Malformed => "the item does not read as a struct, an enum or a union",
+            NotAnAdt::Syntax(error) => error.what.refused(),
         }
     }
 }
 
-/// Whether a lone `=` ends the counting of `<` and `>` in a piece: in an expression (a
-/// discriminant, a field's default) they are operators.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Angles {
-    Always,
-    UntilEq,
-}
-
 /// Reads the derive's item, `stream`, in `alloc`.
-pub(crate) fn read<'a>(
-    stream: &TokenStream<'_>,
-    alloc: Alloc<'a>,
-) -> Result<Adt<'a>, NotAnAdt> {
-    let r = Reader { stream, tokens: stream.tokens() };
-    let end = r.tokens.len();
-    let mut packed = false;
-    let mut at = r.skip_attrs(0, end, |inner| packed |= r.is_packed(inner))?;
-    at = r.skip_vis(at)?;
-    let kind = if r.word(at, "struct") {
-        AdtKind::Struct
-    } else if r.word(at, "enum") {
-        AdtKind::Enum { default_variant: None }
-    } else if r.word(at, "union") {
-        AdtKind::Union
-    } else {
-        return Err(NotAnAdt::WrongKind);
+pub(crate) fn read<'a>(stream: &TokenStream<'_>, alloc: Alloc<'a>) -> Result<Adt<'a>, NotAnAdt> {
+    let tree = crate::extent::item(stream, alloc).map_err(NotAnAdt::Syntax)?;
+    let r = Reader { stream, tree: &tree };
+    let root = 0;
+    let kind = match tree.kind(root) {
+        SyntaxKind::STRUCT => AdtKind::Struct,
+        SyntaxKind::ENUM => AdtKind::Enum { default_variant: None },
+        SyntaxKind::UNION => AdtKind::Union,
+        _ => return Err(NotAnAdt::WrongKind),
     };
-    let name = at + 1;
-    if !r.ident(name) {
-        return Err(NotAnAdt::NoName);
-    }
+    let name = tree.token(tree.child(root, SyntaxKind::NAME).ok_or(NotAnAdt::NoName)?);
     let mut adt = Adt {
         name,
         kind,
@@ -175,405 +165,190 @@ pub(crate) fn read<'a>(
         params: Vec::new_in(alloc),
         predicates: Vec::new_in(alloc),
         assoc: Vec::new_in(alloc),
-        packed,
+        packed: tree.children(root).filter(|&c| tree.kind(c) == SyntaxKind::ATTR).any(|attr| r.is_packed(attr)),
     };
-    at = name + 1;
-    if r.punct(at, '<') {
-        let close = r.generics_end(at)?;
-        r.split(at + 1..close, Angles::Always, |piece| r.param(piece, &mut adt.params))?;
-        at = close + 1;
+    if let Some(list) = tree.child(root, SyntaxKind::GENERIC_PARAM_LIST) {
+        for param in tree.children(list) {
+            if let Some(param) = r.param(param)? {
+                adt.params.push(param);
+            }
+        }
     }
-    if r.word(at, "where") {
-        at = r.where_clause(at, &mut adt.predicates)?;
+    for clause in tree.children(root).filter(|&c| tree.kind(c) == SyntaxKind::WHERE_CLAUSE) {
+        for predicate in tree.children(clause).filter(|&c| tree.kind(c) == SyntaxKind::WHERE_PRED) {
+            adt.predicates.push(tree.range(predicate));
+        }
     }
     match kind {
         AdtKind::Struct => {
-            let fields = if r.open(at, Delim::Brace) {
-                let past = r.past_group(at)?;
-                r.fields(at + 1..past - 1, FieldsKind::Record, &mut adt.fields)?;
-                FieldsKind::Record
-            } else if r.open(at, Delim::Paren) {
-                let past = r.past_group(at)?;
-                r.fields(at + 1..past - 1, FieldsKind::Tuple, &mut adt.fields)?;
-                if r.word(past, "where") {
-                    r.where_clause(past, &mut adt.predicates)?;
-                }
-                FieldsKind::Tuple
-            } else if r.punct(at, ';') {
-                FieldsKind::Unit
-            } else {
-                return Err(NotAnAdt::Malformed);
-            };
+            let fields = r.fields(root, &mut adt.fields, &adt.params, &mut adt.assoc)?;
             adt.variants.push(Variant { name, kind: fields, fields: 0..adt.fields.len() });
         }
-        AdtKind::Enum { .. } => {
-            if !r.open(at, Delim::Brace) {
-                return Err(NotAnAdt::Malformed);
-            }
-            let past = r.past_group(at)?;
-            r.variants(at + 1..past - 1, &mut adt)?;
-        }
         AdtKind::Union => {
-            if !r.open(at, Delim::Brace) {
-                return Err(NotAnAdt::Malformed);
+            r.fields(root, &mut adt.fields, &adt.params, &mut adt.assoc)?;
+        }
+        AdtKind::Enum { .. } => {
+            let list = tree.child(root, SyntaxKind::VARIANT_LIST).ok_or(NotAnAdt::Malformed)?;
+            for variant in tree.children(list).filter(|&c| tree.kind(c) == SyntaxKind::VARIANT) {
+                let name = tree.token(tree.child(variant, SyntaxKind::NAME).ok_or(NotAnAdt::NoName)?);
+                let start = adt.fields.len();
+                let fields = r.fields(variant, &mut adt.fields, &adt.params, &mut adt.assoc)?;
+                if r.is_default(variant)
+                    && let AdtKind::Enum { default_variant } = &mut adt.kind
+                    && default_variant.is_none()
+                {
+                    *default_variant = Some(adt.variants.len());
+                }
+                adt.variants.push(Variant { name, kind: fields, fields: start..adt.fields.len() });
             }
-            let past = r.past_group(at)?;
-            r.fields(at + 1..past - 1, FieldsKind::Record, &mut adt.fields)?;
         }
     }
-    r.assoc_types(&mut adt)?;
     Ok(adt)
 }
 
-struct Reader<'s> {
+struct Reader<'s, 't> {
     stream: &'s TokenStream<'s>,
-    tokens: &'s [Token],
+    tree: &'s Tree<'t>,
 }
 
-impl<'s> Reader<'s> {
-    fn kind(&self, at: usize) -> Option<TokenKind> {
-        self.tokens.get(at).map(|it| it.kind)
-    }
-
-    fn text(&self, at: usize) -> &'s str {
-        self.stream.text_at(at)
-    }
-
-    fn punct(&self, at: usize, want: char) -> bool {
-        matches!(self.kind(at), Some(TokenKind::Punct { char, .. }) if char == want)
-    }
-
-    fn joint_punct(&self, at: usize, want: char) -> bool {
-        matches!(
-            self.kind(at),
-            Some(TokenKind::Punct { char, spacing: Spacing::Joint }) if char == want
-        )
-    }
-
-    /// `::` at `at`.
-    fn path_sep(&self, at: usize) -> bool {
-        self.joint_punct(at, ':') && self.punct(at + 1, ':')
-    }
-
-    fn ident(&self, at: usize) -> bool {
-        matches!(self.kind(at), Some(TokenKind::Ident { .. }))
-    }
-
+impl Reader<'_, '_> {
     /// The keyword or plain name `word` at `at` (not `r#word`).
     fn word(&self, at: usize, word: &str) -> bool {
-        matches!(self.kind(at), Some(TokenKind::Ident { raw: Raw::No, .. }))
-            && self.text(at) == word
+        matches!(self.stream.tokens().get(at).map(|t| t.kind), Some(TokenKind::Ident { raw: Raw::No, .. }))
+            && self.stream.text_at(at) == word
     }
 
-    fn open(&self, at: usize, delim: Delim) -> bool {
-        self.kind(at) == Some(TokenKind::Open(delim))
+    /// The node's first child node (not token) that is none of `not`: a field's or a const
+    /// parameter's type.
+    fn other_child(&self, node: usize, not: &[SyntaxKind]) -> Option<usize> {
+        let t = self.tree;
+        t.children(node).find(|&c| !t.is_token(c) && !not.contains(&t.kind(c)))
     }
 
-    /// The index past the group opened at `at`.
-    fn past_group(&self, at: usize) -> Result<usize, NotAnAdt> {
-        self.stream.close_of(at).map(|close| close + 1).ok_or(NotAnAdt::Malformed)
-    }
-
-    /// The index past the token tree at `at`: a group whole, else the token.
-    fn past(&self, at: usize) -> Result<usize, NotAnAdt> {
-        match self.kind(at) {
-            Some(TokenKind::Open(_)) => self.past_group(at),
-            Some(TokenKind::Close(_)) | None => Err(NotAnAdt::Malformed),
-            Some(_) => Ok(at + 1),
-        }
-    }
-
-    /// Whether the `>` at `at` ends a `->`.
-    fn arrow_end(&self, at: usize) -> bool {
-        at > 0 && self.joint_punct(at - 1, '-')
-    }
-
-    /// Whether the `=` at `at` stands alone: not of `==`, `=>`, `<=`, `!=`, `+=` and the like.
-    fn lone_eq(&self, at: usize) -> bool {
-        let glued_after =
-            self.joint_punct(at, '=') && (self.punct(at + 1, '=') || self.punct(at + 1, '>'));
-        let glued_before = at > 0
-            && matches!(
-                self.kind(at - 1),
-                Some(TokenKind::Punct { char, spacing: Spacing::Joint }) if "<>!=+-*/%^&|".contains(char)
-            );
-        !glued_after && !glued_before
-    }
-
-    /// The outer attributes from `at`, each one's inside handed to `on`; the index past them.
-    fn skip_attrs(
-        &self,
-        mut at: usize,
-        end: usize,
-        mut on: impl FnMut(Range<usize>),
-    ) -> Result<usize, NotAnAdt> {
-        while at < end && self.punct(at, '#') && self.open(at + 1, Delim::Bracket) {
-            let past = self.past_group(at + 1)?;
-            on(at + 2..past - 1);
-            at = past;
-        }
-        Ok(at)
-    }
-
-    /// The index past a visibility at `at`: `pub`, and `(crate)`, `(self)`, `(super)` or
-    /// `(in path)` after it (a tuple field's `pub (A, B)` is a type after `pub`).
-    fn skip_vis(&self, at: usize) -> Result<usize, NotAnAdt> {
-        if !self.word(at, "pub") {
-            return Ok(at);
-        }
-        let restricted = self.open(at + 1, Delim::Paren)
-            && ["crate", "self", "super", "in"].iter().any(|it| self.word(at + 2, it));
-        if restricted { self.past_group(at + 1) } else { Ok(at + 1) }
-    }
-
-    /// The index of the `>` closing the `<` at `open`.
-    fn generics_end(&self, open: usize) -> Result<usize, NotAnAdt> {
-        let mut depth = 1u32;
-        let mut at = open + 1;
-        while at < self.tokens.len() {
-            if self.punct(at, '<') {
-                depth += 1;
-            } else if self.punct(at, '>') && !self.arrow_end(at) {
-                depth -= 1;
-                if depth == 0 {
-                    return Ok(at);
-                }
-            }
-            at = self.past(at)?;
-        }
-        Err(NotAnAdt::Malformed)
-    }
-
-    /// The first lone `=` of `range` outside every group and `<..>`, or its end.
-    fn top_eq(&self, range: Range<usize>) -> Result<usize, NotAnAdt> {
-        let mut depth = 0u32;
-        let mut at = range.start;
-        while at < range.end {
-            if self.punct(at, '<') {
-                depth += 1;
-            } else if self.punct(at, '>') && !self.arrow_end(at) {
-                depth = depth.checked_sub(1).ok_or(NotAnAdt::Malformed)?;
-            } else if depth == 0 && self.punct(at, '=') && self.lone_eq(at) {
-                return Ok(at);
-            }
-            at = self.past(at)?;
-        }
-        Ok(range.end)
-    }
-
-    /// Each comma-separated piece of `range`, to `piece`; a trailing comma's empty piece is not
-    /// handed on.
-    fn split(
-        &self,
-        range: Range<usize>,
-        angles: Angles,
-        mut piece: impl FnMut(Range<usize>) -> Result<(), NotAnAdt>,
-    ) -> Result<(), NotAnAdt> {
-        let (mut start, mut at, mut depth, mut counting) = (range.start, range.start, 0u32, true);
-        while at < range.end {
-            if depth == 0 && self.punct(at, ',') {
-                piece(start..at)?;
-                (start, counting) = (at + 1, true);
-            } else if counting && self.punct(at, '<') {
-                depth += 1;
-            } else if counting && self.punct(at, '>') && !self.arrow_end(at) {
-                depth = depth.checked_sub(1).ok_or(NotAnAdt::Malformed)?;
-            } else if angles == Angles::UntilEq
-                && depth == 0
-                && self.punct(at, '=')
-                && self.lone_eq(at)
-            {
-                counting = false;
-            }
-            at = self.past(at)?;
-        }
-        if start < range.end {
-            piece(start..range.end)?;
-        }
-        Ok(())
-    }
-
-    /// One generic parameter.
-    fn param(
-        &self,
-        piece: Range<usize>,
-        params: &mut AVec<'_, Param>,
-    ) -> Result<(), NotAnAdt> {
-        let at = self.skip_attrs(piece.start, piece.end, |_| {})?;
-        if at >= piece.end {
-            return Err(NotAnAdt::Malformed);
-        }
-        let param = if self.punct(at, '\'') {
-            Param { decl: at..piece.end, name: at..at + 2, kind: ParamKind::Lifetime }
-        } else if self.word(at, "const") {
-            let name = at + 1;
-            if !self.ident(name) || !self.punct(name + 1, ':') {
-                return Err(NotAnAdt::Malformed);
-            }
-            let ty = name + 2..self.top_eq(name + 2..piece.end)?;
-            Param { decl: at..piece.end, name: name..name + 1, kind: ParamKind::Const { ty } }
-        } else {
-            if !self.ident(at) {
-                return Err(NotAnAdt::Malformed);
-            }
-            let bounds = if self.punct(at + 1, ':') {
-                let end = self.top_eq(at + 2..piece.end)?;
-                (end > at + 2).then_some(at + 2..end)
-            } else {
-                None
-            };
-            Param { decl: at..piece.end, name: at..at + 1, kind: ParamKind::Type { bounds } }
-        };
-        params.push(param);
-        Ok(())
-    }
-
-    /// The `where` clause at `at`: its predicates, and the index of what ends it (a body's
-    /// `{`, a `;`, or the item's end).
-    fn where_clause(
-        &self,
-        at: usize,
-        predicates: &mut AVec<'_, Range<usize>>,
-    ) -> Result<usize, NotAnAdt> {
-        let (mut stop, mut depth) = (at + 1, 0u32);
-        while stop < self.tokens.len() {
-            if depth == 0 && (self.open(stop, Delim::Brace) || self.punct(stop, ';')) {
-                break;
-            }
-            if self.punct(stop, '<') {
-                depth += 1;
-            } else if self.punct(stop, '>') && !self.arrow_end(stop) {
-                depth = depth.checked_sub(1).ok_or(NotAnAdt::Malformed)?;
-            }
-            stop = self.past(stop)?;
-        }
-        self.split(at + 1..stop, Angles::Always, |piece| {
-            predicates.push(piece);
-            Ok(())
-        })?;
-        Ok(stop)
-    }
-
-    /// The fields inside a record's braces or a tuple's parentheses.
+    /// The fields of `owner` (the item, or a variant): its record or tuple field list, or none;
+    /// each field type's path types bounded as rustc's derives bound them to `assoc`
+    /// ([`Reader::assoc_types`]), `params` read already.
     fn fields(
         &self,
-        range: Range<usize>,
-        kind: FieldsKind,
+        owner: usize,
         fields: &mut AVec<'_, Field>,
-    ) -> Result<(), NotAnAdt> {
+        params: &[Param],
+        assoc: &mut AVec<'_, Range<usize>>,
+    ) -> Result<FieldsKind, NotAnAdt> {
+        let t = self.tree;
+        let (list, kind) = match (t.child(owner, SyntaxKind::RECORD_FIELD_LIST), t.child(owner, SyntaxKind::TUPLE_FIELD_LIST)) {
+            (Some(list), _) => (list, FieldsKind::Record),
+            (None, Some(list)) => (list, FieldsKind::Tuple),
+            (None, None) => return Ok(FieldsKind::Unit),
+        };
         let first = fields.len();
-        self.split(range, Angles::UntilEq, |piece| {
-            let mut at = self.skip_attrs(piece.start, piece.end, |_| {})?;
-            at = self.skip_vis(at)?;
-            if self.word(at, "unsafe") {
-                at += 1;
-            }
-            let (name, ty) = match kind {
-                FieldsKind::Record => {
-                    if !self.ident(at) || !self.punct(at + 1, ':') {
-                        return Err(NotAnAdt::Malformed);
-                    }
-                    (Some(at), at + 2)
-                }
-                FieldsKind::Tuple | FieldsKind::Unit => (None, at),
+        for field in t.children(list).filter(|&c| matches!(t.kind(c), SyntaxKind::RECORD_FIELD | SyntaxKind::TUPLE_FIELD)) {
+            let name = match kind {
+                FieldsKind::Record => Some(t.token(t.child(field, SyntaxKind::NAME).ok_or(NotAnAdt::NoName)?)),
+                FieldsKind::Tuple | FieldsKind::Unit => None,
             };
-            if ty >= piece.end {
-                return Err(NotAnAdt::Malformed);
+            let ty = self
+                .other_child(field, &[SyntaxKind::ATTR, SyntaxKind::VISIBILITY, SyntaxKind::MUT_RESTRICTION, SyntaxKind::NAME, SyntaxKind::CONST_ARG])
+                .ok_or(NotAnAdt::Malformed)?;
+            let defaulted = t.child(field, SyntaxKind::CONST_ARG).is_some();
+            fields.push(Field { name, index: fields.len() - first, ty: t.range(ty), defaulted });
+            self.assoc_types(ty, params, assoc);
+        }
+        Ok(kind)
+    }
+
+    /// One child of a generic parameter list: a parameter, or `None` for its `<`, `>` and
+    /// commas.
+    fn param(&self, node: usize) -> Result<Option<Param>, NotAnAdt> {
+        let t = self.tree;
+        let kind = t.kind(node);
+        if !matches!(kind, SyntaxKind::LIFETIME_PARAM | SyntaxKind::TYPE_PARAM | SyntaxKind::CONST_PARAM) {
+            return Ok(None);
+        }
+        let decl_start = t.children(node).find(|&c| t.kind(c) != SyntaxKind::ATTR).ok_or(NotAnAdt::Malformed)?;
+        let decl = t.range(decl_start).start..t.range(node).end;
+        let named = |child: SyntaxKind| t.child(node, child).map(|c| t.range(c)).ok_or(NotAnAdt::Malformed);
+        let param = match kind {
+            SyntaxKind::LIFETIME_PARAM => Param { decl, name: named(SyntaxKind::LIFETIME)?, kind: ParamKind::Lifetime },
+            SyntaxKind::TYPE_PARAM => {
+                let bounds = t.child(node, SyntaxKind::TYPE_BOUND_LIST).map(|c| t.range(c)).filter(|r| !r.is_empty());
+                Param { decl, name: named(SyntaxKind::NAME)?, kind: ParamKind::Type { bounds } }
             }
-            let ty = ty..self.top_eq(ty..piece.end)?;
-            // Past the type, a lone `=` and the default's expression (RFC 3681).
-            let defaulted = ty.end < piece.end;
-            fields.push(Field { name, index: fields.len() - first, ty, defaulted });
-            Ok(())
+            _ => {
+                let ty = self.other_child(node, &[SyntaxKind::ATTR, SyntaxKind::NAME, SyntaxKind::CONST_ARG]).ok_or(NotAnAdt::Malformed)?;
+                Param { decl, name: named(SyntaxKind::NAME)?, kind: ParamKind::Const { ty: t.range(ty) } }
+            }
+        };
+        Ok(Some(param))
+    }
+
+    /// The inside of the attribute node `attr` (`#[inside]`), as tokens: its meta node,
+    /// without the invisible groups that are all of it (`#[$attr]` of a `$attr:meta`
+    /// fragment); empty when the attribute holds no meta.
+    fn attr_inside(&self, attr: usize) -> Range<usize> {
+        crate::extent::meta_of(self.stream, self.tree, attr)
+    }
+
+    /// `#[default]` among the variant's attributes.
+    fn is_default(&self, variant: usize) -> bool {
+        let t = self.tree;
+        t.children(variant).filter(|&c| t.kind(c) == SyntaxKind::ATTR).any(|attr| {
+            let inside = self.attr_inside(attr);
+            inside.len() == 1 && self.word(inside.start, "default")
         })
     }
 
-    /// An enum's variants, inside its braces.
-    fn variants(
-        &self,
-        range: Range<usize>,
-        adt: &mut Adt<'_>,
-    ) -> Result<(), NotAnAdt> {
-        self.split(range, Angles::UntilEq, |piece| {
-            let mut default = false;
-            let mut at = self.skip_attrs(piece.start, piece.end, |inner| {
-                default |= inner.len() == 1 && self.word(inner.start, "default");
-            })?;
-            at = self.skip_vis(at)?;
-            if !self.ident(at) {
-                return Err(NotAnAdt::Malformed);
-            }
-            let start = adt.fields.len();
-            let kind = if at + 1 < piece.end && self.open(at + 1, Delim::Brace) {
-                let past = self.past_group(at + 1)?;
-                self.fields(at + 2..past - 1, FieldsKind::Record, &mut adt.fields)?;
-                FieldsKind::Record
-            } else if at + 1 < piece.end && self.open(at + 1, Delim::Paren) {
-                let past = self.past_group(at + 1)?;
-                self.fields(at + 2..past - 1, FieldsKind::Tuple, &mut adt.fields)?;
-                FieldsKind::Tuple
-            } else {
-                FieldsKind::Unit
-            };
-            if default
-                && let AdtKind::Enum { default_variant } = &mut adt.kind
-                && default_variant.is_none()
-            {
-                *default_variant = Some(adt.variants.len());
-            }
-            adt.variants.push(Variant { name: at, kind, fields: start..adt.fields.len() });
-            Ok(())
-        })
+    /// `repr(.. packed ..)` or `blaze::bits`, the attribute node `attr`.
+    fn is_packed(&self, attr: usize) -> bool {
+        let inside = self.attr_inside(attr);
+        let at = inside.start;
+        let open = matches!(self.stream.tokens().get(at + 1).map(|t| t.kind), Some(TokenKind::Open(Delim::Paren)));
+        if self.word(at, "repr") && open {
+            return (at + 2..inside.end).any(|it| self.word(it, "packed"));
+        }
+        let path_sep = matches!(self.stream.tokens().get(at + 1).map(|t| t.kind), Some(TokenKind::Punct { char: ':', spacing: Spacing::Joint }))
+            && matches!(self.stream.tokens().get(at + 2).map(|t| t.kind), Some(TokenKind::Punct { char: ':', .. }));
+        self.word(at, "blaze") && path_sep && self.word(at + 3, "bits")
     }
 
-    /// `repr(.. packed ..)` or `blaze::bits`, an attribute's inside.
-    fn is_packed(&self, inner: Range<usize>) -> bool {
-        let at = inner.start;
-        if self.word(at, "repr") && self.open(at + 1, Delim::Paren) {
-            return (at + 2..inner.end).any(|it| self.word(it, "packed"));
+    /// Each path type of the fields' types that rustc's `find_type_parameters` bounds (its
+    /// `visit_ty`): two segments or more, the first a type parameter's name written alone (not
+    /// `::T`, not `<T as Tr>`), not a trait of a bound and not the trait of a qualified path.
+    fn assoc_types(&self, ty: usize, params: &[Param], assoc: &mut AVec<'_, Range<usize>>) {
+        let t = self.tree;
+        let is_type_param = |at: usize| {
+            params.iter().any(|p| matches!(p.kind, ParamKind::Type { .. }) && self.stream.text_at(p.name.start) == self.stream.text_at(at))
+        };
+        if !params.iter().any(|p| matches!(p.kind, ParamKind::Type { .. })) {
+            return;
         }
-        self.word(at, "blaze") && self.path_sep(at + 1) && self.word(at + 3, "bits")
-    }
-
-    /// Each `T::Assoc` path type of the fields' types, `T` a parameter: `T` not after `::`,
-    /// `as` or `'`, one segment after it with its generic arguments, and no `::` after that.
-    fn assoc_types(&self, adt: &mut Adt<'_>) -> Result<(), NotAnAdt> {
-        if adt.params.iter().all(|it| it.kind == ParamKind::Lifetime) {
-            return Ok(());
-        }
-        for field in 0..adt.fields.len() {
-            let ty = adt.fields[field].ty.clone();
-            let mut at = ty.start;
-            while at < ty.end {
-                match self.assoc_at(at, ty.end, &adt.params)? {
-                    Some(past) => {
-                        adt.assoc.push(at..past);
-                        at = past;
-                    }
-                    None => at += 1,
-                }
+        for node in core::iter::once(ty).chain(t.descendants(ty)) {
+            if t.kind(node) != SyntaxKind::PATH_TYPE || self.trait_position(node) {
+                continue;
+            }
+            let Some(mut path) = t.child(node, SyntaxKind::PATH) else { continue };
+            let mut segments = 1;
+            while let Some(qualifier) = t.child(path, SyntaxKind::PATH) {
+                (path, segments) = (qualifier, segments + 1);
+            }
+            let first = t.child(path, SyntaxKind::PATH_SEGMENT).and_then(|segment| t.children(segment).next());
+            let named = first.is_some_and(|f| t.kind(f) == SyntaxKind::NAME_REF && is_type_param(t.token(f)));
+            if segments >= 2 && named {
+                assoc.push(t.range(node));
             }
         }
-        Ok(())
     }
 
-    fn assoc_at(&self, at: usize, end: usize, params: &[Param]) -> Result<Option<usize>, NotAnAdt> {
-        let is_param = self.ident(at)
-            && params.iter().any(|it| {
-                it.kind != ParamKind::Lifetime && self.text(it.name.start) == self.text(at)
-            });
-        let after_path = at >= 2 && self.path_sep(at - 2);
-        let after = at >= 1 && (self.word(at - 1, "as") || self.punct(at - 1, '\''));
-        if !is_param || after_path || after || !self.path_sep(at + 1) || !self.ident(at + 3) {
-            return Ok(None);
+    /// Whether the path type `node` stands where a trait does: a bound's, or after `as` in a
+    /// qualified path's `<T as Tr>`.
+    fn trait_position(&self, node: usize) -> bool {
+        let t = self.tree;
+        match t.parent(node).map(|p| (p, t.kind(p))) {
+            Some((_, SyntaxKind::TYPE_BOUND)) => true,
+            Some((segment, SyntaxKind::PATH_SEGMENT)) => {
+                t.children(segment).take_while(|&c| c != node).any(|c| t.kind(c) == SyntaxKind::AS_KW)
+            }
+            _ => false,
         }
-        let mut past = at + 4;
-        if self.punct(past, '<') {
-            past = self.generics_end(past)? + 1;
-        }
-        if past > end || self.path_sep(past) {
-            return Ok(None);
-        }
-        Ok(Some(past))
     }
 }

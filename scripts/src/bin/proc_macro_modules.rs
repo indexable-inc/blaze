@@ -1182,10 +1182,12 @@ fn inherit(member: &str, root: &str, root_dir: &Path, path: &Path) -> Result<Str
 
 /// The digest a path package's sources are pinned by, as `blaze_proc_macro::module::
 /// files_digest` computes it (the example `tempo_derives` finds the module by blaze's): SHA-256
-/// over every regular file under `dir` but those under a folder named `target` or starting with
-/// `.`, in the byte order of their `/`-separated paths, each as the path, a zero byte, its length
-/// as 8 little-endian bytes and its bytes. Walked with a stack of folders.
+/// over every regular file of `dir` the one package rule takes (blaze-build-script
+/// `served::in_package`, as blaze walks it), in the byte order of their `/`-separated paths,
+/// each as the path, a zero byte, its length as 8 little-endian bytes and its bytes. Walked with
+/// a stack of folders.
 fn files_digest(dir: &Path) -> Result<String, Failure> {
+    use blaze_build_script::served::{InPackage, in_package};
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut folders = vec![(dir.to_owned(), String::new())];
     while let Some((folder, relative)) = folders.pop() {
@@ -1194,11 +1196,13 @@ fn files_digest(dir: &Path) -> Result<String, Failure> {
             let name = entry.file_name().to_string_lossy().into_owned();
             let path = entry.path();
             let kind = entry.file_type().map_err(io(&path))?;
+            let place = if relative.is_empty() { InPackage::Root } else { InPackage::Beneath };
+            if !in_package(entry.file_name().as_encoded_bytes(), kind.is_dir(), place) {
+                continue;
+            }
             let at = if relative.is_empty() { name.clone() } else { format!("{relative}/{name}") };
             if kind.is_dir() {
-                if name != "target" && !name.starts_with('.') {
-                    folders.push((path, at));
-                }
+                folders.push((path, at));
             } else if kind.is_file() {
                 files.push((at, std::fs::read(&path).map_err(io(&path))?));
             }

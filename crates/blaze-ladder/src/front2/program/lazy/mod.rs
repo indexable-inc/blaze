@@ -38,7 +38,7 @@ mod locate;
 pub mod typed;
 /// The per-fn seam rules both programs answer by (rule 30), `Front2Program`'s calls included.
 pub(in crate::front2::program) mod seam_rules;
-pub use seam_rules::PositionSource;
+pub use seam_rules::{PositionSource, body_place};
 
 use super::*;
 
@@ -260,10 +260,6 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     /// once, sorted by key: the seam's `static_item` and `static_records` (fill.rs
     /// `body_statics`).
     statics: crate::front2::statics::Statics,
-    /// Each static an `extern` block declares that a checked body named, with its C symbol,
-    /// sorted by key: a place at that symbol, never evaluated (fill.rs `foreign_static`; the
-    /// seam's `foreign_static`). Its kind is in `statics.kinds`, its record nowhere.
-    foreign_statics: std::vec::Vec<(ItemKey, Box<str>), Global>,
     /// The object table of each `dyn` principal a checked body's types name, and of every
     /// supertrait under it, made once per trait: the seam's `object_trait` (fill.rs
     /// `body_objects`).
@@ -286,6 +282,8 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     /// What the instance questions' worlds could not answer and no fill makes (a refused
     /// candidate impl, by name): `make_asked`'s refusal when no fill is left (rule 19).
     asked_gaps: RefCell<Vec<crate::front2::world_items::Gap, Global>>,
+    /// Each crate's `#[define_opaque]` definers, read once per crate (tait.rs `Definers`).
+    definers: crate::front2::tait::Definers<'static>,
     /// Each internal-symbol declaration bound to its definition once (front_end.rs
     /// `InternalBindings`; the rule is seam_rules.rs's, shared with the whole program).
     internal_bindings: RefCell<front_end::InternalBindings<'n>>,
@@ -352,8 +350,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             rows: Rows::new_in(alloc),
             live: AVec::new_in(alloc),
             const_values: AVec::new_in(alloc),
-            statics: crate::front2::statics::Statics { values: Vec::new_in(Global), kinds: Vec::new_in(Global) },
-            foreign_statics: std::vec::Vec::new_in(Global),
+            statics: crate::front2::statics::Statics { values: Vec::new_in(Global), kinds: Vec::new_in(Global), foreign: Vec::new_in(Global) },
             objects: HashMap::new_in(Global),
             recipes: Vec::new_in(Global),
             start: None,
@@ -362,6 +359,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             projection_why: RefCell::new(None),
             asked: RefCell::new(Vec::new_in(Global)),
             asked_gaps: RefCell::new(Vec::new_in(Global)),
+            definers: crate::front2::tait::Definers::new_in(alloc),
             internal_bindings: RefCell::new(front_end::InternalBindings::new_in(alloc)),
             member_rows: HashMap::new_in(Global),
             counts: LazyCounts::default(),

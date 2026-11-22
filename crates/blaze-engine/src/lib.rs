@@ -57,6 +57,8 @@ mod owed_rows_sim;
 #[cfg(test)]
 mod pages_sim;
 #[cfg(test)]
+mod plan_file_sim;
+#[cfg(test)]
 mod readers_sim;
 #[cfg(test)]
 mod ready_sim;

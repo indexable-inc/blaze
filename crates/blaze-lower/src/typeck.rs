@@ -337,6 +337,17 @@ pub fn bare_arg_name<'v>(view: &View<'v>, t: TypeId) -> Result<Option<&'v str>, 
     }
 }
 
+/// The namespace a body path is resolved in (the Reference, "Namespaces"). rustc_resolve
+/// late.rs `PathSource::namespace`: a struct expression's or struct pattern's path
+/// (`PathSource::Struct`) and a qualified path's trait (`PathSource::Trait`) are `TypeNS`. A
+/// path expression, a path pattern and a tuple-struct pattern (`Expr`, `Pat`, `TupleStruct`)
+/// are `ValueNS`. So `libc::flock { .. }` is the struct while `libc::flock(fd, op)` is the fn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathNs {
+    Type,
+    Value,
+}
+
 /// A body in blaze-typeck's form: the columns [`TypeckBody::view`] lends.
 pub struct TypeckBody<'a> {
     pub owner: ItemKey,
@@ -359,6 +370,9 @@ pub struct TypeckBody<'a> {
     /// where the world resolves it (blaze-ladder front2 `BodyWorld::path`, by
     /// `crate::mark_site::site_of`); `None` for a lang path and for the item's own text.
     pub path_marks: AVec<'a, Option<crate::mark_site::TextMark>>,
+    /// Parallel to `paths`: the namespace each path is resolved in, a fact of its site
+    /// ([`PathNs`]).
+    pub path_ns: AVec<'a, PathNs>,
     pub segments: AVec<'a, tc::Segment>,
     /// Where each of `segments` is written; short or empty = not known (`BodyView::segment_ranges`).
     pub segment_ranges: AVec<'a, tc::Range>,
@@ -900,8 +914,8 @@ impl Conv<'_, '_, '_, '_, '_> {
     }
 
     /// A body path; `anchors` admits a qualified path (`<T as Tr>::x`, `<T>::x`), which names a
-    /// value only.
-    fn path(&mut self, p: PathIdx, anchors: bool) -> Result<PathIdx, Refused> {
+    /// value only. `ns` is the namespace its site resolves it in ([`PathNs`]).
+    fn path(&mut self, p: PathIdx, anchors: bool, ns: PathNs) -> Result<PathIdx, Refused> {
         let r = self.v.path_range(p)?;
         let path = self.v.path(p)?;
         if let Some(l) = path.lang {
@@ -909,6 +923,7 @@ impl Conv<'_, '_, '_, '_, '_> {
             let at = PathIdx(len(self.out.paths.len()));
             self.out.paths.push(tc::BodyPath { scope, segments: List::EMPTY, lang: Some(lang(l)), anchor: None });
             self.out.path_marks.push(None);
+            self.out.path_ns.push(ns);
             return Ok(at);
         }
         let Some(scope) = path.scope else { return self.refuse("a path with no scope", r) };
@@ -985,6 +1000,7 @@ impl Conv<'_, '_, '_, '_, '_> {
         let mark = self.v.mark_of_path(p)?;
         self.out.paths.push(tc::BodyPath { scope, segments, lang: None, anchor });
         self.out.path_marks.push(mark);
+        self.out.path_ns.push(ns);
         Ok(at)
     }
 
@@ -1012,6 +1028,8 @@ impl Conv<'_, '_, '_, '_, '_> {
         let mark = self.v.mark_of_path(p)?;
         self.out.paths.push(tc::BodyPath { scope: path.scope.unwrap_or(scope), segments, lang: None, anchor: None });
         self.out.path_marks.push(mark);
+        // `PathSource::Trait`: a trait is in the type namespace.
+        self.out.path_ns.push(PathNs::Type);
         Ok(at)
     }
 
@@ -1082,7 +1100,7 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::Missing => tc::Expr::Missing,
             Expr::Lit(l) => tc::Expr::Lit(self.lit(l, r)?),
             Expr::Local { pat, .. } => tc::Expr::Local(pat),
-            Expr::Path(p) => tc::Expr::Path(self.path(p, true)?),
+            Expr::Path(p) => tc::Expr::Path(self.path(p, true, PathNs::Value)?),
             Expr::Paren(i) => tc::Expr::Paren(i),
             Expr::Block { stmts, tail, scope, kind } => {
                 match kind {
@@ -1165,7 +1183,7 @@ impl Conv<'_, '_, '_, '_, '_> {
                     StructBase::Expr(b) => tc::StructBase::Expr(b),
                     StructBase::Defaults => tc::StructBase::Defaults,
                 };
-                let path = self.path(path, false)?;
+                let path = self.path(path, false, PathNs::Type)?;
                 let start = len(self.out.field_inits.len());
                 for &n in self.v.rows(fields)? {
                     let f = FieldInit::decode(n)?;
@@ -1295,12 +1313,12 @@ impl Conv<'_, '_, '_, '_, '_> {
             Pat::Ref { mutbl, inner } => tc::Pat::Ref { mutbl, inner },
             Pat::Lit(l) => tc::Pat::Lit(self.lit(l, r)?),
             Pat::NegLit(l) => tc::Pat::NegLit(self.lit(l, r)?),
-            Pat::Path(x) => tc::Pat::Path(self.path(x, true)?),
+            Pat::Path(x) => tc::Pat::Path(self.path(x, true, PathNs::Value)?),
             Pat::TupleStruct { path, elems, rest } => {
-                tc::Pat::TupleStruct { path: self.path(path, true)?, elems: self.pats(elems)?, rest }
+                tc::Pat::TupleStruct { path: self.path(path, true, PathNs::Value)?, elems: self.pats(elems)?, rest }
             }
             Pat::Struct { path, fields, rest } => {
-                let path = self.path(path, false)?;
+                let path = self.path(path, false, PathNs::Type)?;
                 let start = len(self.out.field_pats.len());
                 for &n in self.v.rows(fields)? {
                     let f = FieldPat::decode(n)?;
@@ -1381,6 +1399,7 @@ pub fn to_typeck<'a>(
         field_pats: Vec::new_in(alloc),
         paths: Vec::new_in(alloc),
         path_marks: Vec::new_in(alloc),
+        path_ns: Vec::new_in(alloc),
         segments: Vec::new_in(alloc),
         segment_ranges: Vec::new_in(alloc),
         type_lists: Vec::new_in(alloc),

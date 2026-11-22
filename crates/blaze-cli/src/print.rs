@@ -520,6 +520,11 @@ pub enum Place {
     /// now (blaze-file-items `place_bytes`), so a comment edit above the finding inside its
     /// body moves the printed line with no body entered.
     Tokens(u64, blaze_surface::Edition, parser::token_key::TokenPlace),
+    /// A lint unit's finding (lints.rs): its range a range of the unit's OWN text (each child one
+    /// mark), the unit the item whose chain this is in the outline of this edition (`None`: the
+    /// file's unit), each child before the range given its length again from that outline
+    /// today (lints.rs `own_to_item`), so a child that grew moves no stored place (rule 71).
+    Own(Option<u64>, blaze_surface::Edition),
     /// Not placed: a finding only counted under its cause (not drawn without `--each`), listed
     /// with its file's path and its task's name, its file never read for it.
     Counted,
@@ -660,6 +665,20 @@ pub(crate) fn place_listed<'f>(cx: &Cx, root: &Dir<ReadWrite>, prints: &[Print<'
                                 Some((place, (start, end)))
                             }
                             (Some(place), _) => Some((place, own)),
+                        }
+                    }
+                    // A lint unit's own range, given its children's lengths from today's outline.
+                    Place::Own(chain, edition) => {
+                        let slot = of_edition[usize::from(edition.byte())].get_or_insert_with(|| OfEdition {
+                            outline: (edition != crate::fix::ITEM_GRAMMAR || grammar.is_none()).then(|| blaze_file_items::outline(text, edition, erased.handle())),
+                            chains: None,
+                            tokens: None,
+                        });
+                        let OfEdition { outline, chains, .. } = slot;
+                        let outline = outline.as_ref().or(grammar.as_ref()).expect("an outline of the edition: the file's grammar, or the edition's own made above");
+                        match chain {
+                            Some(chain) => item_start(outline, chains, text, chain, many, file).and_then(|start| crate::lints::own_to_item(outline, Some(start), own)),
+                            None => crate::lints::own_to_item(outline, None, own),
                         }
                     }
                 };
@@ -1146,6 +1165,7 @@ mod tests {
             (Area::Cli, crate::units::TOOLCHAIN_NAMED),
             (Area::Cli, crate::units::TARGET_REFUSED),
             (Area::Cli, crate::graph::TARGET_SKIPPED),
+            (Area::Cli, crate::graph::RUSTFLAGS_NOT_APPLIED),
             (Area::Cli, crate::work::MODULE_AT_BOTH),
             (Area::Cli, crate::work::FILE_NOT_TEXT),
             (Area::Cli, crate::names::UNRESOLVED),

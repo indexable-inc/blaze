@@ -195,7 +195,7 @@ fn a_left(sim: Sim, n: u64) -> (Sim, u32, bool) {
     let mut left = 0;
     for i in A_ONLY {
         let by_content = lent.get(&CasKey(content(i).0)).expect("a read").is_some();
-        let by_pointer = !matches!(lent.pointed(crate::code_store::CODE_TAG, &CasKey(code(i).0)), Ok(None) | Err(blaze_cas::plain::LentError::TargetGone { .. }));
+        let by_pointer = !matches!(lent.pointed(blaze_keyed::kind::ReservedTag::Code.tag(),&CasKey(code(i).0)), Ok(None) | Err(blaze_cas::plain::LentError::TargetGone { .. }));
         if by_content || by_pointer {
             left += 1;
         }

@@ -27,7 +27,7 @@ use blaze_code::record::{CodeRecord, CodeView, Site, SiteKind, Space, Symbol, Ta
 use blaze_code::unwind::{self, Action, Frame, Row};
 use blaze_own::{AVec, Alloc, Vec};
 
-use super::{COMPACT_DWARF, COMPACT_FRAME, EhSections, eh_room, eh_sections};
+use super::{COMPACT_DWARF, COMPACT_FRAME, EhSections, ROOM_SLACK, TABLES_ALIGN, eh_room, eh_sections};
 use crate::error::ExportError;
 use crate::export::{Panics, export};
 use crate::input::{Entry, Function, Panic, Platform, ProgramIn, Tier};
@@ -363,6 +363,48 @@ fn eh_out_elf_tables_describe_every_row() {
         }
     });
     println!("eh_out: the file's tables describe every row (ELF: eh_frame_hdr leads to them)");
+}
+
+/// Prints `eh_out: the room is the measure plus the start's alignment; a byte short is refused`.
+/// The real tables start [`TABLES_ALIGN`]-aligned after the code as the measure's do, so their
+/// length from that start equals the measure (the 4-alignments inside both fall alike) and the
+/// room `lay_out` keeps is that plus `ROOM_SLACK`, the start's alignment alone. The twin: the
+/// same layout with its kept room one byte short of what the tables take is refused by type
+/// (`EhRoom`), though the page the const region starts on still has room for them (so the check
+/// reads the measure, not the page it was rounded to). The control: the room exactly what they
+/// take is accepted.
+#[test]
+fn eh_out_the_room_is_the_measure_and_a_byte_short_is_refused_by_type() {
+    let records = records();
+    let functions = functions_of(&records);
+    let members: [Member<'_>; 3] = functions.map(|f| Member { symbol: f.symbol, record: f.record, tier: Some(f.tier) });
+    let personality = Some(sym("personality"));
+    for platform in [Platform::MacosArm64, Platform::LinuxArm64] {
+        let plan = match platform {
+            Platform::MacosArm64 => macho::plan(),
+            Platform::LinuxArm64 => elf::plan(),
+        };
+        let room = eh_room(&members, personality, platform, Alloc::global()).unwrap();
+        let mut laid = lay_out(&members, &[], sym("main"), None, plan, room, Alloc::global()).unwrap();
+        assert_eq!(laid.tables_room, room, "the layout keeps what the measure said");
+        let eh = eh_sections(&laid, &members, personality, platform, Alloc::global()).unwrap();
+        let start = laid.text_end().next_multiple_of(TABLES_ALIGN);
+        assert_eq!(eh.eh_frame_at, start, "the first table starts aligned after the code");
+        assert_eq!(eh.end() - start, room - ROOM_SLACK, "every function placed: the tables are exactly the measure from their start");
+        let need = eh.end() - laid.text_end();
+        assert!(need <= room && laid.const_at - laid.text_end() >= need, "the page the const region starts on holds them");
+
+        laid.tables_room = need - 1;
+        let refused = eh_sections(&laid, &members, personality, platform, Alloc::global());
+        assert!(
+            matches!(refused, Err(ExportError::EhRoom { need: n, room: r }) if n == need && r == need - 1),
+            "a room one byte short of the tables is refused by type, whatever the page leaves"
+        );
+
+        laid.tables_room = need;
+        assert!(eh_sections(&laid, &members, personality, platform, Alloc::global()).is_ok(), "the control: exactly enough is accepted");
+    }
+    println!("eh_out: the room is the measure plus the start's alignment; a byte short is refused");
 }
 
 /// Prints `eh_out: refused: export: function <main> ...` (a row that lands with no personality

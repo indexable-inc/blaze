@@ -19,10 +19,11 @@ use blaze_id::CrateItemKey;
 use blaze_own::{Alloc, Erased};
 use blaze_scope::crate_env::EnvLent;
 use blaze_scope::body_scope::BlocksTally;
-use blaze_scope::crate_scope::{CrateScopeError, resolve_crate};
+use blaze_scope::crate_scope::{CrateScopeError, resolve_crate_verified};
 use blaze_scope::graph::Sysroot;
 use blaze_scope::prepares::Prepares;
 use blaze_scope::resolve::CrateInput;
+use blaze_scope::scope_record::Verified;
 use blaze_scope::task::Par;
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
@@ -56,8 +57,10 @@ pub(crate) struct ScopeJob<'j> {
     pub(crate) at: usize,
     /// Its input, its dependencies renumbered to `deps`' order.
     pub(crate) input: CrateInput<'j>,
-    /// The exports record of each crate it reads, 16-byte aligned, in its local order.
-    pub(crate) deps: &'j [&'j [u8]],
+    /// The exports record of each crate it reads, in its local order, each checked once where
+    /// its bytes entered the command (engine_names.rs `checked`, rule 74): the job opens each in
+    /// O(1) and checks none again.
+    pub(crate) deps: &'j [Verified<'j>],
     pub(crate) sysroot: Sysroot,
     pub(crate) packs: &'j [PackView<'j>],
     pub(crate) corrected: &'j [(u32, &'j str, &'j str)],
@@ -320,6 +323,7 @@ fn blocks_differential(
                 env: env.map(|env| (job.at, env)),
                 envs: None,
                 read: RefCell::new(std::vec::Vec::new()),
+                unread: RefCell::new(blaze_own::Vec::new_in(&own)),
                 data: RefCell::new(std::vec::Vec::new()),
                 left: RefCell::new(std::vec::Vec::new()),
                 procs: crate::job_texts::Procs::of(job.procs),
@@ -329,7 +333,10 @@ fn blocks_differential(
                 run_stopped: core::cell::Cell::new(None),
             };
             let par = FilePar { cx: &span, meter: metered, heap: job.kept, workers: job.workers, oracle: NamesOracle::Off, now, seen: RefCell::new(None) };
-            blaze_scope::crate_scope::block_scopes_modules_side(&job.input, job.deps, job.sysroot, &texts, job.at, &par, Prepares::new_in(alloc), alloc, out)
+            // The differential's two solves take bytes and check them again: an oracle's path,
+            // off the command's (`--block-scopes=bodies` only).
+            let deps = blaze_own::AVec::from_iter_in(job.deps.iter().map(|proof| proof.bytes()), alloc);
+            blaze_scope::crate_scope::block_scopes_modules_side(&job.input, &deps, job.sysroot, &texts, job.at, &par, Prepares::new_in(alloc), alloc, out)
                 .map_err(|error| blaze_own::format_in!(job.kept, "block scopes differential: crate `{crate_name}`: DID NOT RUN: {error}"))
         });
         match ran {
@@ -362,6 +369,7 @@ fn blocks_differential(
             env: env.map(|env| (job.at, env)),
             envs: None,
             read: RefCell::new(std::vec::Vec::new()),
+            unread: RefCell::new(blaze_own::Vec::new_in(&own)),
             data: RefCell::new(std::vec::Vec::new()),
             left: RefCell::new(std::vec::Vec::new()),
             procs: crate::job_texts::Procs::of(job.procs),
@@ -371,7 +379,8 @@ fn blocks_differential(
             run_stopped: core::cell::Cell::new(None),
         };
         let par = FilePar { cx: &span, meter: metered, heap: job.kept, workers: job.workers, oracle: NamesOracle::Off, now, seen: RefCell::new(None) };
-        match blaze_scope::crate_scope::block_scopes_bodies_side(&modules, &job.input, job.deps, job.sysroot, &texts, job.at, &par, Prepares::new_in(alloc), alloc) {
+        let deps = blaze_own::AVec::from_iter_in(job.deps.iter().map(|proof| proof.bytes()), alloc);
+        match blaze_scope::crate_scope::block_scopes_bodies_side(&modules, &job.input, &deps, job.sysroot, &texts, job.at, &par, Prepares::new_in(alloc), alloc) {
             Ok(verdict) if verdict.agrees() => (BlocksTally::of(&verdict), None),
             Ok(verdict) => (BlocksTally::of(&verdict), Some(blaze_own::format_in!(job.kept, "{verdict}"))),
             Err(error) => (BlocksTally::failed(), Some(blaze_own::format_in!(job.kept, "block scopes differential: crate `{crate_name}`: DID NOT RUN: {error}"))),
@@ -409,6 +418,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         env: env.map(|env| (job.at, env)),
         envs: None,
         read: RefCell::new(std::vec::Vec::new()),
+        unread: RefCell::new(blaze_own::Vec::new_in(frame)),
         data: RefCell::new(std::vec::Vec::new()),
         left: RefCell::new(std::vec::Vec::new()),
         procs: crate::job_texts::Procs::of(job.procs),
@@ -422,7 +432,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
     let (done, seen) = {
         let solve = cx.span("crate scope: resolve_crate");
         let par = FilePar { cx: &solve, meter: metered, heap: job.kept, workers: job.workers, oracle: job.oracle, now: &now, seen: RefCell::new(None) };
-        let done = resolve_crate(&job.input, job.deps, job.sysroot, &texts, job.at, &par, prepares, alloc);
+        let done = resolve_crate_verified(&job.input, job.deps, job.sysroot, &texts, job.at, &par, prepares, alloc);
         (done, par.seen.into_inner())
     };
     // The crate's comparison, its items named by path while its names are at hand.
@@ -472,7 +482,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
     // waits on it, counted, never a finding (plan row A8, rule 19; blaze-scope waits_on.rs).
     let mut failed_deps: blaze_own::AVec<'_, blaze_scope::waits_on::FailedDep<'_>> = blaze_own::AVec::new_in(alloc);
     failed_deps.extend(job.input.deps.iter().filter_map(|(called, at)| {
-        let (key, name) = blaze_scope::crate_scope::error_record_crate(job.deps.get(*at)?)?;
+        let (key, name) = blaze_scope::crate_scope::error_record_crate(job.deps.get(*at)?.bytes())?;
         Some(blaze_scope::waits_on::FailedDep { called: Some(*called), name, key })
     }));
     let (out, payload, findings, failed, ok, unresolved, test_marks, expansions) = match done {
@@ -523,6 +533,11 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
             None => lacked.push(String::from(path)),
         }
     }
+    // A file read `Unknown` (there, not module text: job_texts.rs `unread`) is a read of the
+    // file as any other, so the answer (this job's failure) is asked again when it moves.
+    for (path, _) in texts.unread.into_inner().iter() {
+        read.push(String::from(*path));
+    }
     read.sort_unstable();
     lacked.sort_unstable();
     let (mut files, mut absent) = (read.clone(), lacked.clone());
@@ -538,7 +553,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
     // Each file read as data, with the slot of the file whose call read it: that file's
     // outline lists it as a data part, so it is the home its want names.
     let mut data: std::vec::Vec<(String, String), Global> =
-        texts.data.into_inner().into_iter().map(|(path, from)| (String::from(path), slot_of(String::from(from), looked))).collect();
+        texts.data.into_inner().into_iter().map(|(path, from, _)| (String::from(path), slot_of(String::from(from), looked))).collect();
     data.sort_unstable();
     data.dedup();
     // The checkout files the crate holds, each at its own place (`x/mod.rs`, not its slot:

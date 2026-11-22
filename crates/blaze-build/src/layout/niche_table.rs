@@ -52,14 +52,17 @@ impl LayoutFacts for Ranged<'_> {
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
         self.world.adt(key)
     }
-    fn repr(&self, key: ItemKey) -> ReprAttrs {
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, Missing> {
         self.world.repr(key)
     }
     fn discriminant(&self, key: ItemKey, variant: u32) -> Result<Option<i128>, Missing> {
         self.world.discriminant(key, variant)
     }
-    fn valid_range(&self, key: ItemKey) -> ValidRange {
-        self.ranges.iter().find(|(k, _)| *k == key).map_or(self.world.valid_range(key), |(_, r)| *r)
+    fn valid_range(&self, key: ItemKey) -> Result<ValidRange, Missing> {
+        match self.ranges.iter().find(|(k, _)| *k == key) {
+            Some((_, r)) => Ok(*r),
+            None => self.world.valid_range(key),
+        }
     }
 }
 

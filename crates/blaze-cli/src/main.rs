@@ -61,6 +61,11 @@ mod own_process;
 // The run parent's sans-IO half; its driver loop waits on the bstd surface its head names.
 #[allow(dead_code, reason = "called once the driver loop lands (run_parent.rs head, NOT HERE 1 to 3)")]
 mod run_parent;
+// A run's records sent inline over descriptor 3 (run wire `Bytes`), chosen at each caller's seam
+// line beside the records folder (files stay the default until its tests pass).
+mod run_bytes;
+// Every folder blaze writes under a home's and a checkout's `.blaze`, and which clean removes it.
+mod layout;
 // The run parent's driver loop over bstd's run child; `run_program` is called from program.rs `run` next.
 #[allow(dead_code, reason = "program.rs `run` calls run_program in the next step (wiring run-parent-io-1, 'Not wired')")]
 mod run_loop;
@@ -794,7 +799,9 @@ mod tests {
     mod fix_tests;
     mod members_tests;
     mod names_records_tests;
+    mod names_verified_once_tests;
     mod engine_check_tests;
+    mod engine_bases_worktrees_tests;
     mod engine_ready_edit_tests;
     mod names_oracle_tests;
     mod engine_const_macro_body_tests;
@@ -802,6 +809,7 @@ mod tests {
     mod engine_body_reads_memory_tests;
     mod engine_body_coverage_tests;
     mod engine_macro_mods_tests;
+    mod engine_found_files_tests;
     mod engine_skipped_targets_tests;
     mod engine_script_reads_tests;
     mod engine_script_reads_e2e_tests;
@@ -853,6 +861,7 @@ mod tests {
     mod engine_meter_tests;
     mod include_data_tests;
     mod include_outside_tests;
+    mod lint_holes_tests;
     mod lints_tests;
     mod owners_tests;
     mod refused_targets_tests;

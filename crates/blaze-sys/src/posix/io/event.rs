@@ -206,6 +206,15 @@ mod kq {
     flag_set! {
         /// A kevent's `fflags` (`NOTE_*`, sys/event.h): the filter's own flags.
         NoteFlags: u32 {
+            /// `NOTE_DELETE` ([`Filter::VNODE`]): the file was unlinked. replaces
+            /// libc::NOTE_DELETE.
+            DELETE = 0x0000_0001;
+            /// `NOTE_WRITE` ([`Filter::VNODE`]): the file was written; of a directory, an entry
+            /// was added, removed or renamed in it. replaces libc::NOTE_WRITE.
+            WRITE = 0x0000_0002;
+            /// `NOTE_RENAME` ([`Filter::VNODE`]): the file was renamed. replaces
+            /// libc::NOTE_RENAME.
+            RENAME = 0x0000_0020;
             /// `NOTE_TRIGGER` ([`Filter::USER`]): fire the event. replaces libc::NOTE_TRIGGER.
             TRIGGER = 0x0100_0000;
             /// `NOTE_EXITSTATUS` ([`Filter::PROC`]): `data` holds the exit's wait status.

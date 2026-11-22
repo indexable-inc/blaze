@@ -16,7 +16,8 @@
 //!   wrote already has its key from its call's key, its kind's tag, its name and its ordinal
 //!   (`blaze_scope::task::key_of`, "the `index`th entry of `parent` (a module, a call or an
 //!   item)"): keys from text, before the work (rules 21, 65);
-//! - the fns declared in a body: that body's lowering keeps them (front2 locals.rs
+//! - the fns, consts and statics declared in a body (each an item with a body; "fns" below
+//!   says all three): that body's lowering keeps them (front2 locals.rs
 //!   `Locals::keep`, keyed by nested_exports.rs `local_key` from the enclosing body's key, the
 //!   kind's tag, the name and the ordinal, with `LibKey::INNER`). They are known only once
 //!   the enclosing body is lowered, so the list is a WORK LIST: each body checked appends the
@@ -101,11 +102,17 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
                 None => continue,
             };
             for row in rows.iter() {
-                if row.kind != LocalKind::Fn {
+                // Each local item with a body: a fn's, a const's or a static's initializer (the
+                // Reference, "Block expressions": an item in a block is an item; its initializer
+                // is checked as a module-level one is). Before (tempo t1935d, 7 lines: chainspec
+                // `mainnet::IDENTITY`, clap's `augment_args::DEFAULT_VALUE`, `thread_local!`'s
+                // `__RUST_STD_INTERNAL_VAL`), only fns were queued: a local static's initializer
+                // was never checked, and no covers listed it ("the body ids hold nothing for").
+                if !matches!(row.kind, LocalKind::Fn | LocalKind::Const | LocalKind::Static) {
                     continue;
                 }
                 let ck = checker_of(row.key);
-                // A fn of an `extern` block in a body: a declaration, no body.
+                // A fn or static of an `extern` block in a body: a declaration, no body.
                 if self.store.locals.foreign(ck).is_some() {
                     continue;
                 }

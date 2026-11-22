@@ -72,6 +72,16 @@ const UNIX_ONLY: &str = "a process spawn, a kill, a listen, a connect, a receive
 /// File calls made on the asker's own thread: [`inline::Inline`], what a native driver whose
 /// file calls are this module's blocking calls hands out ([`crate::Driver::inline_files`]).
 pub mod inline;
+/// Which lane of file threads an effect waits in: the kqueue driver's dispatcher, sans IO.
+pub mod lanes;
+/// How the kqueue driver's file threads open the file of an effect a kept descriptor serves.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code, reason = "mmap of a kept descriptor, under Effect::Map's contract")]
+pub mod opening;
+/// A thread's QoS class on macOS, and the guard that holds a stretch of work at one.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code, reason = "pthread_get_qos_class_np and pthread_set_qos_class_self_np of the calling thread")]
+pub mod qos;
 
 #[cfg_attr(
     target_os = "wasi",

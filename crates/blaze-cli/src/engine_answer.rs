@@ -30,7 +30,7 @@
 //! the root name   engine.<16 hex of H(checkout)>
 //! it names        the sealed pointer's key; `<it>.pages` reaches the root, lines and page
 //!                 indexes, with their payloads
-//! sealed pointer  seal.rs form: last = "BEL7" | answer root key [32] | lines key [32] |
+//! sealed pointer  seal.rs form: last = "BEL8" | answer root key [32] | lines key [32] |
 //!                 files u32 | printed u8 (bit 0 names checked, 1 bodies whole, 2 every
 //!                 printed line is in the lines record) | findings u32 | owed u32 (the
 //!                 certificate's facts) | tools digest [32] | headers u8 (0 current, 1
@@ -70,7 +70,9 @@ use crate::sweep::{Leaves, Rows};
 use crate::{CliError, seal};
 
 /// The pointer's form inside its seal.
-pub(crate) const POINTER_MAGIC: &[u8; 4] = b"BEL7";
+/// BEL8: a file's lint row is ONE (engine_lints.rs, sparse rows: its units' keys in its record,
+/// no row a unit); a BEL7 answer's unit rows are an old home's, reported and rebuilt.
+pub(crate) const POINTER_MAGIC: &[u8; 4] = b"BEL8";
 /// The magic, the answer's root, the lines record's key, then the [`Facts`]: files u32, printed
 /// u8, findings u32, owed u32; then the tools' digest ([`tools_digest`]). The header index's
 /// state ([`Headers`]) follows: its tag, its `since`, then every shard's key; then the
@@ -117,15 +119,321 @@ std::thread_local! {
     pub(crate) static ROOT_PLANT: core::cell::Cell<RootPlant> = const { core::cell::Cell::new(RootPlant::None) };
 }
 
-/// The root naming the home's latest sealed pointer, whichever checkout saved it ([`save`]). A
-/// checkout with no answer of its own (a second worktree, a new clone) starts from it: every row
+/// The root that named the home's latest sealed pointer, whichever checkout saved it: since
+/// 2026-11-21 only the tests' control ([`BasePlant::OnePointer`]); a checkout with no answer of
+/// its own starts from its workspace's base ([`BASES_ROOT`], [`load_base`]). What held of the
+/// one pointer holds of a base: a checkout with no answer of its own starts from it: every row
 /// is valid by its key and reads against today's facts, and the pointer's leaves are
 /// checkout-relative, so the sweep follows them here, every row looked at (its journal places
 /// are the other checkout's and are not read), and the certificate never stands on it
 /// (engine_check.rs, `StoredBase::OtherCheckout`). Its pages stay reachable while the checkout
 /// that wrote it keeps them under its own `<root>.pages`; a page that is gone makes the answer
 /// unreadable, reported, and the request answers in full (rule 3: a stated path).
+#[cfg_attr(not(test), allow(dead_code, reason = "the bases' test control alone (`BasePlant::OnePointer`)"))]
 pub(crate) const LATEST_ROOT: &str = "engine.latest";
+
+// ---- The bases: one list of answers to start from, keyed by the workspace (thoughts2 1.5) ----
+//
+// Until 2026-11-21 a checkout with no answer of its own started from [`LATEST_ROOT`], the
+// home's ONE latest pointer: working in repository B replaced the base a new worktree of
+// repository A started from, which then entered every body B's answer did not hold. Now the
+// home keeps [`BASES_ROOT`]: one record of up to [`BASES_MOST`] entries (workspace, lock digest,
+// layout digest, pointer key), at most [`BASES_PER_WORKSPACE`] a workspace, newest first, and a
+// checkout with none of its own starts from the newest entry of its lock digest, else of its
+// workspace ([`pick_base`]). The single pointer is kept only as the tests' control
+// ([`BasePlant`]).
+//
+// THE WORKSPACE'S IDENTITY ([`workspace_of_lock`]): the digest of the names of the workspace's
+// path packages: a lock's packages with no `source` (cargo writes `source` for every registry
+// and git package, none for a path package: the members and the path dependencies in the
+// repository), or, for a workspace whose layout reads no lock (nothing outside it, units.rs),
+// the members' own lock (graph.rs `members_lock`, the same form). It is equal for two
+// worktrees of one repository (one lock, or one with the same members on another branch),
+// different for two repositories with different members, holds no path, and moves with no
+// checkout's place. Two repositories whose members share every name (two forks, or two `cli`
+// + `core` pairs) share one list: harmless, since the pick is by an equal lock digest first,
+// and every row of any base is valid by its key and reads against today's facts; such a base
+// costs entered tasks, never a wrong answer. Versions are left out: a version bump on a branch
+// keeps its workspace.
+//
+// KNOWN WITH NO READ: a save learns its workspace from the request's own read of the lock
+// ([`Rows::workspace`]), and on a request whose layout stood (no manifest moved, nothing read)
+// from the entry of its layout digest ([`layout_of`]: the manifest rows' paths and ids, which
+// the rows hold), else of its lock digest. A request that read nothing and matches no entry
+// keeps none ([`BaseKept::Unknown`]: its last base stays, older, still valid). The start
+// ([`load_base`], only for a checkout with no answer of its own, after the bases record is
+// read) reads the checkout's `Cargo.lock` once: its workspace's entry of that lock, else its
+// workspace's newest. With no lock on disk, or no entry of its workspace, it reads the root
+// `Cargo.toml` once (the first file the layout reads anyway) and starts from the newest entry
+// whose root manifest has those bytes ([`Base::root`], [`pick_by_root`]): a members-only
+// workspace (blaze itself; a fixture with no lock) whose save learned its workspace from the
+// members' own lock finds its base too, as it did from the one pointer before 2026-11-21
+// (main.rs `a_second_worktree_answers_from_the_first_ones_records`).
+//
+// THE BOUND (rule 18): [`BASES_PER_WORKSPACE`] (4) layouts a workspace and [`BASES_MOST`] (32)
+// entries in all; past either the oldest entry (by the record's own counter, never a clock:
+// rule 25) is dropped. Each save rewrites the record (about 4.4 KiB at the cap) and pins it
+// under [`BASES_ROOT`] and the pointers it lists under [`BASES_KEPT_ROOT`], both through the
+// store's root commit (`store.pin`: the pointer/root commit path of blaze-cas plain
+// pointer_tests.rs and root_commit_tests.rs), so the list moves with the answer it names, in
+// one commit. Two roots, because a root's record holds its keys SORTED (blaze-cas
+// `Plain::root_for`, `sorted_keys`): under one root the bases record was wherever its key
+// sorted among the pointers, and a read of the root's first key found a pointer, "not of this
+// form", on 2026-11-21 (engine_bases_worktrees_tests.rs, every save `Replaced`).
+
+/// The root that names the bases record alone: one key.
+pub(crate) const BASES_ROOT: &str = "engine.bases";
+/// The root that names every pointer the bases record lists, so cleanup keeps each answer a
+/// base names (in key order; the record says which is whose).
+pub(crate) const BASES_KEPT_ROOT: &str = "engine.bases.kept";
+/// The bases record's form: magic, entries u32, then each entry (workspace 32, lock 32 (zero
+/// for a layout that read none), layout 32, root manifest 32 (zero for none), pointer 32, its
+/// counter u64), newest first. `BEB1` (no root manifest) is another form: rewritten.
+const BASES_MAGIC: &[u8; 4] = b"BEB2";
+const BASES_DOMAIN: &str = "blaze-cli engine-check bases 2";
+const BASE_ENTRY: usize = 32 * 5 + 8;
+/// The checkout's root manifest, the first file every layout reads (its row's path).
+const ROOT_MANIFEST: &str = "Cargo.toml";
+/// No root manifest row: the entry's [`Base::root`].
+const NO_ROOT: ContentId = ContentId([0; 32]);
+/// Layouts a workspace keeps a base for.
+pub(crate) const BASES_PER_WORKSPACE: usize = 4;
+/// Entries the record keeps in all.
+pub(crate) const BASES_MOST: usize = 32;
+/// The digest's domain of a workspace's identity.
+const WORKSPACE_DOMAIN: &str = "blaze-cli workspace of a lock 1";
+/// The digest's domain of a layout's manifests ([`layout_of`]).
+const LAYOUT_DOMAIN: &str = "blaze-cli engine-check layout of the manifests 1";
+/// The checkout's lock, from its root (units.rs `LOCK`).
+const LOCK_FILE: &str = "Cargo.lock";
+/// No lock read: the entry's lock digest.
+const NO_LOCK: ContentId = ContentId([0; 32]);
+
+/// A checkout's workspace ([`workspace_of_lock`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Workspace {
+    pub(crate) id: ContentId,
+}
+
+impl Workspace {
+    /// The workspace of the lock whose bytes are `text` (a `Cargo.lock`, or graph.rs
+    /// `members_lock`); `None` for a lock of no path package.
+    pub(crate) fn of_lock(text: &[u8], frame: &Frame) -> Option<Workspace> {
+        Some(Workspace { id: workspace_of_lock(text, frame)? })
+    }
+}
+
+/// The digest of the rows' manifests (each `Manifest` row's path, flags and id, by path): equal
+/// for two checkouts whose layouts read equal files; `None` with no manifest row.
+pub(crate) fn layout_of(rows: &Rows<'_>, frame: &Frame) -> Option<ContentId> {
+    let mut manifests: blaze_own::Vec<(&str, u8, ContentId), &Frame> = blaze_own::Vec::new_in(frame);
+    manifests.extend(rows.rows.iter().filter(|leaf| leaf.kind == crate::sweep::LeafKind::Manifest).map(|leaf| (rows.path(leaf), leaf.flags, leaf.id)));
+    if manifests.is_empty() {
+        return None;
+    }
+    manifests.sort_unstable();
+    let mut h = blaze_ids::Hasher::new(LAYOUT_DOMAIN);
+    for (path, flags, id) in manifests.iter() {
+        h.part(path.as_bytes()).part(&[*flags]).part(&id.0);
+    }
+    Some(h.finish())
+}
+
+/// The digest of the lock's path packages' names (the module's "THE WORKSPACE'S IDENTITY"),
+/// sorted and each once; `None` when it has none. Read line by line in cargo's own form
+/// (`[[package]]`, then `name = "x"` and, for a fetched package, `source = "..."`): only the
+/// names and whether a source is written are read, so a lock this reader cannot follow gives
+/// fewer names (a weaker identity, never a wrong answer: the module's doc).
+pub(crate) fn workspace_of_lock(text: &[u8], frame: &Frame) -> Option<ContentId> {
+    let mut names: blaze_own::Vec<&[u8], &Frame> = blaze_own::Vec::new_in(frame);
+    let mut in_package = false;
+    let mut name: Option<&[u8]> = None;
+    let mut sourced = false;
+    fn flush<'t>(in_package: bool, name: Option<&'t [u8]>, sourced: bool, names: &mut blaze_own::Vec<&'t [u8], &Frame>) {
+        if let (true, Some(name), false) = (in_package, name, sourced) {
+            names.push(name);
+        }
+    }
+    for line in text.split(|b| *b == b'\n') {
+        let line = line.trim_ascii();
+        if line.starts_with(b"[") {
+            flush(in_package, name.take(), sourced, &mut names);
+            in_package = line == b"[[package]]";
+            sourced = false;
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(b"name") {
+            let rest = rest.trim_ascii_start();
+            if let Some(value) = rest.strip_prefix(b"=") {
+                let value = value.trim_ascii();
+                name = value.strip_prefix(b"\"").and_then(|it| it.strip_suffix(b"\""));
+            }
+        } else if line.strip_prefix(b"source").is_some_and(|rest| rest.trim_ascii_start().starts_with(b"=")) {
+            sourced = true;
+        }
+    }
+    flush(in_package, name, sourced, &mut names);
+    if names.is_empty() {
+        return None;
+    }
+    names.sort_unstable();
+    names.dedup();
+    let mut h = blaze_ids::Hasher::new(WORKSPACE_DOMAIN);
+    for name in names.iter() {
+        h.part(name);
+    }
+    Some(h.finish())
+}
+
+/// One base: the answer `pointer` a checkout of `workspace` saved with lock `lock` ([`NO_LOCK`]
+/// for a layout that read none) and layout `layout` ([`layout_of`]), and its place in the
+/// record's order (`seq`: larger is newer).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Base {
+    pub(crate) workspace: ContentId,
+    pub(crate) lock: ContentId,
+    pub(crate) layout: ContentId,
+    /// The id of the root manifest's bytes (its row's, `sweep::FILE_DOMAIN`), [`NO_ROOT`] for
+    /// rows with none: how a checkout with no lock on disk finds its base ([`pick_by_root`]).
+    pub(crate) root: ContentId,
+    pub(crate) pointer: Key,
+    pub(crate) seq: u64,
+}
+
+/// The id of the rows' root manifest ([`Base::root`]), with no read: its row's.
+pub(crate) fn root_of(rows: &Rows<'_>) -> ContentId {
+    rows.rows
+        .iter()
+        .find(|leaf| leaf.kind == crate::sweep::LeafKind::Manifest && !leaf.absent() && rows.path(leaf) == ROOT_MANIFEST)
+        .map_or(NO_ROOT, |leaf| leaf.id)
+}
+
+/// The base a checkout whose root manifest has the id `root` starts from when its lock names
+/// none (sans-IO): the newest entry of an equal root manifest; never a zero-root match.
+pub(crate) fn pick_by_root(bases: &[Base], root: ContentId) -> Option<Base> {
+    bases.iter().find(|it| it.root == root && root != NO_ROOT).copied()
+}
+
+/// The bases record's entries, newest first; `None` for bytes not of this form (the record is
+/// then written anew, [`BaseKept::Replaced`]).
+pub(crate) fn decode_bases<'f>(bytes: &[u8], frame: &'f Frame) -> Option<blaze_own::Vec<Base, &'f Frame>> {
+    let rest = bytes.strip_prefix(BASES_MAGIC.as_slice())?;
+    let count = usize::try_from(u32::from_le_bytes(rest.get(..4)?.try_into().ok()?)).ok()?;
+    let rest = &rest[4..];
+    if count > BASES_MOST || rest.len() != count * BASE_ENTRY {
+        return None;
+    }
+    let mut out = blaze_own::Vec::with_capacity_in(count, frame);
+    for entry in rest.chunks_exact(BASE_ENTRY) {
+        let id = |at: usize| ContentId(entry[at..at + 32].try_into().expect("32 bytes"));
+        let seq = u64::from_le_bytes(entry[160..168].try_into().expect("eight bytes"));
+        out.push(Base { workspace: id(0), lock: id(32), layout: id(64), root: id(96), pointer: Key(id(128)), seq });
+    }
+    // Newest first, each seq once: else not a record this writer made.
+    out.windows(2).all(|pair| pair[0].seq > pair[1].seq).then_some(out)
+}
+
+/// The record's bytes of `bases` (newest first).
+pub(crate) fn encode_bases<'f>(bases: &[Base], frame: &'f Frame) -> blaze_own::Vec<u8, &'f Frame> {
+    let mut out = blaze_own::Vec::with_capacity_in(8 + bases.len() * BASE_ENTRY, frame);
+    out.extend_from_slice(BASES_MAGIC);
+    out.extend_from_slice(&u32::try_from(bases.len()).unwrap_or(u32::MAX).to_le_bytes());
+    for base in bases {
+        out.extend_from_slice(&base.workspace.0);
+        out.extend_from_slice(&base.lock.0);
+        out.extend_from_slice(&base.layout.0);
+        out.extend_from_slice(&base.root.0);
+        out.extend_from_slice(&base.pointer.0.0);
+        out.extend_from_slice(&base.seq.to_le_bytes());
+    }
+    out
+}
+
+/// `bases` with `now` as its newest entry (sans-IO; `now.seq` is ignored and set past every
+/// other): the entry of the same workspace and layout replaced, then the oldest dropped past
+/// [`BASES_PER_WORKSPACE`] of one workspace and past [`BASES_MOST`] in all.
+pub(crate) fn with_base<'f>(bases: &[Base], now: Base, frame: &'f Frame) -> blaze_own::Vec<Base, &'f Frame> {
+    let seq = bases.iter().map(|it| it.seq).max().map_or(0, |most| most.saturating_add(1));
+    let mut out = blaze_own::Vec::with_capacity_in(bases.len() + 1, frame);
+    out.push(Base { seq, ..now });
+    for base in bases {
+        if out.len() == BASES_MOST {
+            break;
+        }
+        let same = base.workspace == now.workspace && base.layout == now.layout;
+        let of_workspace = out.iter().filter(|it| it.workspace == base.workspace).count();
+        if !same && of_workspace < BASES_PER_WORKSPACE {
+            out.push(*base);
+        }
+    }
+    out
+}
+
+/// The base a checkout of `workspace` with lock `lock` starts from (sans-IO): the newest of its
+/// workspace and lock digest, else the newest of its workspace, else none.
+pub(crate) fn pick_base(bases: &[Base], workspace: Workspace, lock: ContentId) -> Option<Base> {
+    let mine = |it: &&Base| it.workspace == workspace.id;
+    bases.iter().filter(mine).find(|it| it.lock == lock && lock != NO_LOCK).or_else(|| bases.iter().find(mine)).copied()
+}
+
+/// The workspace a save's rows are of, with no read (the module's "KNOWN WITH NO READ"): the
+/// request's own read, else the entry of an equal layout, else of an equal lock digest.
+pub(crate) fn workspace_of_rows(bases: &[Base], read: Option<Workspace>, layout: ContentId, lock: ContentId) -> Option<Workspace> {
+    read.or_else(|| bases.iter().find(|it| it.layout == layout).map(|it| Workspace { id: it.workspace }))
+        .or_else(|| bases.iter().find(|it| it.lock == lock && lock != NO_LOCK).map(|it| Workspace { id: it.workspace }))
+}
+
+/// What a save did with the bases ([`Saved::base`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum BaseKept {
+    /// Not a save that keeps one (a test's plain encode).
+    #[default]
+    NotAsked,
+    /// This answer is its workspace's newest base for its layout.
+    Kept { entries: u32 },
+    /// The record read was not of this form, and was written anew with this answer alone.
+    Replaced,
+    /// The rows hold no manifest: no layout, no workspace.
+    NoWorkspace,
+    /// No workspace was had: this request read no lock (nor the members' own) and no entry has
+    /// its layout or lock digest, or what it read names no path package. Known again when the
+    /// layout is next read; the last base stays.
+    Unknown,
+}
+
+impl fmt::Display for BaseKept {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BaseKept::NotAsked => f.write_str("base not kept (not asked)"),
+            BaseKept::Kept { entries } => write!(f, "kept as its workspace's newest base ({entries} bases in the home)"),
+            BaseKept::Replaced => f.write_str("kept as the one base: the home's bases record was not of this form"),
+            BaseKept::NoWorkspace => f.write_str("base not kept: the rows hold no manifest"),
+            BaseKept::Unknown => f.write_str("base not kept: this request read no lock and no base has its layout or lock"),
+        }
+    }
+}
+
+/// The tests' control of the bases (rule 23): [`BasePlant::OnePointer`] keeps and reads the one
+/// [`LATEST_ROOT`] as before 2026-11-21, so a second repository's answer replaces the first's.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BasePlant {
+    None,
+    OnePointer,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static BASE_PLANT: core::cell::Cell<BasePlant> = const { core::cell::Cell::new(BasePlant::None) };
+}
+
+#[cfg(test)]
+fn base_plant() -> BasePlant {
+    BASE_PLANT.get()
+}
 
 /// The digest of every kind's tool, in kind order: what the pointer keeps so the certificate
 /// stands only under the tools that wrote the answer (the module's doc, "THE TOOLS").
@@ -160,7 +468,7 @@ pub(crate) enum Unreadable {
 impl fmt::Display for Unreadable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Unreadable::Older = self {
-            return write!(f, "the stored engine answer is an old home's answer (its pointer is of an older form than `BEL7`), rebuilt (rule 26)");
+            return write!(f, "the stored engine answer is an old home's answer (its pointer is of an older form than `BEL8`), rebuilt (rule 26)");
         }
         write!(f, "the stored engine answer is not read (engine_answer.rs `load`): ")?;
         match self {
@@ -319,6 +627,9 @@ pub(crate) struct AskedByKind {
     pub(crate) distinct: [u32; blaze_drive::key::KINDS],
     pub(crate) by_purpose: [u32; blaze_engine::Ask::PURPOSES],
     pub(crate) purpose_distinct: [u32; blaze_engine::Ask::PURPOSES],
+    /// Each kind's asks by purpose (repeats included): which of a kind's asks repeat (rule 17:
+    /// a row asked 9 times is told as its purposes before anyone guesses which reader asks).
+    pub(crate) kind_purpose: [[u32; blaze_engine::Ask::PURPOSES]; blaze_drive::key::KINDS],
     pub(crate) untold: u32,
 }
 
@@ -329,6 +640,7 @@ impl Default for AskedByKind {
             distinct: [0; blaze_drive::key::KINDS],
             by_purpose: [0; blaze_engine::Ask::PURPOSES],
             purpose_distinct: [0; blaze_engine::Ask::PURPOSES],
+            kind_purpose: [[0; blaze_engine::Ask::PURPOSES]; blaze_drive::key::KINDS],
             untold: 0,
         }
     }
@@ -356,6 +668,17 @@ impl core::fmt::Display for AskedByKind {
             let at = kind.index();
             if self.asks[at] > 0 {
                 write!(f, " {kind:?} {}/{}", self.asks[at], self.distinct[at])?;
+                // Its asks by purpose, when it asked any row more often than it has rows.
+                if self.asks[at] > self.distinct[at] {
+                    let mut sep = " (";
+                    for (purpose, &count) in self.kind_purpose[at].iter().enumerate() {
+                        if count > 0 {
+                            write!(f, "{sep}{} {count}", blaze_engine::Ask::WORDS[purpose])?;
+                            sep = ", ";
+                        }
+                    }
+                    write!(f, ")")?;
+                }
             }
         }
         write!(f, "; by purpose (asks/distinct reads):")?;
@@ -428,6 +751,7 @@ impl<'a> Stored<'a> {
         for &(name, ask) in asked.iter() {
             by.asks[name.kind.index()] += 1;
             by.by_purpose[ask.purpose()] += 1;
+            by.kind_purpose[name.kind.index()][ask.purpose()] += 1;
             let _ = sorted.try_push((name, ask));
         }
         by.untold = u32::try_from(self.asks().saturating_sub(asked.len())).unwrap_or(u32::MAX);
@@ -646,39 +970,43 @@ pub(crate) fn load_pointer<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut Comma
     if keys.len() != 32 {
         return Ok(Some(Err(Unreadable::Names { bytes: keys.len() })));
     }
-    let first = key_at(keys, 0);
-    let Some(held) = store.get(cx, first)? else { return Ok(Some(Err(Unreadable::Missing { key: first }))) };
+    pointer_at(cx, store, key_at(keys, 0)).map(Some)
+}
+
+/// The pointer record `first`, read in place (a root's one key, or a base's, [`load_base`]).
+fn pointer_at<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'m, '_, D, S>, first: Key) -> Result<Result<Pointer<'m>, Unreadable>, CliError> {
+    let Some(held) = store.get(cx, first)? else { return Ok(Err(Unreadable::Missing { key: first })) };
     let sealed: &'m [u8] = held.bytes;
     if !sealed.starts_with(seal::SEAL_MAGIC) {
-        return Ok(Some(Err(Unreadable::Older)));
+        return Ok(Err(Unreadable::Older));
     }
     let (pointer, leaves) = match seal::open(sealed, seal::Plant::None) {
         Ok(opened) => opened,
-        Err(torn) => return Ok(Some(Err(Unreadable::Torn(torn)))),
+        Err(torn) => return Ok(Err(Unreadable::Torn(torn))),
     };
     if pointer.len() < POINTER_BYTES || !pointer.starts_with(POINTER_MAGIC) {
-        return Ok(Some(Err(Unreadable::Older)));
+        return Ok(Err(Unreadable::Older));
     }
     let Some(journal) = crate::journal_sweep::Stored::of(&pointer[POINTER_BYTES..]) else {
-        return Ok(Some(Err(Unreadable::Older)));
+        return Ok(Err(Unreadable::Older));
     };
     let (leaves, older) = Leaves::of(leaves)?;
     if older.is_some() {
-        return Ok(Some(Err(Unreadable::Older)));
+        return Ok(Err(Unreadable::Older));
     }
     let facts = Facts { files: word(pointer, 68), printed: Printed::of_byte(pointer[72]), findings: word(pointer, 73), owed: word(pointer, 77) };
     if pointer[72] > 7 {
-        return Ok(Some(Err(Unreadable::Older)));
+        return Ok(Err(Unreadable::Older));
     }
     let keys = HeaderPages { keys: core::array::from_fn(|i| key_at(pointer, SHARDS_AT + i * 32)) };
     let since = u64::from_le_bytes(pointer[HEADERS_AT + 1..SHARDS_AT].try_into().expect("eight bytes"));
     let headers = match pointer[HEADERS_AT] {
         HEADERS_CURRENT if since == 0 => Headers::Current(keys),
         HEADERS_ABSENT if keys.keys.iter().all(|key| *key == Key::default()) => Headers::Absent { since: blaze_engine::Gen(since) },
-        tag => return Ok(Some(Err(Unreadable::Headers { tag }))),
+        tag => return Ok(Err(Unreadable::Headers { tag })),
     };
     let tools = key_at(pointer, TOOLS_AT).0;
-    Ok(Some(Ok(Pointer { key: first, root: key_at(pointer, 4), headers, lines: key_at(pointer, 36), facts, tools, leaves, journal })))
+    Ok(Ok(Pointer { key: first, root: key_at(pointer, 4), headers, lines: key_at(pointer, 36), facts, tools, leaves, journal }))
 }
 
 /// The printed lines' record the pointer names, every entry checked (engine_lines.rs `decode`).
@@ -724,6 +1052,8 @@ pub(crate) struct Saved {
     /// fell on (blaze-engine pages.rs `Encoded::changed_entries`), each page read once as its
     /// witness; (0, 0) for a whole encode.
     pub(crate) changed: (u32, u32),
+    /// What the save did with the home's bases ([`BASES_ROOT`]).
+    pub(crate) base: BaseKept,
 }
 
 /// Which pages a commit keys into the answer's reach root ([`page_indexes`]).
@@ -1044,10 +1374,102 @@ fn save<'m, D: Driver, S: Sharing>(
     // payloads were admitted with the page and this renewal extends their lifetime.
     store.keep_toolchain(toolchain, &toolchain_records)?;
     store.pin(name, &[key])?;
-    // The home's latest answer, whichever checkout wrote it: a checkout with none of its own
-    // starts from it ([`LATEST_ROOT`]).
-    store.pin(LATEST_ROOT, &[key])?;
+    // This answer as its workspace's newest base: a checkout of it with none of its own starts
+    // from it ([`BASES_ROOT`]). The control keeps the one home-wide pointer instead.
+    #[cfg(test)]
+    if base_plant() == BasePlant::OnePointer {
+        store.pin(LATEST_ROOT, &[key])?;
+        return Ok(saved);
+    }
+    saved.base = keep_base(cx, store, rows, key, frame)?;
     Ok(saved)
+}
+
+/// The bases with `pointer` as its workspace's newest ([`with_base`]), rewritten and pinned
+/// with every pointer they list under [`BASES_ROOT`]. The workspace is the one this request
+/// read ([`Rows::workspace`]), else the one an entry of its layout or lock names
+/// ([`workspace_of_rows`]).
+fn keep_base<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'m, '_, D, S>, rows: &Rows<'_>, pointer: Key, frame: &Frame) -> Result<BaseKept, CliError> {
+    let Some(layout) = layout_of(rows, frame) else { return Ok(BaseKept::NoWorkspace) };
+    let lock = rows.lock_id().unwrap_or(NO_LOCK);
+    let (bases, replaced) = match read_bases(cx, store, frame)? {
+        Some(Some(bases)) => (bases, false),
+        Some(None) => (blaze_own::Vec::new_in(frame), true),
+        None => (blaze_own::Vec::new_in(frame), false),
+    };
+    let Some(workspace) = workspace_of_rows(&bases, rows.workspace, layout, lock) else { return Ok(BaseKept::Unknown) };
+    let now = Base { workspace: workspace.id, lock, layout, root: root_of(rows), pointer, seq: 0 };
+    let bases = with_base(&bases, now, frame);
+    let bytes = encode_bases(&bases, frame);
+    let record = Key(ContentId::of(BASES_DOMAIN, &bytes));
+    store.put(cx, record, &bytes)?;
+    store.pin(BASES_ROOT, &[record])?;
+    let mut pointers = blaze_own::Vec::with_capacity_in(bases.len(), frame);
+    pointers.extend(bases.iter().map(|it| it.pointer));
+    store.pin(BASES_KEPT_ROOT, &pointers)?;
+    Ok(match replaced {
+        true => BaseKept::Replaced,
+        false => BaseKept::Kept { entries: u32::try_from(bases.len()).unwrap_or(u32::MAX) },
+    })
+}
+
+/// The bases the home keeps: `None` with no [`BASES_ROOT`]; `Some(None)` for a root or record
+/// not of this form (written anew by the next save).
+fn read_bases<'m, 'f, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'m, '_, D, S>, frame: &'f Frame) -> Result<Option<Option<blaze_own::Vec<Base, &'f Frame>>>, CliError> {
+    let Some(keys) = store.named(BASES_ROOT)? else { return Ok(None) };
+    // The record alone ([`BASES_ROOT`]); a root of more keys is the one-root form before
+    // 2026-11-21, not this one.
+    if keys.len() != 32 {
+        return Ok(Some(None));
+    }
+    let Some(held) = store.get(cx, key_at(keys, 0))? else { return Ok(Some(None)) };
+    Ok(Some(decode_bases(held.bytes, frame)))
+}
+
+/// The base a checkout with no answer of its own starts from (the module's bases), the bases
+/// record read first (no file is read when the home keeps none): its lock read from `root`
+/// once, its workspace's newest entry of an equal lock digest, else its workspace's newest;
+/// with no lock, a lock of no path package or no entry of its workspace, its root manifest
+/// read once and the newest entry of equal bytes ([`pick_by_root`]); else `None`. The control
+/// ([`BasePlant::OnePointer`]) reads the home's one [`LATEST_ROOT`].
+pub(crate) fn load_base<'m, D: Driver, S: Sharing>(
+    cx: &Cx,
+    store: &mut CommandStore<'m, '_, D, S>,
+    root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
+    frame: &Frame,
+) -> Result<Option<Result<Pointer<'m>, Unreadable>>, CliError> {
+    #[cfg(test)]
+    if base_plant() == BasePlant::OnePointer {
+        return load_pointer(cx, store, LATEST_ROOT);
+    }
+    let Some(Some(bases)) = read_bases(cx, store, frame)? else { return Ok(None) };
+    // One file of the checkout's root, whole: `false` when none is there.
+    let read = |name: &str, text: &mut bstd::mem::Bytes<'_>| -> Result<bool, CliError> {
+        match root.read_all(cx, &bstd::path::Path::new(name)?, text) {
+            Ok(_) => Ok(true),
+            Err(error) if matches!(error.kind, bstd::fs::FsKind::NotFound | bstd::fs::FsKind::IsADirectory) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let mut lock_text = bstd::mem::Bytes::new_in(frame, "the checkout's lock, for its workspace's base");
+    let by_lock = match read(LOCK_FILE, &mut lock_text)? {
+        true => Workspace::of_lock(lock_text.as_slice(), frame).and_then(|now| pick_base(&bases, now, ContentId::of(crate::sweep::FILE_DOMAIN, lock_text.as_slice()))),
+        false => None,
+    };
+    let picked = match by_lock {
+        Some(base) => Some(base),
+        None => {
+            let mut manifest = bstd::mem::Bytes::new_in(frame, "the checkout's root manifest, for its workspace's base");
+            match read(ROOT_MANIFEST, &mut manifest)? {
+                true => pick_by_root(&bases, ContentId::of(crate::sweep::FILE_DOMAIN, manifest.as_slice())),
+                false => None,
+            }
+        }
+    };
+    match picked {
+        Some(base) => pointer_at(cx, store, base.pointer).map(Some),
+        None => Ok(None),
+    }
 }
 
 /// The reach root's page indexes for the pages `now` (one a page with anything on it, its
@@ -1103,7 +1525,7 @@ fn page_indexes<'h, D: Driver>(
         return whole(WhyWhole::NotLast);
     }
     let direct = lent.get(&key_at(answer, 0)).map_err(crate::store::PlaceError::from)?;
-    let Some(direct) = direct.filter(|got| got.tag == blaze_cas::plain::INDEX_TAG && got.bytes.len() % 32 == 0) else { return whole(WhyWhole::NotLast) };
+    let Some(direct) = direct.filter(|got| blaze_keyed::kind::ReservedTag::Index.is(got.tag) &&got.bytes.len() % 32 == 0) else { return whole(WhyWhole::NotLast) };
     // An index's keys are sorted (blaze-cas `index`): found by halving.
     let wanted = blaze_cas::Key(last_root.0);
     let (mut low, mut high) = (0usize, direct.bytes.len() / 32);
@@ -1180,3 +1602,7 @@ fn reach_error(error: crate::engine_answer_rows::PublishError) -> CliError {
 #[cfg(test)]
 #[path = "tests/engine_answer_page_edit.rs"]
 mod page_edit;
+
+#[cfg(test)]
+#[path = "tests/engine_bases_tests.rs"]
+mod bases_tests;

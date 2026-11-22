@@ -887,3 +887,49 @@ fn a_worlds_loop_runs_out_of_fuel_deterministically() {
     once.out_of_fuel();
     assert_eq!((once.fuel_used, twice.fuel_used, &twice.exit), (100_000, 100_000, &once.exit));
 }
+
+/// A package's `src/main.rs` whose `handler!()`, at module level, writes `handle_tip` with
+/// tracing's callsite static (`concat!(file!(), ":", line!())` through
+/// `$crate::__macro_support`: engine_check_tests.rs `CALLSITE_SUPPORT`) and
+/// `const LINE: u32 = line!()`, asserted through a const to be the line of `handler!();` plus
+/// `shift` (`[0; LINE as usize]` typed `[u8; K]`); `main` calls it.
+fn callsite_world(seed: u64, shift: usize) -> World {
+    let support = super::engine_check_tests::CALLSITE_SUPPORT;
+    let text = std::format!(
+        "{support}macro_rules! handler {{\n    () => {{\n        fn handle_tip() -> u8 {{\n            static META: (&str, u8) = ($crate::__macro_support::concat!(file!(), \":\", line!()), 1);\n            const LINE: u32 = line!();\n            let _at: [u8; K] = [0; LINE as usize];\n            META.1\n        }}\n    }};\n}}\n\nhandler!();\n\nfn main() {{\n    let _ = handle_tip();\n}}\n"
+    );
+    let at = text.lines().position(|l| l.starts_with("handler!();")).expect("the call's line") + 1 + shift;
+    let text = text.replace("[u8; K]", &std::format!("[u8; {at}]"));
+    World::new(seed).file("Cargo.toml", MANIFEST_2024).file("src/main.rs", &text)
+}
+
+/// `line!()` IN A FN A MACRO WROTE AT MODULE LEVEL, IN A PACKAGE (so `file!()` is answered:
+/// the given-files fixture of blaze-ladder's tests has no package and refuses it by name).
+/// The check is the run path's gate (D151): the check passes with nothing refused, and `main`
+/// is let run. TWIN, planted: the asserted line one past the call: the check fails (one error),
+/// so the value was read, not refused. Core `line!`: the outermost call's line (front2
+/// body_host.rs `Placed::of`, program/lazy seam_rules.rs `body_place`). Before (tempo a2015):
+/// "HostError { ask: Place, why: Refused }", the body not checked.
+#[test]
+fn line_in_a_fn_a_macro_wrote_is_its_calls_line_at_the_gate() {
+    let world = callsite_world(31, 0);
+    let said = world.check();
+    // Not failed (1, as the gate test's type error); a stage not built yet may leave it
+    // incomplete, which is no finding of this program.
+    assert_ne!(said.status, 1, "clean, `line!()` the call's line\n{}", said.words);    assert!(!said.words.contains("HostError"), "`line!()` and `file!()` answered, never refused\n{}", said.words);
+    assert!(world.gate("src/main.rs", "main").runs(), "`main` is let run\n{}", said.words);
+    let planted = callsite_world(31, 1);
+    let wrong = planted.check();
+    assert_eq!(wrong.status, 1, "planted: one line past the call is a type error\n{}", wrong.words);
+    assert!(!wrong.words.contains("HostError"), "planted: refused by its value, not by a place\n{}", wrong.words);
+    println!("world_run: line!() in a macro-written fn checked as its call's line; one past it failed");
+}
+
+/// The same program RUN: `handle_tip` made on the run path (blaze-ladder run/make_one.rs over
+/// the names records, with the package's body sources) and the run exits 0.
+#[test]
+#[ignore = "G1 make path keeps no LIR"]
+fn a_fn_a_macro_wrote_with_line_in_eager_input_runs() {
+    let ran = callsite_world(32, 0).run(eval(100_000));
+    ran.exit_is(0);
+}

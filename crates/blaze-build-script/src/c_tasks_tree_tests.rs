@@ -306,6 +306,50 @@ fn the_trees_section_round_trips_and_built_drops_it() {
     assert!(matches!(reopened.file("build/configure"), Some(OutFileRef::Inline(_))), "the script's other files are kept");
 }
 
+/// A runner whose tree made `file` holding the host folder `/hosts/x/work/trees/k/out`.
+struct Leaky {
+    file: &'static str,
+}
+
+impl TreeRunner for Leaky {
+    fn run<'a>(&mut self, _job: &TreeJob<'_, '_>, _outputs: &OutputsRef<'_>, _key: ContentId, alloc: Alloc<'a>) -> Result<TreeRan<'a>, Refused<'a>> {
+        // As native_c_tasks.rs's scan answers: a log or a depfile is let go, any other said.
+        match crate::c_tasks_tree::left_out_holding_a_host_folder(self.file) {
+            true => Ok(TreeRan::Made { files: Vec::new_in(alloc), left_out: 1 }),
+            false => Ok(TreeRan::HostPath { file: own(self.file, alloc), host: own("/hosts/x/work/trees/k/out", alloc) }),
+        }
+    }
+}
+
+/// (f) Before 2026-11-21 a file the tree made holding a host folder was left out whatever it
+/// was (`left_out += 1; continue`), so a later step found it missing with no cause. Now only a
+/// log or a depfile is let go: `config.log` and `src/arena.d` (the TWINS, a log and a depfile
+/// at depth) are counted and the tree is made; `bin/jemalloc-config` (the CONTROL: a file the
+/// tree installs, neither) is the crate's error naming the file and the folder it holds, and
+/// nothing is recorded.
+#[test]
+fn a_file_holding_a_host_folder_is_named_unless_a_log_or_a_depfile() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let bytes = record(BASE, alloc);
+    let run = |file: &'static str, store: &mut Store| -> Result<u32, std::string::String> {
+        let outputs = OutputsRef::open(&bytes).expect("the record opens");
+        let plan = c_tasks::plan(&outputs, &roots(), &[], alloc).expect("the plan");
+        let toolchain = Toolchain { kind: CompilerKind::ShelfClang, compiler: [7; 32], sdk: b"26.1 25B78", target: "aarch64-apple-darwin" };
+        let inputs = TreeInputs { toolchain: &toolchain, tools: &[], os_build: "25B78", sources: &[], runner: "fake 1" };
+        run_tree(PACKAGE, &outputs, &roots(), &plan.trees, &inputs, &mut Leaky { file }, store, alloc).map(|done| done.left_out).map_err(|error| error.to_string())
+    };
+    for file in ["config.log", "src/arena.d"] {
+        let mut store = Store { held: std::vec::Vec::new(), puts: 0 };
+        assert_eq!(run(file, &mut store), Ok(1), "twin: {file} is let go and counted");
+    }
+    let mut store = Store { held: std::vec::Vec::new(), puts: 0 };
+    let error = run("bin/jemalloc-config", &mut store).expect_err("control: an installed file holding the folder is refused");
+    assert!(error.contains(PACKAGE) && error.contains("`$OUT_DIR/bin/jemalloc-config`") && error.contains("`/hosts/x/work/trees/k/out`"), "{error}");
+    assert_eq!(store.puts, 0, "nothing recorded");
+    assert!(!crate::c_tasks_tree::left_out_holding_a_host_folder("lib/libjemalloc.a"), "an archive is never let go");
+    assert!(!crate::c_tasks_tree::left_out_holding_a_host_folder("src/arena.d/x.h"), "a folder named like a depfile is not one");
+}
+
 /// A tree error's words name what the coordinator reads first.
 #[test]
 fn a_tree_error_names_the_rule_for_a_cwd_outside() {

@@ -72,7 +72,7 @@ const EDITION: Edition = Edition::E2024;
 // The world, timed: every question the checker asks, counted and timed by kind, then answered
 // by the front end's world. Harness counters only; the checker is unchanged.
 
-const KINDS: usize = 25;
+const KINDS: usize = 26;
 
 fn kind_of(q: &Question) -> usize {
     match q {
@@ -100,13 +100,14 @@ fn kind_of(q: &Question) -> usize {
         Question::TypeAlias(_) => 22,
         Question::FieldDefaults(_) => 23,
         Question::MemberVisible(..) => 24,
+        Question::MemberUnstable(..) => 25,
     }
 }
 
 const KIND_NAMES: [&str; KINDS] = [
     "FnSig", "Predicates", "Adt", "ImplsOf", "ImplHeader", "Inherent", "AssocItem", "TraitsInScope", "Path", "Lang",
     "LangPath", "Const", "Opaque", "Attrs", "TraitDef", "AssocParent", "ConstHolds", "ConstParams", "prefetch", "Closure", "AssocGenerics",
-    "Coroutine", "TypeAlias", "FieldDefaults", "MemberVisible",
+    "Coroutine", "TypeAlias", "FieldDefaults", "MemberVisible", "MemberUnstable",
 ];
 
 struct Tally {
@@ -209,6 +210,9 @@ impl<W: World> World for Timed<'_, W> {
     }
     fn member_visible(&self, seal: Seal, container: ItemKey, name: blaze_typeck::Name) -> Fetch<bool> {
         self.time(24, || self.inner.member_visible(seal, container, name))
+    }
+    fn member_unstable(&self, seal: Seal, container: ItemKey, name: blaze_typeck::Name) -> Fetch<bool> {
+        self.time(25, || self.inner.member_unstable(seal, container, name))
     }
     fn prefetch(&self, seal: Seal, questions: &[Question]) {
         self.time(18,|| self.inner.prefetch(seal, questions))

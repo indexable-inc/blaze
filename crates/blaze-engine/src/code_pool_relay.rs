@@ -28,8 +28,12 @@
 //! A made instance's bytes are kept, keyed, until the relay ends: a child that asks a key the
 //! pool already made is answered at once from them (its walk may ask before the first asker's
 //! walk has put the entry in the store). An unkeyed instance's bytes go when its child takes them.
-//! A refusal is handed whole to the first child that takes it; a later asker of the same key is
-//! answered [`Reply::RefusedElsewhere`] naming that first child (the cause is not `Clone`).
+//! A refusal is kept, keyed, as made bytes are, and EVERY asker of its key is handed the same
+//! refusal ([`Reply::Refused`], a borrow of the one kept): each test whose instance could not be
+//! made prints the cause itself, never a pointer to another test (rule 19; tempo t2000p: 277 NOT
+//! RUN lines said only "the cause is said with the test that asked it first"). A refusal's size
+//! is its driver's (blaze-cli test_drive.rs `CodeRefusal`, its words capped there); there is one
+//! a key, and the keys are bounded by [`Options::asks`].
 
 #![blaze::sans_io]
 
@@ -74,10 +78,8 @@ pub enum Wait {
 pub enum Reply<'r, E> {
     /// The made entry's bytes: the child's walk finishes its pending row with them.
     Made(&'r [u8]),
-    /// The worker's refusal of the make, whole.
-    Refused(E),
-    /// The make was refused, and its cause handed to `first`, the child that took it first.
-    RefusedElsewhere { key: CodeKey, first: Child },
+    /// The worker's refusal of the make, the same one to every asker of its key.
+    Refused(&'r E),
     /// The ask of `key` waited `waited` (the clock's units) and its code did not come.
     Late { key: CodeKey, waited: u64 },
 }
@@ -163,9 +165,8 @@ struct Asker {
 struct Entry<'a, E> {
     /// `None`: the make was refused.
     bytes: Option<SVec<'a, u8>>,
+    /// The make's refusal, handed to every asker (never taken).
     refusal: Option<E>,
-    /// The child that took the refusal.
-    first: Option<Child>,
     unkeyed: bool,
     /// Answers set for this key (the planted dropped wake skips all but the first).
     #[cfg(test)]
@@ -282,7 +283,7 @@ impl<'a, J, E> Relay<'a, J, E> {
             }
             self.held += len;
             self.entries.insert(key, Entry {
-                bytes: Some(bytes), refusal: None, first: None, unkeyed,
+                bytes: Some(bytes), refusal: None, unkeyed,
                 #[cfg(test)]
                 answered: 0,
             });
@@ -297,7 +298,7 @@ impl<'a, J, E> Relay<'a, J, E> {
         let (key, unkeyed) = self.owned(worker)?;
         if !unkeyed || self.asked(key) {
             self.entries.insert(key, Entry {
-                bytes: None, refusal: Some(why), first: None, unkeyed,
+                bytes: None, refusal: Some(why), unkeyed,
                 #[cfg(test)]
                 answered: 0,
             });
@@ -355,15 +356,9 @@ impl<'a, J, E> Relay<'a, J, E> {
                 (key, with(Reply::Made(bytes.as_slice())))
             }
             Got::Refused(key) => {
-                let entry = self.entries.get_mut(&key).ok_or(RelayError::NotMade(key))?;
-                let reply = match entry.refusal.take() {
-                    Some(why) => {
-                        entry.first = Some(child);
-                        Reply::Refused(why)
-                    }
-                    None => Reply::RefusedElsewhere { key, first: entry.first.unwrap_or(child) },
-                };
-                (key, with(reply))
+                let entry = self.entries.get(&key).ok_or(RelayError::NotMade(key))?;
+                let why = entry.refusal.as_ref().ok_or(RelayError::NotMade(key))?;
+                (key, with(Reply::Refused(why)))
             }
         };
         // An unkeyed entry is its one child's: gone once taken.

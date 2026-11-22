@@ -536,6 +536,149 @@ impl CoherenceMarks {
     }
 }
 
+/// An item's `#[unstable(feature = "..", implied_by = "..")]`, as written: the library feature
+/// that a crate turns on with `#![feature(..)]` to use the item (library/std/src/collections/
+/// hash/map.rs: `#[unstable(feature = "map_try_insert", issue = "82766")] pub fn try_insert`;
+/// library/alloc/src/vec/mod.rs: `#[unstable(feature = "allocator_ext", issue = "163177",
+/// implied_by = "allocator_api")] pub fn try_with_capacity_in`). Method lookup reads it through
+/// `World::member_unstable` (rustc_hir_typeck method/probe.rs `consider_candidates`: a
+/// candidate whose `eval_stability` is `Deny` is dropped before the pick, and only when nothing
+/// else is picked is the search run again with it). `issue`, `reason`, `soft` and `old_name`
+/// change no pick and are not kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unstable {
+    pub feature: Box<str>,
+    /// rustc_middle stability.rs `eval_stability_allow_unstable`: "If this item was previously
+    /// part of a now-stabilized feature which is still enabled .. then allow use of this item."
+    pub implied_by: Option<Box<str>>,
+}
+
+/// An item's stability as its own attributes write it (rustc_passes stability.rs
+/// `lookup_stability`: an item's own `#[stable]`/`#[unstable]`, else its parent's when that
+/// is unstable).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Marked {
+    Unmarked,
+    Stable,
+    Unstable(Unstable),
+}
+
+impl Marked {
+    /// The stability attributes of the item `v` is the view of, read from its attribute rows
+    /// (the path's text, then the arguments' tokens: never a scan of the item's text). Two of
+    /// them on one item is rustc's E0544, refused by name.
+    pub(super) fn of(v: &View<'_>) -> Result<Marked, Why> {
+        let mut marked = Marked::Unmarked;
+        for &row in v.rows(v.list(head::ATTRS))? {
+            let attr = v.attr(row)?;
+            let this = match v.text_at(attr.path)?.trim() {
+                "stable" => Marked::Stable,
+                "unstable" => Marked::Unstable(Unstable::of_args(v.text_at(attr.args)?)?),
+                _ => continue,
+            };
+            if marked != Marked::Unmarked {
+                return Err(Why::Program(Box::from("an item with two stability attributes (rustc E0544, \"multiple stability levels\")"), Range::new(0, 0)));
+            }
+            marked = this;
+        }
+        Ok(marked)
+    }
+
+    /// The stability of an item marked `self` whose parent is marked `parent`: its own, else
+    /// the parent's when that is unstable (rustc_passes stability.rs `lookup_stability`:
+    /// `if parent.is_unstable() .. { return Some(parent) }`). `None`: not unstable.
+    pub(super) fn unstable_under(&self, parent: &Marked) -> Option<Unstable> {
+        match (self, parent) {
+            (Marked::Unstable(u), _) | (Marked::Unmarked, Marked::Unstable(u)) => Some(u.clone()),
+            _ => None,
+        }
+    }
+}
+
+impl Unstable {
+    /// `(feature = "x", issue = "n", implied_by = "y", soft)` (or the same without the
+    /// parentheses), from its tokens: each meta item an identifier, then `= "value"` or
+    /// nothing, separated by commas. A `feature` is required (rustc's E0546 "missing
+    /// 'feature'"); a value with an escape or a raw string is refused as unsupported (std's
+    /// feature names are plain identifiers).
+    fn of_args(args: &str) -> Result<Unstable, Why> {
+        use parser::SyntaxKind as K;
+        let at = Range::new(0, 0);
+        let bad = |what: &'static str| Why::Program(format!("an `#[unstable(..)]` attribute: {what}").into_boxed_str(), at);
+        let lexed = parser::LexedStr::new(parser::Edition::Edition2024, args);
+        let mut i = 0usize;
+        let mut next = || {
+            while i < lexed.len() {
+                i += 1;
+                if !lexed.kind(i - 1).is_trivia() {
+                    return Some(i - 1);
+                }
+            }
+            None
+        };
+        let (mut feature, mut implied_by) = (None, None);
+        let mut tok = next();
+        let parens = tok.is_some_and(|t| lexed.kind(t) == K::L_PAREN);
+        if parens {
+            tok = next();
+        }
+        loop {
+            let Some(t) = tok else {
+                if parens {
+                    return Err(bad("no `)` closes its arguments"));
+                }
+                break;
+            };
+            match lexed.kind(t) {
+                K::R_PAREN if parens => {
+                    if next().is_some() {
+                        return Err(bad("tokens after its `)`"));
+                    }
+                    break;
+                }
+                K::IDENT => {}
+                _ => return Err(bad("a meta item that is not a name")),
+            }
+            if lexed.error(t).is_some() {
+                return Err(bad("a token that does not lex"));
+            }
+            let key = lexed.text(t);
+            tok = next();
+            let mut value = None;
+            if tok.is_some_and(|e| lexed.kind(e) == K::EQ) {
+                let Some(s) = next().filter(|&s| lexed.kind(s) == K::STRING && lexed.error(s).is_none()) else {
+                    return Err(bad("a `=` not followed by a string"));
+                };
+                value = Some(lexed.text(s));
+                tok = next();
+            }
+            // Only a feature's name is read: a `reason` may be raw or hold escapes (a line
+            // continuation), and is not kept.
+            let name = |text: &str| -> Result<Box<str>, Why> {
+                let inner = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')).ok_or_else(|| bad("a feature name written as a raw string"))?;
+                if inner.contains(['\\', '\r']) {
+                    return Err(Why::Unsupported("an `#[unstable(..)]` feature name with an escape", at));
+                }
+                Ok(Box::from(inner))
+            };
+            match (key, value) {
+                ("feature", Some(v)) => feature = Some(name(v)?),
+                ("implied_by", Some(v)) => implied_by = Some(name(v)?),
+                ("feature" | "implied_by", None) => return Err(bad("`feature` or `implied_by` with no value")),
+                _ => {}
+            }
+            match tok {
+                Some(c) if lexed.kind(c) == K::COMMA => tok = next(),
+                Some(c) if parens && lexed.kind(c) == K::R_PAREN => {}
+                None if !parens => {}
+                _ => return Err(bad("meta items not separated by commas")),
+            }
+        }
+        let feature = feature.ok_or_else(|| bad("no `feature` (rustc E0546)"))?;
+        Ok(Unstable { feature, implied_by })
+    }
+}
+
 /// Facts of the nominal declaration that are already known before any field type is built.
 #[derive(Clone, Copy)]
 pub struct AdtDeclaration {
@@ -1014,6 +1157,12 @@ pub struct ImplHead {
     /// (`World::member_visible`). A trait impl's members are `Public` (they are as visible as
     /// the trait, which lookup reaches only when it is in scope).
     pub fn_vis: Vec<MemberVis, Global>,
+    /// An inherent impl's fns and constants that are unstable ([`Unstable`]: their own
+    /// `#[unstable]`, or the impl's when they write no stability attribute), by name in
+    /// member order; empty for a trait impl (lookup reaches a trait's member through the
+    /// trait). What method and path lookup ask before taking an inherent candidate
+    /// (`World::member_unstable`).
+    pub unstable: Vec<(Name, Unstable), Global>,
     /// Its associated constants (the Reference, "Associated constants"), each with a row in
     /// `Store::fns` as the checker reads one: no inputs, its type the output, and its body
     /// where its value is written (`has_body`: what the constant evaluator lowers).
@@ -3881,6 +4030,9 @@ impl<'n> Store<'n> {
         // Each fn's visibility from its text too ([`MemberVis`]): a trait impl's members
         // write none and are the trait's (`Public` here).
         let mut fn_vis = Vec::new_in(Global);
+        // An inherent impl's unstable members ([`Unstable`]), under the impl's own stability.
+        let impl_marked = if trait_.is_none() { Marked::of(v)? } else { Marked::Unmarked };
+        let mut unstable = Vec::new_in(Global);
         let mut const_texts = Vec::new_in(Global);
         // Each `type X = U;` value's column (D148, `HeadRegions::impl_assoc`), or why not: filed
         // with the impl's regions below, a refusal refusing them.
@@ -3890,6 +4042,12 @@ impl<'n> Store<'n> {
             let mv = low.view();
             if mv.cfg_out() {
                 continue;
+            }
+            if trait_.is_none()
+                && matches!(m.detail, ItemDetail::Fn { .. } | ItemDetail::Const { .. })
+                && let Some(u) = Marked::of(&mv)?.unstable_under(&impl_marked)
+            {
+                unstable.push((Name::of(m.name), u));
             }
             match m.detail {
                 ItemDetail::Fn { .. } => {
@@ -4037,7 +4195,7 @@ impl<'n> Store<'n> {
         frame_bounds.extend_from_slice(&bounds);
         self.member_frames.insert(ck, member_fn::MemberFrame { module, generics, params: ps.clone(), consts: cs.clone(), bounds: frame_bounds, self_: env.self_ });
         self.preds.insert(ck, preds);
-        self.impls.insert(ck, ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, fn_vis, consts, polarity });
+        self.impls.insert(ck, ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, fn_vis, unstable, consts, polarity });
         self.maps.const_params.insert(key, cs);
         Ok(())
     }
@@ -4276,7 +4434,18 @@ impl<'n> Store<'n> {
         // The return type's builder: an expanded return type is a text of its own, read at the
         // fn's module; the item's marks are not its tokens'.
         let rb = Builder { resolver: Paths { names }, heads: &self.maps, marks: if expanded.is_some() { None } else { marks } };
-        let env = Env { module: outer.module, params: &ps, bounds: Bounds::Building(&[]), self_: outer.self_, self_assoc: outer.self_assoc, anon: &anon, consts: &cs, body: None };
+        // A LOCAL fn's, const's or static's signature stands in the block it is declared in
+        // (the Reference, "Statements", "Item declarations": its scope is the block's), so a
+        // written type's first segment is first asked of that block's `use` items: the body
+        // scope of the local itself, from which `Locals::find` walks out to its declaration
+        // (block_type_uses.rs `through_use`, its local-signature arm). Its head is read at
+        // `LocalHead::names_at`, and a block of only `use` items and fns is no module of the
+        // names library, so without this a block import named nothing there (alloc's
+        // `custom_owner_from_box`: `use core::ptr::NonNull;` then `unsafe fn
+        // drop_box_raw<T: ?Sized>(ptr: NonNull<T>)`: E0412; ladder rungs f3-dyn,
+        // x0-ref-11-deref-unsized, x0-ref-12-wide-ptr-eq; tests/front2_block_use_types.rs).
+        let body = self.locals.head(key).map(|_| super::block_type_uses::BodyScope { locals: &self.locals, owner: key, module: outer.module, alloc: self.tys.alloc() });
+        let env = Env { module: outer.module, params: &ps, bounds: Bounds::Building(&[]), self_: outer.self_, self_assoc: outer.self_assoc, anon: &anon, consts: &cs, body };
         // A bound whose trait names nothing is the fn's own E0405 (kept below), not its head's
         // refusal: the head is made without it, and its callers are not blamed. Only a fn with
         // a body: its body's check is what says the finding (check.rs `signature_misses`); a

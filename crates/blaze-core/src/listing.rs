@@ -429,7 +429,7 @@ mod tests {
     }
 
     fn file(size: u64) -> Stamp {
-        Stamp { ino: size + 1, size, mtime_ns: 1, ctime_ns: 1, mode: crate::S_IFREG | 0o644 }
+        Stamp { ino: size + 1, size, mtime_ns: 1, ctime_ns: 1, dev: 1, mode: crate::S_IFREG | 0o644 }
     }
 
     /// Any names in any order come out sorted by their bytes, each stamp beside its own name;

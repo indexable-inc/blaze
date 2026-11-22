@@ -124,7 +124,7 @@ pub(crate) fn plan<'h>(names: &NamesStage<'_>, alloc: SharedAlloc<'h>) -> Result
     let mut planned = SVec::new_in(alloc);
     let Some(world) = names.names.as_ref() else { return Ok(planned) };
     for (name, source) in crate::names::parts(world).iter() {
-        let at = world.crate_at(name.subject).ok_or(EngineCheckError::Unseen { task: *name, read: *name })?;
+        let at = world.crate_at(name.subject).ok_or(EngineCheckError::MissingEntry { task: *name, table: crate::engine_check::Table::WorldCrates, key: *name })?;
         // A crate with no check scope (refused by the list, or a dependency's proc macro kept for
         // its macros only) has no tables task: it could only fail, and no body asks a proc
         // macro's or a refused crate's impls (blaze-world check_scope.rs `has_check_scope`).

@@ -24,8 +24,12 @@
 //! anywhere in the file's text (an item, an attribute, a body), with `(..)`, `[..]` or `{..}`
 //! and an optional trailing comma. A call whose path is made by another macro
 //! (`include_str!(concat!(env!("CARGO_MANIFEST_DIR"), ".."))`) or written by a `macro_rules!`
-//! expansion is not listed: its read is a part no record lists, and the drive refuses it by name
-//! ("a part its file's record does not list", rule 3), never quietly.
+//! expansion is not listed. In a BODY its read is the file's checkout-read `Given` cell, the one
+//! a build script's `file:` read of it has (engine_script_reads.rs `file_read`): kept as a leaf
+//! row the sweep follows and planned as its `Given` task from the next request on, so an edit of
+//! the file enters the body (engine_bodies.rs `data_read`). At item level (a crate's names) it is
+//! a part no record lists, and the drive refuses it by name ("a part its file's record does not
+//! list", rule 3), never quietly.
 //!
 //! A listed file is opened as the one path it names (`module: false`): its `FileItems` task
 //! reads its bytes and its out is their content id ([`data_out`]). A file that is not there is

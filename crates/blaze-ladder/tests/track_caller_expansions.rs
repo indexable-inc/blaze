@@ -196,7 +196,14 @@ fn line_col(text: &str, written: &str) -> (u32, u32) {
 /// another place (the control); with three lines inserted before `insert_before`, the same
 /// sealed site is three lines later, read from today's text over the old records.
 fn check_expansion_site(decls: &str, site: &'static str, entry: &'static str, insert_before: &str) {
-    let text = format!("{SITE_HEAD}{decls}\n#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 {{ S::sample() as i32 }}");
+    check_expansion_site_calling(decls, "S::sample()", site, entry, insert_before)
+}
+
+/// [`check_expansion_site`] with `main` returning `call` (a `sample` written in a body is
+/// reached through the body). Every `sample` is shown by a path with no block module in it
+/// (item_shown.rs `shown_segments`).
+fn check_expansion_site_calling(decls: &str, call: &str, site: &'static str, entry: &'static str, insert_before: &str) {
+    let text = format!("{SITE_HEAD}{decls}\n#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 {{ {call} as i32 }}");
     let mut moved = text.clone();
     moved.insert_str(text.find(insert_before).expect("edit anchor"), "\n\n\n");
     let text: &'static str = Box::leak(text.into_boxed_str());
@@ -219,7 +226,7 @@ fn check_expansion_site(decls: &str, site: &'static str, entry: &'static str, in
             let mut calls = exprs.iter().enumerate().filter(|(_, e)| matches!(e, Expr::Call { .. }));
             let (i, _) = calls.next().expect("the call of `tracked`");
             assert!(calls.next().is_none(), "only the call of `tracked` is in `sample`");
-            let s = front.caller_site(row.key, ExprId(i as u32)).unwrap_or_else(|| panic!("{label}: the call in `sample` has no source site"));
+            let s = front.caller_site(row.key, ExprId(i as u32)).unwrap_or_else(|gap| panic!("{label}: the call in `sample` has no source site: {gap}"));
             assert!(s.file.ends_with(ROOT), "{label}: shown path {}", s.file);
             let placed = front.source_position(s.item, s.offset);
             assert_eq!(placed, Ok(expected), "{label}: `{site}` is the call site");
@@ -228,6 +235,8 @@ fn check_expansion_site(decls: &str, site: &'static str, entry: &'static str, in
         };
         let saved = site_in("records", &*lazy);
         assert_eq!(site_in("whole", whole), saved, "both fronts seal one site");
+        let named = lazy.item_named(key).expect("`sample` has a path");
+        assert!(named.ends_with("::sample") && !named.contains("__blaze_block"), "shown with no block module: {named}");
         assert_eq!(cold_position(names, moved, saved.1, saved.2), Ok((moved_line, moved_col)), "the sealed site over today's text");
         saved
     });
@@ -284,6 +293,73 @@ fn a_derive_written_by_a_macro_is_placed_at_the_outermost_call() {
         "macro_rules! Sampled { derive() ($(#[$m:meta])* struct $name:ident;) => { impl $name { fn sample() -> u8 { tracked(9) } } }; }\n\
          macro_rules! wrap { () => { #[derive(Sampled)] struct S; } }\n/// A doc comment above the call.\nwrap!();",
         "wrap!();", "/// A doc comment", "/// A doc comment")
+}
+
+// ---- a call written in a block of a body (tempo t1855d, 2026-11-21: 50 NOT RUN) ----
+//
+// Before: a call written in a body's block is in the names library's module text of that
+// body's blocks (`(body, "blocks")`, resolve.rs `make_blocks`), which no call wrote and which
+// keeps no origins, so the walk out to the outermost call stopped there (`call_origin` of the
+// fragment: no expansion) and every `#[track_caller]` call such a call's expansion writes had
+// no site ("the world does not say where the expression is (`Adts::caller_site`)"): tempo's
+// `#[derive(serde::Serialize)] struct BlockRef` in `fn serialize`, `#[derive(RlpDecodable)]
+// struct WireSignature` in `<impl Decodable for ..>::decode`, rand's `const _: () = unsafe {
+// impl_fill!(..) };`. Now the call's site in the fragment is carried back to the byte of the
+// body it was copied from (seam_rules/local_position.rs `block_call_site`), and the body is
+// placed as any item. With that step removed every row below panics at "has no source site".
+// The edit above the body moves the line and not the sealed site; the doc comment above the
+// call (the calling entry's first byte) is the control in each.
+
+const IN_CONST: &str = "macro_rules! Sampled { derive() ($(#[$m:meta])* struct $name:ident;) => { const _: () = { impl $name { fn sample() -> u8 { tracked(9) } } }; }; }\n";
+
+/// serde's shape in tempo's `serde_sealed_or_recovered_block::serialize`: a derive on a struct
+/// declared in a fn's body, the impl in the derive's `const _: () = { .. };`.
+#[test]
+fn a_derive_in_a_fn_body_is_placed_at_the_derive_path() {
+    check_expansion_site_calling(
+        &format!("{IN_CONST}fn outer() -> u8 {{\n    /// A doc comment above the derive.\n    #[derive(Other, Sampled)]\n    struct S;\n    S::sample()\n}}"),
+        "outer()", "Sampled)]", "/// A doc comment", "fn outer")
+}
+
+/// The twin: the derive writes its impl bare, with no `const _` around it.
+#[test]
+fn a_bare_derive_in_a_fn_body_is_placed_at_the_derive_path() {
+    check_expansion_site_calling(
+        "macro_rules! Sampled { derive() ($(#[$m:meta])* struct $name:ident;) => { impl $name { fn sample() -> u8 { tracked(9) } } }; }\n\
+         fn outer() -> u8 {\n    /// A doc comment above the derive.\n    #[derive(Other, Sampled)]\n    struct S;\n    S::sample()\n}",
+        "outer()", "Sampled)]", "/// A doc comment", "fn outer")
+}
+
+/// The body is a member (tempo's `#[derive(alloy_rlp::RlpDecodable)] struct WireSignature` in
+/// `<impl Decodable for ConfigurableAccountSignature>::decode`): placed through its impl.
+#[test]
+fn a_derive_in_a_member_fns_body_is_placed_at_the_derive_path() {
+    check_expansion_site_calling(
+        &format!("{IN_CONST}struct T;\nimpl T {{\n    fn outer() -> u8 {{\n        /// A doc comment above the derive.\n        #[derive(Other, Sampled)]\n        struct S;\n        S::sample()\n    }}\n}}"),
+        "T::outer()", "Sampled)]", "/// A doc comment", "struct T;")
+}
+
+/// rand's shape (rng.rs `const _: () = unsafe { impl_fill!(u16, u32, u64, u128,) };`): a
+/// function-like call in a const's block whose expansion is a block of statement calls, the
+/// impl two calls in. rustc places it at the outermost call, the one the const's block holds.
+/// The call is the block's tail, so the block's module text writes it with a `;` of its own
+/// (blaze-scope expanded_blocks.rs `render`): with that `;` taken as the body's again
+/// (local_position.rs `written_range`), this row has no site over records (the 19:41 run).
+#[test]
+fn a_statement_call_in_a_consts_block_is_placed_at_the_call() {
+    check_expansion_site(
+        "struct S;\nmacro_rules! fill {\n    () => {};\n    (@one $t:ident) => {{ impl $t { fn sample() -> u8 { tracked(9) } } }};\n    ($t:ident, $($tt:ident,)*) => {{ fill!(@one $t); fill!($($tt,)*); }};\n}\n\
+         /// A doc comment above the const.\nconst _: () = unsafe { fill!(S,) };",
+        "fill!(S,)", "/// A doc comment", "/// A doc comment")
+}
+
+/// The twin: the same call as a statement, its `;` written in the const's block.
+#[test]
+fn a_statement_call_with_its_semicolon_in_a_consts_block_is_placed_at_the_call() {
+    check_expansion_site(
+        "struct S;\nmacro_rules! fill {\n    () => {};\n    (@one $t:ident) => {{ impl $t { fn sample() -> u8 { tracked(9) } } }};\n    ($t:ident, $($tt:ident,)*) => {{ fill!(@one $t); fill!($($tt,)*); }};\n}\n\
+         /// A doc comment above the const.\nconst _: () = { fill!(S,); };",
+        "fill!(S,);", "/// A doc comment", "/// A doc comment")
 }
 
 // ---- an expansion record with no call part (tempo a1425) ----
@@ -354,7 +430,7 @@ fn a_body_written_by_an_expansion_without_a_call_part_is_made_and_only_its_locat
         lazy.check_one(key).expect("`sample` is checked without the call part").expect("`sample` has a body");
         let row = lazy.function(lazy.fn_index(key).expect("owner row"));
         let (i, _) = row.body.expect("live caller").0.exprs.iter().enumerate().find(|(_, e)| matches!(e, Expr::Call { .. })).expect("the call");
-        lazy.caller_site(row.key, ExprId(i as u32)).map(|s| lazy.source_position(s.item, s.offset))
+        lazy.caller_site(row.key, ExprId(i as u32)).ok().map(|s| lazy.source_position(s.item, s.offset))
     });
     assert_eq!(site(true), None, "no call part: only the location is unplaced");
     assert_eq!(site(false), Some(Ok((line, col))), "control: with the call part, the derive path");

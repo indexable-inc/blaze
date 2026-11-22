@@ -19,6 +19,7 @@
 //! caller's buffer and read in place, borrowing its text, byte strings and lists
 //! ([`List`]) from the frame.
 
+mod bytes;
 pub mod cbor;
 pub mod data;
 pub mod fault;

@@ -98,6 +98,7 @@ impl Wait {
             | Refusal::InvalidTag { .. }
             | Refusal::TransmuteSize { .. }
             | Refusal::Unreachable
+            | Refusal::NonzeroOnZero { .. }
             | Refusal::Panic { .. }
             | Refusal::DiscriminantOverflow { .. }
             | Refusal::StepLimit { .. }

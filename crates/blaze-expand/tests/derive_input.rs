@@ -128,6 +128,51 @@ fn an_element_end_reads_arrows_discriminants_and_generic_lists() {
     assert_eq!(input("#[derive(X)] struct T(#[cfg(windows)] HashMap<u8, u16>, u32);"), "struct T ( u32 ) ;");
 }
 
+/// The cases the old walk (`element_end`, deleted: it counted `<` and `>` until a lone `=`,
+/// then ended the element at the next comma outside a group) got wrong, each now the parser's
+/// element whole. CONTROL, the old walk's answers on the same inputs:
+/// - `struct S<#[cfg(windows)] T = HashMap<K, V>, U>`: it ended `T` at `K,`, leaving
+///   `struct S < V > , U > ..`.
+/// - `struct S { #[cfg(windows)] f: u8 = g::<A, B>(), h: u8 }`: it ended `f` at `A,`, leaving
+///   `struct S { B > ( ) , h : u8 }`.
+/// - `struct S { #[cfg(windows)] f: fn(u8, u8) -> u8 = |a, b| a, h: u8 }`: it ended `f` at
+///   `a,`, leaving `struct S { b | a , h : u8 }`.
+/// - a `#[cfg]` after a `;` in a default's block: no element started there for it, so the false
+///   `cfg` and its statement stayed.
+#[test]
+fn an_element_is_the_parsers_whole() {
+    assert_eq!(input("#[derive(X)] struct S<#[cfg(windows)] T = HashMap<K, V>, U> { u: U }"), "struct S < U > { u : U }");
+    assert_eq!(input("#[derive(X)] struct S { #[cfg(windows)] f: u8 = g::<A, B>(), h: u8 }"), "struct S { h : u8 }");
+    assert_eq!(input("#[derive(X)] struct S { #[cfg(windows)] f: fn(u8, u8) -> u8 = |a, b| a, h: u8 }"), "struct S { h : u8 }");
+    assert_eq!(
+        input("#[derive(X)] struct S { f: u8 = { let a = 1; #[cfg(windows)] let b = 2; a }, h: u8 }"),
+        "struct S { f : u8 = { let a = 1 ; a } , h : u8 }"
+    );
+}
+
+/// The negative twins: an item that does not parse is a typed refusal naming the element and
+/// the token, never an element cut short or a derive input with a piece of one left in it.
+#[test]
+fn a_malformed_element_is_a_typed_refusal() {
+    use blaze_expand::{Extent, ExtentError, ExtentWhy, ItemAttrsError};
+    let refusal = |text: &str| {
+        let mut unix = |name: &str, _: Option<&str>| Ok::<bool, ()>(name == "unix");
+        match ItemAttrs::new(tokens(text)).derives(&mut unix) {
+            Err(ItemAttrsError::Syntax(error)) => error,
+            Err(other) => panic!("{text}: refused, but not as syntax: {other}"),
+            Ok(_) => panic!("{text}: read, though it does not parse"),
+        }
+    };
+    let field = refusal("#[derive(X)] struct S { #[cfg(windows)] f: , h: u8 }");
+    assert!(matches!(field, ExtentError { what: Extent::Field, why: ExtentWhy::Refused, .. }), "{field}");
+    let param = refusal("#[derive(X)] struct S<#[cfg(windows)] T = , U> { u: U }");
+    assert!(matches!(param, ExtentError { what: Extent::GenericParam, .. }), "{param}");
+    let variant = refusal("#[derive(X)] enum E { #[cfg(windows)] A = , B }");
+    assert!(matches!(variant, ExtentError { what: Extent::Variant, .. }), "{variant}");
+    let trailing = refusal("#[derive(X)] struct S; struct T;");
+    assert!(matches!(trailing, ExtentError { what: Extent::Item, why: ExtentWhy::Trailing, .. }), "{trailing}");
+}
+
 /// A `cfg` a `#[cfg_attr]` leaves removes the field the same way: the attributes written
 /// before the `cfg_attr` go too; one that holds leaves them, and its other metas, in place.
 #[test]

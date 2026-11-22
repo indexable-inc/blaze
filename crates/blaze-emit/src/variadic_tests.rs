@@ -153,6 +153,10 @@ impl Names for ByC {
     fn name(&self, _: Outside) -> Option<Named<'_>> {
         Some(Named::C("snprintf"))
     }
+
+    fn routines(&self) -> crate::RoutinePlaces {
+        crate::RoutinePlaces::NONE
+    }
 }
 
 /// In the record form the call site's three instructions are contiguous, with the area opened

@@ -118,6 +118,12 @@ impl PendingDiag {
         PendingDiag { code, at, expected: None, found, name: None, because: None, unmet: Some((goal, leaf)), why: None, undecided: None, said: Said(()) }
     }
 
+    /// This finding about the name `name` (an E0599 whose reason is a candidate's unmet bound
+    /// names the method too: rule 19).
+    pub(crate) const fn with_name(self, name: Option<Name>) -> PendingDiag {
+        PendingDiag { name, ..self }
+    }
+
     /// [`PendingDiag::unmet`] with the solver's chain of why the goal has no solution.
     pub(crate) const fn unmet_why(code: DiagCode, at: At, found: Option<Ty>, goal: PendingGoal, leaf: Option<PendingGoal>, why: PendingWhy) -> PendingDiag {
         PendingDiag { code, at, expected: None, found, name: None, because: None, unmet: Some((goal, leaf)), why: Some(why), undecided: None, said: Said(()) }

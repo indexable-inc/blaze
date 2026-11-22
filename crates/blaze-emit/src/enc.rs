@@ -292,6 +292,24 @@ pub(crate) const fn stur(size: Size, rt: Reg, rn: Reg, imm9: i32) -> u32 {
     0x3800_0000 | ((size as u32) << 30) | (((imm9 as u32) & 0x1ff) << 12) | (rn << 5) | rt
 }
 
+/// `ldr{b,h,,} rt, [rn, rm]` (LDR (register): `option 15:13 = 011` (LSL), `S 12 = 0`):
+/// the address `rn + rm`, the offset a whole 64-bit register.
+pub(crate) const fn ldr_reg(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3860_6800 | ((size as u32) << 30) | (rm << 16) | (rn << 5) | rt
+}
+
+/// `str{b,h,,} rt, [rn, rm]` (STR (register)), as [`ldr_reg`] with `opc 23:22 = 00`.
+pub(crate) const fn str_reg(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3820_6800 | ((size as u32) << 30) | (rm << 16) | (rn << 5) | rt
+}
+
+/// The SIMD&FP form of one of the three loads and three stores above (LDR, LDUR, STR, STUR
+/// (immediate) and LDR, STR (register), SIMD&FP): the same word with `V 26 = 1`, `size` naming the register (`W`
+/// an `s` register, `X` a `d` one). The upper lanes of a loaded register are zeroed.
+pub(crate) const fn fp_access(word: u32) -> u32 {
+    word | (1 << 26)
+}
+
 /// `stp xt, xt2, [rn, #off]!`, `off` a multiple of 8 in -512..=504.
 pub(crate) const fn stp_pre(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
     0xa980_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt

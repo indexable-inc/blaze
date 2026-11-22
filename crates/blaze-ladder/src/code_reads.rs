@@ -14,8 +14,9 @@
 //!   variants (key, name, ctor, field count) and every field's name and type, the type digested
 //!   by its structure (`term`), never by a table handle. A struct gaining a field moves it.
 //! - `Repr`, `Discriminant` (item, variant), `ValidRange`: the rest of what a layout reads.
-//! - `Normalize` (trait, name, arguments) and `OpaqueHidden` (opaque, arguments): the type
-//!   a projection or an `impl Trait` is at the instance, by structure.
+//! - `Normalize` (trait, name, arguments) and `OpaqueHidden` (the opaque's owner row: the fn
+//!   whose head made it and its index; arguments, normalized): the type a projection or an
+//!   `impl Trait` is at the instance, by structure.
 //! - `Const` (item, arguments), `ConstBlock` and `Promoted` (owner, expression, arguments):
 //!   the value's bytes, alignment, mutability and relocations, every allocation.
 //! - `Static` (item): thread-local and mutable.
@@ -23,8 +24,19 @@
 //! - `DropImpl` (type): the `Drop` impl the type's glue calls.
 //! - `Abi`, `Nounwind` (item) and `TrackCaller` (instance).
 //! - `Resolve` (a call's instance): the instance that runs, the impl a trait's fn is selected
-//!   to. Not an `Adts` question: the walk (run.rs `build_from`) asks the front end's `resolve`
-//!   after the build, and logs it through [`ReadLog::ask_resolve`].
+//!   to. Not an `Adts` question: the walk asks the front end's `resolve` as it names a
+//!   reference, and logs it through [`ReadLog::ask_resolve`].
+//! - `ForeignStatic`, `ForeignFn` (item): a static's or a callee's C symbol, the walk's too
+//!   ([`ReadLog::ask_foreign_static`], [`ReadLog::ask_foreign_fn`]).
+//! - `CVariadic`, `LegacyConstGenerics` (item): the signature attributes a call reads.
+//! - `Laid` (owner, ordinal, arguments): the full lay of the coroutine one of whose functions
+//!   the entry is (run/lay_states.rs `lay_one`: its state, region, niche and saved locals'
+//!   table), digested ([`laid_answer`]); asked again by laying it again
+//!   ([`Beyond::laid`]). What the lay read (the owner's recipe, its held types' layouts) is in
+//!   that answer, so the lay keeps no rows of its own.
+//! - `CoroutineState`, `CoroutineNiche` (owner, ordinal, arguments): a coroutine state's shape
+//!   and its tag's niche as the build read them through `LayoutFacts`; asked again once the
+//!   verifier has laid that state as the build's lay did (run/make_one.rs `verify_instance`).
 //!
 //! FORWARDED, NOT RECORDED: literals, patterns, string and format pieces, and caller sites of
 //! a body (`int_lit`, `int_pat`, `float_pat`, `str_pat`, `float_lit`, `byte_str`, `str_lit`,
@@ -32,11 +44,13 @@
 //! is the instance's own fn); lang items and the run's settings (`lang_fn`, `fn_trait_method`,
 //! `future_poll`, `async_items`, `deref_fn`, `index_fn`, `lang_adt`, `fmt_argument_new`,
 //! `fmt_argument_adt`, `location_adt`, `panic`, `overflow_checks`, `type_names`); the
-//! signature attributes `c_variadic`, `legacy_const_generics` and `intrinsic`; instance keys
-//! (`const_fn_instance`); and the closure and coroutine facts (`closure`,
-//! `coroutine`, `coroutine_state`, `coroutine_niche`). A lang item or attribute edited in a
-//! crate of the workspace (a `no_core` program's) is not caught by the list; neither is a
-//! closure built in an owner's body other than the instance's own fn.
+//! attribute `intrinsic`; instance keys (`const_fn_instance`); and the closure and coroutine
+//! facts (`closure`, `coroutine`). A lang item or
+//! attribute edited in a crate of the workspace (a `no_core` program's) is not caught by the
+//! list; neither is a closure built in an owner's body other than the instance's own fn.
+//!
+//! VERIFYING: [`verify_today`] asks each row again, a question already answered this run
+//! answered by [`Answers`] (a binary search), any other one front-end lookup and one digest.
 //!
 //! A QUESTION'S BYTES outlive the run: the kind's byte, an 8-byte scalar (a variant, a name,
 //! an expression), then the item and its arguments as an instance name (symbols.rs
@@ -50,7 +64,8 @@ use std::alloc::Global;
 
 use blaze_build::data::DataRecord;
 use blaze_build::layout::{ClosureFacts, IntRepr, LayoutFacts, Missing, ReprAttrs, ValidRange};
-use blaze_build::{Abi, Adts, BuildError, Instance, InstanceKey, Intrinsic, StaticItem};
+use blaze_build::coroutine_state::{LaidState, StateName};
+use blaze_build::{Abi, Adts, BuildError, Instance, InstanceKey, Intrinsic, StateNiche, StateShape, StaticItem};
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AVec, Alloc};
 use blaze_typeck::{Adt, ExprId, ItemKey, LangItem, List, Mutbl, Name, PNode, PTy, PTys, PatId, PortableTys};
@@ -86,10 +101,25 @@ pub enum ReadKind {
     Nounwind = 14,
     TrackCaller = 15,
     Resolve = 16,
+    /// A static's C symbol, when an `extern` block declares it (the seam's `foreign_static`).
+    ForeignStatic = 17,
+    /// A callee's C symbol, when it is an `extern` block's fn (its row's `FnKind::Foreign`).
+    ForeignFn = 18,
+    /// A fn's C-variadic parameter (`Adts::c_variadic`).
+    CVariadic = 19,
+    /// A fn's `#[rustc_legacy_const_generics]` (`Adts::legacy_const_generics`).
+    LegacyConstGenerics = 20,
+    /// The full lay of the coroutine a part's entry was built into ([`laid_answer`]), asked
+    /// again by laying it again ([`Beyond::laid`]).
+    Laid = 21,
+    /// A coroutine state's shape (`LayoutFacts::coroutine_state`).
+    CoroutineState = 22,
+    /// A coroutine state's tag niche (`LayoutFacts::coroutine_niche`).
+    CoroutineNiche = 23,
 }
 
 impl ReadKind {
-    const ALL: [ReadKind; 16] = [
+    const ALL: [ReadKind; 23] = [
         ReadKind::Adt,
         ReadKind::Repr,
         ReadKind::Discriminant,
@@ -106,6 +136,13 @@ impl ReadKind {
         ReadKind::Nounwind,
         ReadKind::TrackCaller,
         ReadKind::Resolve,
+        ReadKind::ForeignStatic,
+        ReadKind::ForeignFn,
+        ReadKind::CVariadic,
+        ReadKind::LegacyConstGenerics,
+        ReadKind::Laid,
+        ReadKind::CoroutineState,
+        ReadKind::CoroutineNiche,
     ];
 
     /// The kind whose byte is `byte`.
@@ -131,6 +168,13 @@ impl ReadKind {
             ReadKind::Nounwind => "a fn's unwinding",
             ReadKind::TrackCaller => "an instance's track_caller",
             ReadKind::Resolve => "the instance a call runs",
+            ReadKind::ForeignStatic => "a static's C symbol",
+            ReadKind::ForeignFn => "a callee's C symbol",
+            ReadKind::CVariadic => "a fn's C-variadic parameter",
+            ReadKind::LegacyConstGenerics => "a fn's legacy const generics",
+            ReadKind::Laid => "a coroutine's full lay",
+            ReadKind::CoroutineState => "a coroutine state's shape",
+            ReadKind::CoroutineNiche => "a coroutine state's tag niche",
         }
     }
 }
@@ -155,6 +199,15 @@ pub enum ReadsError {
     Full { kind: ReadKind, item: ItemKey },
     /// More than [`READS_CAP`] questions in one build.
     TooMany,
+    /// A stored row of `kind`, which the verifier handed in cannot ask today (the whole-program
+    /// walk's [`verify`] asks no C symbol; a callee with no row): [`verify_today`] takes the row
+    /// as not holding, never as holding.
+    Unanswered { kind: ReadKind },
+    /// `kind` of `item` was asked before the record it reads (`unmade`: an ADT's head, an
+    /// explicit discriminant's value) was made: no answer, so no read list holds it (D194). The
+    /// build refused it as a need and makes it; a list sealed past it would be keyed by what
+    /// was asked first.
+    Unmade { kind: ReadKind, item: ItemKey, unmade: ItemKey },
 }
 
 impl fmt::Display for ReadsError {
@@ -169,6 +222,10 @@ impl fmt::Display for ReadsError {
             ReadsError::Question => write!(f, "{rule} holds a question shorter than its kind and scalar"),
             ReadsError::Full { kind, item } => write!(f, "{rule}: the ground table could not take the arguments of {} of item {:#x}", kind.as_str(), item.0),
             ReadsError::TooMany => write!(f, "{rule}: more than {READS_CAP} questions in one build"),
+            ReadsError::Unanswered { kind } => write!(f, "{rule} holds a row of {}, which this walk's verifier does not ask", kind.as_str()),
+            ReadsError::Unmade { kind, item, unmade } => {
+                write!(f, "{rule}: {} of item {:#x} was asked before the record of item {:#x} it reads was made (D194)", kind.as_str(), item.0, unmade.0)
+            }
         }
     }
 }
@@ -237,6 +294,7 @@ impl ReadLog {
             Ok(it) => it,
             Err(Stop::TooLarge) => return self.stop(ReadsError::TermTooLarge { kind, item }),
             Err(Stop::Malformed) => return self.stop(ReadsError::Malformed { kind, item }),
+            Err(Stop::Unmade(unmade)) => return self.stop(ReadsError::Unmade { kind, item, unmade }),
         };
         let mut asked = self.asked.borrow_mut();
         if asked.len() >= READS_CAP {
@@ -270,6 +328,36 @@ impl ReadLog {
             }
         }
         self.ask(kind, called.item, 0, args, Ok(h.finish()));
+    }
+
+    /// Static `item`'s C symbol as the front end answered it (`None`: no `extern` block
+    /// declares it, so it has a record of its own).
+    pub fn ask_foreign_static(&self, item: ItemKey, c_name: Option<&str>) {
+        self.ask(ReadKind::ForeignStatic, item, 0, &[], Ok(symbol_answer(c_name)));
+    }
+
+    /// Callee `item`'s C symbol as its row answered it (`None`: it is no `extern` block's fn).
+    pub fn ask_foreign_fn(&self, item: ItemKey, symbol: Option<&str>) {
+        self.ask(ReadKind::ForeignFn, item, 0, &[], Ok(symbol_answer(symbol)));
+    }
+
+    /// Coroutine `ordinal` of `owner` at `args` laid out in full as `laid` digests it
+    /// ([`laid_answer`]): the coroutine a part's entry was built into ([`ReadKind::Laid`]).
+    pub fn ask_laid(&self, owner: ItemKey, ordinal: u32, args: &[PTy], laid: ContentId) {
+        self.ask(ReadKind::Laid, owner, u64::from(ordinal), args, Ok(laid));
+    }
+
+    /// Every question `other` logged, logged here as asked (this log's plant applies), and
+    /// its stop if it stopped: a coroutine's build is logged apart (run/lay_states.rs
+    /// `build_laid`, once for its three functions), and each part's make takes its rows into
+    /// its own read list.
+    pub fn absorb(&self, other: &ReadLog) {
+        if let Some(error) = other.stopped.get() {
+            self.stop(error);
+        }
+        for a in other.asked.borrow().iter() {
+            self.ask(a.kind, a.item, a.extra, &a.args, Ok(a.answer));
+        }
     }
 
     /// The answer of the one question logged since the last [`ReadLog::clear`].
@@ -350,6 +438,8 @@ impl ReadList {
 enum Stop {
     TooLarge,
     Malformed,
+    /// The answer reads the record of this item, which is not made yet ([`ReadsError::Unmade`]).
+    Unmade(ItemKey),
 }
 
 /// A `core::hash::Hasher` that feeds every write to a [`Hasher`] as one part, every integer
@@ -589,9 +679,62 @@ fn data_answer(value: Option<&DataRecord<Global>>) -> ContentId {
     h.finish()
 }
 
+/// A coroutine's full lay as one answer ([`ReadKind::Laid`]): its state's shape, the region
+/// its flow's saved locals take, its tag's niche, and each saved local's identity, offset,
+/// size and drop flag (sorted by identity: run/lay_states.rs `lay_one`). What a part's code
+/// was built into, so two lays equal here build equal parts.
+pub fn laid_answer(laid: &LaidState, names: &[StateName]) -> ContentId {
+    let mut h = Hasher::new(ANSWER_DOMAIN);
+    let f = &mut Fed(&mut h);
+    shape_parts(laid.shape).hash(f);
+    (laid.region.start, laid.region.end, laid.region.align).hash(f);
+    niche_parts(laid.niche).hash(f);
+    names.len().hash(f);
+    for n in names {
+        (n.identity, n.offset, n.size, n.flag).hash(f);
+    }
+    h.finish()
+}
+
+fn shape_parts(s: StateShape) -> (u32, u8, u32, u16) {
+    (s.size, s.align, s.tag_offset, s.tag_ty.0)
+}
+
+fn niche_parts(n: StateNiche) -> (u32, u16, u32) {
+    (n.tag_offset, n.tag_ty.0, n.valid_end)
+}
+
+/// `LayoutFacts::coroutine_state`'s answer ([`ReadKind::CoroutineState`]).
+/// A state not laid yet is no answer: a need ([`Stop::Unmade`]), never a digest.
+fn state_answer(answer: Result<Option<StateShape>, Missing>) -> Result<ContentId, Stop> {
+    match answer {
+        Ok(None) => Ok(small(0u8)),
+        Ok(Some(s)) => Ok(small((1u8, shape_parts(s)))),
+        Err(missing) => Err(Stop::Unmade(missing.item)),
+    }
+}
+
+/// `LayoutFacts::coroutine_niche`'s answer ([`ReadKind::CoroutineNiche`]), as [`state_answer`].
+fn niche_answer(answer: Result<Option<StateNiche>, Missing>) -> Result<ContentId, Stop> {
+    match answer {
+        Ok(None) => Ok(small(0u8)),
+        Ok(Some(n)) => Ok(small((1u8, niche_parts(n)))),
+        Err(missing) => Err(Stop::Unmade(missing.item)),
+    }
+}
+
 fn small(value: impl Hash) -> ContentId {
     let mut h = Hasher::new(ANSWER_DOMAIN);
     value.hash(&mut Fed(&mut h));
+    h.finish()
+}
+
+fn symbol_answer(symbol: Option<&str>) -> ContentId {
+    let mut h = Hasher::new(ANSWER_DOMAIN);
+    match symbol {
+        None => h.part(&[0]),
+        Some(s) => h.part(&[1]).part(s.as_bytes()),
+    };
     h.finish()
 }
 
@@ -615,26 +758,30 @@ impl LayoutFacts for Recorded<'_> {
         answer
     }
 
-    fn repr(&self, key: ItemKey) -> ReprAttrs {
+    /// A `Missing` is no answer: the log stops ([`ReadsError::Unmade`]), so the list is never
+    /// sealed with it, and the build's refusal makes the record (D194).
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, Missing> {
         let answer = self.world.facts().repr(key);
-        self.log.ask(ReadKind::Repr, key, 0, &[], Ok(repr_answer(answer)));
+        self.log.ask(ReadKind::Repr, key, 0, &[], answer.map(repr_answer).map_err(|m| Stop::Unmade(m.item)));
         answer
     }
 
+    /// A `Missing` as [`Self::repr`]'s: never digested as an answer.
     fn discriminant(&self, key: ItemKey, variant: u32) -> Result<Option<i128>, Missing> {
         let answer = self.world.facts().discriminant(key, variant);
         let digest = match answer {
-            Ok(None) => small(0u8),
-            Ok(Some(v)) => small((1u8, v)),
-            Err(missing) => small((2u8, missing.item)),
+            Ok(None) => Ok(small(0u8)),
+            Ok(Some(v)) => Ok(small((1u8, v))),
+            Err(missing) => Err(Stop::Unmade(missing.item)),
         };
-        self.log.ask(ReadKind::Discriminant, key, u64::from(variant), &[], Ok(digest));
+        self.log.ask(ReadKind::Discriminant, key, u64::from(variant), &[], digest);
         answer
     }
 
-    fn valid_range(&self, key: ItemKey) -> ValidRange {
+    /// A `Missing` as [`Self::repr`]'s.
+    fn valid_range(&self, key: ItemKey) -> Result<ValidRange, Missing> {
         let answer = self.world.facts().valid_range(key);
-        self.log.ask(ReadKind::ValidRange, key, 0, &[], Ok(small((answer.start, answer.end))));
+        self.log.ask(ReadKind::ValidRange, key, 0, &[], answer.map(|r| small((r.start, r.end))).map_err(|m| Stop::Unmade(m.item)));
         answer
     }
 
@@ -653,16 +800,28 @@ impl LayoutFacts for Recorded<'_> {
     }
 
     fn coroutine_state(&self, owner: ItemKey, ordinal: u32, args: &[PTy], ground: PTys<'_>) -> Result<Option<blaze_build::StateShape>, Missing> {
-        self.world.facts().coroutine_state(owner, ordinal, args, ground)
+        let answer = self.world.facts().coroutine_state(owner, ordinal, args, ground);
+        self.log.ask(ReadKind::CoroutineState, owner, u64::from(ordinal), args, state_answer(answer));
+        answer
     }
 
     fn coroutine_niche(&self, owner: ItemKey, ordinal: u32, args: &[PTy], ground: PTys<'_>) -> Result<Option<blaze_build::StateNiche>, Missing> {
-        self.world.facts().coroutine_niche(owner, ordinal, args, ground)
+        let answer = self.world.facts().coroutine_niche(owner, ordinal, args, ground);
+        self.log.ask(ReadKind::CoroutineNiche, owner, u64::from(ordinal), args, niche_answer(answer));
+        answer
     }
 
+    /// Named by the head that made the opaque, `(owner, index)` (`Adts::opaque_of`), never by
+    /// the opaque's own key: a fresh program knows an opaque only once that head is made (a fn
+    /// declared in a body, core's `for_each`'s inner `call`, is made only when asked), and from
+    /// the row the verifier makes it, by name, before it asks (make_one.rs `verify_instance`).
+    /// Asked with no such head, the read is of a record not made: `Unmade` (D194).
     fn opaque_hidden(&self, opaque: ItemKey, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<PTy, BuildError> {
         let answer = self.world.facts().opaque_hidden(opaque, args, ground);
-        self.log.ask(ReadKind::OpaqueHidden, opaque, 0, args, ty_answer(&answer, ground.view()));
+        match self.world.opaque_of(opaque) {
+            Some((owner, index)) => self.log.ask(ReadKind::OpaqueHidden, owner, u64::from(index), args, ty_answer(&answer, ground.view())),
+            None => self.log.ask(ReadKind::OpaqueHidden, opaque, 0, args, Err(Stop::Unmade(opaque))),
+        }
         answer
     }
 }
@@ -672,6 +831,11 @@ impl Adts for Recorded<'_> {
         let answer = self.world.adt(key);
         self.log.ask(ReadKind::Adt, key, 0, &[], adt_answer(answer));
         answer
+    }
+
+    // No row: it names the `OpaqueHidden` question itself (`Recorded::opaque_hidden`).
+    fn opaque_of(&self, opaque: ItemKey) -> Option<(ItemKey, u32)> {
+        self.world.opaque_of(opaque)
     }
 
     fn int_lit(&self, owner: ItemKey, expr: ExprId) -> Option<u128> {
@@ -782,11 +946,15 @@ impl Adts for Recorded<'_> {
     }
 
     fn c_variadic(&self, item: ItemKey) -> Option<u32> {
-        self.world.c_variadic(item)
+        let answer = self.world.c_variadic(item);
+        self.log.ask(ReadKind::CVariadic, item, 0, &[], Ok(small(answer)));
+        answer
     }
 
     fn legacy_const_generics(&self, item: ItemKey) -> &[u32] {
-        self.world.legacy_const_generics(item)
+        let answer = self.world.legacy_const_generics(item);
+        self.log.ask(ReadKind::LegacyConstGenerics, item, 0, &[], Ok(small(answer)));
+        answer
     }
 
     fn str_lit(&self, owner: ItemKey, expr: ExprId) -> Option<&str> {
@@ -854,14 +1022,14 @@ impl Adts for Recorded<'_> {
         answer
     }
 
-    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Option<blaze_build::CallerSite<'_>> {
+    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
         self.world.caller_site(owner, expr)
     }
 
     /// Not logged, as `caller_site`: the builder asks it only of the body's own owner (a
     /// `Fn*` shim's `Fn*` method, blaze-build walk/track_caller.rs `shim_caller_arg`), so the
     /// site is of the item the record is named by and item-relative (rule 71).
-    fn def_site(&self, item: ItemKey) -> Option<blaze_build::CallerSite<'_>> {
+    fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
         self.world.def_site(item)
     }
 
@@ -881,50 +1049,221 @@ pub enum Verdict {
     Holds,
     /// The first row answered otherwise: the entry is stale and is built again.
     Stale { kind: ReadKind, item: ItemKey },
+    /// The first row not held could not be answered: `kind` of `item` reads the record of
+    /// `unmade`, which is not made yet (a lazy front noted it: [`ReadsError::Unmade`]). A NEED,
+    /// not a difference: the verifier makes what was noted and asks again (run/make_one.rs
+    /// `verify_instance`); a record that cannot be made today (its item gone) leaves the entry
+    /// stale. Nothing from such a round is kept in [`Answers`].
+    Needs { kind: ReadKind, item: ItemKey, unmade: ItemKey },
+}
+
+/// The questions of a read list that are not `Adts` questions, answered by the walk's front
+/// end as the build asked them: a call's instance (`Resolve`) and the C symbols
+/// (`ForeignStatic`, `ForeignFn`).
+pub trait Beyond {
+    /// The instance a call of `item` at `args` runs; `None` where the front end refuses it.
+    fn resolve(&mut self, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Option<(ItemKey, List)>;
+    /// Static `item`'s C symbol (`None`: it has a record of its own).
+    fn foreign_static(&mut self, item: ItemKey) -> Result<Option<&str>, ReadsError>;
+    /// Callee `item`'s C symbol (`None`: it is no `extern` block's fn).
+    fn foreign_fn(&mut self, item: ItemKey) -> Result<Option<&str>, ReadsError>;
+    /// Coroutine `ordinal` of `owner` at `args` (a list of the verifier's ground table) laid
+    /// out in full again, digested as the build digested it ([`laid_answer`]);
+    /// [`ReadsError::Unanswered`] where it was not laid today.
+    fn laid(&mut self, owner: ItemKey, ordinal: u32, args: List) -> Result<ContentId, ReadsError>;
+}
+
+/// The answers one run found holding, by question (a row's bytes, which hold no table handle),
+/// sorted: a question many entries ask (one ADT every instance over it lays out) is asked of
+/// the front end once a run, each later row a binary search (the "batch by fact" of the read
+/// list's cost). Only an answer equal to a stored row's is kept: a run's facts do not move
+/// under it, so it is today's for every entry.
+pub struct Answers<'a> {
+    rows: AVec<'a, (AVec<'a, u8>, ContentId)>,
+    alloc: Alloc<'a>,
+}
+
+impl<'a> Answers<'a> {
+    pub fn new_in(alloc: Alloc<'a>) -> Answers<'a> {
+        Answers { rows: blaze_own::Vec::new_in(alloc), alloc }
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn get(&self, question: &[u8]) -> Option<ContentId> {
+        self.rows.binary_search_by(|row| row.0[..].cmp(question)).ok().map(|at| self.rows[at].1)
+    }
+
+    fn keep(&mut self, question: &[u8], answer: ContentId) {
+        if let Err(at) = self.rows.binary_search_by(|row| row.0[..].cmp(question)) {
+            let mut q = blaze_own::Vec::with_capacity_in(question.len(), self.alloc);
+            q.extend_from_slice(question);
+            self.rows.insert_shift(at, (q, answer));
+        }
+    }
+}
+
+/// A stored row's question read back: its kind, its scalar (a variant, a name, an expression),
+/// and its item and arguments decoded into `ground`. The one reader of a row's bytes.
+pub fn question(bytes: &[u8], ground: &mut PortableTys<'_>, scratch: Alloc<'_>) -> Result<(ReadKind, u64, ItemKey, List), ReadsError> {
+    let (kind, extra, name) = question_head(bytes)?;
+    let (item, list) = decode_instance(name, ground, scratch).map_err(|why| ReadsError::Symbol { kind, item: ItemKey(0), why })?;
+    Ok((kind, extra, item, list))
+}
+
+/// A row's kind and scalar, and the bytes of its instance name, nothing decoded.
+fn question_head(bytes: &[u8]) -> Result<(ReadKind, u64, &[u8]), ReadsError> {
+    let (&byte, rest) = bytes.split_first().ok_or(ReadsError::Question)?;
+    let kind = ReadKind::of(byte).ok_or(ReadsError::Kind { byte })?;
+    let (extra, name) = rest.split_first_chunk::<8>().ok_or(ReadsError::Question)?;
+    Ok((kind, u64::from_le_bytes(*extra), name))
+}
+
+/// What one verification did ([`verify_today`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Verified {
+    pub verdict: Verdict,
+    /// Rows asked of the front end.
+    pub asked: u32,
+    /// Rows answered by [`Answers`], asked of no one.
+    pub known: u32,
 }
 
 /// Asks each row of `entry`'s read list again through `world` (the same world the build is
-/// handed), its arguments decoded into `ground`; `resolve` answers a `Resolve` row as the walk
-/// resolves a call. Stops at the first row answered otherwise.
-pub fn verify(
+/// handed) and `beyond`, its arguments decoded into `ground`; a row `known` holds is answered
+/// there. With `each`, every row is asked though one differed (so a lazy front end notes every
+/// head the list reads unmade, made in one round: run/make_one.rs `verify_instance`); without,
+/// it stops at the first. A [`ReadKind::Laid`] row is answered by `beyond` laying the
+/// coroutine again; its `CoroutineState` and `CoroutineNiche` rows by `world`, which holds the
+/// states the caller laid again first. A row `beyond` cannot answer today
+/// ([`ReadsError::Unanswered`]) does not hold. The
+/// verdict names the first row answered otherwise, in the list's order.
+///
+/// `known` takes this entry's answers only when EVERY row held: a lazy front end answers some
+/// questions with a default while a head is unmade (its `repr`, `valid_range` and
+/// `discriminant`), and such an answer met in a round that did not hold is never kept for a
+/// later entry or round.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_today(
     entry: &EntryView<'_>,
     world: &dyn Adts,
-    resolve: &mut dyn FnMut(ItemKey, List, &mut PortableTys<'_>) -> Option<(ItemKey, List)>,
+    beyond: &mut dyn Beyond,
+    known: &mut Answers<'_>,
+    each: bool,
     ground: &mut PortableTys<'_>,
     scratch: Alloc<'_>,
-) -> Result<Verdict, ReadsError> {
+) -> Result<Verified, ReadsError> {
     let log = ReadLog::new(ReadPlant::None);
     let recorded = Recorded::new(world, &log);
-    let mut args: Vec<PTy, Global> = Vec::new_in(Global);
+    let mut args: AVec<'_, PTy> = blaze_own::Vec::new_in(scratch);
+    let mut out = Verified { verdict: Verdict::Holds, asked: 0, known: 0 };
+    // This entry's rows answered the same today, kept in `known` once every row held.
+    let mut held: AVec<'_, (&[u8], ContentId)> = blaze_own::Vec::new_in(scratch);
     for row in entry.reads() {
         let (question, answer) = row.map_err(|_| ReadsError::Question)?;
-        let (&byte, rest) = question.split_first().ok_or(ReadsError::Question)?;
-        let kind = ReadKind::of(byte).ok_or(ReadsError::Kind { byte })?;
-        let (extra, name) = rest.split_first_chunk::<8>().ok_or(ReadsError::Question)?;
-        let extra = u64::from_le_bytes(*extra);
+        let (kind, extra, name) = question_head(question)?;
+        // A row answered from `known` or a `Laid` row is named by no item: its name is not
+        // decoded (that is the saving).
+        let stale = |item: ItemKey, out: &mut Verified| {
+            if out.verdict == Verdict::Holds {
+                out.verdict = Verdict::Stale { kind, item };
+            }
+        };
+        if let Some(today) = known.get(question) {
+            out.known += 1;
+            if today != answer {
+                stale(ItemKey(0), &mut out);
+                if !each {
+                    return Ok(out);
+                }
+            }
+            continue;
+        }
         let (item, list) = decode_instance(name, ground, scratch).map_err(|why| ReadsError::Symbol { kind, item: ItemKey(0), why })?;
         args.clear();
         args.extend_from_slice(ground.view().list(list).map_err(|_| ReadsError::Malformed { kind, item })?);
         log.clear();
+        out.asked += 1;
         match kind {
+            ReadKind::Laid => {
+                let ordinal = u32::try_from(extra).map_err(|_| ReadsError::Question)?;
+                match beyond.laid(item, ordinal, list) {
+                    Ok(laid) => log.ask_laid(item, ordinal, &args, laid),
+                    // Not laid again today (its owner refused, a lay refused): the row does not
+                    // hold, and the make that follows lays it and meets the refusal by name.
+                    Err(ReadsError::Unanswered { .. }) => {
+                        stale(item, &mut out);
+                        if !each {
+                            return Ok(out);
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            ReadKind::CoroutineState | ReadKind::CoroutineNiche => {
+                let ordinal = u32::try_from(extra).map_err(|_| ReadsError::Question)?;
+                match kind {
+                    ReadKind::CoroutineState => {
+                        let _ = recorded.coroutine_state(item, ordinal, &args, ground.view());
+                    }
+                    _ => {
+                        let _ = recorded.coroutine_niche(item, ordinal, &args, ground.view());
+                    }
+                }
+            }
+            ReadKind::ForeignStatic | ReadKind::ForeignFn => {
+                let today = match kind {
+                    ReadKind::ForeignStatic => beyond.foreign_static(item),
+                    _ => beyond.foreign_fn(item),
+                };
+                match today {
+                    Ok(symbol) if kind == ReadKind::ForeignStatic => log.ask_foreign_static(item, symbol),
+                    Ok(symbol) => log.ask_foreign_fn(item, symbol),
+                    // Not answerable today: the row does not hold, and the make that follows
+                    // meets the question itself.
+                    Err(ReadsError::Unanswered { .. }) => {
+                        stale(item, &mut out);
+                        if !each {
+                            return Ok(out);
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            ReadKind::CVariadic => {
+                recorded.c_variadic(item);
+            }
+            ReadKind::LegacyConstGenerics => {
+                recorded.legacy_const_generics(item);
+            }
             ReadKind::Adt => {
                 LayoutFacts::adt(&recorded, item);
             }
             ReadKind::Repr => {
-                recorded.repr(item);
+                let _ = recorded.repr(item);
             }
             ReadKind::Discriminant => {
                 let variant = u32::try_from(extra).map_err(|_| ReadsError::Question)?;
                 let _ = recorded.discriminant(item, variant);
             }
             ReadKind::ValidRange => {
-                recorded.valid_range(item);
+                let _ = recorded.valid_range(item);
             }
             ReadKind::Normalize => {
                 let _ = recorded.normalize(item, Name(extra), &args, ground);
             }
+            // Named by its owner row (`Recorded::opaque_hidden`): the opaque is that row's.
             ReadKind::OpaqueHidden => {
-                let _ = recorded.opaque_hidden(item, &args, ground);
+                let index = u32::try_from(extra).map_err(|_| ReadsError::Question)?;
+                let _ = recorded.opaque_hidden(crate::front2::keys::opaque_of_row(item, index), &args, ground);
             }
             ReadKind::Const => {
                 recorded.const_value(item, &args);
@@ -956,13 +1295,69 @@ pub fn verify(
                 recorded.track_caller(Instance { item, args: list }, ground);
             }
             ReadKind::Resolve => {
-                let resolved = resolve(item, list, ground);
+                let resolved = beyond.resolve(item, list, ground);
                 log.ask_resolve(Instance { item, args: list }, resolved, ground.view(), scratch);
             }
         }
-        if log.only_answer(kind, item)? != answer {
-            return Ok(Verdict::Stale { kind, item });
+        let today = match log.only_answer(kind, item) {
+            Ok(today) => today,
+            // Asked before the record it reads was made: no answer to compare, a need (a lazy
+            // front noted it for `make_asked`), never a digest of a default (D194).
+            Err(ReadsError::Unmade { kind, item, unmade }) => {
+                if out.verdict == Verdict::Holds {
+                    out.verdict = Verdict::Needs { kind, item, unmade };
+                }
+                if !each {
+                    return Ok(out);
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if today == answer {
+            held.push((question, today));
+        } else {
+            stale(item, &mut out);
+            if !each {
+                return Ok(out);
+            }
         }
     }
-    Ok(Verdict::Holds)
+    if out.verdict == Verdict::Holds {
+        for &(question, answer) in held.iter() {
+            known.keep(question, answer);
+        }
+    }
+    Ok(out)
+}
+
+/// [`verify_today`] for the whole-program walk (run.rs `build_from`): `resolve` answers a
+/// `Resolve` row as that walk resolves a call; a C symbol's row does not hold
+/// ([`ReadsError::Unanswered`]: that walk records none). Stops at the first row answered
+/// otherwise; nothing is kept between entries.
+pub fn verify(
+    entry: &EntryView<'_>,
+    world: &dyn Adts,
+    resolve: &mut dyn FnMut(ItemKey, List, &mut PortableTys<'_>) -> Option<(ItemKey, List)>,
+    ground: &mut PortableTys<'_>,
+    scratch: Alloc<'_>,
+) -> Result<Verdict, ReadsError> {
+    struct Calls<'r>(&'r mut dyn FnMut(ItemKey, List, &mut PortableTys<'_>) -> Option<(ItemKey, List)>);
+    impl Beyond for Calls<'_> {
+        fn resolve(&mut self, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Option<(ItemKey, List)> {
+            (self.0)(item, args, ground)
+        }
+        fn foreign_static(&mut self, _: ItemKey) -> Result<Option<&str>, ReadsError> {
+            Err(ReadsError::Unanswered { kind: ReadKind::ForeignStatic })
+        }
+        fn foreign_fn(&mut self, _: ItemKey) -> Result<Option<&str>, ReadsError> {
+            Err(ReadsError::Unanswered { kind: ReadKind::ForeignFn })
+        }
+        // That walk lays no state again before it verifies: a part's entry is made again.
+        fn laid(&mut self, _: ItemKey, _: u32, _: List) -> Result<ContentId, ReadsError> {
+            Err(ReadsError::Unanswered { kind: ReadKind::Laid })
+        }
+    }
+    let mut known = Answers::new_in(scratch);
+    verify_today(entry, world, &mut Calls(resolve), &mut known, false, ground, scratch).map(|v| v.verdict)
 }

@@ -523,6 +523,7 @@ impl Refusal<'_> {
             Refusal::InvalidTag { bits } => Refusal::InvalidTag { bits },
             Refusal::TransmuteSize { from, to } => Refusal::TransmuteSize { from, to },
             Refusal::Unreachable => Refusal::Unreachable,
+            Refusal::NonzeroOnZero { name } => Refusal::NonzeroOnZero { name },
             Refusal::DiscriminantOverflow { variant } => Refusal::DiscriminantOverflow { variant },
             Refusal::StepLimit { limit } => Refusal::StepLimit { limit },
             Refusal::MemoryLimit { limit } => Refusal::MemoryLimit { limit },

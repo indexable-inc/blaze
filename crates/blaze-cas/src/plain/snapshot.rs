@@ -28,10 +28,15 @@
 //!   never changed"; blaze-core lib.rs, `Mapping::map_file`: "the bytes below the length it had
 //!   when mapped are never written again and it is never truncated". The snapshot lists only
 //!   segments proved once ([`super::verified::Verified`], decision 18), so a read checks nothing.
-//! - (c) A key put after the snapshot was taken, or put before it and not yet committed, is
-//!   ABSENT through it, by design: the list is fixed at the take, and an arena put is in no
-//!   segment. Evidence: the same test (its oracle), and its controls
-//!   [`tests::the_oracle_catches_a_snapshot_that_sees_an_uncommitted_put`].
+//! - (c) A key put after the snapshot was taken is ABSENT through it, by design: the list is
+//!   fixed at the take. Under `Visibility::AfterCommit` (arena.rs), a key put before it and not
+//!   yet committed is absent too: a private arena put is in no segment. Evidence: the same test
+//!   (its oracle), and its controls
+//!   [`tests::the_oracle_catches_a_snapshot_that_sees_an_uncommitted_put`]. Under
+//!   `Visibility::InArena`, a key put before the take reads its exact bytes through it from the
+//!   shared arena (the take seals the puts since the last into a run; the view holds the arena
+//!   and its runs' and blocks' watermarks at the take, so a later put is absent): evidence in
+//!   arena_tests.rs, its controls `SnapshotPlant::SeesLater` and `ShortWatermark`.
 //!
 //! A snapshot is taken from a WHOLE store ([`Lent::snapshot_in`] maps every segment first,
 //! [`Lent::map_all`]): a lazy store has rows not mapped yet, and a snapshot over it would answer
@@ -64,10 +69,11 @@ use std::alloc::Allocator;
 
 use blaze_core::{Driver, Mapping};
 use blaze_ids::ContentId;
-use blaze_keyed::kind::Namespace;
+use blaze_keyed::kind::{Namespace, ReservedTag};
 use blaze_keyed::store::{ENTRY, Generation};
 
-use super::core::{POINTER_TAG, Plain};
+use super::arena::ArenaView;
+use super::core::Plain;
 use super::format::{self, Entry, Segment};
 use super::lent::{Lent, LentError};
 use super::verified::Proof;
@@ -99,6 +105,10 @@ pub enum SnapshotError {
     /// A pointer met where a record was asked: a pointer is read by `Lent::pointed` alone (its
     /// newest value is a name in the newest generation, not a probe).
     PointerTag { key: Key },
+    /// A record of the shared arena's runs this snapshot sees, whose bytes are not below its
+    /// block watermark: its index was published before its bytes (arena.rs: never, by
+    /// construction; a planted control's word).
+    Unpublished { key: Key },
 }
 
 impl fmt::Display for SnapshotError {
@@ -113,6 +123,7 @@ impl fmt::Display for SnapshotError {
             }
             SnapshotError::Alloc { segments } => write!(f, "a store snapshot: the allocator refused its list of {segments} segments"),
             SnapshotError::PointerTag { key } => write!(f, "a store snapshot read of {:?}: a pointer met as a record (a pointer is read by Lent::pointed alone)", key.0),
+            SnapshotError::Unpublished { key } => write!(f, "a store snapshot read of {:?}: the shared arena's run names it, but its bytes were not published at the take (an index published before its bytes)", key.0),
         }
     }
 }
@@ -131,6 +142,13 @@ pub(crate) enum SnapshotPlant {
     /// Taken without making the store whole: a row not mapped yet (a lazy open's) is not listed,
     /// and its committed keys read as absent.
     SkipsMapAll,
+    /// `Visibility::InArena`: the view reads every run and block of the shared arena published
+    /// by the time of the READ, not of the take: a record put (and sealed by a later take) after
+    /// this snapshot was taken is seen through it (seq N sees N + 1).
+    SeesLater,
+    /// `Visibility::InArena`: the take's block watermark one block short, as a take that
+    /// published a run before its last record's bytes would leave it.
+    ShortWatermark,
 }
 
 /// One listed segment: its manifest row (where its index lies), its mapping, shared, and the
@@ -171,6 +189,9 @@ pub struct Snapshot<A: Allocator> {
     listed: Vec<Listed, A>,
     generation: u64,
     plant: SnapshotPlant,
+    /// `Visibility::InArena`: what the take saw of the shared arena of puts not yet committed
+    /// (arena.rs); read before the segments. `None` under `AfterCommit`, or with no such put.
+    arena: Option<ArenaView>,
 }
 
 // `Snapshot` is `Send + Sync` (the pool's workers share `&Snapshot`): a field that is not breaks
@@ -204,7 +225,17 @@ impl<A: Allocator> Snapshot<A> {
                 listed.push(Listed { seg: *verified.seg(), map: verified.mapping().clone(), proof: verified.proof(branded) });
             }
         }
-        Ok(Snapshot { listed, generation, plant })
+        Ok(Snapshot { listed, generation, plant, arena: None })
+    }
+
+    /// This snapshot with `view` of the shared arena beside its segments.
+    fn with_arena(self, view: Option<ArenaView>) -> Snapshot<A> {
+        Snapshot { arena: view, ..self }
+    }
+
+    /// `(runs, blocks)` of the shared arena this snapshot sees: `(0, 0)` with none.
+    pub fn arena_seen(&self) -> (u32, u32) {
+        self.arena.as_ref().map_or((0, 0), ArenaView::seen)
     }
 
     /// The bytes committed under `key` in the first listed segment that holds it, in place from
@@ -227,12 +258,26 @@ impl<A: Allocator> Snapshot<A> {
     /// segment that holds the key (made once, at the take, from its `Verified`; nothing checked
     /// here). The same pure read: no lock, no allocation, no syscall.
     pub fn get_proved(&self, key: &Key) -> Result<Option<Proved<'_>>, SnapshotError> {
+        if let Some(view) = &self.arena {
+            // A key is put once (a put of a held key is `Same`), so where it lies the order of
+            // the probe does not change: the arena's runs first, a few bisections.
+            let unbounded = self.plant == SnapshotPlant::SeesLater;
+            if let Some(entry) = view.find(&key.0.0, unbounded) {
+                if ReservedTag::Pointer.is(entry.tag) {
+                    return Err(SnapshotError::PointerTag { key: *key });
+                }
+                let Some(bytes) = view.bytes(&entry, unbounded) else { return Err(SnapshotError::Unpublished { key: *key }) };
+                // This process's own put, copied by this tool (blaze-cli plain_place.rs
+                // `Checked`, way 2): the proof of a record not yet in any segment.
+                return Ok(Some(Proved { bytes, proof: Proof::own(Generation(self.generation)) }));
+            }
+        }
         for listed in self.listed.iter() {
             let file = listed.map.bytes();
             let run = listed.seg.run(file);
             let Some(i) = self.find(run, &key.0) else { continue };
             let entry = Entry::read(&run[i * ENTRY..(i + 1) * ENTRY]);
-            if entry.tag == POINTER_TAG {
+            if ReservedTag::Pointer.is(entry.tag) {
                 // Found in probe order, which may be an older value of the name.
                 return Err(SnapshotError::PointerTag { key: *key });
             }
@@ -259,7 +304,7 @@ impl<A: Allocator> Snapshot<A> {
     fn find(&self, run: &[u8], key: &ContentId) -> Option<usize> {
         match self.plant {
             SnapshotPlant::ShortPrefix => find_by_prefix(run, key),
-            SnapshotPlant::None | SnapshotPlant::CommitsFirst | SnapshotPlant::SkipsMapAll => format::find(run, key),
+            SnapshotPlant::None | SnapshotPlant::CommitsFirst | SnapshotPlant::SkipsMapAll | SnapshotPlant::SeesLater | SnapshotPlant::ShortWatermark => format::find(run, key),
         }
     }
 }
@@ -302,7 +347,11 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         if plant != SnapshotPlant::SkipsMapAll {
             self.map_all().map_err(|why| SnapshotError::Lent { doing: "mapping every segment named", why })?;
         }
-        self.store_with(|store| Snapshot::of(store.core(), alloc, plant))
+        // `Visibility::InArena`: the puts since the last take sealed, and what is published now
+        // seen (nothing under `AfterCommit`, which has no shared arena).
+        let view = self.seal_run().map_err(|why| SnapshotError::Lent { doing: "sealing the shared arena's run", why })?;
+        let view = if plant == SnapshotPlant::ShortWatermark { view.map(ArenaView::short) } else { view };
+        Ok(self.store_with(|store| Snapshot::of(store.core(), alloc, plant))?.with_arena(view))
     }
 }
 

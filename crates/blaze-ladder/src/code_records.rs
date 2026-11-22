@@ -391,6 +391,33 @@ impl Names for InstanceNames<'_> {
             Outside::TlsGetter => Some(Named::Symbol(tls_getter_symbol())),
         }
     }
+
+    /// None: an instance's routines are bound after its own references (front2/builtins_shim.rs
+    /// `Bound::bind` appends them to `funcs`) and handed beside these names as `Routines`;
+    /// [`Routed`] puts the two together for a tier behind the seam.
+    fn routines(&self) -> blaze_tier::RoutinePlaces {
+        blaze_tier::RoutinePlaces::NONE
+    }
+}
+
+/// An instance's names with the routine table its `funcs` holds the routines at: what a tier
+/// behind the seam (`blaze_tier::Tier::emit`) is handed, so the routine table is the seam's input
+/// (D197 root 6, piece (a)). [`make_entry`] calls the Reference emitter directly today
+/// ([`EMITTING`]) and takes the table as `Routines`; it hands a `Routed` once the run places the
+/// seam's record form (piece (b)).
+pub struct Routed<'n> {
+    pub names: &'n InstanceNames<'n>,
+    pub routines: blaze_tier::RoutinePlaces,
+}
+
+impl Names for Routed<'_> {
+    fn name(&self, of: Outside) -> Option<Named<'_>> {
+        self.names.name(of)
+    }
+
+    fn routines(&self) -> blaze_tier::RoutinePlaces {
+        self.routines
+    }
 }
 
 /// One instance an entry declares: the fn it is tabled as (whose body or signature builds it)
@@ -1008,14 +1035,73 @@ pub struct Met {
     pub found: bool,
 }
 
+/// One instance a census walk hands over ([`LirSeen::seen`]): its LIR exactly as
+/// [`make_entry`] would get it, the names of what it references, the soft-float routines bound
+/// after its own references (as [`make_entry`]'s `routines`), and the declaration of every
+/// target its code can name ([`instance_declares`]), so a receiver that emits the tier record
+/// form (`blaze_tier::record::MAGIC`) declares its targets as the run path will (`blaze_tier::record::declare`
+/// before the seal, D106). The declarations are the receiver's to keep.
+pub struct SeenInstance<'s> {
+    /// As the program names it.
+    pub function: &'s str,
+    pub symbol: Symbol,
+    pub func: Verified<'s>,
+    pub names: &'s InstanceNames<'s>,
+    pub routines: blaze_tier::RoutinePlaces,
+    pub declares: crate::declared_names::DeclaredNames<'static>,
+}
+
+/// Every target one instance's code can name, declared (D106, blaze-tier record/declared.rs):
+/// the instances it reaches (`reached`, the rows [`make_entry`] gets as `declared`); its
+/// statics, a foreign one excepted (a C name, declared by no row); its vtables (`vtables`, the
+/// build's, each by its principal and `symbols::vtable_trees`, as `names.vtables` names them);
+/// its thread-locals and the program's thread-local runtime; and every soft-float routine
+/// `routines` binds. A row whose target the record does not name is never written
+/// (`blaze_tier::record::declare` takes only its targets' rows), so declaring all of them is
+/// exact, not a guess at what the emitter calls.
+pub fn instance_declares(
+    reached: &[Declared<'_>],
+    names: &InstanceNames<'_>,
+    vtables: &[blaze_build::vtable::VtableRef],
+    ground: blaze_typeck::PTys<'_>,
+    routines: &crate::front2::builtins_shim::Routines<'_>,
+    alloc: Alloc<'static>,
+) -> Result<crate::declared_names::DeclaredNames<'static>, CodeRecordError> {
+    let large = |_| CodeRecordError::Seal(RecordError::TooLarge { what: "an instance's declared names" });
+    let mut d = crate::declared_names::DeclaredNames::new_in(alloc);
+    for row in reached {
+        d.instance(row.tabled, row.name).map_err(large)?;
+    }
+    for r in blaze_lir::legalize::SoftFloat::ALL {
+        if routines.places().place(r).is_some() {
+            let row = routines.declared(r)?;
+            d.instance(row.tabled, row.name).map_err(large)?;
+        }
+    }
+    for &s in names.statics.iter().filter(|s| !names.c_statics.iter().any(|(k, _)| k == *s)) {
+        d.static_item(s).map_err(large)?;
+    }
+    let mut trees: AVec<'_, u8> = Vec::new_in(alloc);
+    for &table in vtables {
+        trees.clear();
+        crate::symbols::vtable_trees(table, ground, alloc, &mut trees).map_err(CodeRecordError::Symbol)?;
+        d.vtable(table.principal, &trees, alloc).map_err(large)?;
+    }
+    for &t in names.tls {
+        d.thread_local(t).map_err(large)?;
+    }
+    d.tls_runtime().map_err(large)?;
+    d.finish();
+    Ok(d)
+}
+
 /// What a census walk ([`RecordRun::census`]) hands each instance it builds to, in the walk's
 /// order, IN PLACE of making its record: the instance's LIR exactly as [`make_entry`] would get
 /// it, and the names of what it references. The census emits it itself (examples/fast_census.rs:
 /// every tier over every reached body); the walk puts nothing in the store for it.
 pub trait LirSeen {
-    /// Instance `function` (as the program names it; its symbol `symbol`), built as `func`, its
-    /// references named by `names`.
-    fn seen(&mut self, function: &str, symbol: Symbol, func: Verified<'_>, names: &InstanceNames<'_>);
+    /// One instance, as [`SeenInstance`] says.
+    fn seen(&mut self, instance: SeenInstance<'_>);
 }
 
 /// A record walk's state (run.rs `build_records`): the store, what the records are built for,

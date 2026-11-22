@@ -183,7 +183,10 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// 33: the term tag 26 (`T_FOREIGN`, an extern type `extern { type T; }` by its item) is new:
 /// heads.rs `alias` files a type with no `= ..` as one (core's `Code`, the type of
 /// `FnPtr::as_ptr`'s `NonNull<Code>`), where a 32 record refused it.
-pub const VERSION: u32 = 33;
+/// 34: an impl's record holds its unstable members after its fn visibilities
+/// (`ImplHead::unstable`: each a name, its feature's text and an optional `implied_by` text;
+/// what method and path lookup's `World::member_unstable` reads).
+pub const VERSION: u32 = 34;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -1179,6 +1182,13 @@ fn encode_with<'b>(
             for &vis in head.fn_vis.iter() {
                 o.byte(vis.byte());
             }
+            // Form 34: an inherent impl's unstable members (`ImplHead::unstable`).
+            o.count(head.unstable.len(), "an impl's unstable members")?;
+            for (name, u) in head.unstable.iter() {
+                o.name(*name);
+                o.text(&u.feature, "an unstable member's feature")?;
+                o.opt(u.implied_by.as_deref(), |o, by| o.text(by, "an unstable member's `implied_by`"))?;
+            }
             o.named_keys(&head.consts, "an impl's constants")?;
             o.byte(match head.polarity {
                 tc::ImplPolarity::Positive => 0,
@@ -1288,6 +1298,12 @@ struct Out<'b, 't, 'o> {
 impl Out<'_, '_, '_> {
     fn byte(&mut self, b: u8) {
         self.body.push(b);
+    }
+    /// A text: its length, then its bytes ([`In::text`]).
+    fn text(&mut self, s: &str, what: &'static str) -> Result<(), E> {
+        self.count(s.len(), what)?;
+        self.body.extend_from_slice(s.as_bytes());
+        Ok(())
     }
     fn flag(&mut self, b: bool) {
         self.body.push(u8::from(b));
@@ -2249,6 +2265,12 @@ impl<'r> In<'r, '_, '_> {
         a.copy_from_slice(self.take(N, what)?);
         Ok(a)
     }
+    /// A text written by [`Out::text`]: its length, then its bytes, UTF-8.
+    fn text(&mut self, what: &'static str) -> Result<&'r str, E> {
+        let n = self.count(what)?;
+        let bytes = self.take(n, what)?;
+        core::str::from_utf8(bytes).map_err(|_| E::Shape { what })
+    }
     fn u8(&mut self, what: &'static str) -> Result<u8, E> {
         Ok(self.array::<1>(what)?[0])
     }
@@ -3015,6 +3037,12 @@ impl<'r> In<'r, '_, '_> {
             let byte = r.u8("an impl's fn visibility")?;
             MemberVis::of_byte(byte).ok_or(E::Byte { what: "an impl's fn visibility", byte })
         })?;
+        let unstable = self.many("an impl's unstable members", |r| {
+            let name = r.name("an unstable member's name")?;
+            let feature = Box::<str>::from(r.text("an unstable member's feature")?);
+            let implied_by = r.opt("an unstable member's `implied_by`", |r| Ok(Box::<str>::from(r.text("an unstable member's `implied_by`")?)))?;
+            Ok((name, super::heads::Unstable { feature, implied_by }))
+        })?;
         let consts = self.named_keys("an impl's constants")?;
         let polarity = match self.u8("an impl's polarity")? {
             0 => tc::ImplPolarity::Positive,
@@ -3029,7 +3057,7 @@ impl<'r> In<'r, '_, '_> {
             let (params, consts, bounds, self_) = r.scope()?;
             Ok(MemberFrame { module, generics, params, consts, bounds, self_ })
         })?;
-        let head = ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, fn_vis, consts, polarity };
+        let head = ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, fn_vis, unstable, consts, polarity };
         if head.fn_self.len() != head.fns.len() {
             return Err(E::Shape { what: "an impl's fn `self` flags are not one per fn" });
         }
@@ -3243,7 +3271,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(h1.self_ty == h2.self_ty, "an impl's self type");
             need!(h1.trait_ == h2.trait_ && l(h1.trait_args.list(), h2.trait_args.list()), "an impl's trait");
             need!(h1.assoc[..] == h2.assoc[..], "an impl's associated types");
-            need!(h1.fns[..] == h2.fns[..] && h1.fn_self[..] == h2.fn_self[..] && h1.fn_vis[..] == h2.fn_vis[..] && h1.consts[..] == h2.consts[..], "an impl's members");
+            need!(h1.fns[..] == h2.fns[..] && h1.fn_self[..] == h2.fn_self[..] && h1.fn_vis[..] == h2.fn_vis[..] && h1.unstable[..] == h2.unstable[..] && h1.consts[..] == h2.consts[..], "an impl's members");
             need!(h1.polarity == h2.polarity, "an impl's polarity");
             need!(preds(p1, p2), "an impl's where-clauses");
             None

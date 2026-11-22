@@ -132,8 +132,6 @@ pub enum MacrosError {
     Graph(blaze_unit_graph::record::RecordRefused),
     /// No lock was read this command (a graph needs one, so the layout is the tool's fault).
     NoLock,
-    /// The lock's text is not UTF-8.
-    LockText,
     /// The module store could not be listed, or a path crate's files read.
     Procs(blaze_world::procs::ProcsError),
 }
@@ -143,7 +141,6 @@ impl core::fmt::Display for MacrosError {
         match self {
             MacrosError::Graph(refused) => write!(f, "the unit graph record at byte {}: {}", refused.at, refused.why),
             MacrosError::NoLock => f.write_str("no lock was read this command"),
-            MacrosError::LockText => f.write_str("Cargo.lock is not UTF-8"),
             MacrosError::Procs(error) => write!(f, "{error}"),
         }
     }
@@ -154,8 +151,7 @@ impl core::fmt::Display for MacrosError {
 /// task's scratch, made over `scratch`.
 fn list(graph_record: &[u8], lock: &crate::fetch::Lockfile<'_>, modules: &std::path::Path, place: &Place<'_, '_>, scratch: Alloc<'_>) -> Result<MacroCrates, MacrosError> {
     let decoded = blaze_unit_graph::record::decode(graph_record, scratch).map_err(MacrosError::Graph)?;
-    let text = core::str::from_utf8(lock.text).map_err(|_| MacrosError::LockText)?;
-    let locked = LockedPackages::read(text);
+    let locked = LockedPackages::of(lock.lock);
     let folders = git_folders(modules).map_err(MacrosError::Procs)?;
     let mut crates = std::vec::Vec::new_in(Global);
     for unit in decoded.graph.units.iter().filter(|unit| matches!(unit.kind, UnitKind::ProcMacro)) {

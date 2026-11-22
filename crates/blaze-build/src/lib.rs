@@ -259,6 +259,16 @@ pub struct Subst<'g, 't> {
 pub trait Adts {
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>>;
 
+    /// The fn whose head made the opaque type `opaque` (an `impl Trait` in its return type, an
+    /// `async fn`'s future; for a type alias's, the alias) and the opaque's index among its
+    /// owner's: what names the question of its hidden type in a code entry's read list, so a
+    /// verifier makes that head, by name, before it asks (blaze-ladder code_reads.rs
+    /// `ReadKind::OpaqueHidden`). Defaults to none: a world with no opaques.
+    fn opaque_of(&self, opaque: ItemKey) -> Option<(ItemKey, u32)> {
+        let _ = opaque;
+        None
+    }
+
     /// The value of integer literal `expr` of the body of `owner`, as written (unsigned; a
     /// negative literal is a `Unary { op: Neg }` of it).
     fn int_lit(&self, owner: ItemKey, expr: ExprId) -> Option<u128> {
@@ -573,10 +583,11 @@ pub trait Adts {
     /// call below it (rule 71). The expression is the one rustc's `Location` reports (a call's,
     /// an operator's, an index's, a `caller_location` call's own), and for one inside a macro's
     /// expansion its outermost call's. Asked only when a `Location` is made for it
-    /// (walk/track_caller.rs). No answer is refused with [`BuildError::TrackCaller`].
-    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Option<CallerSite<'_>> {
+    /// (walk/track_caller.rs). No answer is refused with [`BuildError::TrackCaller`] carrying
+    /// the front's [`SiteGap`].
+    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Result<CallerSite<'_>, SiteGap> {
         let _ = (owner, expr);
-        None
+        Err(SiteGap::Unanswered)
     }
 
     /// Where fn `item` is DEFINED, in [`Adts::caller_site`]'s item-relative form (rule 71):
@@ -588,10 +599,10 @@ pub trait Adts {
     /// method it is (rustc_mir_transform shim.rs `build_call_shim`: the call's span is
     /// `tcx.def_span` of the shim's def, `FnOnce::call_once`, `FnMut::call_mut` or `Fn::call`;
     /// the shim itself is never tracked, rustc_middle instance.rs `requires_caller_location`).
-    /// No answer is refused with [`BuildError::TrackCaller`].
-    fn def_site(&self, item: ItemKey) -> Option<CallerSite<'_>> {
+    /// No answer is refused with [`BuildError::TrackCaller`] carrying the front's [`SiteGap`].
+    fn def_site(&self, item: ItemKey) -> Result<CallerSite<'_>, SiteGap> {
         let _ = item;
-        None
+        Err(SiteGap::Unanswered)
     }
 
     /// Expression `expr` of `owner`'s body as a trap row keeps it: its first byte counted from
@@ -601,7 +612,7 @@ pub trait Adts {
     /// one; the report places it by the item (blaze-cli run_fault.rs). By default the offset of
     /// [`Adts::caller_site`]'s answer.
     fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {
-        self.caller_site(owner, expr).map(|site| site.offset)
+        self.caller_site(owner, expr).ok().map(|site| site.offset)
     }
 
     /// The struct `core::panic::Location` (lang `panic_location`), the hidden parameter's
@@ -651,6 +662,109 @@ pub struct CallerSite<'a> {
     pub item: ItemKey,
     /// The expression's first byte, counted from the item's first byte.
     pub offset: u32,
+}
+
+/// Why a front end gave no line and column for a place (blaze-ladder `FrontEnd::source_position`),
+/// or no place of an item in its file ([`SiteGap::Placement`]). One home (rule 30): the seam
+/// re-exports it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PositionGap {
+    /// The front end does not answer the question (the old front).
+    Unanswered,
+    /// The item is not one the front end places: not tabled, or no first byte today.
+    NoItem,
+    /// The item's text is not in a file of its crate (a macro's expansion), or the file is not
+    /// one the front end holds.
+    NoFile,
+    /// The site is past the end of the file's text, or not on a char's first byte.
+    PastText,
+}
+
+impl fmt::Display for PositionGap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PositionGap::Unanswered => "this front end does not place source positions (`FrontEnd::source_position`)",
+            PositionGap::NoItem => "the front end places no such item today",
+            PositionGap::NoFile => "the item's text is in no file the front end holds (a macro's expansion, or an unknown file)",
+            PositionGap::PastText => "the site is past its file's text, or inside a char",
+        })
+    }
+}
+
+/// Why [`Adts::caller_site`] or [`Adts::def_site`] gave no place: each step of the front end's
+/// rule by name (rule 19; blaze-ladder lazy seam_rules.rs `caller_site`, `def_site`,
+/// `body_anchor`), so a refused `#[track_caller]` location says which fact was missing. Before
+/// 2026-11-21 every step was a bare `None` ("the world does not say where the expression is").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SiteGap {
+    /// The front end places nothing (a test's world, the trait's default).
+    Unanswered,
+    /// `owner`'s body is not live on this front end: asked outside its build.
+    NotLive { owner: ItemKey },
+    /// The lowered body of `owner` kept no range for `expr`.
+    NoRange { owner: ItemKey, expr: ExprId },
+    /// `item`'s own head (its text) is not made on this front end.
+    NoRow { item: ItemKey },
+    /// Body-local `local`'s enclosing item `enclosing` has no head on this front end: the make did
+    /// not ask for it (blaze-ladder make_one.rs asks the chain up front, `FrontEnd::site_heads`).
+    NoEnclosingRow { local: ItemKey, enclosing: ItemKey },
+    /// Body-local `local`'s range is not inside its enclosing item's text (or past `u32`).
+    LocalOutsideEnclosing { local: ItemKey },
+    /// The chain of body-locals from `owner` is longer than the locals kept (rule 18).
+    TooDeep { owner: ItemKey, kept: usize },
+    /// Member `owner` has no row in its container's members.
+    NoMemberRow { owner: ItemKey },
+    /// `owner` names no library item: for a body-local, its enclosing body was never located on
+    /// this front end (no local head is filed for it).
+    NoLibrary { owner: ItemKey },
+    /// Item `item` has neither a text of its own nor a member row to count from.
+    NoAnchor { item: ItemKey },
+    /// Item `item`'s place in its file was not read: the names source answered `gap`.
+    Placement { item: ItemKey, gap: PositionGap },
+    /// A written body-local's declaration at byte `declaration` of `item`'s text keys no source local.
+    LocalKey { item: ItemKey, declaration: u32 },
+    /// `item`'s key clashes with another in the front end's key map.
+    KeyClash { item: ItemKey },
+    /// File `file` of crate `krate`, where `item` is written, has no shown path (`file!()`):
+    /// over records, a toolchain or dependency crate's file row may keep none (the names source).
+    NoShownFile { item: ItemKey, krate: usize, file: u32 },
+    /// The place `offset` of `item` is before its declaration's first token at `first`.
+    BeforeDeclaration { item: ItemKey, offset: u32, first: u32 },
+    /// No token of `item`'s declaration follows its outer attributes, or its text does not lex.
+    PastAttributes { item: ItemKey },
+    /// The text of `item` is not in the names source.
+    NoText { item: ItemKey },
+    /// Crate `krate` of `item` has no edition in the names source.
+    NoEdition { item: ItemKey, krate: usize },
+}
+
+impl fmt::Display for SiteGap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SiteGap::Unanswered => f.write_str("this front end places no expressions"),
+            SiteGap::NotLive { owner } => write!(f, "the body of {:#x} is not live on the front end (asked outside its build)", owner.0),
+            SiteGap::NoRange { owner, expr } => write!(f, "expression {} of {:#x} kept no range in its lowering", expr.0, owner.0),
+            SiteGap::NoRow { item } => write!(f, "the head of {:#x} is not made on this front end", item.0),
+            SiteGap::NoEnclosingRow { local, enclosing } => {
+                write!(f, "the body-local {:#x}'s enclosing item {:#x} has no head on this front end (asked up front: `FrontEnd::site_heads`)", local.0, enclosing.0)
+            }
+            SiteGap::LocalOutsideEnclosing { local } => write!(f, "the body-local {:#x}'s range is not inside its enclosing item's text", local.0),
+            SiteGap::TooDeep { owner, kept } => write!(f, "the body-locals enclosing {:#x} are nested deeper than the {kept} kept (rule 18)", owner.0),
+            SiteGap::NoMemberRow { owner } => write!(f, "the member {:#x} has no row among its container's members", owner.0),
+            SiteGap::NoLibrary { owner } => write!(f, "{:#x} names no library item (a body-local whose enclosing body was not located here)", owner.0),
+            SiteGap::NoAnchor { item } => write!(f, "{:#x} has neither a text of its own nor a member row to count from", item.0),
+            SiteGap::Placement { item, gap } => write!(f, "the place of {:#x} in its file: {gap}", item.0),
+            SiteGap::LocalKey { item, declaration } => write!(f, "the body-local declared at byte {declaration} of {:#x} keys no source local", item.0),
+            SiteGap::KeyClash { item } => write!(f, "the key of {:#x} clashes in the front end's key map", item.0),
+            SiteGap::NoShownFile { item, krate, file } => {
+                write!(f, "file {file} of crate {krate}, where {:#x} is written, has no shown path (`file!()`) in the names source (a dependency or toolchain crate's file row over records)", item.0)
+            }
+            SiteGap::BeforeDeclaration { item, offset, first } => write!(f, "byte {offset} of {:#x} is before its declaration's first token at {first}", item.0),
+            SiteGap::PastAttributes { item } => write!(f, "no token of {:#x}'s declaration follows its outer attributes", item.0),
+            SiteGap::NoText { item } => write!(f, "the text of {:#x} is not in the names source", item.0),
+            SiteGap::NoEdition { item, krate } => write!(f, "crate {krate} of {:#x} has no edition in the names source", item.0),
+        }
+    }
 }
 
 /// One piece of a `format_args!` template ([`Adts::format_template`]).
@@ -751,6 +865,10 @@ pub struct Built<A: Allocator> {
     /// record.rs `TrapSource`: by its ordinal among the function's `unreachable`s, its kind and
     /// its item-relative site): the code record's trap table, what a fault's report says.
     pub traps: Vec<blaze_code::record::TrapSource, A>,
+    /// How many of `func`'s instructions the walk's aggregate copies wrote (walk.rs `copy`:
+    /// leaf by leaf, a switch per enum): the make's size report names it (rule 16). A
+    /// coroutine's resume and drop carry the count of the walk they were split from.
+    pub copy_insts: u64,
 }
 
 /// What a panic does. The Reference, "Panic": "unwind — unwinds the stack and is potentially
@@ -911,7 +1029,8 @@ pub enum BuildError {
     /// inserted with no expression of its own) for fn `item` was not made, named by `why`: the
     /// world does not say where `expr` is or whether a fn is tracked, or a tracked fn is taken
     /// where its shim would be needed (a fn pointer, a vtable slot).
-    TrackCaller { expr: Option<ExprId>, item: ItemKey, why: &'static str },
+    /// `gap`: the front end's step that gave no place, when a site was asked ([`SiteGap`]).
+    TrackCaller { expr: Option<ExprId>, item: ItemKey, why: &'static str, gap: Option<SiteGap> },
     /// The layout row of declared field `field` of a value of type `ty` (its head node) is
     /// named `found`, not the declared field's name (walk.rs `decl_field`): the rows are not in
     /// declaration order, so no offset is read by index. This crate's bug, named.
@@ -1059,11 +1178,15 @@ impl fmt::Display for BuildError {
             BuildError::NoCleanup { what } => {
                 write!(f, "a call that may unwind (panic = unwind): its cleanup is not built exactly: {what} (blaze-build walk/unwind.rs)")
             }
-            BuildError::TrackCaller { expr: Some(expr), item, why } => {
-                write!(f, "expression {}: the `#[track_caller]` location for fn {:#x}: {why}", expr.0, item.0)
-            }
-            BuildError::TrackCaller { expr: None, item, why } => {
-                write!(f, "a call the build inserted: the `#[track_caller]` location for fn {:#x}: {why}", item.0)
+            BuildError::TrackCaller { expr, item, why, gap } => {
+                match expr {
+                    Some(expr) => write!(f, "expression {}: the `#[track_caller]` location for fn {:#x}: {why}", expr.0, item.0)?,
+                    None => write!(f, "a call the build inserted: the `#[track_caller]` location for fn {:#x}: {why}", item.0)?,
+                }
+                match gap {
+                    Some(gap) => write!(f, " ({gap})"),
+                    None => Ok(()),
+                }
             }
             BuildError::FieldOrder { ty, field, found } => write!(
                 f,

@@ -35,12 +35,12 @@ fn list_head() -> StartHead {
 
 /// `lines` as a list under [`LISTED`] onto `bytes` (the planted writer, start_list.rs
 /// `encode_lines`, so a test can name rows one by one).
-fn listed(lines: &[Line], bytes: &mut AVec<'_, u8>) {
+pub(super) fn listed(lines: &[Line], bytes: &mut AVec<'_, u8>) {
     start_list::encode_lines(&LISTED, list_head(), lines, bytes).expect("a small list");
 }
 
 /// The list in `bytes` read back under its own certificate: today's rows.
-fn today_rows<'b>(bytes: &'b [u8], alloc: Alloc<'_>) -> TodayRows<'b> {
+pub(super) fn today_rows<'b>(bytes: &'b [u8], alloc: Alloc<'_>) -> TodayRows<'b> {
     let start_list::Held::Today(rows) = start_list::read(bytes, alloc).expect("the list reads").under(&LISTED) else { panic!("the list under its own certificate is not today's") };
     rows
 }
@@ -51,7 +51,7 @@ fn today_groups<'b>(bytes: &'b [u8], alloc: Alloc<'_>) -> std::vec::Vec<TodayGro
 }
 
 /// This run's first answers as rows (the list it writes at exit).
-fn first_lines(needs: &Needs<'_>) -> std::vec::Vec<Line> {
+pub(super) fn first_lines(needs: &Needs<'_>) -> std::vec::Vec<Line> {
     needs.first().lines().collect()
 }
 
@@ -77,6 +77,7 @@ pub(super) fn frames(bytes: &[u8]) -> std::vec::Vec<std::string::String> {
             Down::ThreadLocals { descriptor, ender } => std::format!("ThreadLocals {} {}", descriptor.0[0], ender.0[0]),
             Down::Hooks { slot, kind } => std::format!("Hooks {} {kind:?}", slot.0),
             Down::Promote { slot, record, inlined, .. } => std::format!("Promote {} {} {}", slot.0, record.0[0], inlined.len()),
+            Down::Bytes { record, at, total, part } => std::format!("Bytes {} {at} {total} {}", record.0[0], part.len()),
         });
         at += len;
     }
@@ -96,7 +97,7 @@ impl Resolve for Fixed {
     fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
         let n = symbol.0[0];
         Ok(match (n == 1 || n == 2) && symbol.0 == [n; 32] {
-            true => Resolved::Record { key: CodeKey(blaze_ids::ContentId([n; 32])), record: RecordId([n * 10; 32]), declares: &[], data: &[], named: &[] },
+            true => Resolved::Record { key: CodeKey(blaze_ids::ContentId([n; 32])), record: RecordId([n * 10; 32]), declares: &[], data: &[], named: &[], sent: Sent::NONE },
             false => Resolved::Unknown,
         })
     }
@@ -138,9 +139,9 @@ impl Resolve for Counting {
         *self.asks.entry(symbol.0[0]).or_insert(0) += 1;
         let key = CodeKey(blaze_ids::ContentId([symbol.0[0]; 32]));
         Ok(match symbol.0[0] {
-            1 => Resolved::Record { key, record: RecordId([10; 32]), declares: &self.one, data: &[], named: &[] },
-            2 => Resolved::Record { key, record: RecordId([20; 32]), declares: &self.two, data: &[], named: &[] },
-            3 => Resolved::Record { key, record: RecordId([30; 32]), declares: &[], data: &[], named: &[] },
+            1 => Resolved::Record { key, record: RecordId([10; 32]), declares: &self.one, data: &[], named: &[], sent: Sent::NONE },
+            2 => Resolved::Record { key, record: RecordId([20; 32]), declares: &self.two, data: &[], named: &[], sent: Sent::NONE },
+            3 => Resolved::Record { key, record: RecordId([30; 32]), declares: &[], data: &[], named: &[], sent: Sent::NONE },
             _ => Resolved::Unknown,
         })
     }
@@ -226,9 +227,9 @@ const THREAD_LOCALS: [(u128, &[u128]); 1] = [(THREADY, &[V])];
 
 /// A fn that makes a `&dyn` of a type: its record names vtable [`W`], whose datum its entry
 /// carries (code_records.rs form 6), and calls `leaf` (the vtable's method word's instance).
-const DYN: u128 = 0xA009;
+pub(super) const DYN: u128 = 0xA009;
 /// The vtable `DYN` names.
-const W: u128 = 0xA0E4;
+pub(super) const W: u128 = 0xA0E4;
 /// The length that marks a vtable row in a toy entry: the vtable's id, its datum the id's bytes.
 const VT_ROW: u32 = u32::MAX - 2;
 
@@ -534,7 +535,7 @@ impl<'t> Front for ToyFront<'t> {
         Ok(ToyIds { reads: [Read { fact: FACT, digest: DIGEST }], clean: self.clean })
     }
 
-    fn maker(&mut self, _start: &ToyStart) -> Result<ToyMaker<'t>, ParentError> {
+    fn maker(&mut self, _start: &ToyStart, _ids: &ToyIds) -> Result<ToyMaker<'t>, ParentError> {
         // A body that is not clean has no typed record (the Bodies stage puts one per clean body).
         Ok(ToyMaker { calls: self.calls, typed: self.clean })
     }
@@ -569,16 +570,32 @@ pub(super) struct ToyFolder {
     bytes: std::collections::BTreeMap<[u8; 32], std::vec::Vec<u8>>,
 }
 
+/// The files control's model: a record is held once filed, as a file is.
 impl Folder for &mut ToyFolder {
-    fn holds(&self, record: &RecordId) -> Result<bool, ParentError> {
-        Ok(self.held.contains(&record.0))
-    }
+    fn begin(&mut self) {}
 
     fn file(&mut self, record: &[u8]) -> Result<RecordId, ParentError> {
         let id = blaze_blake3::hash(record);
         self.held.insert(id);
         self.bytes.insert(id, record.to_vec());
         Ok(RecordId(id))
+    }
+
+    fn kept(&mut self, _record: RecordId, _kept: Kept, _store: &mut dyn CodeStore) -> Result<(), ParentError> {
+        Ok(())
+    }
+
+    fn ahead<F: Front>(&mut self, _symbol: Symbol, record: &RecordId, _code: Option<CodeKey>, _front: &F, _store: &dyn CodeStore) -> Result<bool, ParentError> {
+        Ok(self.held.contains(&record.0))
+    }
+
+    fn take(&mut self) -> Sent<'_> {
+        Sent::NONE
+    }
+
+    fn read<F: Front>(&self, record: &RecordId, _front: &F, _store: &dyn CodeStore, into: &mut bstd::mem::Bytes<'_>) -> Result<(), ParentError> {
+        let bytes = self.bytes.get(&record.0).ok_or(ParentError::Sent { record: record.0, why: crate::run_bytes::SentWhy::NotKept })?;
+        into.try_extend(bytes).map_err(|_| ParentError::Sent { record: record.0, why: crate::run_bytes::SentWhy::NoRoom { len: bytes.len() } })
     }
 }
 
@@ -923,10 +940,10 @@ impl Resolve for TwoNamers {
         let key = CodeKey(blaze_ids::ContentId([n; 32]));
         let record = RecordId([n * 10; 32]);
         Ok(match n {
-            1 => Resolved::Record { key, record, declares: &[], data: &self.told, named: &self.s },
-            2 => Resolved::Record { key, record, declares: &[], data: &[], named: &self.s },
-            3 => Resolved::Record { key, record, declares: &[], data: &[], named: &[] },
-            4 => Resolved::Record { key, record, declares: &[], data: &[], named: &self.rogue },
+            1 => Resolved::Record { key, record, declares: &[], data: &self.told, named: &self.s, sent: Sent::NONE },
+            2 => Resolved::Record { key, record, declares: &[], data: &[], named: &self.s, sent: Sent::NONE },
+            3 => Resolved::Record { key, record, declares: &[], data: &[], named: &[], sent: Sent::NONE },
+            4 => Resolved::Record { key, record, declares: &[], data: &[], named: &self.rogue, sent: Sent::NONE },
             _ => Resolved::Unknown,
         })
     }
@@ -1251,8 +1268,8 @@ impl<'t> Front for Landing<'t> {
         self.toy.ids()
     }
 
-    fn maker(&mut self, start: &Headed) -> Result<ToyMaker<'t>, ParentError> {
-        self.toy.maker(&start.toy)
+    fn maker(&mut self, start: &Headed, ids: &ToyIds) -> Result<ToyMaker<'t>, ParentError> {
+        self.toy.maker(&start.toy, ids)
     }
 
     fn form(&self) -> &dyn Form {
@@ -1368,8 +1385,8 @@ impl<'t> Front for Watched<'t> {
         self.toy.ids()
     }
 
-    fn maker(&mut self, start: &ToyStart) -> Result<ToyMaker<'t>, ParentError> {
-        self.toy.maker(start)
+    fn maker(&mut self, start: &ToyStart, ids: &ToyIds) -> Result<ToyMaker<'t>, ParentError> {
+        self.toy.maker(start, ids)
     }
 
     fn form(&self) -> &dyn Form {
@@ -1509,6 +1526,11 @@ impl crate::test_drive::KeptMakers for ToyMakers<'_> {
         self.forgot += 1;
         self.kept.forget(suite);
     }
+
+    /// A toy maker has no program to name or place by: the crossed refusal keeps its fn's name.
+    fn shown(&mut self, job: &crate::test_drive::Job<'static>, refusal: &mut crate::run_parent::CodeRefusal) {
+        let _ = (job, refusal);
+    }
 }
 
 fn toy_makers(calls: &Cell<usize>, plant: crate::test_drive::MakersPlant, panics: usize) -> ToyMakers<'_> {
@@ -1574,8 +1596,8 @@ fn resolve_pooled(
         let came = code
             .answer(child, |reply| match reply {
                 Reply::Made(entry) => lazy.made(entry),
-                Reply::Refused(why) => Err(lazy.refused(why)),
-                Reply::RefusedElsewhere { .. } | Reply::Late { .. } => panic!("the one child's ask was refused elsewhere or late"),
+                Reply::Refused(why) => Err(lazy.refused(why.for_asker())),
+                Reply::Late { .. } => panic!("the one child's ask was late"),
             })
             .expect("the relay answers");
         came.expect("the ask was answered in its turn")?;

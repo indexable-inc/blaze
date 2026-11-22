@@ -91,7 +91,8 @@ pub fn want_of<'n, S: super::source::NamesSource<'n>>(names: S, keys: &Keys, q: 
         | Question::AssocGenerics(k, _)
         | Question::TypeAlias(k)
         | Question::FieldDefaults(k)
-        | Question::MemberVisible(k, _) => want_of_key(names, keys, k),
+        | Question::MemberVisible(k, _)
+        | Question::MemberUnstable(k, _) => want_of_key(names, keys, k),
         _ => Err(FillError::NotAHead(q)),
     }
 }

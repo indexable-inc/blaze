@@ -67,6 +67,29 @@ pub enum EngineCheckError {
     /// file's path in its tree, not by two hashes (rule 19; turso 2026-11-21 17:22: `core/io/unix.rs`,
     /// a `mod unix;` that `cfg_block!`'s expansion writes in `turso_core`'s `core/io/mod.rs`).
     UnseenFile { task: Name, read: Name, krate: blaze_own::String<SharedAlloc<'static>>, path: blaze_own::String<SharedAlloc<'static>> },
+    /// Crate `krate`'s names read `count` files no outline of the request holds, past `cap`
+    /// ([`FOUND_CAP`], rule 18): the chain named by its first and last file (engine_names.rs
+    /// `unoutlined`), a macro that writes modules without end.
+    FoundTooMany { task: Name, krate: blaze_own::String<SharedAlloc<'static>>, count: u32, cap: u32, first: blaze_own::String<SharedAlloc<'static>>, last: blaze_own::String<SharedAlloc<'static>> },
+    /// Two member units of one root and kind (engine_body_plan.rs `FoundUnitsShare`): a found
+    /// file's place could not say which found it.
+    FoundUnitsShare(crate::engine_body_plan::FoundUnitsShare),
+    /// The found file `file` is read by member units of two roots: its place keeps one root
+    /// ([`blaze_engine::pages::FilePlace`]'s `unit`), so the other's edge would be lost (rule 3).
+    FoundTwoRoots { file: Name, first: Name, second: Name },
+    /// Two names tasks outlined the found file `file` to two outlines: its text moved between
+    /// their reads (one outline a file a request, rule 21).
+    FoundTwoOutlines { file: Name },
+    /// The names task `task` found `file` on the ready driver. The ready driver runs no names
+    /// task (engine_ready_edit.rs `admit`: `READY_KINDS` holds no `CrateScope`; an edit that
+    /// enters one takes the phase path), so it finds no file, and a found file of the last
+    /// answer is planned there from its place as any file is: a find here is the driver's own
+    /// inconsistency, checked after its drive (rule 3), never a request it serves.
+    FoundOnReady { task: Name, file: Name },
+    /// A table a stage keeps for the request holds no entry for `key` where `task`'s step must
+    /// find one: the stage's own inconsistency, named by the table (rule 19), never a task's
+    /// need (that is [`EngineCheckError::Unseen`] alone, rule 30).
+    MissingEntry { task: Name, table: Table, key: Name },
     /// A task was admitted twice or its result was filed twice in one request.
     Twice { task: Name },
     /// The crates' dependency edges do not settle to depths: a cycle through `krate`.
@@ -130,6 +153,73 @@ pub enum EngineCheckError {
     Unoutlined(crate::engine_body_plan::Unoutlined),
 }
 
+/// The request's tables a stage looks an entry up in, each named where it lives
+/// ([`EngineCheckError::MissingEntry`]). One variant a table; a stage that keeps another adds
+/// its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Table {
+    /// The names world's crate index (names.rs `Names::crate_at`).
+    WorldCrates,
+    /// The names stage itself, or its world, gone while a names step needs it
+    /// (engine_names.rs `NamesStage::names`, engine_check.rs `Drive::names`).
+    NamesWorld,
+    /// The dependencies' exports mapped for one names wave (engine_names.rs `WaveInputs::slots`).
+    MappedExports,
+    /// The wave's wire headers waiting for the put (engine_names.rs `NamesStage::heads`).
+    WaveHeads,
+    /// The pipelined names tasks running (engine_names.rs `NamesQueue::running`).
+    NamesRunning,
+    /// The pipelined names tasks answered and not yet filed (engine_names.rs `NamesQueue::answered`).
+    NamesAnswered,
+    /// The pipelined names tasks' filing order (engine_names.rs `NamesQueue::order`).
+    NamesOrder,
+    /// The Bodies phase's run facts, handed to its put (engine_check.rs `run_stage`, `put_phase`).
+    BodyFacts,
+    /// The names world's build-script module index (names.rs `script_module`).
+    WorldScriptModules,
+    /// Each planned script task's reads (engine_scripts.rs `ScriptsStage::reads`).
+    ScriptReads,
+    /// The planned script runs by name (engine_scripts.rs `ScriptsStage::runs`).
+    ScriptRuns,
+    /// The script tasks running on workers (engine_scripts.rs `ScriptQueue::running`).
+    ScriptsRunning,
+    /// A finished script worker's answer slot (engine_scripts.rs `Running::output`).
+    ScriptsOutput,
+    /// The script tasks' filing order (engine_scripts.rs `ScriptQueue::order`).
+    ScriptsOrder,
+    /// The given cells' tasks (engine_scripts.rs `ScriptsStage::given`).
+    ScriptsGiven,
+    /// The script tasks answered and not yet filed (engine_scripts.rs `ScriptsStage::completed`).
+    ScriptsCompleted,
+    /// What the names said of the found files, applied once (engine_check.rs `Served`): a found
+    /// file's place, its outline's task in its plan, or the table set a second time.
+    FoundServed,
+}
+
+impl fmt::Display for Table {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Table::WorldCrates => "the names world's crate index (names.rs `crate_at`)",
+            Table::NamesWorld => "the names stage's world (engine_names.rs `NamesStage::names`)",
+            Table::MappedExports => "the names wave's mapped dependency exports (engine_names.rs `WaveInputs::slots`)",
+            Table::WaveHeads => "the names wave's headers for the put (engine_names.rs `NamesStage::heads`)",
+            Table::NamesRunning => "the running names tasks (engine_names.rs `NamesQueue::running`)",
+            Table::NamesAnswered => "the answered names tasks (engine_names.rs `NamesQueue::answered`)",
+            Table::NamesOrder => "the names tasks' filing order (engine_names.rs `NamesQueue::order`)",
+            Table::BodyFacts => "the Bodies phase's run facts (engine_check.rs `run_stage`)",
+            Table::WorldScriptModules => "the names world's build-script module index (names.rs `script_module`)",
+            Table::ScriptReads => "the planned script tasks' reads (engine_scripts.rs `ScriptsStage::reads`)",
+            Table::ScriptRuns => "the planned script runs (engine_scripts.rs `ScriptsStage::runs`)",
+            Table::ScriptsRunning => "the running script tasks (engine_scripts.rs `ScriptQueue::running`)",
+            Table::ScriptsOutput => "a finished script worker's answer slot (engine_scripts.rs `Running::output`)",
+            Table::ScriptsOrder => "the script tasks' filing order (engine_scripts.rs `ScriptQueue::order`)",
+            Table::ScriptsGiven => "the given cells' tasks (engine_scripts.rs `ScriptsStage::given`)",
+            Table::ScriptsCompleted => "the answered script tasks (engine_scripts.rs `ScriptsStage::completed`)",
+            Table::FoundServed => "the found files served (engine_check.rs `Served`)",
+        })
+    }
+}
+
 impl From<crate::engine_phase_mem::PhaseMemError> for CliError {
     fn from(error: crate::engine_phase_mem::PhaseMemError) -> CliError {
         CliError::EngineCheck(EngineCheckError::PhaseMem(error))
@@ -156,8 +246,17 @@ impl fmt::Display for EngineCheckError {
             }
             EngineCheckError::UnseenFile { task, read, krate, path } => write!(
                 f,
-                "crate `{krate}`'s names read the file `{path}` ({task:?} needs {read:?}), which its plan did not hand it: the file walk did not outline that file. A module file a macro wrote from a computed name (`mod $name;`, a proc macro's `mod`), or an `include!` of a computed path: not planned yet (the walk plans only the `mod NAME;` a macro call's tokens hold literally: work.rs `macro_module_files`; engine_check.rs `plan`, engine_names.rs `finish`)"
+                "crate `{krate}`'s names read the file `{path}` ({task:?} needs {read:?}), which its plan did not hand it: the file walk did not outline that file, and the names did not serve it. A module file a macro writes (`cfg_if!`'s `mod unix;`, `mod $name;`, a proc macro's `mod`), or an `include!` of a computed path, is outlined by the names that read it and planned after them (engine_names.rs `Job::run`, engine_check.rs `serve_found`); this read was not served (the control's plant, engine_check.rs `without_found_serve`)"
             ),
+            EngineCheckError::FoundTooMany { task, krate, count, cap, first, last } => write!(
+                f,
+                "crate `{krate}`'s names ({task:?}) read {count} files the file walk did not outline, from `{first}` to `{last}`: past the cap of {cap} files a crate's names may find in one request (rule 18, engine_check.rs `FOUND_CAP`, engine_names.rs `unoutlined`)"
+            ),
+            EngineCheckError::FoundUnitsShare(why) => write!(f, "{why}"),
+            EngineCheckError::FoundTwoRoots { file, first, second } => write!(f, "the found file {file:?} is read by the names of member units of two roots, {first:?} and {second:?}: its place keeps one root, so the other's module tree would lose it (engine_check.rs `serve_found`, rule 3)"),
+            EngineCheckError::FoundTwoOutlines { file } => write!(f, "two crates' names outlined the found file {file:?} to two outlines in one request: its text moved between their reads (engine_check.rs `serve_found`, rule 21)"),
+            EngineCheckError::FoundOnReady { task, file } => write!(f, "{task:?} read {file:?}, a file no outline of the request holds, on the ready driver, which runs no names task (engine_ready_edit.rs `admit`, `READY_KINDS`): the driver's own inconsistency (engine_check.rs `FoundOnReady`)"),
+            EngineCheckError::MissingEntry { task, table, key } => write!(f, "{task:?}: {table} holds no entry for {key:?}: the stage's own inconsistency, never a read the plan missed"),
             EngineCheckError::Twice { task } => write!(f, "{task:?} was admitted or filed more than once in this request"),
             EngineCheckError::Cycle { krate } => write!(f, "the crates' dependencies do not settle to depths: a cycle, seen from {krate:?} (engine_names.rs `plan`)"),
             EngineCheckError::Levels { levels } => write!(f, "the dependency graph was not resolved in {levels} levels of the lock (engine_units.rs `LEVELS`)"),
@@ -355,11 +454,19 @@ fn edge<R>(
     // stale). Every served read takes it from `place`.
     let served = crate::engine_script_reads::Served::at_edge(io, checkout_at, frame).map_err(EngineCheckError::ServedRoot)?;
     phases.mark_cx(cx, "open checkout: the checkout's root resolved (one realpath)", frame);
+    // cargo's `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` for this machine's target (rustflags.rs).
+    let target_rustflags_var = blaze_manifest::rustflags::target_variable(crate::graph::TRIPLE, heap.alloc());
     let place = Place {
         checkout: checkout_at,
         served,
         cert_file: var("SSL_CERT_FILE"),
         cert_dir: var("SSL_CERT_DIR"),
+        rustflags: blaze_manifest::rustflags::RustflagsEnv {
+            encoded: var("CARGO_ENCODED_RUSTFLAGS"),
+            plain: var("RUSTFLAGS"),
+            build: var("CARGO_BUILD_RUSTFLAGS"),
+            target: var(target_rustflags_var.as_str()),
+        },
         home: var("HOME"),
         cargo_home: cargo_home.as_ref().map(|cargo| cargo.as_str()),
         start: served.root_text(),
@@ -483,6 +590,13 @@ impl<'r, 'm> Standing<'r, 'm> {
     /// (`BodyReads`), while the store is lent to the names reader and the parent.
     pub(crate) fn rows(&self) -> &'r blaze_engine::Answer<'r> {
         self.rows
+    }
+
+    /// Where each stored row's record is, for as long as the standing answer: the run's typing
+    /// finds a body's run facts record through it (engine_body_record.rs `StoreTyped`), while
+    /// the store is lent to the names reader and the parent.
+    pub(crate) fn records(&self) -> &'r dyn crate::engine_run_answer::Records {
+        self.records
     }
 }
 
@@ -626,6 +740,8 @@ pub(crate) struct Place<'f> {
     pub(crate) served: crate::engine_script_reads::Served<'f>,
     pub(crate) cert_file: Option<&'f str>,
     pub(crate) cert_dir: Option<&'f str>,
+    /// The rustflags variables (fetch.rs `FetchEnv::rustflags`).
+    pub(crate) rustflags: blaze_manifest::rustflags::RustflagsEnv<'f>,
     /// `HOME`: the store and the sources are beneath it.
     pub(crate) home: Option<&'f str>,
     pub(crate) cargo_home: Option<&'f str>,
@@ -645,6 +761,7 @@ impl<'f> Place<'f> {
             served: self.served,
             cert_file: self.cert_file,
             cert_dir: self.cert_dir,
+            rustflags: self.rustflags,
             home: self.home,
             cargo_home: self.cargo_home,
             start: self.start,
@@ -763,6 +880,10 @@ pub(crate) struct Checked {
     /// the store (engine_heads.rs `complete`).
     #[cfg(test)]
     pub(crate) heads: (u32, u32, u32),
+    /// The Lints stage's rows in the answer, entered or standing: one a linted file, however
+    /// many units it has (engine_lints.rs, sparse rows). 0 on a certified replay (no audit).
+    #[cfg(test)]
+    pub(crate) lint_rows: u32,
     /// The `Signature` head tasks entered this request (lane RH4's edit rows count them).
     pub(crate) signatures_entered: u32,
     /// The `Lint` tasks entered this request and their findings (engine_lints.rs `seen`).
@@ -917,10 +1038,9 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         let stored = match fresh {
             true => None,
             false => match crate::engine_answer::load_pointer(cx, &mut store, &answer_root)? {
-                // No answer of this checkout's own: the home's latest, whichever checkout wrote
-                // it (engine_answer.rs `LATEST_ROOT`, `StoredBase::OtherCheckout`).
+                // No answer of this checkout's own: its workspace's base (engine_answer.rs `load_base`, `StoredBase::OtherCheckout`).
                 None => {
-                    let latest = crate::engine_answer::load_pointer(cx, &mut store, crate::engine_answer::LATEST_ROOT)?;
+                    let latest = crate::engine_answer::load_base(cx, &mut store, root, frame)?;
                     other_checkout = latest.is_some();
                     latest
                 }
@@ -988,7 +1108,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     // `Both`) until the differential holds on tempo; then `Asked`. No helper is started
     // (`HelperStart::None`): with none answering, this is `Replay` and one failed connect.
     use crate::journal_sweep::ChangedSince as _;
-    let me = crate::journal_ask::Me::of(&io.need_host()?.build_id()?, place.served.root_text(), frame);
+    let me = crate::journal_ask::Me::of(&io.need_host()?.build_id()?, place.served.root_text(), place.home, frame);
     let strategy = crate::journal_ask::Shipped { me, start: crate::journal_ask::HelperStart::None };
     let journal = strategy.changed_since(cx, root, opened.home.dir(), phases.clock(), chosen.places(), frame)?;
     let now_places = crate::journal_checkpoint::Places::of_taken(&journal, frame);
@@ -1019,8 +1139,10 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
             crate::engine_ready_edit::StoredBase::Own | crate::engine_ready_edit::StoredBase::ToolsMoved => journal.marked(&pointer.leaves, frame),
         };
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
+        let follow_began = phases.clock().now();
         let (followed, statted) = follow.follow_served(cx, root, Some(opened.home.dir()), &pointer.leaves, marked.as_deref(), script_sweep.as_mut(), frame)?;
-        sweep_counts = journal.counts(statted, u32::try_from(pointer.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&pointer.leaves, frame));
+        let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
+        sweep_counts = journal.counts(statted, u32::try_from(pointer.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&pointer.leaves, frame)).with_looks(followed.looks, follow_ns);
         // Set, then borrowed SHARED: `Option::insert` hands back a `&mut`, and `today_slots` below
         // keeps paths out of it, which would hold that exclusive borrow past the later readers.
         followed_kept = Some(followed);
@@ -1118,7 +1240,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
                 let Some(last) = last_root else { return Err(EngineCheckError::ReadyRefused(ReadyRefused::Root(PhasesWhy::NoAnswer)).into()) };
                 let Some(followed) = followed_kept.as_ref() else { return Err(EngineCheckError::ReadyRefused(ReadyRefused::Root(PhasesWhy::NoAnswer)).into()) };
                 let Some(lines) = last_lines.as_ref() else { return Err(EngineCheckError::ReadyRefused(ReadyRefused::Root(PhasesWhy::NoAnswer)).into()) };
-                let setup = ready_setup(cx, root, &stamps, stood, followed, last, lines, &start, &records, &tools, &mut store, &env, workers, alloc, frame)?.map_err(EngineCheckError::ReadyRefused)?;
+                let setup = ready_setup(cx, root, &stamps, stood, followed, last, lines, &start, &records, &tools, &mut store, &env, workers, Some(linting.rules), alloc, frame)?.map_err(EngineCheckError::ReadyRefused)?;
                 phases.mark_cx(cx, "ready setup (the graph's row and crate list, outlines read back, the edited files outlined)", frame);
                 let mut discovered = crate::engine_units::Discovered::ready(stood, frame);
                 discovered.plan.files_read = setup.rows_read;
@@ -1140,11 +1262,13 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
                 let units = sweep::units_source(rows.rows.iter().map(|leaf| (rows.path(leaf), leaf)), frame);
                 if let (Some(lockfile), Some(parts)) = (laid_here.lock.as_ref(), laid_here.parts.take()) {
                     let program = crate::program::dev_profile_panic(cx, root, frame)?;
-                    let target = crate::graph::target(cx, &env, program, &blaze_unit_graph::UnitKind::Lib, frame)?;
-                    let host = crate::graph::target(cx, &env, program, &blaze_unit_graph::UnitKind::BuildScript, frame)?;
-                    // PHASE-MEM-DEBT(Units): the unit graph on the process heap (graph.rs `Graph::new`,
+                    // Each with the rustflags cargo gives its unit (graph.rs `target_of`): a `--cfg`
+                    // of the checkout's `.cargo/config.toml` reaches every unit's cfg.
+                    let target = crate::graph::target_of(cx, &env, &laid_here.rustflags, program, &blaze_unit_graph::UnitKind::Lib, frame)?;
+                    let host = crate::graph::target_of(cx, &env, &laid_here.rustflags, program, &blaze_unit_graph::UnitKind::BuildScript, frame)?;
+                    // PHASE-MEM-DEBT(Units): the unit graph on the process heap (graph.rs `Graph::of`,
                     // `heap: &'static Heap`): the request's; the graph is a record (`discover` puts it).
-                    laid_here.graph = Some(crate::graph::Graph::new(parts, lockfile, units, target, host, true, heap, frame));
+                    laid_here.graph = Some(crate::graph::Graph::of(parts, lockfile, units, target, host, true, heap, frame));
                 }
                 phases.mark_cx(cx, "plan (the graph's inputs: the profile's panic, the target's and the host's cfg)", frame);
                 // The graph and its fetches read back when nothing it is a function of moved (plan row
@@ -1159,9 +1283,15 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
                 };
                 phases.mark_cx(cx, discovered.cause.phase(), frame);
                 let kept = Kept { slots: &today_slots, answer: &start, records: &records, tools: &tools, read: core::cell::Cell::new(0) };
+                // The last answer's found files (D161, [`PLACE_FOUND`]), sorted: the walk takes each
+                // it does not reach from the roots ([`plan`]).
+                let mut found_last: SVec<'_, (Name, blaze_engine::pages::FilePlace)> = SVec::new_in(alloc);
+                if let Some(last) = last_root {
+                    found_last.extend(last.places.iter().filter(|(_, place)| place.flags & PLACE_FOUND != 0).map(|(file, place)| (*file, *place)));
+                }
                 let (outlined, probes, file_counts, skipped, file_places) = {
                     let cx = cx.span(FILE_WALK_SPAN);
-                    plan(&cx, root, &stamps, &laid_here, workers, &kept, &mut store, discovered.names.as_ref(), alloc)?
+                    plan(&cx, root, &stamps, &laid_here, workers, &kept, &mut store, discovered.names.as_ref(), &found_last, Some(linting.rules), alloc)?
                 };
                 discovered.plan.files_read = kept.read.get();
                 discovered.plan.files_total = file_counts.read_back.saturating_add(file_counts.outlined);
@@ -1240,9 +1370,29 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         Some(stored) => stored.as_ref(),
         None => plan_list,
     };
-    let reach =bodies.plan_reach(cx, &mut store, graph, plan_list, &outlined, reach_from, heap.alloc())?;
+    // THE FOUND FILES (D161, [`PLACE_FOUND`]), sorted: on the phase path the walk's (it took the
+    // last answer's, [`plan`]), on the ready path the last answer's. Each is in its finders'
+    // reach (engine_body_plan.rs `FoundEdge`) and in the edit as any file the walk outlined, so
+    // its outline is merged before the names read it; once the names have said what they read,
+    // a plan that moved is given again or the file dropped ([`serve_found`]).
+    let mut found_places: SVec<'_, (Name, blaze_engine::pages::FilePlace)> = SVec::new_in(alloc);
+    match slots {
+        Some(_) => {
+            if let Some(last) = last_root {
+                found_places.extend(last.places.iter().filter(|(_, place)| place.flags & PLACE_FOUND != 0).map(|(file, place)| (*file, *place)));
+            }
+        }
+        None => found_places.extend(file_places.iter().filter(|(_, place)| place.flags & PLACE_FOUND != 0).copied()),
+    }
+    found_places.sort_unstable_by_key(|(file, _)| *file);
+    let found_units = match plan_list {
+        Some(list) if !found_places.is_empty() => crate::engine_body_plan::found_units(list, heap.alloc()).map_err(EngineCheckError::FoundUnitsShare)?,
+        _ => blaze_own::Vec::new_in(heap.alloc()),
+    };
+    let found_edges = crate::engine_body_plan::found_edges(&found_units, &found_places, heap.alloc());
+    let reach = bodies.plan_reach(cx, &mut store, graph, plan_list, &outlined, &found_edges, reach_from, heap.alloc())?;
     crate::engine_ready_edit::file_tasks(&outlined, &skipped.files, names.is_some(), &linting.rules, reach, alloc, &mut planned);
-    let mut lints = crate::engine_lints::LintsStage::new(linting.rules);
+    let mut lints = crate::engine_lints::LintsStage::new(linting.rules, tools.0[blaze_drive::Kind::Lint.index()].0);
     let mut heads = crate::engine_heads::HeadsStage::new(scope_reads);
     heads.freeze = head_units;
     heads.jobs = head_jobs;
@@ -1375,7 +1525,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
                 crate::engine_ready_edit::CommitPlant::ReadsNoVisitedTree => &[],
                 _ => &closed,
             };
-            let unread = read_needed(cx, root, &stamps, &kept, &mut store, &deferred, (closed, owed.as_slice()), &mut outlined, &mut file_counts, alloc)?;
+            let unread = read_needed(cx, root, &stamps, &kept, &mut store, &deferred, (closed, owed.as_slice()), &mut outlined, &mut file_counts, Some(linting.rules), alloc)?;
             discovered.plan.files_read = discovered.plan.files_read.saturating_add(kept.read.get());
             let mut unread_files: Vec<Name, blaze_own::Alloc<'static>> = Vec::with_capacity_in(unread.files.len(), g);
             unread_files.extend_from_slice(&unread.files);
@@ -1409,7 +1559,20 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         // the Scripts and Names phases after; the record is what should cross.
         heap,
     });
-    let handles = Handles { root, lock: laid_now.and_then(|laid| laid.lock.as_ref()).map(|lockfile| lockfile.lock), members, env: &env, side: side.as_ref(), outlined: &outlined, workers, board, oracle: names_oracle };
+    let handles = Handles {
+        root,
+        lock: laid_now.and_then(|laid| laid.lock.as_ref()).map(|lockfile| lockfile.lock),
+        members,
+        env: &env,
+        side: side.as_ref(),
+        outlined: &outlined,
+        workers,
+        board,
+        oracle: names_oracle,
+        stamps,
+        plants: OutlinePlants::now(Some(linting.rules)),
+        found: &found_places,
+    };
     // PHASE-MEM-DEBT(CHECKED): returned in `Checked`, which has no lifetime.
     let mut ran = blaze_own::Vec::new_in(heap.alloc());
     // What each stage's records cost this process (engine_store.rs `Ledger`).
@@ -1443,6 +1606,8 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     // threaded even when a request admits only one job at a time.
     let scope = cx.scope();
     let mut pipeline = crate::engine_scripts::Pipeline::new(&scope, job_frame, job_alloc.handle(), &handles);
+    // What the names say of the found files, set once by the drive ([`serve_found`]).
+    let serving = ServeFound { rules: linting.rules, skipped: &skipped.files, places: &file_places, served: core::cell::OnceCell::new() };
     // The drive's state, made once and placed in the request's frame: every stage from here is
     // a call taking it by `&mut`, so this frame holds its pointer and each stage's temporaries
     // die with its call (rule 54; [`Drive`]).
@@ -1485,6 +1650,8 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         planted_kept: &mut planted_kept,
         puts: 0,
         pipelined: false,
+        serve: &serving,
+        found_served: false,
     });
     let drove = match driving.parts() {
         Ok((mut engine, why)) => drive(rq, &mut *engine, &mut store, &mut read, &mut records, &mut pipeline, last_lines.as_ref()).map(|()| Drove::Phases(engine, why)),
@@ -1501,6 +1668,20 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     let drove = drained.and(joined).and(drove)?;
     drop(job_alloc);
     drop(jobs);
+    // The ready driver runs no names task (engine_ready_edit.rs `admit`), so nothing is found
+    // on it; the found files of the last answer it plans from their places as any file. A find
+    // after its drive is its own inconsistency ([`EngineCheckError::FoundOnReady`]).
+    if matches!(drove, Drove::Ready(_))
+        && let Some((task, file)) = names.as_ref().and_then(|stage| stage.found().iter().find_map(|by| by.outlined.first().map(|one| (by.unit, one.name))))
+    {
+        return Err(EngineCheckError::FoundOnReady { task, file }.into());
+    }
+    // The request's outlines from here: the served table when the names moved the found files
+    // ([`Served`]), else the walk's.
+    let outlined: &[Outlined<'_>] = match serving.served.get() {
+        Some(served) => &served.outlined[..],
+        None => &outlined[..],
+    };
     // 3. The tail, in two calls of their own ([`own_frame`]): from the drive's end through the
     // store's last write, then (after the commit) the profile and the request's counts. Under a
     // debug build every temporary of a function has a stack slot of its own for the whole call,
@@ -1553,14 +1734,21 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         // 3. Print: the whole answer's lines (engine_lines.rs), each entered task's block made from
         // its result now, each standing row's copied from the last request's record.
         let signatures_entered = u32::try_from(finished.causes.iter().filter(|one| one.name.kind == blaze_drive::Kind::Signature).count()).unwrap_or(u32::MAX);
+        // Each file outlined after the walk ([`serve_found`]): its leaf row, as the walk's (`plan`).
+        if let Some(served) = serving.served.get() {
+            for (slot, probed) in served.probes.iter() {
+                let slot = core::str::from_utf8(slot).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
+                sweep::opened(slot, *probed, &mut rows);
+            }
+        }
         // 3. Print: the whole answer's lines, in a call of their own ([`lines_of`]).
-        let made = lines_of(&finished, last_lines.as_ref(), (names.as_ref(), &scripts, &mut bodies, &heads, &lints), (outlined.as_slice(), unread_notes.as_slice()), &discovered, &rows, &skipped, heap, erased.handle(), alloc, frame)?;
+        let made = lines_of(&finished, last_lines.as_ref(), (names.as_ref(), &scripts, &mut bodies, &heads, &lints), (outlined, unread_notes.as_slice()), &discovered, &rows, &skipped, heap, erased.handle(), alloc, frame)?;
         phases.mark_cx(cx, "lines made", frame);
         let heap_lines_made = crate::engine_phase_mem::heap_now();
         // The closing line's count: every file the request has an outline of (on the ready setup,
         // those read back and those it did not need: `slots`), as the phase path's walk outlines each.
         let files_checked = slots.unwrap_or_else(|| u32::try_from(outlined.len()).unwrap_or(u32::MAX));
-        let printed = print_answer(cx, root, &view_slot, &mut store, &made, &mut rows, (names.as_ref(), &bodies), &finished, (outlined.as_slice(), files_checked), unreadable.as_ref(), names_oracle, (&*phases, began), shown, frame, out)?;
+        let printed = print_answer(cx, root, &view_slot, &mut store, &made, &mut rows, (names.as_ref(), &bodies), &finished, (outlined, files_checked), unreadable.as_ref(), names_oracle, (&*phases, began), shown, frame, out)?;
         let AnswerPrinted { tally, lines_key, lines_bytes, status, oracle, bodies_whole } = printed;
         let unprinted = made.unprinted;
         drop(made);
@@ -1568,11 +1756,16 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         let heap_printed = crate::engine_phase_mem::heap_now();
         // The answer stored, its pointer written last, all in the store's one commit after it.
         let report = finished.report;
-        // The leaf rows of the scripts' reads a row of the answer still reads (engine_script_reads.rs).
+        // The leaf rows of the checkout reads a row of the answer still reads: the scripts', and
+        // the bodies' computed data includes (engine_script_reads.rs `keep_rows`). Kept while a
+        // row READS the cell, not while its `Given` task has a row: a planned task always has
+        // one, so a read no row makes any more would be followed forever (rule 18). One lookup
+        // of the cell's readers a followed or fresh read (its readers page).
         let refused = core::cell::Cell::new(None);
-        scripts.script_rows(followed_kept.as_ref().map(|followed| &followed.now), |name| {
-            match finished.answer.row_facts(name) {
-                Ok(row) => row.is_some(),
+        scripts.script_rows(followed_kept.as_ref().map(|followed| &followed.now), bodies.data_files(), |name| {
+            let cell = CellId { of: name, cell: WHOLE };
+            match blaze_engine::LastAnswer::readers(&finished.answer, cell, blaze_own::Alloc::from(alloc)) {
+                Ok(readers) => readers.iter().any(|reader| *reader != name),
                 Err(error) => {
                     refused.set(Some(error));
                     false
@@ -1600,6 +1793,19 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         // Each planned file's place beside its plan digest in the root (blaze-engine pages.rs
         // `FilePlace`), the same on both drivers.
         kept_answer.places.extend(file_places.iter().copied());
+        // The found files' places as the names left them ([`serve_found`]): a dropped file keeps none.
+        if let Some(served) = serving.served.get() {
+            for (file, place) in served.places.iter() {
+                match place {
+                    Some(place) => {
+                        kept_answer.places.insert(*file, *place);
+                    }
+                    None => {
+                        kept_answer.places.remove(file);
+                    }
+                }
+            }
+        }
         // Whether every line printed beyond the closing one and its coverage is in the lines record,
         // or the next certificate cannot stand (it prints that record alone).
         let replayable = unprinted == 0 && bodies.ownerless == 0;
@@ -1649,7 +1855,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     })?;
     let (causes, report, saved, stored_keys, (task_pages_read, header_pages_read, pages_read), (tally, status, oracle), accounts, macro_modules, (heap_engine, heap_lines_made, heap_printed, heap_stored), driver_line, signatures_entered, audited) = answered;
     #[cfg(test)]
-    let (undefined_reads, head_rows) = audited;
+    let (undefined_reads, head_rows, lint_rows) = audited;
     #[cfg(not(test))]
     let NotAudited = audited;
     // The whole cleanup line: this profile is written after the commit (store.rs).
@@ -1659,6 +1865,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         let because = entered_because(&causes, alloc);
         let mut text = profile_text(&ran, &report, &because, &causes, &outlined, phases, frame);
         bodies.profile(&outlined, workers, &mut text);
+        let _ = pool.balance_line(&mut text);
         lints.profile(&mut text);
         scripts.profile(&mut text);
         crate::engine_memory::profile(&ledger, names.as_ref(), &mut text);
@@ -1696,10 +1903,11 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
                 (false, _) => "started from no answer",
                 (true, crate::engine_ready_edit::StoredBase::Own) => "started from the stored answer",
                 (true, crate::engine_ready_edit::StoredBase::ToolsMoved) => "started from the stored answer, written under other tools",
-                (true, crate::engine_ready_edit::StoredBase::OtherCheckout) => "started from the stored answer of another checkout (the home's latest)",
+                (true, crate::engine_ready_edit::StoredBase::OtherCheckout) => "started from the stored answer of another checkout (its workspace's base)",
             };
             // A full frame cuts the profile short where it stood (as `profile_text`).
             let _ = writeln!(text, "stored answer: {from}; written: {} record(s) put, {} page(s), {} bytes", saved.puts, saved.pages, saved.bytes);
+            let _ = writeln!(text, "stored answer base: {}", saved.base);
             let _ = writeln!(text, "stored answer pages read through publication: {task_pages_read} task, {header_pages_read} producer header; changed pages written: {} task ({} bytes, the largest {}), {} producer header", saved.new_pages, saved.new_page_bytes, saved.largest_new_page, saved.new_headers);
             let _ = writeln!(text, "{pages_read}");
             // The rows asked of the stored answer by kind, repeats and distinct names apart (rule
@@ -1753,6 +1961,8 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
             undefined_reads,
             #[cfg(test)]
             heads: (head_rows, u32::try_from(heads.refused.len()).unwrap_or(u32::MAX), heads.read_back),
+            #[cfg(test)]
+            lint_rows,
             signatures_entered,
             lints: lints.seen(&outlined),
             ownerless: (bodies.ownerless, bodies.ownerless_paths(&outlined)),
@@ -2211,6 +2421,8 @@ fn certificate_checked(
         undefined_reads: (Vec::new_in(heap.alloc()), 0, 0),
         #[cfg(test)]
         heads: (0, 0, 0),
+        #[cfg(test)]
+        lint_rows: 0,
         signatures_entered: 0,
         lints: crate::engine_lints::LintsSeen::default(),
         ownerless: (0, std::vec::Vec::new_in(std::alloc::Global)),
@@ -2287,6 +2499,39 @@ struct Drive<'d, 'f, 'r, 's, 'w> {
     puts: u32,
     /// Scripts and Names run through the pipeline (engine_scripts.rs `Pipeline`).
     pipelined: bool,
+    /// What [`serve_found`] reads and where it leaves what the names said of the found files.
+    serve: &'d ServeFound<'d, 'r>,
+    /// Whether [`serve_found`] ran: once a request, before the first phase after the names.
+    found_served: bool,
+}
+
+/// What [`serve_found`] reads beside the drive's tables, made by [`checking`] before the drive,
+/// and where it leaves its answer ([`Served`]) for the drive and the answer's tail. One reference
+/// in [`Drive`], so the drive stays small.
+struct ServeFound<'d, 'r> {
+    /// The lint rules a file's plan names (engine_ready_edit.rs `file_tasks`).
+    rules: blaze_lint::RuleSet,
+    /// The files of skipped targets only, sorted (their bodies are not planned).
+    skipped: &'d [Name],
+    /// Each file's place from the walk ([`plan`]): a found file's names its last flags.
+    places: &'d [(Name, blaze_engine::pages::FilePlace)],
+    /// Set once, by [`serve_found`], only when what the names said moves the plan.
+    served: core::cell::OnceCell<Served<'r>>,
+}
+
+/// What the names said of the found files (D161), applied ([`serve_found`]): the request's
+/// outlines and plan from here on, and what the answer's tail keeps of them.
+struct Served<'r> {
+    /// Every outline of the request, sorted by name: the walk's, copied, and each found file's
+    /// (a worker's, and the files its parts name), less each file dropped.
+    outlined: SVec<'r, Outlined<'r>>,
+    /// The request's plan, sorted by file then name: each affected file's group made again.
+    planned: SVec<'r, Planned>,
+    /// Each affected file's place now, sorted; `None` for a file dropped.
+    places: SVec<'r, (Name, Option<blaze_engine::pages::FilePlace>)>,
+    /// Each file outlined after the walk: its slot and probe, the leaf rows the next request's
+    /// sweep proves it unchanged by (sweep.rs `opened`).
+    probes: SVec<'r, (SVec<'r, u8>, sweep::Probed)>,
 }
 
 /// The drive stays a pointer's size in [`checking`]'s frame: its state is all references and
@@ -2359,6 +2604,15 @@ where
             return Err(CliError::Text { what: "Scripts and Names have pending readers with no runnable producer (engine_check.rs)" });
         }
     }
+    // THE FOUND FILES SERVED (D161): once the names have all answered and before any later phase
+    // opens (or the drive ends), what they said moves the plan ([`serve_found`]).
+    if prior.is_none()
+        && mixed.is_none()
+        && !rq.found_served
+        && ![Stage::Units, Stage::Outlines, Stage::Scripts, Stage::Names].into_iter().any(|stage| engine.has_pending_stage(stage))
+    {
+        serve_found(rq, engine, store, read, records)?;
+    }
     let phase = match prior.or_else(|| mixed.map(|task| task.planned.phase)) {
         Some(phase) => phase,
         None => match engine.next_phase()? { Some(phase) => phase, None => return Ok(false) },
@@ -2428,6 +2682,323 @@ where
     Ok(true)
 }
 
+/// THE FOUND FILES SERVED (D161, engine invariant 14): once a request on the phase path, when
+/// every names task has answered and before any later phase opens. Each crate whose names ran
+/// said which found files it read and outlined each file it read that no outline held
+/// (engine_names.rs `FoundBy`); a crate that stood or failed said nothing, so its unit keeps its
+/// flag. From that:
+/// 1. each found file's flags (a unit's [`found_bit`] where its names read it) and its one root
+///    ([`EngineCheckError::FoundTwoRoots`]), each new file's one outline
+///    ([`EngineCheckError::FoundTwoOutlines`]); when none of it moved, nothing more is done (a
+///    replay enters nothing);
+/// 2. the new files' parts outlined here as the walk outlines a file's (`wants`, `outline_one`),
+///    so a cfg-off child is outlined as under a literal `mod`, and every outline in one table;
+/// 3. the reach made again with today's found edges (engine_body_plan.rs `found_edges`), and the
+///    files' plans (engine_ready_edit.rs `file_tasks`);
+/// 4. each affected file (the parts' closure of the found files then and now), in name order:
+///    one no live file or root reaches is dropped (`Engine::drop_file`), a new one is filed with
+///    its outline (`Engine::plan_file`), one whose plan moved is planned again with none;
+/// 5. the filed outlines put as an Outlines phase's are, and the drive's tables re-pointed.
+#[inline(never)]
+fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
+    rq: &mut Drive<'d, 'f, 'r, 's, 'w>,
+    engine: &mut Engine<'r, Everything>,
+    store: &mut crate::store::CommandStore<'m, '_, bstd::io::LentDriver>,
+    read: &mut crate::engine_records::EngineRecords<'m>,
+    records: &mut RecordKeys<'_>,
+) -> Result<(), CliError> {
+    use blaze_engine::pages::FilePlace;
+    rq.found_served = true;
+    let (cx, alloc, heap, serve) = (rq.cx, rq.alloc, rq.heap, rq.serve);
+    let old: &[(Name, FilePlace)] = rq.handles.found;
+    let Some(stage) = rq.names.as_ref() else { return Ok(()) };
+    let by = stage.found();
+    // No found file then and none now: the request of every project with no computed module.
+    if old.is_empty() && by.iter().all(|one| one.outlined.is_empty()) {
+        return Ok(());
+    }
+    let Some(list) = stage.names.as_ref().map(|world| world.list()) else { return Ok(()) };
+    let units = crate::engine_body_plan::found_units(list, heap.alloc()).map_err(EngineCheckError::FoundUnitsShare)?;
+    let unit_of = |unit: Name| units.iter().find(|one| one.2 == unit).map(|one| (one.0, one.1));
+    // 1. Each found file's root and flags now: a unit whose names answered gives its flag where
+    // they read the file; one that stood or failed keeps its flag; one the list no longer has
+    // gives none.
+    let mut masks: SMap<'_, Name, (Name, u8)> = SMap::new_in(alloc);
+    for one in by.iter() {
+        let Some((root, test)) = unit_of(one.unit) else {
+            // A crate no member unit is: a fetched or toolchain crate (every checkout crate, a
+            // path dependency too, is a member: blaze-world crate_list.rs `member`), whose names
+            // read its pack and list no checkout read (job_texts.rs `read`), so it finds
+            // nothing. A checkout read listed by one is the stop of a read no outline holds,
+            // named (rule 3): no member's tree could hold the file.
+            if let Some(file) = one.read.first() {
+                return Err(EngineCheckError::Unseen { task: one.unit, read: *file }.into());
+            }
+            continue;
+        };
+        for file in one.read.iter() {
+            found_mark(&mut masks, *file, root, found_bit(test))?;
+        }
+    }
+    for (file, place) in old.iter() {
+        for test in [false, true] {
+            if place.flags & found_bit(test) == 0 {
+                continue;
+            }
+            let Ok(at) = units.binary_search_by(|one| (one.0, one.1).cmp(&(place.unit, test))) else { continue };
+            if by.binary_search_by_key(&units[at].2, |one| one.unit).is_ok() {
+                continue;
+            }
+            found_mark(&mut masks, *file, place.unit, found_bit(test))?;
+        }
+    }
+    // Each new file's one outline, with its probe and its finder's root: two finders' (the
+    // non-test and test units of one root) must be equal.
+    let mut fresh: SVec<'_, (&Outlined<'static>, &(SVec<'static, u8>, sweep::Probed, bool), Name)> = SVec::new_in(alloc);
+    for one in by.iter() {
+        let Some((root, _)) = unit_of(one.unit) else { continue };
+        fresh.extend(one.outlined.iter().zip(one.probes.iter()).map(|(outline, probe)| (outline, probe, root)));
+    }
+    fresh.sort_unstable_by_key(|(outline, _, root)| (outline.name, *root));
+    let mut news: SVec<'_, (&Outlined<'static>, &(SVec<'static, u8>, sweep::Probed, bool), Name)> = SVec::new_in(alloc);
+    for one in fresh.iter().copied() {
+        if let Some(last) = news.last().copied()
+            && last.0.name == one.0.name
+        {
+            if last.2 != one.2 {
+                return Err(EngineCheckError::FoundTwoRoots { file: one.0.name, first: last.2, second: one.2 }.into());
+            }
+            if !same_outline(last.0, one.0) || last.1.2 != one.1.2 {
+                return Err(EngineCheckError::FoundTwoOutlines { file: one.0.name }.into());
+            }
+            continue;
+        }
+        news.push(one);
+    }
+    let moved = !news.is_empty() || masks.len() != old.len() || old.iter().any(|(file, place)| masks.get(file) != Some(&(place.unit, place.flags & PLACE_FOUND)));
+    if !moved {
+        return Ok(());
+    }
+    // 2. Every outline in one table: the walk's copied (COST: the outlines' bytes, once on a
+    // request whose found files moved; the append-only table is the follow-up), each new
+    // file's, and each file their parts name, outlined here.
+    let mut merged: SVec<'r, Outlined<'r>> = SVec::new_in(alloc);
+    for one in rq.outlined.iter() {
+        merged.push(outline_copy(one, alloc)?);
+    }
+    let mut probes: SVec<'r, (SVec<'r, u8>, sweep::Probed)> = SVec::new_in(alloc);
+    // Each file outlined here, its place but for the found flags, sorted below.
+    let mut new_places: SVec<'_, (Name, FilePlace)> = SVec::new_in(alloc);
+    let mut seen: SSet<'r, Name> = SSet::new_in(alloc);
+    seen.extend(merged.iter().map(|one| one.name));
+    seen.extend(news.iter().map(|(outline, ..)| outline.name));
+    let mut wave: SVec<'r, Want<'r>> = SVec::new_in(alloc);
+    for (outline, probe, root) in news.iter().copied() {
+        let copy = outline_copy(outline, alloc)?;
+        if let Ok(record) = &copy.made {
+            wants(&record.parts, &record.paths, &record.path_bytes, Some(root), &mut seen, &mut wave, alloc)?;
+        }
+        new_places.push((copy.name, FilePlace { unit: root, edition: copy.edition, flags: if probe.2 { PLACE_MODULE } else { 0 } }));
+        probes.push((SVec::from_slice_in(&probe.0, alloc), probe.1));
+        merged.push(copy);
+    }
+    while !wave.is_empty() {
+        let mut next: SVec<'r, Want<'r>> = SVec::new_in(alloc);
+        for want in wave.iter() {
+            let (one, probed) = outline_one(cx, rq.root, &rq.handles.stamps, want, None, rq.handles.plants.lints, alloc).map_err(|stopped| stopped.of(want))?;
+            if let Ok(record) = &one.made {
+                wants(&record.parts, &record.paths, &record.path_bytes, Some(want.root), &mut seen, &mut next, alloc)?;
+            }
+            new_places.push((want.name, FilePlace { unit: want.root, edition: want.edition, flags: if want.module { PLACE_MODULE } else { 0 } }));
+            probes.push((SVec::from_slice_in(&want.slot, alloc), probed));
+            merged.push(one);
+        }
+        wave = next;
+    }
+    merged.sort_unstable_by_key(|one| one.name);
+    new_places.sort_unstable_by_key(|(file, _)| *file);
+    let place_of = |file: Name| -> Option<FilePlace> {
+        match new_places.binary_search_by_key(&file, |(name, _)| *name) {
+            Ok(at) => Some(new_places[at].1),
+            Err(_) => serve.places.iter().find(|(name, _)| *name == file).map(|(_, place)| *place),
+        }
+    };
+    // Each found file's place now, sorted: its place but for the flags, which are the names'.
+    let mut found_now: SVec<'_, (Name, FilePlace)> = SVec::new_in(alloc);
+    for (file, (root, flags)) in masks.iter() {
+        let place = place_of(*file).ok_or(EngineCheckError::MissingEntry { task: *file, table: Table::FoundServed, key: *file })?;
+        found_now.push((*file, FilePlace { unit: *root, edition: place.edition, flags: (place.flags & !PLACE_FOUND) | *flags }));
+    }
+    let edges = crate::engine_body_plan::found_edges(&units, &found_now, heap.alloc());
+    // The affected files: the parts' closure of the found files then and now.
+    let mut affected: SSet<'_, Name> = SSet::new_in(alloc);
+    let mut stack: SVec<'_, Name> = SVec::new_in(alloc);
+    stack.extend(old.iter().map(|(file, _)| *file));
+    stack.extend(masks.keys().copied());
+    stack.extend(new_places.iter().map(|(file, _)| *file));
+    while let Some(file) = stack.pop() {
+        if !affected.insert(file) {
+            continue;
+        }
+        let Ok(at) = merged.binary_search_by_key(&file, |one| one.name) else { continue };
+        if let Ok(record) = &merged[at].made {
+            stack.extend(record.parts.iter().filter(|part| matches!(part.locate, Locate::File { .. })).map(|part| part.name));
+        }
+    }
+    // Live: a found file now, a member's root, a file a part of a file outside the affected
+    // ones names, and a file a part of a live one names; an affected file with no outline is not.
+    let mut live: SSet<'_, Name> = SSet::new_in(alloc);
+    live.extend(found_now.iter().map(|(file, _)| *file));
+    live.extend(units.iter().map(|one| one.0).filter(|root| affected.contains(root)));
+    let mut inner: SVec<'_, (Name, Name)> = SVec::new_in(alloc);
+    for one in merged.iter() {
+        let Ok(record) = &one.made else { continue };
+        for part in record.parts.iter().filter(|part| matches!(part.locate, Locate::File { .. }) && affected.contains(&part.name)) {
+            if affected.contains(&one.name) {
+                inner.push((one.name, part.name));
+            } else {
+                live.insert(part.name);
+            }
+        }
+    }
+    loop {
+        let before = live.len();
+        for (parent, child) in inner.iter() {
+            if live.contains(parent) {
+                live.insert(*child);
+            }
+        }
+        if live.len() == before {
+            break;
+        }
+    }
+    live.retain(|file| merged.binary_search_by_key(file, |one| one.name).is_ok());
+    merged.retain(|one| !affected.contains(&one.name) || live.contains(&one.name));
+    // 3. The reach with today's found edges, and each affected file's plan from it.
+    let reach = rq.bodies.plan_reach(cx, &mut *store, rq.graph, Some(list), &merged, &edges, crate::engine_bodies::ReachFrom::Walk, heap.alloc())?;
+    let mut plan_now: SVec<'r, Planned> = SVec::new_in(alloc);
+    crate::engine_ready_edit::file_tasks(&merged, serve.skipped, true, &serve.rules, reach, alloc, &mut plan_now);
+    // The request's plan: each affected file's tasks of the stages `file_tasks` plans are
+    // today's; a dropped file has none.
+    let mut planned: SVec<'r, Planned> = SVec::new_in(alloc);
+    planned.extend(rq.planned.iter().filter(|one| !affected.contains(&one.file) || (live.contains(&one.file) && !matches!(one.phase.stage, Stage::Outlines | Stage::Heads | Stage::Bodies | Stage::Lints))).copied());
+    planned.extend(plan_now.iter().filter(|one| affected.contains(&one.file) && live.contains(&one.file)).copied());
+    planned.sort_unstable_by_key(|one| (one.file, one.name));
+    drop(plan_now);
+    let mut places: SVec<'r, (Name, Option<FilePlace>)> = SVec::new_in(alloc);
+    for file in affected.iter().copied() {
+        let place = match (live.contains(&file), found_now.binary_search_by_key(&file, |(name, _)| *name)) {
+            (false, _) => None,
+            (true, Ok(at)) => Some(found_now[at].1),
+            (true, Err(_)) => Some(place_of(file).map(|place| FilePlace { unit: place.unit, edition: place.edition, flags: place.flags & !PLACE_FOUND }).ok_or(EngineCheckError::MissingEntry { task: file, table: Table::FoundServed, key: file })?),
+        };
+        places.push((file, place));
+    }
+    drop(news);
+    drop(fresh);
+    let first = affected.first().copied().unwrap_or(Name::units());
+    serve.served.set(Served { outlined: merged, planned, places, probes }).map_err(|_| EngineCheckError::Twice { task: first })?;
+    let served = serve.served.get().ok_or(EngineCheckError::MissingEntry { task: first, table: Table::FoundServed, key: first })?;
+    // 4. Each affected file in name order: dropped, filed, or planned again.
+    let tasks = Tasks { outlined: &served.outlined };
+    let mut filed: SVec<'r, Task> = SVec::new_in(alloc);
+    for file in affected.iter().copied() {
+        let before = file_group(rq.planned, file);
+        if !live.contains(&file) {
+            if !before.is_empty() {
+                engine.drop_file(file)?;
+            }
+            continue;
+        }
+        let now = file_group(&served.planned, file);
+        if rq.outlined.binary_search_by_key(&file, |one| one.name).is_err() {
+            let own = now.iter().find(|one| one.name == file).copied().ok_or(EngineCheckError::MissingEntry { task: file, table: Table::FoundServed, key: file })?;
+            let task = Task { planned: own, key: rq.tools.key(file, &own.source) };
+            let merged_before = engine.merged().len();
+            engine.plan_file(file, Some(tasks.outline(&task, alloc)), now)?;
+            if engine.merged().len() > merged_before {
+                filed.push(task);
+            }
+        } else if now != before {
+            engine.plan_file(file, None, now)?;
+        }
+    }
+    // 5. The drive reads the served tables from here; the filed outlines are put as an
+    // Outlines phase's are, so a later phase and the next request read them by key.
+    rq.outlined = &served.outlined[..];
+    rq.planned = &served.planned[..];
+    if !filed.is_empty() {
+        rq.bodies.note_entered(filed.iter().map(|task| task.planned.name), heap.alloc());
+        let request_mem = rq.request_mem;
+        let mem = request_mem.phase(Stage::Outlines)?;
+        put_phase(rq, &*engine, store, read, records, Phase::new(Stage::Outlines, 0), &filed, None, &mem)?;
+        drop(filed);
+        let row = mem.end();
+        rq.board.phase_mem(row.stage, rq.phase_mem.add(row));
+    }
+    Ok(())
+}
+
+/// Marks `file` found by a unit of `root` ([`serve_found`]): one root a found file
+/// ([`EngineCheckError::FoundTwoRoots`]).
+fn found_mark(masks: &mut SMap<'_, Name, (Name, u8)>, file: Name, root: Name, bit: u8) -> Result<(), EngineCheckError> {
+    let entry = masks.entry(file).or_insert((root, 0));
+    if entry.0 != root {
+        return Err(EngineCheckError::FoundTwoRoots { file, first: entry.0, second: root });
+    }
+    entry.1 |= bit;
+    Ok(())
+}
+
+/// Whether two finders' outlines of one file are one outline: the same text, form and answer.
+fn same_outline(a: &Outlined<'_>, b: &Outlined<'_>) -> bool {
+    a.source == b.source
+        && a.outline_source == b.outline_source
+        && a.edition == b.edition
+        && match (&a.made, &b.made) {
+            (Ok(a), Ok(b)) => a.out == b.out,
+            (Err(a), Err(b)) => a == b,
+            _ => false,
+        }
+}
+
+/// The tasks of `plan` (sorted by file) whose file is `file`.
+fn file_group(plan: &[Planned], file: Name) -> &[Planned] {
+    let from = plan.partition_point(|one| one.file < file);
+    let len = plan[from..].partition_point(|one| one.file == file);
+    &plan[from..from + len]
+}
+
+/// A copy of `one` in `alloc` ([`serve_found`]'s one table): its path and every list of its
+/// record, its payload as built. An outline has no records beside its own; one that has is
+/// refused by name (rule 3), never copied short.
+fn outline_copy<'r>(one: &Outlined<'_>, alloc: SharedAlloc<'r>) -> Result<Outlined<'r>, CliError> {
+    let made = match &one.made {
+        Err(why) => Err(*why),
+        Ok(record) => {
+            if !record.extras.records.is_empty() {
+                return Err(EngineCheckError::MissingEntry { task: one.name, table: Table::FoundServed, key: record.name }.into());
+            }
+            let mut copy = work::Record::new_in(record.name, alloc);
+            copy.out = record.out;
+            copy.parts.extend_from_slice(&record.parts);
+            copy.findings.extend_from_slice(&record.findings);
+            copy.messages.extend_from_slice(&record.messages);
+            copy.payload.extend_from_slice(record.payload_bytes()?);
+            copy.paths.extend_from_slice(&record.paths);
+            copy.path_bytes.extend_from_slice(&record.path_bytes);
+            copy.reads.extend_from_slice(&record.reads);
+            copy.cells.extend_from_slice(&record.cells);
+            copy.body_facts.extend_from_slice(&record.body_facts);
+            copy.covered.extend_from_slice(&record.covered);
+            Ok(copy)
+        }
+    };
+    let mut path = SVec::new_in(alloc);
+    path.extend_from_slice(&one.path);
+    Ok(Outlined { name: one.name, path, source: one.source, outline_source: one.outline_source, edition: one.edition, made })
+}
+
 /// The phase's tasks run by their stage: filed from the pipeline, on the pool, or by the
 /// stage's own driver. The Bodies phase hands back its run facts, in the phase's arena.
 #[inline(never)]
@@ -2456,7 +3027,7 @@ where
     let clock = &env.clock;
     match (mixed, phase.stage) {
         (Some(first), _) => {
-            let stage = rq.names.as_mut().ok_or(EngineCheckError::Unseen { task: first.planned.name, read: first.planned.name })?;
+            let stage = rq.names.as_mut().ok_or(EngineCheckError::MissingEntry { task: first.planned.name, table: Table::NamesWorld, key: first.planned.name })?;
             pipeline.collect(cx, &mut *rq.scripts, stage, &mut *store, rq.handles, first, entered, &mut rq.buffers[0], &mut *rq.times, alloc, frame)?;
         }
         (None, Stage::Outlines) => outlines_phase(rq, engine, &entered[..])?,
@@ -2488,9 +3059,40 @@ where
         (None, Stage::Heads) => heads_phase(rq, engine, store, read, &entered[..])?,
         // PHASE-MEM-DEBT(Lints): `LintsStage::made` on the process heap, kept to the command's
         // end for the put and the print; to take `at_phase`.
-        (None, Stage::Lints) => rq.lints.run_phase(cx, rq.root, rq.outlined, rq.workers, clock, &entered[..], &mut rq.buffers[0], &mut *rq.times, alloc)?,
+        (None, Stage::Lints) => {
+            lint_priors(cx, &mut *store, records, rq.fresh, &entered[..], &mut *rq.lints)?;
+            rq.lints.run_phase(cx, rq.root, rq.outlined, rq.workers, clock, &entered[..], &mut rq.buffers[0], &mut *rq.times, alloc)?
+        }
     }
     Ok(None)
+}
+
+/// Each entered `Lint` task's last record (the stored answer's row's, by `records`, before this
+/// request puts its own) handed to the stage as what its file's units may be kept by key from
+/// (engine_lints.rs `Prior`, sparse rows: rule 77). A memo, never a read of the task: a fresh
+/// request reads none, and a task with no last row lints every unit. A row naming a record the
+/// store does not hold is a named stop (rule 3), never a task of no memo.
+fn lint_priors(
+    cx: &Cx,
+    store: &mut crate::store::CommandStore<'_, '_, bstd::io::LentDriver>,
+    records: &RecordKeys<'_>,
+    fresh: bool,
+    tasks: &[Task],
+    lints: &mut crate::engine_lints::LintsStage,
+) -> Result<(), CliError> {
+    if fresh {
+        return Ok(());
+    }
+    for task in tasks.iter() {
+        let name = task.planned.name;
+        let Some(key) = records.get(name)? else { continue };
+        let record = match crate::store::Store::get(&mut *store, cx, key)? {
+            None => return Err(EngineCheckError::OutlineBack(crate::engine_store::OutlineBack::Missing { name, key }).into()),
+            Some(held) => crate::engine_store::outline_from(name, key, held.bytes, std::alloc::Global).map_err(EngineCheckError::OutlineBack)?,
+        };
+        lints.remember(name, &record);
+    }
+    Ok(())
 }
 
 /// An Outlines phase: its tasks on the pool's workers, each timed on its worker.
@@ -2570,9 +3172,10 @@ fn bodies_phase<'r, 'm, 'p>(
         table.list_too(once.put_keys());
     }
     // PHASE-MEM-DEBT(Bodies): the stage's packs, groups and notes on the process heap
-    // (`handles.env.heap`, engine_bodies.rs `run_phase`), and each run's frame shared by its
-    // bodies, not reset per body; its notes kept to the command's end for the print. To take
-    // `at_phase` for what lives to the phase's end. The stored head listings are read by key
+    // (`handles.env.heap`, engine_bodies.rs `run_phase`), its notes kept to the command's end
+    // for the print. To take `at_phase` for what lives to the phase's end. (A run's frames are
+    // no longer debt: a stretch's frame ends with its stretch, and a body's scratch is reset as
+    // it ends and trimmed past `SCRATCH_KEEP`, engine_bodies.rs `run_bodies`, `run_stretch`.) The stored head listings are read by key
     // from the committed snapshot (engine_listing_record.rs): a one-body edit makes none.
     let listing_snapshot = crate::store::Store::snapshot(&*store)?;
     let listings = rq.heads.listings(heap, listing_snapshot.as_ref(), handles.tool);
@@ -2740,6 +3343,8 @@ fn ready_setup<'f, 'h, 'a>(
     store: &mut dyn crate::store::Store<'_>,
     env: &FetchEnv<'_>,
     workers: NonZeroU32,
+    // The rule set the request lints with: an edited file is outlined for it ([`outline_one`]).
+    lints: Option<blaze_lint::RuleSet>,
     alloc: SharedAlloc<'h>,
     frame: &'f Frame,
 ) -> Result<Result<ReadySetup<'f, 'h>, crate::engine_ready_edit::ReadyRefused>, CliError> {
@@ -2836,10 +3441,9 @@ fn ready_setup<'f, 'h, 'a>(
             module: place.flags & PLACE_MODULE != 0,
             edition: place.edition,
             root: place.unit,
+            found: place.flags & PLACE_FOUND,
             #[cfg(test)]
             text_only_outline: TEXT_ONLY_OUTLINE.get(),
-            #[cfg(test)]
-            without_macro_mods: WITHOUT_MACRO_MODS.get(),
         };
         // The slot as the sweep found it today, when it was read as this kind of slot ([`Kept::slot`]).
         let Some(probed) = ((leaf.flags & sweep::MODULE != 0) == want.module).then_some((leaf.flags, leaf.stamp, leaf.id)) else {
@@ -2876,7 +3480,7 @@ fn ready_setup<'f, 'h, 'a>(
         let known = *known;
         files.outlined += 1;
         files.probed += u32::from(known.is_none());
-        handles.push(scope.may_overlap("outline", TASK_FRAME, move |cx: &Cx| Ok::<_, Infallible>(outline_one(cx, root, stamps, want, known, alloc))));
+        handles.push(scope.may_overlap("outline", TASK_FRAME, move |cx: &Cx| Ok::<_, Infallible>(outline_one(cx, root, stamps, want, known, lints, alloc))));
     }
     let mut stopped = None;
     for (handle, (want, known)) in handles.into_iter().zip(wanted.iter()) {
@@ -2941,6 +3545,7 @@ fn read_needed<'h>(
     (closed, owed): (&[Name], &[Name]),
     outlined: &mut SVec<'h, Outlined<'h>>,
     files: &mut Files,
+    lints: Option<blaze_lint::RuleSet>,
     alloc: SharedAlloc<'h>,
 ) -> Result<UnreadOutlines<'h>, CliError> {
     let mut taken: SVec<'h, bool> = SVec::with_capacity_in(deferred.len(), alloc);
@@ -2992,7 +3597,7 @@ fn read_needed<'h>(
             // thread, its probe the sweep's, as [`ready_setup`] outlines an edited file.
             None => {
                 files.outlined += 1;
-                outline_one(cx, root, stamps, want, Some(*probed), alloc).map_err(|why| why.of(want))?.0
+                outline_one(cx, root, stamps, want, Some(*probed), lints, alloc).map_err(|why| why.of(want))?.0
             }
         };
         if close {
@@ -3070,6 +3675,9 @@ fn ready_drive<'d, 'f, 'r, 's, 'w, 'm>(
     let mem = request_mem.phase(Stage::Bodies)?;
     // 3. The edited files' outlines, put whole as the Outlines phase puts them.
     let mut puts = ready_put(rq, store, records, Stage::Outlines, &outline_tasks, None, &mem)?;
+    // 3b. Each entered file's last lint record, read before the drive (its runs read the stage,
+    // never write it), so a unit its key keeps is copied, not linted.
+    lint_priors(cx, &mut *store, &*records, rq.fresh, &lint_tasks, &mut *rq.lints)?;
     // 4. The bodies' setup, as `bodies_phase` makes a Bodies phase's, over the engine's view
     // before the drive: the cells of the stages before Bodies stand (the precondition), and a
     // decided row's reads are read again through the host when its task runs.
@@ -3283,6 +3891,7 @@ fn ready_put<'m>(
     drop(put);
     put_now += rq.heads.put_listings(cx, &mut *store, &mut *rq.ledger, stage)?;
     if put_now > 0 {
+        let _cx = cx.span("store: a phase's commit on the command thread (batch copy, layout copy, segment digest, flip, map)");
         store.commit_puts()?;
     }
     rq.ledger.merged(stage, crate::store::Store::kept(&*store));
@@ -3344,7 +3953,7 @@ fn put_phase<'m>(
     let mut facts_bytes: Vec<u8, blaze_own::Alloc<'_>> = Vec::new_in(mem.alloc());
     let mut facts_at: Vec<(blaze_ids::ContentId, usize, usize), blaze_own::Alloc<'_>> = Vec::new_in(mem.alloc());
     if phase.stage == Stage::Bodies {
-        let made = phase_facts.ok_or(EngineCheckError::Unseen { task: entered.first().map_or(Name::units(), |task| task.planned.name), read: Name::units() })?;
+        let made = phase_facts.ok_or(EngineCheckError::MissingEntry { task: entered.first().map_or(Name::units(), |task| task.planned.name), table: Table::BodyFacts, key: Name::units() })?;
         for task in entered.iter() {
             let name = task.planned.name;
             let row = engine.view().row(name).ok_or(EngineCheckError::BodyFacts { body: name, why: crate::engine_body_facts::MakeError::NoRow })?;
@@ -3448,7 +4057,10 @@ fn put_phase<'m>(
     // Written now, so the store's arena frees them: the next phase reads them in place from the
     // segment's mapping (rule 51; store.rs `commit_puts`).
     if put_now > 0 {
-        store.commit_puts()?;
+        {
+            let _cx = cx.span("store: a phase's commit on the command thread (batch copy, layout copy, segment digest, flip, map)");
+            store.commit_puts()?;
+        }
         if phase.stage == Stage::Heads
             && let Some(once) = rq.heads.once.as_mut()
         {
@@ -3545,9 +4157,10 @@ fn audit_answer(
     answer: &Answer<'_>,
     scratch: SharedAlloc<'_>,
     alloc: blaze_own::Alloc<'static>,
-) -> Result<(UndefinedReads, u32), CliError> {
+) -> Result<(UndefinedReads, u32, u32), CliError> {
     let mut undefined = (Vec::new_in(alloc), 0u32, 0u32);
     let mut heads = 0u32;
+    let mut lint_rows = 0u32;
     let mut names = SVec::new_in(scratch);
     answer.visit_rows(|name| { names.push(name); Ok(()) }).map_err(EngineError::from)?;
     names.sort_unstable();
@@ -3555,6 +4168,9 @@ fn audit_answer(
         let row = answer.row_facts(name).map_err(EngineError::from)?.ok_or(EngineCheckError::MissingIndexedRow { name })?;
         if row.phase.stage == Stage::Heads {
             heads = heads.saturating_add(1);
+        }
+        if row.phase.stage == Stage::Lints {
+            lint_rows = lint_rows.saturating_add(1);
         }
         let reads = answer.observations(name).map_err(EngineError::from)?.ok_or(EngineCheckError::MissingIndexedRow { name })?;
         for (id, _) in reads {
@@ -3573,7 +4189,7 @@ fn audit_answer(
             }
         }
     }
-    Ok((undefined, heads))
+    Ok((undefined, heads, lint_rows))
 }
 
 /// One group of the "entered because" table: the stage, the cause's kind, and the task that
@@ -3765,12 +4381,13 @@ struct Want<'h> {
     edition: u8,
     /// The root file of the crate target whose module tree reached it first.
     root: Name,
+    /// Its place's found flags ([`PLACE_FOUND`]): a found file's, the units whose names read it
+    /// (the walk took it from the last answer's place, [`plan`]), kept until the names say again
+    /// ([`serve_found`]); 0 for a file a part names, a found file's parts too (each unit's reach
+    /// walks them from the found file under its cuts, engine_body_plan.rs `reached_under`).
+    found: u8,
     #[cfg(test)]
     text_only_outline: bool,
-    /// The control's plant: its outline plans no `mod` a macro call's tokens hold
-    /// ([`without_macro_mods`]).
-    #[cfg(test)]
-    without_macro_mods: bool,
 }
 
 struct SkippedTarget {
@@ -3819,22 +4436,94 @@ pub(crate) fn with_text_only_outlines<R>(run: impl FnOnce() -> R) -> R {
 
 #[cfg(test)]
 std::thread_local! {
-    static WITHOUT_MACRO_MODS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static WITHOUT_FOUND_SERVE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static FOUND_CAP_PLANT: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
 }
 
-/// Plant the walk before it planned the `mod NAME;` a macro call's tokens hold (work.rs
-/// `macro_module_files`), for a request's file wants, those sent to workers too (each [`Want`]
-/// carries it): the control that removes the cause (rule 23, engine_macro_mods_tests.rs).
+/// The most files one crate's names may find in one request (rule 18), each outlined on its
+/// names worker and filed after the names ([`serve_found`]): the bound is a crate's module and
+/// data files a macro names, so a crate's own file count, not a re-run count (the engine's
+/// `NEEDS_CAP` bounds one task's cells per run, and a task past it runs again: a found file is
+/// served in the run that read it, never again). Past it, [`EngineCheckError::FoundTooMany`]
+/// names the crate and the count.
+pub(crate) const FOUND_CAP: usize = 4096;
+
+/// Run `run` with the found cap at `cap` (a test's: the cap's refusal with a few files, never
+/// [`FOUND_CAP`] of them). Each request reads it when it starts ([`OutlinePlants::now`]).
 #[cfg(test)]
-pub(crate) fn without_macro_mods<R>(run: impl FnOnce() -> R) -> R {
+pub(crate) fn with_found_cap<R>(cap: usize, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FOUND_CAP_PLANT.set(self.0);
+        }
+    }
+    let _restore = Restore(FOUND_CAP_PLANT.replace(Some(cap)));
+    run()
+}
+
+/// Plant the names before they were served the files they find (D161): a crate's names that
+/// read a file no outline holds stop by [`EngineCheckError::UnseenFile`], as before this piece
+/// (the control that removes the cause, rule 23, engine_found_files_tests.rs).
+#[cfg(test)]
+pub(crate) fn without_found_serve<R>(run: impl FnOnce() -> R) -> R {
     struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {
-            WITHOUT_MACRO_MODS.set(self.0);
+            WITHOUT_FOUND_SERVE.set(self.0);
         }
     }
-    let _restore = Restore(WITHOUT_MACRO_MODS.replace(true));
+    let _restore = Restore(WITHOUT_FOUND_SERVE.replace(true));
     run()
+}
+
+/// A test's plants for the outlines a names worker makes of the files its crate found
+/// ([`outline_found`]): read on the command's thread when the request starts, since the worker's
+/// thread has its own (each [`Want`] carries them the same way); and the rule set the request
+/// lints with, for which such an outline lists its lint units as the walk's do ([`outline_one`]).
+#[derive(Clone, Copy)]
+pub(crate) struct OutlinePlants {
+    lints: Option<blaze_lint::RuleSet>,
+    #[cfg(test)]
+    text_only_outline: bool,
+    #[cfg(test)]
+    without_found_serve: bool,
+    /// The most files one crate's names may find ([`FOUND_CAP`]; a test's [`with_found_cap`]).
+    found_cap: usize,
+}
+
+impl OutlinePlants {
+    pub(crate) fn now(lints: Option<blaze_lint::RuleSet>) -> OutlinePlants {
+        #[cfg(test)]
+        let found_cap = FOUND_CAP_PLANT.get().unwrap_or(FOUND_CAP);
+        #[cfg(not(test))]
+        let found_cap = FOUND_CAP;
+        OutlinePlants {
+            lints,
+            #[cfg(test)]
+            text_only_outline: TEXT_ONLY_OUTLINE.get(),
+            #[cfg(test)]
+            without_found_serve: WITHOUT_FOUND_SERVE.get(),
+            found_cap,
+        }
+    }
+
+    /// The most files one crate's names may find this request ([`FOUND_CAP`]).
+    pub(crate) fn found_cap(self) -> usize {
+        self.found_cap
+    }
+
+    /// Whether a crate's names are served the files they find ([`without_found_serve`]).
+    pub(crate) fn serves(self) -> bool {
+        #[cfg(test)]
+        {
+            !self.without_found_serve
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
 }
 
 /// Every file of the members' crates, outlined, sorted by name: found forward from the crate
@@ -3844,6 +4533,13 @@ pub(crate) fn without_macro_mods<R>(run: impl FnOnce() -> R) -> R {
 /// whose stored `Outlines` row stands by today's source is not read: its outline is read back
 /// from the record its row names ([`crate::engine_store::outline_from`]). Every other file is
 /// probed (unless the sweep found it) and outlined on the workers.
+///
+/// Then the FOUND FILES (D161): each of `found_last` (the last answer's places with a found flag,
+/// [`PLACE_FOUND`]) the walk from the roots did not reach is walked from as a root is, at the
+/// slot the sweep followed it at, with its place's flags; what it reaches takes them too. The
+/// names say after their stages whether each is still read ([`serve_found`]). One whose slot the
+/// sweep did not follow is not walked: its rows go with the last answer's plan of it, and a
+/// names task that still reads it finds it again.
 #[allow(clippy::too_many_arguments)]
 fn plan<'h, 'm>(
     cx: &Cx,
@@ -3854,6 +4550,8 @@ fn plan<'h, 'm>(
     kept: &Kept<'_, '_>,
     store: &mut dyn crate::store::Store<'m>,
     names: Option<&crate::names::Names<'_>>,
+    found_last: &[(Name, blaze_engine::pages::FilePlace)],
+    lints: Option<blaze_lint::RuleSet>,
     alloc: SharedAlloc<'h>,
 ) -> Result<(SVec<'h, Outlined<'h>>, SVec<'h, (SVec<'h, u8>, sweep::Probed)>, Files, Skipped<'h>, SVec<'h, (Name, blaze_engine::pages::FilePlace)>), CliError> {
     let mut files = Files::default();
@@ -3894,6 +4592,12 @@ fn plan<'h, 'm>(
         wants(&made.parts, &made.paths, &made.path_bytes, None, &mut seen, &mut wave, alloc)?;
     }
     let mut outlined: SVec<'h, Outlined<'h>> = SVec::new_in(alloc);
+    // The found files' wants once the roots' walk is done (above): a file it reached is not one.
+    let mut found_walked = false;
+    if wave.is_empty() {
+        found_walked = true;
+        found_wants(kept, found_last, &mut seen, &mut wave, alloc)?;
+    }
     while !wave.is_empty() {
         let scope = cx.scope();
         scope.narrow_workers(workers, Class::Foreground);
@@ -3940,7 +4644,7 @@ fn plan<'h, 'm>(
                 None => {
                     files.outlined += 1;
                     files.probed += u32::from(known.is_none());
-                    handles.push(Ok(scope.may_overlap("outline", TASK_FRAME, move |cx: &Cx| Ok::<_, Infallible>(outline_one(cx, root, stamps, want, known, alloc)))));
+                    handles.push(Ok(scope.may_overlap("outline", TASK_FRAME, move |cx: &Cx| Ok::<_, Infallible>(outline_one(cx, root, stamps, want, known, lints, alloc)))));
                 }
             }
         }
@@ -3956,7 +4660,7 @@ fn plan<'h, 'm>(
                     if let Ok(record) = &one.made {
                         wants(&record.parts, &record.paths, &record.path_bytes, Some(want.root), &mut seen, &mut next, alloc)?;
                     }
-                    places.push((want.name, blaze_engine::pages::FilePlace { unit: want.root, edition: want.edition, flags: if want.module { PLACE_MODULE } else { 0 } }));
+                    places.push((want.name, blaze_engine::pages::FilePlace { unit: want.root, edition: want.edition, flags: (if want.module { PLACE_MODULE } else { 0 }) | want.found }));
                     outlined.push(one);
                     let mut slot = SVec::new_in(alloc);
                     slot.extend_from_slice(&want.slot);
@@ -3975,6 +4679,10 @@ fn plan<'h, 'm>(
             return Err(error);
         }
         wave = next;
+        if wave.is_empty() && !found_walked {
+            found_walked = true;
+            found_wants(kept, found_last, &mut seen, &mut wave, alloc)?;
+        }
     }
     outlined.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     let mut selected_files: SSet<'h, Name> = SSet::new_in(alloc);
@@ -4032,6 +4740,21 @@ pub(crate) const PLACE_MODULE: u8 = 1;
 /// A [`blaze_engine::pages::FilePlace`]'s flag: the file is reached only from a target its
 /// features skip ([`Skipped`]): it has an outline and no body task.
 pub(crate) const PLACE_SKIPPED: u8 = 2;
+/// A [`blaze_engine::pages::FilePlace`]'s flag: a non-test member unit whose root is the place's
+/// `unit` read the file through its names (D161), and no `mod` the walk follows names it: a
+/// module a macro wrote from a computed name, a data file of a computed path. That unit's tree
+/// holds it (engine_body_plan.rs [`crate::engine_body_plan::FoundEdge`]): its resolution decided
+/// every cfg on the way under the unit's own cfg.
+pub(crate) const PLACE_FOUND_LIB: u8 = 4;
+/// As [`PLACE_FOUND_LIB`], by the test unit of the place's root.
+pub(crate) const PLACE_FOUND_TEST: u8 = 8;
+/// Both found flags: a place with either is a found file's.
+pub(crate) const PLACE_FOUND: u8 = PLACE_FOUND_LIB | PLACE_FOUND_TEST;
+
+/// The found flag of a member unit by whether it is a test build.
+pub(crate) const fn found_bit(test: bool) -> u8 {
+    if test { PLACE_FOUND_TEST } else { PLACE_FOUND_LIB }
+}
 
 /// The stored answer's units-stage rows as the units stage reads them: one header row at a time,
 /// as it asks (engine_units.rs `StoredUnits`), never the whole stage up front.
@@ -4182,11 +4905,39 @@ fn wants<'h>(
         let mut slot = SVec::new_in(alloc);
         slot.extend_from_slice(&path_bytes[start as usize..end as usize]);
         into.push(Want {
-            name: part.name, slot, module, edition, root: root.unwrap_or(part.name),
+            name: part.name, slot, module, edition, root: root.unwrap_or(part.name), found: 0,
             #[cfg(test)]
             text_only_outline: TEXT_ONLY_OUTLINE.get(),
+        });
+    }
+    Ok(())
+}
+
+/// Each found file of `found_last` (sorted by name) the walk has not reached, as a [`Want`] of
+/// `into` at the slot the sweep followed it at ([`Kept::slots`]), its place's crate root, edition,
+/// module form and found flags ([`plan`]). One the sweep did not follow is left: no slot today.
+fn found_wants<'h>(kept: &Kept<'_, '_>, found_last: &[(Name, blaze_engine::pages::FilePlace)], seen: &mut SSet<'h, Name>, into: &mut SVec<'h, Want<'h>>, alloc: SharedAlloc<'h>) -> Result<(), CliError> {
+    if found_last.is_empty() {
+        return Ok(());
+    }
+    for (path, _) in kept.slots.iter() {
+        let file = Name::file(path.as_bytes());
+        let Ok(at) = found_last.binary_search_by(|(name, _)| name.cmp(&file)) else { continue };
+        if !seen.insert(file) {
+            continue;
+        }
+        let place = found_last[at].1;
+        let mut slot = SVec::new_in(alloc);
+        slot.extend_from_slice(path.as_bytes());
+        into.push(Want {
+            name: file,
+            slot,
+            module: place.flags & PLACE_MODULE != 0,
+            edition: place.edition,
+            root: place.unit,
+            found: place.flags & PLACE_FOUND,
             #[cfg(test)]
-            without_macro_mods: WITHOUT_MACRO_MODS.get(),
+            text_only_outline: TEXT_ONLY_OUTLINE.get(),
         });
     }
     Ok(())
@@ -4219,8 +4970,9 @@ pub(crate) fn absent_module_out() -> blaze_ids::ContentId {
 }
 
 /// One file probed and outlined, on a worker, in its task's frame; the record in `alloc`.
-/// `known`: the slot as the sweep found it today, so it is not probed again.
-fn outline_one<'h>(cx: &Cx, root: &Dir<ReadWrite>, stamps: &FromMeta, want: &Want<'_>, known: Option<sweep::Probed>, alloc: SharedAlloc<'h>) -> Result<(Outlined<'h>, sweep::Probed), Stopped> {
+/// `known`: the slot as the sweep found it today, so it is not probed again. `lints`: the rule
+/// set the request runs (lints.rs `of_root`), for which the outline lists its lint units.
+fn outline_one<'h>(cx: &Cx, root: &Dir<ReadWrite>, stamps: &FromMeta, want: &Want<'_>, known: Option<sweep::Probed>, lints: Option<blaze_lint::RuleSet>, alloc: SharedAlloc<'h>) -> Result<(Outlined<'h>, sweep::Probed), Stopped> {
     let scratch = cx.frame();
     let slot = core::str::from_utf8(&want.slot).map_err(|_| Stopped::Unread(Unread::Text("a path is not UTF-8")))?;
     let probed = match known {
@@ -4245,17 +4997,16 @@ fn outline_one<'h>(cx: &Cx, root: &Dir<ReadWrite>, stamps: &FromMeta, want: &Wan
         let outline_source = want.outline_source(source, flags);
         return Ok((Outlined { name: want.name, path, source, outline_source, edition: want.edition, made: Ok(made) }, probed));
     }
-    // Every outline lists its lint units (lints.rs `parts`) whatever the step, so what it holds
-    // never depends on the rule set, which is in each `Lint` task's source (engine_lints.rs).
+    // The outline lists its lint units keyed for the request's rule set (lints.rs `parts_in`:
+    // `variant-count`'s fact gathered only when it runs), the set being in the `FileItems`
+    // kind's tool (home.rs `tools`) and in each file's `Lint` task's source (engine_lints.rs).
     let job = Job {
         name: want.name,
         slot,
         flags,
         edition: want.edition,
         expect: source,
-        lints: true,
-        #[cfg(test)]
-        macro_mods: !want.without_macro_mods,
+        lints,
     };
     let made = match work::unwinding(|| work::outline_file(cx, root, &job, scratch, alloc)) {
         Ok(Ok(made)) => made,
@@ -4266,4 +5017,37 @@ fn outline_one<'h>(cx: &Cx, root: &Dir<ReadWrite>, stamps: &FromMeta, want: &Wan
     let source = crate::engine_tasks::edition_source(source, want.edition);
     let outline_source = want.outline_source(source, flags);
     Ok((Outlined { name: want.name, path, source, outline_source, edition: want.edition, made }, probed))
+}
+
+/// A file a crate's names found (D161, engine_names.rs `Job::run`), as the walk would have
+/// wanted it ([`Want`]): its slot (a module's `x.rs` for `x/mod.rs` too), whether a `mod` names
+/// it, its edition byte (its crate's; a data file's `DATA_FILE`), and its crate's root file.
+pub(crate) struct FoundWant<'p> {
+    pub(crate) slot: &'p str,
+    pub(crate) module: bool,
+    pub(crate) edition: u8,
+    pub(crate) root: Name,
+}
+
+/// One found file probed and outlined, on the names worker that found it, in its task's frame,
+/// as [`plan`] outlines a file the walk reached ([`outline_one`]: one code, so the outline, its
+/// source and its key are a literal `mod`'s); the record in `alloc`. Filed after the names by
+/// [`serve_found`].
+pub(crate) fn outline_found<'h>(cx: &Cx, root: &Dir<ReadWrite>, stamps: &FromMeta, found: &FoundWant<'_>, plants: OutlinePlants, alloc: SharedAlloc<'h>) -> Result<(Outlined<'h>, sweep::Probed), Unread> {
+    let mut slot = SVec::new_in(alloc);
+    slot.extend_from_slice(found.slot.as_bytes());
+    let want = Want {
+        name: Name::file(found.slot.as_bytes()),
+        slot,
+        module: found.module,
+        edition: found.edition,
+        root: found.root,
+        found: 0,
+        #[cfg(test)]
+        text_only_outline: plants.text_only_outline,
+    };
+    match outline_one(cx, root, stamps, &want, None, plants.lints, alloc) {
+        Ok(one) => Ok(one),
+        Err(Stopped::Unread(error)) => Err(error),
+    }
 }

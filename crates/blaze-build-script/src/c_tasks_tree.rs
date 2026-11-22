@@ -124,6 +124,21 @@ pub enum TreeRan<'a> {
     /// Step `request` did not succeed: how, and its last [`TREE_LINES`] lines of standard error
     /// with the host folders shown as their guest spellings.
     Failed { request: u32, exit: TreeExit, last_lines: AString<'a> },
+    /// Every step exited 0, and the tree made `file` (relative to `OUT_DIR`) holding the host
+    /// folder `host`, and `file` is none [`left_out_holding_a_host_folder`] lets go: a record of
+    /// it would hold this machine (rule 25), and leaving it out would leave a later step to find
+    /// it missing with no cause given (rule 3).
+    HostPath { file: AString<'a>, host: AString<'a> },
+}
+
+/// Whether a file the tree made that holds a host folder is let go (counted in
+/// [`TreeRan::Made`]'s `left_out`, never stored): a log (`*.log`: configure's `config.log`)
+/// or a depfile (`*.d`: the compiler's `-MD` output, make's own input), which only the build
+/// system that wrote it reads, and only in the folder it was written in. Any other is
+/// [`TreeRan::HostPath`]. `name` is relative to `OUT_DIR`.
+pub fn left_out_holding_a_host_folder(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    base.ends_with(".log") || base.ends_with(".d")
 }
 
 /// The tree strategy (rule 78): runs `job`'s steps in order against `outputs`' state
@@ -163,6 +178,8 @@ pub enum TreeError<'a, 'b> {
     Refused { package: &'b str, words: AString<'a> },
     /// The runner gave a file name no record may hold, or one name twice, or too many files.
     BadFile { package: &'b str, name: AString<'a> },
+    /// The tree made `file` holding the host folder `host` ([`TreeRan::HostPath`]).
+    HostPath { package: &'b str, file: AString<'a>, host: AString<'a> },
     Store { package: &'b str },
     Damaged { package: &'b str, key: ContentId },
 }
@@ -188,6 +205,12 @@ impl core::fmt::Display for TreeError<'_, '_> {
             }
             TreeError::Refused { package, words } => write!(f, "the C of {package}: its process tree could not be run: {}", words.as_str()),
             TreeError::BadFile { package, name } => write!(f, "the C of {package}: its process tree left `{}`, which a record cannot hold (a bad name, twice, or past {MOST_TREE_FILES} files)", name.as_str()),
+            TreeError::HostPath { package, file, host } => write!(
+                f,
+                "the C of {package}: its process tree made `$OUT_DIR/{}`, which holds this machine's folder `{}`; no record may hold a machine's path (rule 25: equal inputs, equal bytes), and only a log or a depfile is let go (c_tasks_tree.rs `left_out_holding_a_host_folder`)",
+                file.as_str(),
+                host.as_str()
+            ),
             TreeError::Store { package } => write!(f, "the C of {package}: the store refused its process tree's record"),
             TreeError::Damaged { package, key } => write!(f, "the C of {package}: the process-tree record at {key:?} is not of its form (c_tasks_tree.rs `TREE_MAGIC`)"),
         }
@@ -400,6 +423,7 @@ pub fn run_tree<'a, 'b>(
             let text = job.steps.iter().find(|step| step.request == request).map_or("", |step| step.text);
             return Err(TreeError::Failed { package, request, command: command(text, alloc), exit, last_lines });
         }
+        Ok(TreeRan::HostPath { file, host }) => return Err(TreeError::HostPath { package, file, host }),
         Err(refused) => return Err(TreeError::Refused { package, words: refused.words }),
     };
     if let Err(name) = check_files(&mut files) {

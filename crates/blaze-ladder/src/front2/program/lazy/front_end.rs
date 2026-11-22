@@ -50,6 +50,24 @@ impl<'n> InternalBindings<'n> {
 }
 
 impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
+    /// ADT `key`'s head is not made: a NEED, noted for the build's `make_asked` (as a world's
+    /// question notes what it found unmade); the build's `NoAdt` makes it and asks again (run.rs
+    /// `asks_again`). Only a key of a struct, an enum or a union is noted (by `kind_of_key`, the
+    /// one reading of what a key names): a question about any other key is no need. The one
+    /// home of the note for every head fact (`adt`, `repr`, `valid_range`, `discriminant`).
+    fn head_unmade(&self, key: ItemKey) -> blaze_build::layout::Missing {
+        use crate::front2::by_origin::{ItemKind, KeyKind, kind_of_key};
+        use crate::front2::heads::Want;
+        use crate::front2::world_items::Fill;
+        if let Ok(KeyKind::Item(ItemKind::Adt(lib))) = kind_of_key(self.front.names, &self.front.keys, key) {
+            let mut asked = self.asked.borrow_mut();
+            if !asked.iter().any(|f| matches!(f, Fill::Store(Want::Adt(l)) if *l == lib)) {
+                asked.push(Fill::Store(Want::Adt(lib)));
+            }
+        }
+        blaze_build::layout::Missing { item: key }
+    }
+
     /// `f` over the checker's world of row `i`'s live body: as `Front2Program::in_world`. A ctor
     /// (a row with no body, built as a fn) is asked in its ADT's world (`ctor_world`); any other
     /// row with no live body has no world: the question is the world's own refusal (`Missing`),
@@ -80,6 +98,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             traits: scope.traits,
             blocks: scope.blocks,
             path_marks: scope.path_marks,
+            path_ns: scope.path_ns,
             fills: RefCell::new(Vec::new_in(Global)),
             gaps: RefCell::new(Vec::new_in(Global)),
             // As `Front2Program::in_world`: every question is at ground arguments after the
@@ -321,14 +340,14 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// From `owner`'s live body (the build asks while it builds that body) by program/
     /// seam_rules.rs `caller_site`: item-relative, the file by its shown path from the names
     /// source (over records, the items record's file row).
-    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Option<blaze_build::CallerSite<'_>> {
-        let live = self.live_by_key(owner)?;
+    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
+        let live = self.live_by_key(owner).ok_or(blaze_build::SiteGap::NotLive { owner })?;
         super::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, owner, &live.made, expr)
     }
 
     /// By program/seam_rules.rs `def_site`, from `item`'s head and the names source: no body
     /// is read (a `Fn*` method has none).
-    fn def_site(&self, item: ItemKey) -> Option<blaze_build::CallerSite<'_>> {
+    fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
         super::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, item)
     }
 
@@ -410,10 +429,17 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
 
     /// In the first live body's world: selection and the projection step read the impls and
     /// the traits, never a body's own scope (as `Front2Program::normalize`).
+    /// With no live body (a found code entry's read list asked again before any check:
+    /// run/make_one.rs `verify_instance`), the first row's world (world_items.rs `ctor_world`:
+    /// a fn row's module), for the same reason.
     fn normalize(&self, trait_: ItemKey, name: tc::Name, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<Option<PTy>, ResolveError> {
-        let Some(i) = self.live.iter().flatten().map(|l| l.row as usize).min() else {
-            *self.projection_why.borrow_mut() = Some(Box::from("the lazy program holds no live body to ask in"));
-            return Ok(None);
+        let i = match self.live.iter().flatten().map(|l| l.row as usize).min() {
+            Some(i) => i,
+            None if !self.rows.key.is_empty() => 0,
+            None => {
+                *self.projection_why.borrow_mut() = Some(Box::from("the lazy program holds no row to ask in"));
+                return Ok(None);
+            }
         };
         let alloc = self.store.tys.alloc();
         let out = self.in_world(i, |w| blaze_typeck::normalize_projection(w, trait_, name, args, ground, alloc))?;
@@ -493,16 +519,8 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// `kind_of_key`, the one reading of what a key names): a question about any other key is
     /// no need, and stays unanswered.
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
-        use crate::front2::by_origin::{ItemKind, KeyKind, kind_of_key};
-        use crate::front2::heads::Want;
-        use crate::front2::world_items::Fill;
         let Some(a) = self.store.adts.get(&key) else {
-            if let Ok(KeyKind::Item(ItemKind::Adt(lib))) = kind_of_key(self.front.names, &self.front.keys, key) {
-                let mut asked = self.asked.borrow_mut();
-                if !asked.iter().any(|f| matches!(f, Fill::Store(Want::Adt(l)) if *l == lib)) {
-                    asked.push(Fill::Store(Want::Adt(lib)));
-                }
-            }
+            self.head_unmade(key);
             return None;
         };
         // The head store's own table, which holds every head's types: `types()` is a fork of it
@@ -512,16 +530,32 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
         Some(Adt { kind: a.kind, generics: a.generics, variants: &a.variants, fields: &a.fields, types: self.store.tys.view() })
     }
 
-    fn repr(&self, key: ItemKey) -> ReprAttrs {
-        self.store.adts.get(&key).map_or(ReprAttrs::RUST, |a| a.repr)
+    /// The row's `#[repr(..)]`. No row yet: a NEED, as [`Self::adt`]'s (its head noted for
+    /// `make_asked`), answered `Missing`, never a default `repr(Rust)`: a packed, `simd` or
+    /// niche-hiding ADT asked before its head would otherwise be laid out by what was asked
+    /// first (D194).
+    fn repr(&self, key: ItemKey) -> Result<ReprAttrs, blaze_build::layout::Missing> {
+        match self.store.adts.get(&key) {
+            Some(a) => Ok(a.repr),
+            None => Err(self.head_unmade(key)),
+        }
     }
 
-    fn valid_range(&self, key: ItemKey) -> blaze_build::layout::ValidRange {
-        self.store.adts.get(&key).map_or(blaze_build::layout::ValidRange::default(), |a| a.valid)
+    /// The row's valid range; no row yet: `Missing`, its head noted, as [`Self::repr`].
+    fn valid_range(&self, key: ItemKey) -> Result<blaze_build::layout::ValidRange, blaze_build::layout::Missing> {
+        match self.store.adts.get(&key) {
+            Some(a) => Ok(a.valid),
+            None => Err(self.head_unmade(key)),
+        }
     }
 
-    fn discriminant(&self, adt: ItemKey, variant: u32) -> Option<i128> {
-        self.store.adts.get(&adt)?.discrs.get(variant as usize).copied()
+    /// The row's value of the variant; no row yet: `Missing`, its head noted, as
+    /// [`Self::repr`] (never `None`, which numbers the variants by index).
+    fn discriminant(&self, adt: ItemKey, variant: u32) -> Result<Option<i128>, blaze_build::layout::Missing> {
+        match self.store.adts.get(&adt) {
+            Some(a) => Ok(a.discrs.get(variant as usize).copied()),
+            None => Err(self.head_unmade(adt)),
+        }
     }
 
     fn ctor_of(&self, key: ItemKey) -> Option<(ItemKey, u32)> {
@@ -534,11 +568,30 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
         self.store.opaques.get(&opaque).copied()
     }
 
-    /// The table `check_one` made for a principal the checked bodies name (fill.rs
-    /// `body_objects`), as `Front2Program::object_trait`.
+    fn alias_definer(&self, alias: ItemKey) -> Result<ItemKey, crate::front2::tait::DefinerMiss> {
+        let names = self.front.names;
+        let lib = self.front.keys.library_in(names, alias).ok_or(crate::front2::tait::DefinerMiss::NoLibraryKey)?;
+        crate::front2::tait::defining_fn(&self.definers, names, lib).map(crate::front2::keys::checker_of)
+    }
+
+    /// The table made for a principal the checked bodies name (fill.rs `body_objects`, a
+    /// prefetch) or that a build asked for by name ([`FrontEnd::object_table`]), as
+    /// `Front2Program::object_trait`.
     fn object_trait(&self, t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>> {
         let o = self.objects.get(&t)?;
         Some(blaze_build::vtable::ObjectTrait { supers: &o.supers, super_args: &o.super_args, methods: &o.methods, shape: o.shape })
+    }
+
+    /// fill.rs `object_asked`: `t`'s table from its head and its supertraits' heads, so an
+    /// instance's vtable never waits on another body's check (D194).
+    fn object_table(&mut self, t: ItemKey) -> Result<bool, crate::run::RunError> {
+        self.object_asked(t).map_err(|e| crate::run::RunError::Front2(Front2Refusal::Lazy(e)))
+    }
+
+    /// fill.rs `site_heads_asked`: each head enclosing a body-local owner, made before its build
+    /// (D194).
+    fn site_heads(&mut self, owner: ItemKey) -> Result<(), crate::run::RunError> {
+        self.site_heads_asked(owner).map_err(|e| crate::run::RunError::Front2(Front2Refusal::Lazy(e)))
     }
 
     /// `crate::module::Name`, over the source's questions (module path, name).
@@ -644,7 +697,7 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     }
 
     fn foreign_static(&self, key: ItemKey) -> Option<&str> {
-        self.foreign_static_symbol(key)
+        self.statics.foreign(key)
     }
 
     /// The statics made so far, sorted by key: each one's own data record.

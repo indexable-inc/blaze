@@ -47,9 +47,9 @@ impl Resolve for Statics {
         let key = CodeKey(blaze_ids::ContentId([n; 32]));
         let record = RecordId([n * 10; 32]);
         Ok(match (n, symbol.0 == [n; 32]) {
-            (1 | 4, true) => Resolved::Record { key, record, declares: &[], data: &[], named: &[] },
-            (2, true) => Resolved::Record { key, record, declares: &[], data: &self.one, named: &self.named_one },
-            (3, true) => Resolved::Record { key, record, declares: &[], data: &self.both, named: &self.named_both },
+            (1 | 4, true) => Resolved::Record { key, record, declares: &[], data: &[], named: &[], sent: Sent::NONE },
+            (2, true) => Resolved::Record { key, record, declares: &[], data: &self.one, named: &self.named_one, sent: Sent::NONE },
+            (3, true) => Resolved::Record { key, record, declares: &[], data: &self.both, named: &self.named_both, sent: Sent::NONE },
             _ => Resolved::Unknown,
         })
     }
@@ -109,7 +109,7 @@ fn said(bytes: &[u8], firsts: bool) -> std::vec::Vec<Said> {
             Down::Personality { slot } => out.push(Said::Personality(*slots.get(&slot.0).expect("a personality slot never declared"))),
             Down::Failed { .. } => out.push(Said::Failed),
             Down::Native { .. } => out.push(Said::Native),
-            Down::Hooks { .. } | Down::Promote { .. } => {}
+            Down::Hooks { .. } | Down::Promote { .. } | Down::Bytes { .. } => {}
         }
         at += len;
     }

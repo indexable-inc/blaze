@@ -1105,7 +1105,8 @@ impl<D: Driver, S: Sharing> AnswerSink for StoreSink<'_, '_, '_, '_, D, S> {
     }
 
     fn index_rows(&mut self, owner: Key, records: &[Key], scopes: &[(Name, Key)], alloc: Alloc<'_>) -> Result<(), PublishError> {
-        use blaze_cas::plain::{INDEX_KEYS_MOST, INDEX_TAG, beside_key};
+        use blaze_cas::plain::{INDEX_KEYS_MOST, beside_key};
+        use blaze_keyed::kind::ReservedTag;
 
         // CAS reach follows one index level. Include each expansion's key and its owner's
         // side index so a later carried names row can be indexed again after compaction.
@@ -1124,7 +1125,7 @@ impl<D: Driver, S: Sharing> AnswerSink for StoreSink<'_, '_, '_, '_, D, S> {
             let index = beside_key(blaze_cas::Key(record.0));
             // put_all creates this optional local index only for a nonempty expansion set.
             let Some(held) = self.lent.get(&index).map_err(PublishError::Cas)? else { continue };
-            if held.namespace != blaze_cas::plain::Namespace::LOCAL || held.tag != INDEX_TAG || held.bytes.len() % 32 != 0 || held.bytes.len() / 32 > INDEX_KEYS_MOST {
+            if held.namespace != blaze_cas::plain::Namespace::LOCAL || !ReservedTag::Index.is(held.tag) ||held.bytes.len() % 32 != 0 || held.bytes.len() / 32 > INDEX_KEYS_MOST {
                 return Err(PublishError::ExpansionIndex { record, index: Key(index.0), namespace: held.namespace.0, tag: held.tag.0, bytes: held.bytes.len() });
             }
             keep(Key(index.0))?;
@@ -1137,7 +1138,8 @@ impl<D: Driver, S: Sharing> AnswerSink for StoreSink<'_, '_, '_, '_, D, S> {
     }
 
     fn pin_children(&mut self, names: &RootNames<'_>, segments: &[SegmentRef], lines: Key, alloc: Alloc<'_>) -> Result<(), PublishError> {
-        use blaze_cas::plain::{INDEX_KEYS_MOST, INDEX_TAG, Namespace, ROOT_LIFE_NS, beside_key};
+        use blaze_cas::plain::{INDEX_KEYS_MOST, Namespace, ROOT_LIFE_NS, beside_key};
+        use blaze_keyed::kind::ReservedTag;
 
         let mut direct = Vec::with_capacity_in(segments.len() + 1, alloc);
         direct.extend(segments.iter().map(|one| blaze_cas::Key(one.id)));
@@ -1149,7 +1151,7 @@ impl<D: Driver, S: Sharing> AnswerSink for StoreSink<'_, '_, '_, '_, D, S> {
             // A portable segment may arrive before its local reach index. root_through
             // accepts index names, so check presence before publishing those names.
             let held = self.lent.get(&index).map_err(PublishError::Cas)?;
-            if !held.is_some_and(|held| held.namespace == Namespace::LOCAL && held.tag == INDEX_TAG && held.bytes.len() % 32 == 0 && held.bytes.len() / 32 <= INDEX_KEYS_MOST) {
+            if !held.is_some_and(|held| held.namespace == Namespace::LOCAL && ReservedTag::Index.is(held.tag) &&held.bytes.len() % 32 == 0 && held.bytes.len() / 32 <= INDEX_KEYS_MOST) {
                 return Err(PublishError::RowsIndex { segment: Key(one.id), index: Key(index.0) });
             }
             indexes.push(index);

@@ -584,6 +584,30 @@ mod tests {
         bytes
     }
 
+    /// Two records, two magics: the tapes reader refuses the postings record's bytes as not its
+    /// record, and the postings reader refuses the tapes record's. The cause it guards: both were
+    /// `BZTP` at version 1, so postings bytes passed the tapes magic check and were refused, if
+    /// at all, by a later field (a one-row postings header reads as a tapes header of kind 1 with
+    /// zero padding). Control: each reader opens its own bytes.
+    ///
+    /// Expected line: `test tapes::tests::each_reader_refuses_the_other_records_bytes_by_magic ... ok`
+    #[test]
+    fn each_reader_refuses_the_other_records_bytes_by_magic() {
+        use crate::postings::{self, Ask, FnName, Postings, PostingsError};
+        assert_ne!(super::MAGIC, postings::MAGIC, "one magic per record kind");
+        let (test, address, path) = (TestId(key(7)), Address(key(9)), "blaze_run::tapes::tests::magic");
+        let failing = [Entry { primitives: 1, tape: b"1" }];
+        let mut tapes = Own::new_in(Alloc::global());
+        encode(&TapesRecord { kind: TapeKind::Failing, test, address, path, tapes: &failing }, &mut tapes).expect("a well-formed record encodes");
+        let posted = postings::encode(&[(Ask::Fn(FnName(key(1))), test)], Alloc::global()).expect("one row encodes");
+        // Controls: each reader opens its own record.
+        assert_eq!(open(tapes.as_slice()).map(|v| v.len()), Ok(1));
+        assert_eq!(Postings::open(posted.as_slice()).map(|p| p.len()), Ok(1));
+        // Each refuses the other's by its magic, before any later field is read.
+        assert_eq!(open(posted.as_slice()).map(|v| v.len()), Err(TapesError::NotThisRecord));
+        assert_eq!(Postings::open(tapes.as_slice()).map(|p| p.len()), Err(PostingsError::NotThisRecord));
+    }
+
     /// Every kind of tapes record round-trips byte-equal; the record cut at each length is
     /// refused; an unsorted pair is refused on both sides; caps, the kind, the version, the path
     /// and a tape that is not in text.rs's form are refused by name. And a kept line's three

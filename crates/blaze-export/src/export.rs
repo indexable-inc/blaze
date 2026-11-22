@@ -124,7 +124,7 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
         (Some(image), Platform::MacosArm64) => Some((image, native_merge::libraries(image, alloc).map_err(ExportError::Native)?)),
     };
     let plan = match platform {
-        Platform::MacosArm64 => macho::plan_with(natives.as_ref().map_or(0, |(_, libraries)| native_merge::command_room(libraries))),
+        Platform::MacosArm64 => macho::plan_for(natives.as_ref().map(|(_, libraries)| &libraries[..])),
         Platform::LinuxArm64 => elf::plan(),
     };
     let room = eh_room_with(&members, program.personality, platform, program.natives, alloc)?;

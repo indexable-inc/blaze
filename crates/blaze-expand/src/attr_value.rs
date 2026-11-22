@@ -26,6 +26,7 @@
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::builtin::stringified;
+use crate::extent::{Prefix, Words};
 use crate::literal::{Buf, concat_piece, string_value};
 use crate::tokens::{Edition, LitKind, TokenKind, TokenStream, lex};
 
@@ -162,30 +163,15 @@ fn read_piece<'a>(
             stringified(&input, alloc, value).map_err(|_| AttrLiteralError::Malformed { index: at(open) })
         }
         "concat" => {
-            // The arguments, split at the commas outside groups; a last empty one (a trailing
-            // comma) is no argument.
+            // The arguments, each an expression: the parser's list (a trailing comma taken), so
+            // a comma inside `f::<A, B>()` ends no argument.
+            let words = Words::new(stream, alloc);
+            let args = words
+                .list(Prefix::Expr, inner, alloc)
+                .map_err(|error| AttrLiteralError::Malformed { index: error.token })?;
             let first = work.len();
-            let mut arg = inner.start;
-            let mut i = inner.start;
-            while i < inner.end {
-                match tokens[i].kind {
-                    TokenKind::Open(_) => {
-                        i = stream.close_of(i).ok_or(AttrLiteralError::Malformed { index: at(i) })? + 1;
-                        continue;
-                    }
-                    TokenKind::Punct { char: ',', .. } => {
-                        if arg == i {
-                            return Err(AttrLiteralError::Malformed { index: at(i) });
-                        }
-                        work.push(Piece { start: arg, end: i, depth: depth + 1, top: false });
-                        arg = i + 1;
-                    }
-                    _ => {}
-                }
-                i += 1;
-            }
-            if arg < inner.end {
-                work.push(Piece { start: arg, end: inner.end, depth: depth + 1, top: false });
+            for arg in args.iter() {
+                work.push(Piece { start: arg.start, end: arg.end, depth: depth + 1, top: false });
             }
             work[first..].reverse();
             Ok(())

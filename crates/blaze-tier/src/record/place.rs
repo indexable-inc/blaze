@@ -1,4 +1,4 @@
-//! [`place`]: one `bzcode02` record made code at an address in a running program, completing
+//! [`place`]: one `bzcode08` record made code at an address in a running program, completing
 //! each relocation by its kind. The model is blaze-code place.rs's `place` for `bzcode01`, whose
 //! [`Words`] and [`At`] it reuses, and whose answers it gives: a call loads the callee's SLOT
 //! word, a load of a function's address its entry thunk's word, an address or relro word a
@@ -19,7 +19,7 @@
 use blaze_code::a64::{ADD64, ADRP, LDR64, adrp, expect, ldr_lo12, read32, write32};
 use blaze_code::image::ImageError;
 use blaze_code::place::{At, PlaceError, Words};
-use blaze_code::record::{OWN_CODE, OWN_RELRO, Space, Symbol};
+use blaze_code::record::{OWN_CODE, OWN_RELRO, PositionPart, Space, Symbol};
 
 use super::form::RecordView;
 use super::{Reloc, RelocKind};
@@ -31,11 +31,8 @@ const B_OR_BL: (u32, u32) = (0x7C00_0000, 0x1400_0000);
 /// Load/store register, unsigned immediate offset: bits 29..27 `111`, 25..24 `01`.
 const LDST_UIMM: (u32, u32) = (0x3B00_0000, 0x3900_0000);
 
-/// Places `view` (function `symbol`) at `at`: copies its code into `code` and its relro part into
-/// `relro` (the write view's bytes at `at.code` and `at.relro`), completes every relocation by its
-/// kind against the run's words, and fills every relro word. Deterministic: the same record, `at`
-/// and answers of `words` give the same bytes. x86-64's kinds (`Pc32`, `GotPc32`) are refused by
-/// name: this is the arm64 placer.
+/// [`place_resolved`] of a record with no source-position slot: one with any is refused naming
+/// its rows (`PlaceError::PositionBytes`), since only the run's answers fill them.
 pub fn place(
     view: &RecordView<'_>,
     symbol: Symbol,
@@ -43,6 +40,26 @@ pub fn place(
     words: &mut dyn Words,
     code: &mut [u8],
     relro: &mut [u8],
+) -> Result<(), PlaceError> {
+    place_resolved(view, symbol, at, words, code, relro, &[])
+}
+
+/// Places `view` (function `symbol`) at `at`: copies its code into `code` and its relro part into
+/// `relro` (the write view's bytes at `at.code` and `at.relro`), fills each source-position
+/// slot with its answer in `values` (one little-endian `u32` per slot, in the view's slot order:
+/// the parent's, blaze-cli run_parent.rs `position_values`), completes every relocation by its
+/// kind against the run's words, and fills every relro word. Each part's address must honour
+/// the record's alignment (`code_align`, `relro_align`). Deterministic: the same record, `at`,
+/// `values` and answers of `words` give the same bytes. x86-64's kinds (`Pc32`, `GotPc32`) are
+/// refused by name: this is the arm64 placer.
+pub fn place_resolved(
+    view: &RecordView<'_>,
+    symbol: Symbol,
+    at: At,
+    words: &mut dyn Words,
+    code: &mut [u8],
+    relro: &mut [u8],
+    values: &[u8],
 ) -> Result<(), PlaceError> {
     let want = view.code().len();
     if code.len() != want {
@@ -52,14 +69,34 @@ pub fn place(
     if relro.len() != want {
         return Err(PlaceError::Size { symbol, what: "relro", want, got: relro.len() });
     }
-    if at.code % 4 != 0 {
-        return Err(PlaceError::Misaligned { symbol, what: "the code", at: at.code, align: 4 });
+    if view.position_slots().checked_mul(4) != Some(values.len()) {
+        return Err(PlaceError::PositionBytes { symbol, rows: view.position_slots(), bytes: values.len() });
     }
-    if at.relro % 8 != 0 {
-        return Err(PlaceError::Misaligned { symbol, what: "the relro part", at: at.relro, align: 8 });
+    // Each part where its record says: a data row aligned to 64 is at a multiple of 64 from its
+    // part's first byte, so only that byte's alignment makes the row's address one.
+    let align = 1u64 << view.code_align();
+    if at.code % align != 0 {
+        return Err(PlaceError::Misaligned { symbol, what: "the code", at: at.code, align });
+    }
+    let align = 1u64 << view.relro_align();
+    if at.relro % align != 0 {
+        return Err(PlaceError::Misaligned { symbol, what: "the relro part", at: at.relro, align });
     }
     code.copy_from_slice(view.code());
     relro.copy_from_slice(view.relro());
+    // The slots first: the seal proved none shares a byte with a relocation or relro word.
+    for i in 0..view.position_slots() {
+        let row = view.position_slot(i);
+        let resolved = read32(values, (i * 4) as u64);
+        if resolved == 0 {
+            return Err(PlaceError::Site(ImageError::ZeroPosition { symbol, row }));
+        }
+        let part = match row.part {
+            PositionPart::Code => &mut *code,
+            PositionPart::Relro => &mut *relro,
+        };
+        write32(part, u64::from(row.at), resolved);
+    }
     for i in 0..view.relocs() {
         let r = view.reloc(i);
         let off = u64::from(r.at);

@@ -100,7 +100,8 @@ fn stamp_of(meta: &Metadata) -> Stamp {
     else {
         return Stamp::UNKNOWN;
     };
-    Stamp { ino: meta.ino(), size: meta.len(), mtime_ns, ctime_ns, mode }
+    // `dev` 0, as this system's `Meta` (fs.rs `meta_of`): a stamp proves what a stat does.
+    Stamp { ino: meta.ino(), size: meta.len(), mtime_ns, ctime_ns, dev: 0, mode }
 }
 
 /// The stamp of what `got` says of one name: gone where there is nothing there, unknown where

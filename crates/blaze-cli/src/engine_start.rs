@@ -327,6 +327,10 @@ pub(crate) fn run_program(
     let units = (standing.names)(blaze_drive::Name::units()).ok_or(CliError::Start(StartError::NoUnits))?.at;
     let producer = standing.producers.get::<blaze_ids::producer::CodeBuilder>();
     let lent = standing.lent;
+    // What the run reads each body's checked columns from (engine_body_record.rs `TypedFrom`):
+    // the check's typed records, found through the answer's records in the command's store,
+    // decoded into the process's heap, where the lazy program's tables live.
+    let typed = crate::engine_body_record::TypedFrom { cx, lent, records: standing.records(), alloc: heap.alloc() };
     let env = &facts.fetch_env;
     // The runner, made at a body's first proc-macro call ([`RunProcs`]; C9).
     let inputs = RunProcs { cx, root, snapshot: found.snapshot(), graph: standing.graph, env, frame };
@@ -339,7 +343,7 @@ pub(crate) fn run_program(
             .map_err(|error| crate::run_parent::ParentError::Names { shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) })
     };
     let mut ids = || made.take().ok_or_else(|| crate::run_parent::ParentError::BodyIds { shown: std::boxed::Box::from("the body ids were asked a second time (run_parent.rs `CommandFront` asks once)") });
-    let ran = program::run(cx, root, launch, picked, units, native.send, producer, lent, today, &mut names, &mut ids, &mut phases.code_records, watch, heap, frame);
+    let ran = program::run(cx, root, launch, picked, units, native.send, producer, lent, today, &mut names, &mut ids, typed, &mut phases.code_records, watch, heap, frame);
     end_procs(cx, &maker, standing.err, "run")?;
     let ids_line = crate::run_ids::IdsLine { read: asked.bodies(), folded: asked.reads(), ..ids_line };
     phases.run_names = Some(run_names::NamesRead::of(read.counts(), &seen).with_ids(ids_line));

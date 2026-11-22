@@ -3,7 +3,7 @@
 //! It is how `blaze test` finds the tests an edit can affect FORWARD from what changed: one binary
 //! search per changed ask, in place, with no graph held in memory and no scan of the tests.
 //!
-//! The form (integers little-endian): a 16-byte header (`BZTP`, the version, the row count,
+//! The form (integers little-endian): a 16-byte header (`BZPS`, the version, the row count,
 //! zero), then the rows, FIXED 72 bytes, sorted by their bytes and each once: the ask's tag (0 a
 //! function, 1 a read), seven zero bytes, the ask's 32-byte name, the test's 32-byte id. Since
 //! the tag comes first and names compare as bytes, byte order is `(Ask, TestId)` order, so any
@@ -53,7 +53,10 @@ impl Ask {
     }
 }
 
-const MAGIC: [u8; 4] = *b"BZTP";
+/// The record's magic, its own: the tapes record (tapes.rs) is `BZTP`, and a header both
+/// shared let one record's bytes pass the other's check (a postings header of three rows or
+/// fewer reads as a tapes header of kind 0..3 with zero padding).
+pub(crate) const MAGIC: [u8; 4] = *b"BZPS";
 const VERSION: u32 = 1;
 const HEADER: usize = 16;
 const ROW: usize = 72;
@@ -78,7 +81,7 @@ pub enum PostingsError {
 impl fmt::Display for PostingsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            PostingsError::NotThisRecord => write!(f, "not a postings record (magic `BZTP`, version {VERSION})"),
+            PostingsError::NotThisRecord => write!(f, "not a postings record (magic `BZPS`, version {VERSION})"),
             PostingsError::Length { rows, len } => {
                 write!(f, "postings record of {len} bytes, but its header counts {rows} rows of {ROW} bytes after {HEADER}")
             }

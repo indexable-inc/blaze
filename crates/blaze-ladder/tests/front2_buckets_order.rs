@@ -357,7 +357,7 @@ fn ten_thousand_negative_goals_offer_each_dependency_once_and_derive_one_probe_i
 /// records' bucket index (`ItemsIndex`).
 ///
 /// CONTROL (rule 23): before the split the refusal was `TablesReadError::NoLibraryKey`, under
-/// `CheckFail::Tables`, which blaze-cli test_drive.rs `front_stops_suite` takes as the suite's
+/// `CheckFail::Tables`, which blaze-ladder scope.rs `CheckFail::scope` gives the suite's
 /// stop; before D193 point 5's lead it was a names-log gap and `Ok(0)`, an answer of "no
 /// impl". The first assertion fails on either.
 #[test]

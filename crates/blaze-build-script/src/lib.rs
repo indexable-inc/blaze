@@ -46,6 +46,8 @@ pub mod probe;
 pub mod probe_ask;
 pub mod probe_check;
 pub mod served;
+#[cfg(test)]
+mod served_ban_tests;
 pub mod shelf_pins;
 pub mod toolchain;
 

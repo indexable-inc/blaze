@@ -175,7 +175,7 @@ pub enum Effect {
     /// A function the start needs has no code: the program does not start.
     NoStart(CompileError),
     /// Put [`Parent::image`] in the store as the program's startup image (blaze-cas
-    /// `IMAGE_TAG`, keyed by `StartupImage::key_for(manifest)`), committed with the run's other
+    /// blaze-keyed `ReservedTag::Image`, keyed by `StartupImage::key_for(manifest)`), committed with the run's other
     /// records: the set or order of what was placed before `main` changed from the image read.
     WriteImage,
     /// Only under a planted bug: the run stopped at a failed compile.

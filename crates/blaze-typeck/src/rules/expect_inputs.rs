@@ -106,7 +106,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 let resolved = m.ty.resolve(formal)?;
                 let one = m.mk_list(&[resolved])?;
                 let says_nothing = m.ty.list_has_infer_since(one, mark) || matches!(m.ty.view(resolved), TyView::Error);
-                hints.push(if says_nothing { None } else { Some(m.rvalue_hint(resolved)) });
+                hints.push(if says_nothing { None } else { Some(m.rvalue_hint(resolved)?) });
             }
             Ok(true)
         })?;

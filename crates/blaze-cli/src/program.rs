@@ -74,6 +74,9 @@ pub(crate) fn run<'h>(
     // most once (run_parent.rs `CommandFront`).
     names: &mut dyn FnMut() -> Result<blaze_ladder::run::make_one::NamesRecords<'h>, crate::run_parent::ParentError>,
     ids: &mut dyn FnMut() -> Result<crate::run_ids::RunIds<'h>, crate::run_parent::ParentError>,
+    // What the run reads each body's checked columns from, besides the ids: the check's typed
+    // records, by kind (engine_body_record.rs `TypedFrom`, run_parent.rs `RunMaker`).
+    typed: crate::engine_body_record::TypedFrom<'h>,
     // The run's closing count, for the profile (own_process.rs `run_own`).
     counted: &mut Option<crate::run_parent::RunTally>,
     // The sink the run's events go to (blaze-screen `Watch`): main.rs's live line on a
@@ -102,7 +105,9 @@ pub(crate) fn run<'h>(
     let roots = blaze_own::Erased::new(frame);
     // The Rust fns the program's C calls are roots of its walk (run_parent.rs `CommandFront`).
     let exports = native.map_or(&[][..], |send| send.items);
-    let front = crate::run_parent::CommandFront::new(names, ids, builder, heap.alloc(), roots.handle(), watch, exports);
+    // The make watch's clock starts here, at the command's edge (rule 75).
+    let make_watch = crate::run_parent::command_make_watch();
+    let front = crate::run_parent::CommandFront::new(names, ids, typed, builder, heap.alloc(), roots.handle(), watch, exports, make_watch);
     crate::own_process::run_own(&cx, launch, package, builder, front, native, lent, today, counted, frame).map_err(move |error| CliError::OwnProcess(blaze_own::Box::new_in(error, heap.alloc())))
 }
 

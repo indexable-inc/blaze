@@ -26,7 +26,7 @@
 //! - each standing row's task record (names, tree, outlines, heads, body results, lint
 //!   findings, the unit graph), the answer's pages and the printed lines: the answer's
 //!   `.pages` root, through one index (engine_answer.rs `save`, `CommandStore::pin_through`);
-//! - a names record's expansion records (`EXPANSION_TAG`): the index filed beside the names
+//! - a names record's expansion records (`ReservedTag::Expansion`): the index filed beside the names
 //!   record (engine_store.rs `put_all`, blaze-cas `Plain::index_beside`), named by the same
 //!   root; std's also by the toolchain root;
 //! - the sealed pointer: the answer's root itself (`store.pin(name, ..)`);
@@ -35,7 +35,7 @@
 //! - the rows-form answer's segments and roots: its checkout and tree roots
 //!   (engine_answer_rows.rs `write_effects`).
 //!
-//! What a POINTER is to the sweep (blaze-cas core.rs `POINTER_TAG`, `live_of`, `copy_live`): a
+//! What a POINTER is to the sweep (blaze-keyed `ReservedTag::Pointer`; blaze-cas core.rs `live_of`, `copy_live`): a
 //! record under its NAME's key, live only when a root reaches that name, and then only its
 //! newest value; its TARGET is not followed. So a code key that is a pointer is kept by naming
 //! both the code key and the content key it points at: [`keep_program`] names each (the walk's
@@ -53,7 +53,8 @@ use core::fmt;
 use core::marker::PhantomData;
 
 use blaze_cas::Key as CasKey;
-use blaze_cas::plain::{INDEX_TAG, INDEXED_ROOT_TAG, Lent, LentError, ROOT_LIFE_NS, Sliced};
+use blaze_cas::plain::{Lent, LentError, ROOT_LIFE_NS, Sliced};
+use blaze_keyed::kind::{TagReach, reach_of};
 use blaze_core::Driver;
 use blaze_toolchain::ToolchainId;
 
@@ -172,7 +173,7 @@ impl fmt::Display for RootError {
             RootError::Store { class, root, why } => write!(f, "the root `{}` of {class} was not set: {why}", root.as_str()),
             RootError::List(why) => write!(f, "the program's root: {why}"),
             RootError::NotIndexed { class, root, key } => {
-                write!(f, "the root `{}` of {class} names {:?}, which is not an indexed root or an index record (blaze-cas `INDEXED_ROOT_TAG`, `INDEX_TAG`)", root.as_str(), key.0)
+                write!(f, "the root `{}` of {class} names {:?}, which is not an indexed root or an index record (blaze-keyed `ReservedTag::IndexedRoot`, `ReservedTag::Index`)", root.as_str(), key.0)
             }
         }
     }
@@ -237,7 +238,7 @@ pub(crate) fn keep_toolchain<D: Driver>(lent: &Lent<D, StoreAlloc>, toolchain: T
     let mut indexes: std::vec::Vec<CasKey, StoreAlloc> = std::vec::Vec::new_in(*lent.alloc());
     if let Some(key) = lent.root_named(root.as_str()) {
         let Some(held) = lent.get(&key).map_err(store)? else { return Err(not_indexed(key)) };
-        if held.tag != INDEXED_ROOT_TAG {
+        if reach_of(held.tag) != TagReach::Indexes {
             return Err(not_indexed(key));
         }
         indexes.extend(held.bytes.chunks_exact(32).map(|it| CasKey(blaze_ids::ContentId(it.try_into().expect("32 bytes")))));
@@ -257,7 +258,7 @@ pub(crate) fn keep_toolchain<D: Driver>(lent: &Lent<D, StoreAlloc>, toolchain: T
         let mut keys: std::vec::Vec<CasKey, StoreAlloc> = std::vec::Vec::new_in(*lent.alloc());
         for index in &indexes {
             let Some(held) = lent.get(index).map_err(store)? else { return Err(not_indexed(*index)) };
-            if held.tag != INDEX_TAG {
+            if reach_of(held.tag) != TagReach::IndexKeys {
                 return Err(not_indexed(*index));
             }
             keys.extend(held.bytes.chunks_exact(32).map(|it| CasKey(blaze_ids::ContentId(it.try_into().expect("32 bytes")))));
@@ -282,6 +283,17 @@ pub struct CleanupLine {
     pub slices: u32,
     pub carried: u64,
     pub leases: u32,
+    /// The put path's tally (blaze-cas `PutTally`, rule 16): up to the commit after the answer
+    /// (the phases' commits and every copy before it), and from it on (that commit, the
+    /// cleanup's merges, the seal's barriers). Set by plain_place.rs `after_answer`.
+    pub put: PutLine,
+}
+
+/// The two stretches of a command's put path ([`CleanupLine::put`]).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct PutLine {
+    pub before_answer: blaze_cas::plain::PutTally,
+    pub after_answer: blaze_cas::plain::PutTally,
 }
 
 impl fmt::Display for CleanupLine {
@@ -297,7 +309,8 @@ impl fmt::Display for CleanupLine {
             if self.slices == 1 { "" } else { "s" },
             self.carried,
             self.leases,
-        )
+        )?;
+        write!(f, "\nstore put    before the answer's commit: {}\nstore put    from the answer's commit on: {}", self.put.before_answer, self.put.after_answer)
     }
 }
 
@@ -320,6 +333,7 @@ impl CleanupLine {
             slices,
             carried: lent.carried(),
             leases: u32::try_from(lent.leases().len()).unwrap_or(u32::MAX),
+            put: PutLine::default(),
         }
     }
 

@@ -12,6 +12,9 @@ trait Sized {}
 #[lang = "copy"]
 trait Copy {}
 
+// core's own impls (core/src/marker.rs `marker_impls!`): a primitive is `Copy` only by an impl.
+impl Copy for usize {}
+
 trait Sized2 {
     fn size(&self) -> usize;
     fn weight(&self) -> usize {

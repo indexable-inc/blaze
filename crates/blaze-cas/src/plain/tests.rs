@@ -108,6 +108,7 @@ fn cfg(n: u64, boot: u64, durable: bool, root: &Frame) -> PlainConfig<&Frame> {
         writes: spaces_in(writes(), root),
         reads: spaces_in(reads(), root),
         liveness: super::Liveness::Everything,
+        lock_step: crate::plain::LockStep::Backoff,
     }
 }
 

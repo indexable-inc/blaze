@@ -132,7 +132,7 @@ fn filled<A: Allocator + Clone>(check: Check, ty: PTy, layouts: &mut Layouts<A>,
                 match adt.kind {
                     AdtKind::Union => continue,
                     AdtKind::Struct => {
-                        let range = facts.valid_range(key);
+                        let range = facts.valid_range(key).map_err(|m| refuse(m.head()))?;
                         if (range.start.is_some() || range.end.is_some()) && !narrowed_holds(check, &l) {
                             return Ok(false);
                         }

@@ -13,11 +13,12 @@
 //! `out` digest, never the name alone, so two checks of one name with other answers are two
 //! records.
 //!
-//! A body whose check left stalled goals, decided later (blaze-ladder front2
-//! stalled_goals.rs), has NO record: [`encode`] refuses it (`NotClean { what: "stalled" }`), and
-//! a run that asks for it meets `TypedGap::NoRecord`. That is accepted for now, and counted: the
-//! body's `BodyReads::typed_stalled` (front2 tables/task.rs) is set, so a run's census says how
-//! many such bodies it has.
+//! A body whose check left stalled goals is decided later (blaze-ladder front2
+//! stalled_goals.rs). When every one held on its exact interior (`Decision::Proved`) the body
+//! keeps the record a clean check keeps ([`encode_decided`]: no column holds stalled rows, and a
+//! run reads none; F18). Any other decision files a diagnostic, a gap or a refusal, and
+//! [`encode`] refuses its stalled rows (`NotClean { what: "stalled" }`): the body's
+//! `BodyReads::typed_stalled` (front2 tables/task.rs) is set and a run's census counts it.
 //!
 //! Layout, little-endian, nothing of the machine (rule 25):
 //!
@@ -981,6 +982,7 @@ fn put_question(p: &mut Put, q: Question) {
         Question::TypeAlias(k) => key(p, 21, k),
         Question::FieldDefaults(k) => key(p, 22, k),
         Question::MemberVisible(k, n) => key_name(p, 23, k, n),
+        Question::MemberUnstable(k, n) => key_name(p, 24, k, n),
     }
 }
 
@@ -1011,6 +1013,7 @@ fn get_question(g: &mut Get<'_>) -> Result<Question, E> {
         21 => Question::TypeAlias(g.key()?),
         22 => Question::FieldDefaults(g.key()?),
         23 => Question::MemberVisible(g.key()?, Name(g.u64()?)),
+        24 => Question::MemberUnstable(g.key()?, Name(g.u64()?)),
         _ => return Err(g.bad(tag)),
     })
 }
@@ -1061,7 +1064,22 @@ impl Writer<'_, '_> {
 /// `alloc`. Refuses a check with a diagnostic, a stalled goal or an undecided place
 /// ([`CheckedRecordError::NotClean`]): a record is kept only after a clean check.
 pub fn encode<'b>(c: &Checked<'_>, alloc: Alloc<'b>) -> Result<Vec<u8, Alloc<'b>>, CheckedRecordError> {
-    for (what, n) in [("diags", c.diags.len()), ("why", c.why.len()), ("stalled", c.stalled.len()), ("undecided", c.undecided.len())] {
+    encode_rows(c, false, alloc)
+}
+
+/// [`encode`] of a check whose stalled goals were each decided to hold on its exact interior
+/// afterwards (blaze-ladder front2 stalled_goals.rs `Decision::Proved`, its one caller,
+/// borrows.rs `check_borrows_in`): the record holds no stalled column (a run reads none), so its
+/// bytes are a clean check's, and [`decode`] of them re-encodes to them (F18).
+pub fn encode_decided<'b>(c: &Checked<'_>, alloc: Alloc<'b>) -> Result<Vec<u8, Alloc<'b>>, CheckedRecordError> {
+    encode_rows(c, true, alloc)
+}
+
+/// [`encode`]'s one body: `stalled_proved` says the check's stalled rows were each decided to
+/// hold ([`encode_decided`]), so they do not make it unclean.
+fn encode_rows<'b>(c: &Checked<'_>, stalled_proved: bool, alloc: Alloc<'b>) -> Result<Vec<u8, Alloc<'b>>, CheckedRecordError> {
+    let stalled = if stalled_proved { 0 } else { c.stalled.len() };
+    for (what, n) in [("diags", c.diags.len()), ("why", c.why.len()), ("stalled", stalled), ("undecided", c.undecided.len())] {
         if n != 0 {
             return Err(E::NotClean { what, rows: rows_u32(n, what)? });
         }

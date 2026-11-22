@@ -36,6 +36,7 @@ use blaze_own::AVec;
 use blaze_typeck::BodyView;
 
 use super::*;
+use crate::code_records::reads::{ReadLog, ReadPlant, Recorded, laid_answer};
 use crate::front2::coroutine_needs::{HOLDS_ITSELF, OrderError, held_coroutines, layout_order};
 
 /// How a lay ended.
@@ -179,6 +180,111 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     roots: &[CoroutineOf],
     alloc: Alloc<'static>,
 ) -> Result<Lay, RunError> {
+    let (all, laid_all) = match order_and_lay(program, consts, langs, bodies, ground, layouts, asking, roots, alloc)? {
+        Ordered::Laid { all, laid } => (all, laid),
+        Ordered::Unchecked(owner) => return Ok(Lay::Unchecked(owner)),
+    };
+    let unchecked: Cell<Option<ItemKey>> = Cell::new(None);
+    let owner_of = |c: CoroutineOf| -> Option<usize> {
+        let ci = program.fn_index(c.owner)?;
+        if bodies.checked.get(ci).and_then(Option::as_ref).is_none() {
+            unchecked.set(Some(c.owner));
+            return None;
+        }
+        Some(ci)
+    };
+    // 3. BUILD. A build that stops (a refusal, or a `Missing` the run makes and steps again)
+    // forgets every state recorded above and not built into `stash`: one left recorded would be
+    // skipped as made by the next lay, its functions never built.
+    let before = stash.len();
+    let out = build_laid(program, consts, langs, bodies, ground, stash, &all, &laid_all, &owner_of, &unchecked, alloc);
+    if !matches!(out, Ok(Lay::Done)) {
+        forget_laid(bodies, &all[stash.len() - before..], ground.view());
+    }
+    out
+}
+
+/// What a verification's lay did ([`relay`]).
+pub(super) enum Relaid {
+    /// `recorded`: the states this lay recorded, none built, which the caller forgets once it
+    /// has asked ([`forget_laid`]: a later make lays and builds them); `laid`: each root's full
+    /// lay, digested as the build digested it (code_reads.rs `laid_answer`).
+    Done { recorded: AVec<'static, CoroutineOf>, laid: AVec<'static, (CoroutineOf, ContentId)> },
+    /// As [`Lay::Unchecked`]: check that owner, lay again.
+    Unchecked(ItemKey),
+}
+
+/// The verifier's lay (run/make_one.rs `verify_instance`): phases 1 and 2 of
+/// [`lay_and_build`] over `roots` (the coroutines a read list's `Laid`, `CoroutineState` and
+/// `CoroutineNiche` rows name), so the states are recorded as the build's lay recorded them and
+/// a row is asked of the same facts; then each root laid once more in full ([`lay_one`], what
+/// a part was built into) and digested. Nothing is built: the build's lay is the one that
+/// builds. Cost: one lay per state the rows name and per state those hold, types only.
+#[expect(clippy::too_many_arguments, reason = "the lay's tables, borrowed apart")]
+pub(super) fn relay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
+    program: &P,
+    langs: &BackLangs,
+    bodies: &Bodies<'_>,
+    ground: &mut PortableTys<'_>,
+    layouts: &mut Layouts<L>,
+    asking: usize,
+    roots: &[CoroutineOf],
+    alloc: Alloc<'static>,
+) -> Result<Relaid, RunError> {
+    let recorded = match order_and_lay(program, &[], langs, bodies, ground, layouts, asking, roots, alloc)? {
+        Ordered::Laid { all, .. } => all,
+        Ordered::Unchecked(owner) => return Ok(Relaid::Unchecked(owner)),
+    };
+    let mut laid: AVec<'static, (CoroutineOf, ContentId)> = AVec::with_capacity_in(roots.len(), alloc);
+    for &c in roots {
+        let digest = match program.fn_index(c.owner) {
+            Some(ci) if bodies.checked.get(ci).and_then(Option::as_ref).is_some() => {
+                let adts = FrontAdts(program, ci, &[], langs, bodies);
+                lay_one(program, bodies, &adts, ci, c, &mut *ground, layouts, alloc).map(|(state, names)| laid_answer(&state, &names[..]))
+            }
+            _ => Err(not_answered()),
+        };
+        match digest {
+            Ok(d) => laid.push((c, d)),
+            Err(error) => {
+                forget_laid(bodies, &recorded, ground.view());
+                return Err(build_error(program, program.function(asking).named(), error, None));
+            }
+        }
+    }
+    Ok(Relaid::Done { recorded, laid })
+}
+
+/// Forgets the states of `laid` (`States::forget`): recorded by a lay that built none of them.
+pub(super) fn forget_laid(bodies: &Bodies<'_>, laid: &[CoroutineOf], ground: PTys<'_>) {
+    for &c in laid {
+        if let Ok(args) = ground.list(c.owner_args) {
+            bodies.coroutines.states.forget(c.owner, c.ordinal, args);
+        }
+    }
+}
+
+/// Phases 1 and 2 of [`lay_and_build`]'s answer.
+enum Ordered {
+    /// Every state laid, in order, each recorded.
+    Laid { all: AVec<'static, CoroutineOf>, laid: AVec<'static, (LaidState, AVec<'static, StateName>)> },
+    Unchecked(ItemKey),
+}
+
+/// Phases 1 (ORDER) and 2 (LAY) of [`lay_and_build`]. A lay that stops forgets the states it
+/// recorded: one left recorded would be taken as made by the next lay, never built.
+#[expect(clippy::too_many_arguments, reason = "lay_and_build's tables, borrowed apart")]
+fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
+    program: &P,
+    consts: &[(ItemKey, DataRecord<Global>)],
+    langs: &BackLangs,
+    bodies: &Bodies<'_>,
+    ground: &mut PortableTys<'_>,
+    layouts: &mut Layouts<L>,
+    asking: usize,
+    roots: &[CoroutineOf],
+    alloc: Alloc<'static>,
+) -> Result<Ordered, RunError> {
     use crate::front2::coroutine_needs::MOST_HELD;
     let states = &bodies.coroutines.states;
     let unchecked: Cell<Option<ItemKey>> = Cell::new(None);
@@ -217,7 +323,7 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
         };
         let order = match order {
             Ok(o) => o,
-            Err(_) if let Some(owner) = unchecked.get() => return Ok(Lay::Unchecked(owner)),
+            Err(_) if let Some(owner) = unchecked.get() => return Ok(Ordered::Unchecked(owner)),
             Err(OrderError::HoldsItself(cycle)) => {
                 let mut path = std::string::String::new();
                 for (n, c) in cycle.iter().enumerate() {
@@ -238,7 +344,7 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
         pending.clear();
         for &c in order.iter() {
             let Some(ci) = owner_of(c) else {
-                return Ok(Lay::Unchecked(unchecked.get().unwrap_or(c.owner)));
+                return Ok(Ordered::Unchecked(unchecked.get().unwrap_or(c.owner)));
             };
             let adts = FrontAdts(program, ci, consts, langs, bodies);
             let args = args_of(ground, c, alloc).map_err(|error| build_error(program, program.function(ci).named(), error, None))?;
@@ -256,31 +362,27 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     }
     // 2. LAY.
     let mut laid_all: AVec<'static, (LaidState, AVec<'static, StateName>)> = AVec::with_capacity_in(all.len(), alloc);
-    for &c in all.iter() {
+    for (n, &c) in all.iter().enumerate() {
         let Some(ci) = owner_of(c) else {
-            return Ok(Lay::Unchecked(unchecked.get().unwrap_or(c.owner)));
+            forget_laid(bodies, &all[..n], ground.view());
+            return Ok(Ordered::Unchecked(unchecked.get().unwrap_or(c.owner)));
         };
         let function = program.function(ci);
         let at_owner = |error| build_error(program, function.named(), error, None);
         let adts = FrontAdts(program, ci, consts, langs, bodies);
-        let laid =lay_one(program, bodies, &adts, ci, c, &mut *ground, layouts, alloc).map_err(at_owner)?;
-        let args = args_of(ground, c, alloc).map_err(at_owner)?;
-        states.record(c.owner, c.ordinal, &args, laid.0.shape);
+        let laid = match lay_one(program, bodies, &adts, ci, c, &mut *ground, layouts, alloc).and_then(|laid| Ok((args_of(ground, c, alloc)?, laid))) {
+            Ok((args, laid)) => {
+                states.record(c.owner, c.ordinal, &args, laid.0.shape);
+                laid
+            }
+            Err(error) => {
+                forget_laid(bodies, &all[..n], ground.view());
+                return Err(at_owner(error));
+            }
+        };
         laid_all.push(laid);
     }
-    // 3. BUILD. A build that stops (a refusal, or a `Missing` the run makes and steps again)
-    // forgets every state recorded above and not built into `stash`: one left recorded would be
-    // skipped as made by the next lay, its functions never built.
-    let before = stash.len();
-    let out = build_laid(program, consts, langs, bodies, ground, stash, &all, &laid_all, &owner_of, &unchecked, alloc);
-    if !matches!(out, Ok(Lay::Done)) {
-        for &c in all.iter().skip(stash.len() - before) {
-            if let Ok(args) = ground.view().list(c.owner_args) {
-                states.forget(c.owner, c.ordinal, args);
-            }
-        }
-    }
-    out
+    Ok(Ordered::Laid { all, laid: laid_all })
 }
 
 /// Phase 3 of [`lay_and_build`]: each of `all` built into its laid state, in order, its three
@@ -314,9 +416,13 @@ fn build_laid<P: FrontEnd>(
         // The flow's saved locals by identity (async-P8-4): what the build names its slots by.
         let names = StateNames::new(&rows[..], laid.region).map_err(at_owner)?;
         let plan = StatePlan { laid: *laid, names, plant: StatePlant::None };
+        // Every question of the coroutine's build logged (F20), apart: its three parts' makes
+        // each take these rows (BuiltParts::reads).
+        let reads = ReadLog::new(ReadPlant::None);
         let built = {
+            let recorded = Recorded::new(&adts, &reads);
             let mut subst = Subst { args: &args, ground: &mut *ground, scratch: alloc };
-            blaze_build::build_coroutine(&view, done, c.ordinal, &mut subst, &adts, Some(plan), Global)
+            blaze_build::build_coroutine(&view, done, c.ordinal, &mut subst, &recorded, Some(plan), Global)
         };
         let built = built.map_err(|error| {
             let range = match error {
@@ -328,7 +434,8 @@ fn build_laid<P: FrontEnd>(
         })?;
         let mut kept = Vec::with_capacity_in(args.len(), Global);
         kept.extend_from_slice(&args);
-        stash.push(BuiltParts { owner: c.owner, ordinal: c.ordinal, args: kept, parts: [Some(built.poll), Some(built.resume), Some(built.drop)] });
+        let laid = laid_answer(laid, &rows[..]);
+        stash.push(BuiltParts { owner: c.owner, ordinal: c.ordinal, args: kept, parts: [Some(built.poll), Some(built.resume), Some(built.drop)], laid, reads });
     }
     Ok(Lay::Done)
 }
