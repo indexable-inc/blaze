@@ -532,7 +532,8 @@ pub(crate) fn emit_sota_a64<'a>(
             let r2 = reg_alloc.callee_saved.get(p * 2 + 1).copied().unwrap_or(ZR);
             words.push(enc::stp_pre(r1, r2, SP, -16));
         }
-        out.frame = (cs_pairs * 16) as u32;
+        let x_pairs = ((1u32 << cs_pairs.min(5)) - 1) as u8;
+        out.frame = blaze_code::unwind::Frame { x_pairs, d_pairs: 0 }.word().unwrap_or(0);
     }
 
     // Move entry parameters from `X0..X7` to their allocated registers (usually zero moves due to coalescing!).
