@@ -68,12 +68,15 @@ impl core::error::Error for TestRefusal {}
 /// row 0 the test fn at no arguments, the entry [`EntryForm::Unit`] at its symbol; then, for
 /// `panic = "unwind"`, the personality routine over `lang_crates`, its symbol in
 /// [`Roots::head`]. `start` is [`StartOf::Direct`]: the entry is called directly, through no
-/// `#[lang = "start"]` item.
+/// `#[lang = "start"]` item. `exports`: the Rust fns the test binary's C calls, each a root row
+/// before the personality's, as a program's ([`super::run_roots`]).
+#[expect(clippy::too_many_arguments, reason = "each is one input of the test's roots, named at the call")]
 pub fn test_roots<'n, 'a, S: NamesSource<'n>>(
     names: S,
     test: LibKey,
     lang_crates: &[usize],
     panic: PanicStrategy,
+    exports: &[LibKey],
     frame: &'n blaze_mem::Frame,
     tables: Alloc<'static>,
     alloc: Alloc<'a>,
@@ -102,6 +105,7 @@ pub fn test_roots<'n, 'a, S: NamesSource<'n>>(
     }
     let mut table = RootTable { rows: DeclaredList::new_in(alloc), symbols: Vec::new_in(alloc), name: Vec::new_in(alloc), alloc };
     let entry = table.push("the test fn", key, List::EMPTY, store.tys.view())?;
+    super::push_exports(&mut table, exports, store.tys.view())?;
     let personality = match crate::personality::personality_of(names, lang_crates, panic).map_err(RootsError::Personality)? {
         None => None,
         Some(routine) => Some(table.push("the personality routine", checker_of(routine), List::EMPTY, store.tys.view())?),

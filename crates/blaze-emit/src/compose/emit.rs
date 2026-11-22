@@ -19,7 +19,11 @@
 //!   the loop's last back edge), so a local never meets a home.
 //! - Callee-saved registers are taken only when the analysis pass saves them (`saved`): the
 //!   prologue is made before the first instruction, so the set cannot grow during the pass.
-//! - Every non-constant value has a 16-byte cell at `sp + offset`, above the stack slots. Like
+//! - Every non-constant value has a 16-byte cell at `sp + offset`, above the stack slots (and a
+//!   function with a block of two or more parameters has one more, the parallel copy's spare cell,
+//!   at `sp + 0`, below the slots, so it is always in a cell load's reach). A cell or slot past
+//!   the near forms' reach (32 KiB for a cell, 4 KiB for a slot's address) is reached by the far
+//!   templates (`glue::FAR`: `add t, sp, #hi, lsl #12` and the access at `#lo`), up to 16 MiB. Like
 //!   the Reference tier's cells, a register or a cell holds a value ZERO-EXTENDED TO 64 BITS (an
 //!   `i1` is 0 or 1), so a template of width `w` gives a result already narrowed (T1's templates
 //!   are enc.rs's sequences of the Reference tier's lowering).
@@ -42,7 +46,10 @@
 //! # Blocks, edges, loops and the poll
 //!
 //! An edge's arguments move into the target's parameters as one parallel copy, a cycle broken
-//! through the scratch pair (x16, then x17 for a cell-to-cell move). A conditional edge with
+//! through the spare cell (the moves form trees hanging off disjoint cycles, as each parameter
+//! has one writer, so one cycle is broken at a time and one spare cell serves every edge). No
+//! scratch register is held from one move to the next: a cell-to-cell move takes one for its two
+//! templates, and a far cell's address is a template temporary. A conditional edge with
 //! moves gets a stub after the fall-through path. Each back edge (the analysis pass's
 //! `back_edges`) runs the poll after its moves (D100 point 3: `adrp x16, poll@PAGE; ldr xzr,
 //! [x16, poll@PAGEOFF]`, a `Page21` and a `PageOff12 { scale: 3 }` relocation to the runtime's
@@ -55,10 +62,17 @@
 //! Values that are not an integer of at most 64 bits, a pointer, an `f32` or an `f64` (compounds,
 //! `i128`, vectors); `sret`/`byval` parameters, more arguments than registers, calls returning two
 //! values; landing blocks, `invoke`, `resume`; atomics, fences, bulk memory, `asm`, intrinsics,
-//! thread-locals, the function's own data, tail calls, coroutines' `suspend`; a frame past one
-//! page under the saved registers (no stack-probe template yet: pass/probe.rs,
-//! `FAST_FRAME_PAST_A_PAGE`), past the cell loads' reach (32 KiB), or a slot aligned past 16
-//! bytes.
+//! thread-locals, the function's own data, tail calls, coroutines' `suspend`; a frame of 16 MiB
+//! or more, or a slot aligned past 16 bytes.
+//!
+//! # Scratch registers (end-state.md D193 point 6)
+//!
+//! The description's scratch pair is a [`Pool`] (scratch.rs): a use that spans templates takes a
+//! [`Scratch`] token and gives it back; a template's `TEMP0`/`TEMP1` are lent from the free
+//! registers for that template alone; `Composer::place` checks every template's scratch inputs,
+//! result and clobbers against the pool, and every instruction ends with the pool idle. A frame
+//! past one page under the saved registers is probed by the `glue::PROBE` template (the
+//! Reference tier's sequence, pass/probe.rs, with its count in a lent temporary).
 
 use blaze_code::record::{SiteKind, Space, Symbol, Target};
 use blaze_code::unwind::{Action, Frame, INST, Row};
@@ -73,8 +87,9 @@ use blaze_tier::{
 };
 
 use super::analysis::{Analysis, Home};
-use crate::pass::probe::{FAST_FRAME_PAST_A_PAGE, PROBE_STEP};
 use super::loop_map::slot_of;
+use super::scratch::{Pool, Scratch, ScratchError, Use};
+use crate::pass::probe::PROBE_STEP;
 
 /// The C name of the runtime's poll page: the launcher maps it readable, and makes it unreadable
 /// to stop every running loop at its next back edge (D100 point 3; piece L's fault handler).
@@ -86,9 +101,12 @@ const LABEL: u32 = 1 << 31;
 /// A register's holder that is a temporary of the current instruction.
 const TEMP: u32 = u32::MAX - 1;
 const TIER: TierName = TierName::Fast;
-/// The cell loads' reach: `ldr x, [sp, #imm12 * 8]`.
+/// The near cell loads' reach: `ldr x, [sp, #imm12 * 8]`; past it, the far templates.
 const CELL_REACH: u32 = 4096 * 8;
-/// The frame `sub sp` can make in two steps (`lsl #12` and plain).
+/// The near slot address's reach: `add x, sp, #imm12`; past it, the far template.
+const SLOT_REACH: u32 = 4096;
+/// The frame `sub sp` can make in two steps (`lsl #12` and plain), and the far templates' reach
+/// (`add t, sp, #imm12, lsl #12` and an offset under 4 KiB).
 const FRAME_REACH: u32 = 1 << 24;
 
 /// The composer's own patterns: what it emits besides LIR's instructions. Each is a row the
@@ -115,6 +133,15 @@ pub(crate) mod glue {
     pub(crate) const RESTORE_PAIR: u8 = 6;
     /// `ldp x29, x30, [sp], #16`.
     pub(crate) const LEAVE: u8 = 7;
+    /// The stack probe of a frame past one page (pass/probe.rs's sequence, its count in TEMP0):
+    /// `movz t, #(F & 0xffff); movk t, #(F >> 16), lsl #16; loop: sub sp, sp, #1, lsl #12;
+    /// str xzr, [sp]; sub t, t, #1, lsl #12; cmp t, #1, lsl #12; b.hs loop; sub sp, sp, t, uxtx`.
+    /// Operand 0 is `F` (`Slot`: a `Frame { scale: 0 }` field of 24 bits), at least 4096.
+    pub(crate) const PROBE: u8 = 8;
+
+    /// The variant of a cell access or slot address past the near form's reach: `add TEMP0 (or
+    /// the result), sp, #hi, lsl #12`, then the access at `#lo` from it.
+    pub(crate) const FAR: u8 = 1;
 
     const fn p(op: Op, width: u8, variant: u8, result: Form, operands: [Form; 4]) -> Pattern {
         Pattern { op, width, variant, result, operands, inner: None }
@@ -149,6 +176,25 @@ pub(crate) mod glue {
             operands: [Form::Reg(class), N, N, Form::Slot],
             inner: Some(Inner { op: Op::SlotAddr, variant: 0, operand: 1 }),
         }
+    }
+
+    /// A cell's load past `CELL_REACH` (32 KiB): `add RESULT, sp, #hi, lsl #12; ldr xRESULT,
+    /// [RESULT, #lo]` for a general register (no temporary), `add TEMP0, sp, ..; ldr dRESULT,
+    /// [TEMP0, #lo]` for a float one. Operand 2 a `Frame { scale: 3 }` field of 21 bits, split.
+    pub(crate) const fn cell_load_far(class: RegClass) -> Pattern {
+        Pattern { variant: FAR, ..cell_load(class) }
+    }
+
+    /// A cell's store past `CELL_REACH` (32 KiB): `add TEMP0, sp, #hi, lsl #12; str op0, [TEMP0,
+    /// #lo]`. Operand 3 a `Frame { scale: 3 }` field of 21 bits, split.
+    pub(crate) const fn cell_store_far(class: RegClass) -> Pattern {
+        Pattern { variant: FAR, ..cell_store(class) }
+    }
+
+    /// A slot's address past `SLOT_REACH` (4 KiB): `add RESULT, sp, #hi, lsl #12; add RESULT,
+    /// RESULT, #lo`. Operand 0 a `Frame { scale: 0 }` field of 24 bits, split.
+    pub(crate) const fn slot_address_far() -> Pattern {
+        Pattern { variant: FAR, ..slot_address() }
     }
 
     /// `mov RESULT, op0` / `fmov dRESULT, dop0`: a block parameter's move.
@@ -374,7 +420,11 @@ struct Composer<'v, 'r, 'a> {
     regs: &'r RegDesc,
     names: &'r dyn Names,
     out: Emitted<'a>,
-    scratch: [Reg; 2],
+    /// The description's general scratch registers (scratch.rs): taken and given back, or lent
+    /// to one template; idle between instructions.
+    scratch: Pool,
+    /// The parallel copy's spare cell (`sp + 0`), or `NONE` where no block has two parameters.
+    spare: u32,
     /// The instruction being lowered (for errors).
     inst: usize,
     /// Per instruction: its position in the analysis pass's order, or `NONE`.
@@ -459,12 +509,7 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
                 return Err(refused_fn("a landing block (unwinding edges are the Reference tier's)"));
             }
         }
-        let Some(s0) = regs.scratch.first() else {
-            return Err(refused_fn("a register description with fewer than two scratch registers"));
-        };
-        let Some(s1) = regs.scratch.without(s0).first() else {
-            return Err(refused_fn("a register description with fewer than two scratch registers"));
-        };
+        let scratch = Pool::of(regs).map_err(|error| refused_fn(error.what()))?;
         let mut c = Composer {
             view,
             an,
@@ -472,7 +517,8 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
             regs,
             names,
             out: Emitted::new_in(alloc),
-            scratch: [s0, s1],
+            scratch,
+            spare: NONE,
             inst: 0,
             pos: Vec::from_elem_in(NONE, n, alloc),
             cell: Vec::from_elem_in(NONE, n, alloc),
@@ -596,10 +642,15 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
         Ok(())
     }
 
-    /// Stack slots from `sp + 0`, then a 16-byte cell per non-constant value.
+    /// The spare cell at `sp + 0` where a block has two parameters or more, stack slots after
+    /// it, then a 16-byte cell per non-constant value; refused at 16 MiB.
     fn frame(&mut self) -> Result<(), TierError> {
         let view = self.view;
         let mut off: u32 = 0;
+        if (0..view.blocks()).any(|b| view.params(Block(b as u32)).len() >= 2) {
+            self.spare = 0;
+            off = 16;
+        }
         for slot in view.slots {
             if slot.align > 4 {
                 return Err(refused_fn("a stack slot aligned past 16 bytes"));
@@ -615,8 +666,8 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
             if self.pos[v] == NONE || view.ty(Value(v as u32)).is_none() || constant {
                 continue;
             }
-            if off + 8 > CELL_REACH {
-                return Err(too_large("the frame past the cell loads' reach (32 KiB)"));
+            if off + 16 >= FRAME_REACH {
+                return Err(too_large("the frame (16 MiB)"));
             }
             self.cell[v] = off;
             off += 16;
@@ -761,28 +812,31 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
     }
 
     /// `value` into `dst` by T1's constant templates: `iconst [Imm(Mov16)]` (one `movz`) below
-    /// 65536, else `iconst [Imm(I64)]` (`movz` and three `movk`). An `Fpr` goes through the
-    /// first scratch register.
+    /// 65536, else `iconst [Imm(I64)]` (`movz` and three `movk`). An `Fpr` goes through a
+    /// scratch register taken for the two templates.
     fn mov_imm(&mut self, dst: Reg, value: u64) -> Result<(), TierError> {
-        let gpr = match dst.class() {
-            RegClass::Gpr => dst,
-            RegClass::Fpr => self.scratch[0],
-        };
         let class = match value < 0x1_0000 {
             true => ImmClass::Mov16,
             false => ImmClass::I64,
         };
-        let mut args = [Arg::None; 7];
-        args[0] = Arg::Imm(value);
-        args[RESULT as usize] = Arg::Reg(gpr);
         let forms = [Form::Imm(class), Form::None, Form::None, Form::None];
         let pattern =
             Pattern { op: Op::Iconst, width: 64, variant: 0, result: Form::Reg(RegClass::Gpr), operands: forms, inner: None };
-        self.put(pattern, &args)?;
-        if dst.class() == RegClass::Fpr {
-            self.mov(dst, gpr)?;
+        let mut args = [Arg::None; 7];
+        args[0] = Arg::Imm(value);
+        match dst.class() {
+            RegClass::Gpr => {
+                args[RESULT as usize] = Arg::Reg(dst);
+                self.put(pattern, &args).map(drop)
+            }
+            RegClass::Fpr => {
+                let s = self.take_scratch()?;
+                args[RESULT as usize] = Arg::Reg(s.reg());
+                self.put(pattern, &args)?;
+                self.mov(dst, s.reg())?;
+                self.give_scratch(s)
+            }
         }
-        Ok(())
     }
 
     fn materialize(&mut self, v: usize, dst: Reg) -> Result<(), TierError> {
@@ -804,7 +858,27 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
         self.place(&t, args)
     }
 
+    /// The one place template bytes enter the code: the template's scratch use checked against
+    /// the pool and its temporaries lent (scratch.rs, `Pool::lend`), then its bytes copied and
+    /// every field filled.
     fn place(&mut self, t: &Template<'_>, args: &[Arg; 7]) -> Result<u32, TierError> {
+        let mut inputs = RegSet::EMPTY;
+        for arg in &args[..RESULT as usize] {
+            if let Arg::Reg(r) = *arg {
+                inputs = inputs.with(r);
+            }
+        }
+        let result = match args[RESULT as usize] {
+            Arg::Reg(r) => Some(r),
+            _ => None,
+        };
+        let temps = match (t.fields.iter().any(|f| f.operand == TEMP0), t.fields.iter().any(|f| f.operand == TEMP1)) {
+            (_, true) => 2,
+            (true, false) => 1,
+            (false, false) => 0,
+        };
+        let call = matches!(t.pattern.op, Op::Call | Op::CallIndirect);
+        let lent = self.scratch.lend(Use { inputs, result, temps, clobbers: t.clobbers, call }).map_err(|error| self.scratch_refused(error))?;
         let start = self.out.code.len();
         let len = t.bytes.len();
         if start + len >= (u32::MAX / 2) as usize {
@@ -814,10 +888,10 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
         self.out.code.extend_from_slice(t.bytes);
         let mut site_at = NONE;
         for (k, field) in t.fields.iter().enumerate() {
-            let arg = match field.operand {
-                TEMP0 => Arg::Reg(self.scratch[0]),
-                TEMP1 => Arg::Reg(self.scratch[1]),
-                o if o <= RESULT => args[o as usize],
+            let arg = match (field.operand, lent) {
+                (TEMP0, [Some(r), _]) => Arg::Reg(r),
+                (TEMP1, [_, Some(r)]) => Arg::Reg(r),
+                (o, _) if o <= RESULT => args[o as usize],
                 _ => return Err(bad_field(k as u32, "a field naming no operand")),
             };
             match (field.kind, arg) {
@@ -850,9 +924,16 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
                         return Err(bad_field(k as u32, "a frame offset not a multiple of its field's unit"));
                     }
                     let units = u64::from(bytes >> scale);
-                    if u32::from(field.from_bit) + u32::from(field.width) < 64
-                        && units >> (u32::from(field.from_bit) + u32::from(field.width)) != 0
-                    {
+                    // A far template splits one offset over two fields (`from_bit` 0 and 9, say):
+                    // the reach is the operand's highest field bit, not this field's.
+                    let reach = t
+                        .fields
+                        .iter()
+                        .filter(|f| f.operand == field.operand && matches!(f.kind, FieldKind::Frame { .. }))
+                        .map(|f| u32::from(f.from_bit) + u32::from(f.width))
+                        .max()
+                        .unwrap_or(0);
+                    if reach < 64 && units >> reach != 0 {
                         return Err(too_large("a frame offset past its field"));
                     }
                     self.set_bits(start, len, field, units)?;
@@ -861,6 +942,20 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
             }
         }
         Ok(start)
+    }
+
+    /// The pool's refusal as the tier's, naming the instruction.
+    fn scratch_refused(&self, error: ScratchError) -> TierError {
+        refused(self.inst, error.what())
+    }
+
+    /// A scratch register held over several templates (scratch.rs).
+    fn take_scratch(&mut self) -> Result<Scratch, TierError> {
+        self.scratch.take().map_err(|error| self.scratch_refused(error))
+    }
+
+    fn give_scratch(&mut self, s: Scratch) -> Result<(), TierError> {
+        self.scratch.give(s).map_err(|error| self.scratch_refused(error))
     }
 
     /// Bits `[from_bit, from_bit + width)` of `value` into the template at `start`, bit `at` on.
@@ -950,7 +1045,11 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
         let mut args = [Arg::None; 7];
         args[2] = Arg::Frame(off);
         args[RESULT as usize] = Arg::Reg(r);
-        self.put(glue::cell_load(r.class()), &args).map(drop)
+        let pattern = match off < CELL_REACH {
+            true => glue::cell_load(r.class()),
+            false => glue::cell_load_far(r.class()),
+        };
+        self.put(pattern, &args).map(drop)
     }
 
     fn store_cell(&mut self, r: Reg, off: u32) -> Result<(), TierError> {
@@ -960,7 +1059,13 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
         let mut args = [Arg::None; 7];
         args[0] = Arg::Reg(r);
         args[3] = Arg::Frame(off);
-        self.put(glue::cell_store(r.class()), &args).map(drop)
+        // Past the near reach the template's address is its TEMP0, lent from the free scratch
+        // registers by `place`: never `r`, never a register the composer holds (D193 point 6).
+        let pattern = match off < CELL_REACH {
+            true => glue::cell_store(r.class()),
+            false => glue::cell_store_far(r.class()),
+        };
+        self.put(pattern, &args).map(drop)
     }
 
     /// `dst = src`, within or across the classes.
@@ -1227,12 +1332,6 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
     // ---- prologue, entry, blocks -----------------------------------------------------------
 
     fn prologue(&mut self) -> Result<(), TierError> {
-        // A guard page must not be stepped over (pass/probe.rs): `sp` drops `frame` bytes
-        // under the last saved pair before anything writes again, and the table has no probe
-        // template. Refused by name; the Reference tier serves and probes it.
-        if 16 + u64::from(self.out.frame) > u64::from(PROBE_STEP) {
-            return Err(refused_fn(FAST_FRAME_PAST_A_PAGE));
-        }
         let none = [Arg::None; 7];
         self.put(glue::frame(glue::ENTER, [Form::None; 4]), &none)?;
         let saved = self.an.saved;
@@ -1266,15 +1365,26 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
         }
         let frame = self.out.frame;
         let (hi, lo) = (frame >> 12, frame & 0xfff);
-        if hi != 0 {
+        // A guard page must not be stepped over (pass/probe.rs): where `sp` would drop more
+        // than a page under the last saved pair before anything writes again, the probe walks
+        // it down a page at a time, touching each (a frame here is a multiple of 16, so past
+        // the bound it is at least 4096: the probe's loop runs at least once). No slot is
+        // aligned past 16 (`frame`), so there is no rounding to count.
+        if 16 + u64::from(frame) > u64::from(PROBE_STEP) {
             let mut args = none;
-            args[0] = Arg::Imm(u64::from(hi));
-            self.put(glue::frame(glue::SUB_SP_HI, [Form::Imm(ImmClass::U12Lsl12), Form::None, Form::None, Form::None]), &args)?;
-        }
-        if lo != 0 {
-            let mut args = none;
-            args[0] = Arg::Imm(u64::from(lo));
-            self.put(glue::frame(glue::SUB_SP, [Form::Imm(ImmClass::U12), Form::None, Form::None, Form::None]), &args)?;
+            args[0] = Arg::Frame(frame);
+            self.put(glue::frame(glue::PROBE, [Form::Slot, Form::None, Form::None, Form::None]), &args)?;
+        } else {
+            if hi != 0 {
+                let mut args = none;
+                args[0] = Arg::Imm(u64::from(hi));
+                self.put(glue::frame(glue::SUB_SP_HI, [Form::Imm(ImmClass::U12Lsl12), Form::None, Form::None, Form::None]), &args)?;
+            }
+            if lo != 0 {
+                let mut args = none;
+                args[0] = Arg::Imm(u64::from(lo));
+                self.put(glue::frame(glue::SUB_SP, [Form::Imm(ImmClass::U12), Form::None, Form::None, Form::None]), &args)?;
+            }
         }
         self.out.frame = frame + 16 * self.pairs.len() as u32;
         self.out.unwind_frame = Some(Frame { x_pairs, d_pairs });
@@ -1317,19 +1427,21 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
                     self.loc[inst] = Loc::Reg(r);
                 }
                 H::Cell | H::Local => {
-                    let from = match narrow {
+                    match narrow {
                         true => {
-                            self.narrow(self.scratch[0], src, width)?;
-                            self.scratch[0]
+                            let s = self.take_scratch()?;
+                            self.narrow(s.reg(), src, width)?;
+                            self.store_cell(s.reg(), self.cell[inst])?;
+                            self.give_scratch(s)?;
                         }
-                        false => src,
-                    };
-                    self.store_cell(from, self.cell[inst])?;
+                        false => self.store_cell(src, self.cell[inst])?,
+                    }
                     self.in_cell[inst] = true;
                     self.loc[inst] = Loc::Cell;
                     self.next[inst] = self.def_next[inst];
                 }
             }
+            self.scratch_idle()?;
         }
         Ok(())
     }
@@ -1489,7 +1601,16 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
             _ => self.generic(inst, op)?,
         }
         self.after(inst);
-        Ok(())
+        self.scratch_idle()
+    }
+
+    /// Between two instructions every scratch register is free: a token not given back is
+    /// refused here, never left to overlap the next use (scratch.rs).
+    fn scratch_idle(&self) -> Result<(), TierError> {
+        match self.scratch.is_idle() {
+            true => Ok(()),
+            false => Err(refused(self.inst, "a scratch register still held after its instruction (a token not given back)")),
+        }
     }
 
     fn constant(&mut self, inst: usize) -> Result<(), TierError> {
@@ -1510,12 +1631,19 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
             // cell (`frame`), written once here.
             H::Cell => {
                 let bits = self.const_bits(inst).unwrap_or(0);
-                let s = match class {
-                    RegClass::Gpr => self.scratch[0],
-                    RegClass::Fpr => self.temp(RegClass::Fpr)?,
-                };
-                self.mov_imm(s, bits)?;
-                self.store_cell(s, self.cell[inst])?;
+                match class {
+                    RegClass::Gpr => {
+                        let s = self.take_scratch()?;
+                        self.mov_imm(s.reg(), bits)?;
+                        self.store_cell(s.reg(), self.cell[inst])?;
+                        self.give_scratch(s)?;
+                    }
+                    RegClass::Fpr => {
+                        let t = self.temp(RegClass::Fpr)?;
+                        self.mov_imm(t, bits)?;
+                        self.store_cell(t, self.cell[inst])?;
+                    }
+                }
                 self.loc[inst] = Loc::Cell;
             }
         }
@@ -1760,7 +1888,11 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
         let mut args = [Arg::None; 7];
         args[0] = Arg::Frame(off);
         args[RESULT as usize] = Arg::Reg(dest.reg());
-        self.emit_op(glue::slot_address(), &args, false)?;
+        let pattern = match off < SLOT_REACH {
+            true => glue::slot_address(),
+            false => glue::slot_address_far(),
+        };
+        self.emit_op(pattern, &args, false)?;
         self.finish_dest(dest)
     }
 
@@ -1860,6 +1992,11 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
             }
         }
         let mut a = [Arg::None; 7];
+        // An indirect callee not in a register is loaded into a scratch register held over the
+        // call's own spills: they and the call template see it held (a far spill's address is
+        // lent the other one), and the call, which clobbers it after its `blr` reads it, spends
+        // it (scratch.rs).
+        let mut held: Option<Scratch> = None;
         let pattern = match (reference, callee) {
             (Some(r), _) => {
                 let rec = view.reference(r);
@@ -1873,9 +2010,11 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
                 let reg = match self.src_of(fv)? {
                     Src::Reg(r) => r,
                     _ => {
-                        let s = self.scratch[1];
-                        self.value_into(fv, s)?;
-                        s
+                        let s = self.take_scratch()?;
+                        let reg = s.reg();
+                        held = Some(s);
+                        self.value_into(fv, reg)?;
+                        reg
                     }
                 };
                 a[0] = Arg::Reg(reg);
@@ -1884,6 +2023,9 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
             (None, None) => return Err(refused(inst, "a call with no callee")),
         };
         let (start, len) = self.emit_op(pattern, &a, true)?;
+        if let Some(s) = held {
+            self.give_scratch(s)?;
+        }
         let row = Row { start: start + len - INST, len: INST, landing: 0, action: Action::Continue };
         self.out.unwind.push(row);
         self.out.pads.push(row.pad());
@@ -2002,8 +2144,11 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
     }
 
     /// The target's parameters take the edge's arguments at once: moves whose destination no
-    /// other move still reads go first; a cycle goes through the first scratch register;
-    /// constants last.
+    /// other move still reads go first; a cycle is broken by copying one source to the spare
+    /// cell (one at a time: a parameter has one writer, so the moves are trees hanging off
+    /// disjoint cycles, and a broken cycle's moves all become ready before another is broken;
+    /// a second break while the spare cell is still read is refused by name); constants last.
+    /// No scratch register is held from one move to the next.
     fn parallel_copy(&mut self, to: &Edge<'_>) -> Result<(), TierError> {
         let params = self.view.params(to.block);
         if params.len() != to.args.len() {
@@ -2050,29 +2195,24 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
                 }
                 None => {
                     let Some(i) = self.moves.iter().position(|m| !matches!(m.src, Src::Const(_))) else { break };
-                    let s = self.scratch[0];
-                    match self.moves[i].src {
-                        Src::Reg(r) => self.mov(s, r)?,
-                        Src::Cell(off) => self.load_cell(s, off)?,
-                        Src::Const(_) => {}
+                    let spare = self.spare;
+                    if spare == NONE {
+                        return Err(refused(self.inst, "a cycle of moves in a function with no spare cell (no block has two parameters)"));
                     }
-                    self.moves[i].src = Src::Reg(s);
+                    if self.moves.iter().any(|m| m.src == Src::Cell(spare)) {
+                        return Err(refused(self.inst, "a second cycle of moves broken while the spare cell is still read"));
+                    }
+                    let m = self.moves[i];
+                    self.one_move(m.src, Dst::Cell(spare), m.class)?;
+                    self.moves[i].src = Src::Cell(spare);
                 }
             }
         }
         let mut k = 0;
         while k < self.moves.len() {
             let m = self.moves[k];
-            if let Src::Const(c) = m.src {
-                match m.dst {
-                    Dst::Reg(r) => self.materialize(c as usize, r)?,
-                    Dst::Cell(off) => {
-                        let s = self.scratch[0];
-                        let bits = self.const_bits(c as usize).ok_or(refused(self.inst, "a constant with no bits"))?;
-                        self.mov_imm(s, bits)?;
-                        self.store_cell(s, off)?;
-                    }
-                }
+            if let Src::Const(_) = m.src {
+                self.one_move(m.src, m.dst, m.class)?;
             }
             k += 1;
         }
@@ -2080,23 +2220,28 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
         Ok(())
     }
 
+    /// One move of the parallel copy. A cell-to-cell move takes a scratch register for its load
+    /// and its store and gives it back; a far cell's address is the templates' own temporary.
+    /// A cell holds 64 bits whatever the class, so the copy goes through a general register.
     fn one_move(&mut self, src: Src, dst: Dst, class: RegClass) -> Result<(), TierError> {
+        let _ = class;
         match (src, dst) {
             (Src::Reg(a), Dst::Reg(b)) => self.mov(b, a),
             (Src::Reg(a), Dst::Cell(off)) => self.store_cell(a, off),
             (Src::Cell(off), Dst::Reg(b)) => self.load_cell(b, off),
             (Src::Cell(from), Dst::Cell(to)) => {
-                let s = self.scratch[1];
-                let _ = class;
-                self.load_cell(s, from)?;
-                self.store_cell(s, to)
+                let s = self.take_scratch()?;
+                self.load_cell(s.reg(), from)?;
+                self.store_cell(s.reg(), to)?;
+                self.give_scratch(s)
             }
             (Src::Const(c), Dst::Reg(r)) => self.materialize(c as usize, r),
             (Src::Const(c), Dst::Cell(off)) => {
-                let s = self.scratch[0];
                 let bits = self.const_bits(c as usize).ok_or(refused(self.inst, "a constant with no bits"))?;
-                self.mov_imm(s, bits)?;
-                self.store_cell(s, off)
+                let s = self.take_scratch()?;
+                self.mov_imm(s.reg(), bits)?;
+                self.store_cell(s.reg(), off)?;
+                self.give_scratch(s)
             }
         }
     }

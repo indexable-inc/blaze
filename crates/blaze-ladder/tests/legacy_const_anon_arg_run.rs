@@ -50,7 +50,7 @@ pub extern \"C\" fn main() -> i32 {
 }
 ");
     println!("ARITHMETIC LEGACY ARGUMENT: {got:?}");
-    assert_eq!(got, Ok(41), "`shr(256, 10 - 2)` is `shr::<{ 10 - 2 }>(256)`");
+    assert_eq!(got, Ok(41), "`shr(256, 10 - 2)` is `shr::<{{ 10 - 2 }}>(256)`");
 }
 
 /// The site's own form: the expression written by a macro from a `literal` fragment
@@ -83,7 +83,7 @@ pub extern \"C\" fn main() -> i32 {
 }
 ");
     println!("BLOCK LEGACY ARGUMENT: {got:?}");
-    assert_eq!(got, Ok(61), "`shr(256, { 4 + 4 })` is `shr::<{ 4 + 4 }>(256)`");
+    assert_eq!(got, Ok(61), "`shr(256, {{ 4 + 4 }})` is `shr::<{{ 4 + 4 }}>(256)`");
 }
 
 /// The control: a literal (read by the checker itself, passed before the fix): 1 + 70.

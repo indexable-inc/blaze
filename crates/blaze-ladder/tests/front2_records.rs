@@ -272,11 +272,11 @@ fn impl_answers<'n, S: NamesSource<'n>>(names: S, sized: Option<ItemKey>, frame:
     prepare_home(names, &mut keys, &mut store, Ask::Trait(trait_, Shape::Bool)).unwrap_or_else(|e| panic!("prepare coherence: {e}"));
     let home = trait_home(names, &keys, &store, trait_, Shape::Bool).unwrap_or_else(|e| panic!("trait home: {e}"));
     b.admit(names, home);
-    b.admit_asked(names, &keys, home, Ask::Trait(trait_, Shape::Bool));
+    b.admit_asked(names, &keys, home, Ask::Trait(trait_, Shape::Bool)).unwrap_or_else(|e| panic!("admit `bool: Clone`: {e}"));
     let of_trait = b.trait_candidates(trait_, Shape::Bool, home);
     let inherent = inherent_home(names, &keys, &store, Shape::Bool).unwrap_or_else(|e| panic!("inherent home: {e}"));
     b.admit(names, inherent);
-    b.admit_asked(names, &keys, inherent, Ask::Inherent(Shape::Bool));
+    b.admit_asked(names, &keys, inherent, Ask::Inherent(Shape::Bool)).unwrap_or_else(|e| panic!("admit `impl bool`: {e}"));
     let of_bool = b.inherent_candidates(Shape::Bool, inherent);
     (format!("bool: Clone in {home:?}: {of_trait:?}\nimpl bool in {inherent:?}: {of_bool:?}\n"), of_trait.len())
 }
@@ -728,7 +728,7 @@ fn records_answer_what_the_solved_names_answer() {
         prepare_home(asked, &mut alone_keys, &mut alone_store, Ask::Trait(checker_of(clone.key), Shape::Bool)).unwrap_or_else(|e| panic!("prepare coherence: {e}"));
         let home = trait_home(asked, &alone_keys, &alone_store, checker_of(clone.key), Shape::Bool).unwrap_or_else(|e| panic!("trait home: {e}"));
         asked_lazy.admit(asked, home);
-        asked_lazy.admit_asked(asked, &alone_keys, home, Ask::Trait(checker_of(clone.key), Shape::Bool));
+        asked_lazy.admit_asked(asked, &alone_keys, home, Ask::Trait(checker_of(clone.key), Shape::Bool)).unwrap_or_else(|e| panic!("admit `bool: Clone`: {e}"));
         let candidates = asked_lazy.trait_candidates(checker_of(clone.key), Shape::Bool, home);
         (
             asked.opened(),
@@ -779,7 +779,7 @@ fn records_answer_what_the_solved_names_answer() {
         let mut planted_index = Buckets::lazy(asked);
         let planted_keys = Keys::new();
         planted_keys.item(clone_lib).unwrap_or_else(|e| panic!("filing `Clone`: {e}"));
-        planted_index.admit_asked(asked, &planted_keys, alone_home, Ask::Trait(checker_of(clone_lib), Shape::Bool));
+        planted_index.admit_asked(asked, &planted_keys, alone_home, Ask::Trait(checker_of(clone_lib), Shape::Bool)).unwrap_or_else(|e| panic!("admit `bool: Clone` (planted): {e}"));
         planted_index.trait_candidates(checker_of(clone_lib), Shape::Bool, alone_home)
     };
     let expected: Vec<ItemKey> = alone_candidates.iter().copied().filter(|k| *k != in_bucket[0]).collect();
@@ -881,7 +881,7 @@ fn records_answer_what_the_solved_names_answer() {
     let display_home = trait_home(asked, &display_keys, &display_store, display_trait, io_shape).unwrap_or_else(|e| panic!("trait home: {e}"));
     let before_display = asked.opened();
     let mut display_index = Buckets::lazy(asked);
-    display_index.admit_asked(asked, &display_keys, display_home, Ask::Trait(display_trait, io_shape));
+    display_index.admit_asked(asked, &display_keys, display_home, Ask::Trait(display_trait, io_shape)).unwrap_or_else(|e| panic!("admit `Display`: {e}"));
     let after_display = asked.opened();
     let reads = display_index.trait_reads(display_trait, io_shape);
     let first_16 = |key: CrateItemKey| u128::from_be_bytes(key.0.0[..16].try_into().expect("sixteen bytes"));

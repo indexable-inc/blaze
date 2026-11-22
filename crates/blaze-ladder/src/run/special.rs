@@ -284,7 +284,7 @@ impl<'a> Roots<'a> {
 /// The start alone: no personality row ([`Roots::head`] names none). `blaze run`'s parent
 /// takes [`run_roots`].
 pub fn roots<'n, 'a, S: NamesSource<'n>>(names: S, frame: &'n blaze_mem::Frame, tables: Alloc<'static>, alloc: Alloc<'a>) -> Result<Roots<'a>, RootsError> {
-    roots_with(names, None, frame, tables, alloc)
+    roots_with(names, None, &[], frame, tables, alloc)
 }
 
 /// THE RUN'S ROOTS as `blaze run`'s parent takes them: [`roots`], and for a program built
@@ -293,20 +293,43 @@ pub fn roots<'n, 'a, S: NamesSource<'n>>(names: S, frame: &'n blaze_mem::Frame, 
 /// calls the routine (the system's unwinder does, through the slot the parent names), so it is
 /// a root of the walk; a program that unwinds and declares none is refused here, before the
 /// spawn ([`RootsError::Personality`]).
+///
+/// `exports`: the library items of the program's native image's words (blaze-cli
+/// engine_native.rs `NativeSend::items`, in word order): the Rust fns its C calls. Each is a
+/// root row at no arguments, after the start's rows and before the personality's ([`push_exports`]).
 pub fn run_roots<'n, 'a, S: NamesSource<'n>>(
     names: S,
     lang_crates: &[usize],
     panic: crate::code_records::PanicStrategy,
+    exports: &[blaze_id::ItemKey],
     frame: &'n blaze_mem::Frame,
     tables: Alloc<'static>,
     alloc: Alloc<'a>,
 ) -> Result<Roots<'a>, RootsError> {
-    roots_with(names, Some((lang_crates, panic)), frame, tables, alloc)
+    roots_with(names, Some((lang_crates, panic)), exports, frame, tables, alloc)
+}
+
+/// Each Rust fn the program's C calls as a root row: no Rust record need call it, so the walk
+/// reaches it only from here, and C's first call through its word (blaze-cli run_parent.rs
+/// `Needs::tell_native`) finds the row, never `Unknown`. At no arguments (an exported fn is not
+/// generic), so the row's symbol is the word's (engine_native.rs `send_of`: `fn_symbol` of
+/// `checker_of` the item, no arguments). An item already a row (an exported entry C also
+/// names) is not pushed twice.
+fn push_exports(table: &mut RootTable<'_>, exports: &[blaze_id::ItemKey], ground: PTys<'_>) -> Result<(), RootsError> {
+    for &export in exports {
+        let item = checker_of(export);
+        if (0..table.rows.len()).any(|i| table.rows.row(i).0 == item) {
+            continue;
+        }
+        table.push("an export the program's C calls", item, List::EMPTY, ground)?;
+    }
+    Ok(())
 }
 
 fn roots_with<'n, 'a, S: NamesSource<'n>>(
     names: S,
     unwinding: Option<(&[usize], crate::code_records::PanicStrategy)>,
+    exports: &[blaze_id::ItemKey],
     frame: &'n blaze_mem::Frame,
     tables: Alloc<'static>,
     alloc: Alloc<'a>,
@@ -332,6 +355,7 @@ fn roots_with<'n, 'a, S: NamesSource<'n>>(
             (EntryForm::Unit, table.push("`main`", checker_of(main), List::EMPTY, store.tys.view())?, false)
         }
     };
+    push_exports(&mut table, exports, store.tys.view())?;
     let personality = match unwinding {
         None => None,
         Some((lang_crates, panic)) => match crate::personality::personality_of(names, lang_crates, panic).map_err(RootsError::Personality)? {

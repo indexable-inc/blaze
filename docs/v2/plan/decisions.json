@@ -1546,6 +1546,38 @@
    "recommended": "design/test.md, 'The order as built (D191)'.",
    "why": "`blaze test` on tempo (2026-11-21 05:52) reaches the engine; every test that calls a library fn of its own package finds no row under the test unit's key and is NOT RUN (engine_start.rs ignored test). The design's own first slice put point 8 last, behind the every-ItemKey port, cfg-as-read across 19 front2 files and the engine's lift: none of which a running test needs. 'The first holder checks' is also unsound today: a body that reads cfg(test), or resolves a name differently under test, is checked under the non-test unit alone and reported checked (engine_body_plan.rs:33; tempo has 4 cfg(not(test)) and 87 cfg(any(test..))/cfg_attr(test..) forms). Cost, stated: at most +9,221 body tasks on tempo's 16,586 (the bodies two or more units hold), no more heads or names; an edit of a shared body checks it once a view.",
    "state": "decided: writers briefed 2026-11-21 06:25; nothing compiled"
+  },
+  {
+   "id": "D192",
+   "date": "2026-11-21",
+   "decision": "Nothing a sandboxed step runs or reads comes from the machine unless it absolutely has to (the owner, 2026-11-21 16:57: \"NOTHIGN shoudl come from whatever the mac has ideally\", \"unless it abosltuely has to\"). A build script's spawned programs, a deferred C compile, a process tree (sh configure, make) and a native script module see ONE pinned base tool set per platform: an archive named by its digest in pins/, fetched once to the toolchain shelf, its folder the step's whole PATH; the digest is in every key that used it. The per-package `host_tools` grants of OS paths (pins/clang.json: /bin/sh, /usr/bin/perl, Xcode's make) are replaced by it and then deleted. What still comes from the machine is a short named list, each with its identity in the key: the Apple SDK (not redistributable: version + ProductBuildVersion), the kernel and the system libraries a process must load (libSystem, dyld). git stays answered from recorded facts and is never run. A tool missing from the set is the named error a machine without that tool would give, never a reach to the OS. Spec: docs/v2/plan/design/base-tools.md.",
+   "recommended": "A pinned base set: a busybox-style multi-call binary for the shell, core and text tools, plus GNU make, cmake, ninja, pkg-config, perl, python3, tar and the compressors, built once by CI and named by digest; git not included.",
+   "why": "Two machines with different OS versions run different sh, make and perl, so a build step's result is not the same for anyone (rule 25, the owner's 'build steps always deterministic'); a per-package grant table is also a refusal waiting for each new crate (tempo's jemalloc stopped on `sh` on 2026-11-21).",
+   "state": "decided by the owner 2026-11-21; spec written; not built: the interim per-package host_tools table still serves tempo's jemalloc"
+  },
+  {
+   "id": "D193",
+   "date": "2026-11-21",
+   "decision": "Six revisions from a day of real runs on tempo and turso (design/end-state.md D193): compile-time code runs as blaze's own code now (D175 moved up; the interim cargo/rustc module builder, Wasmtime and the wasm std go); a build script's rustc probe is answered by blaze's own front end and its cc probe by running the pinned clang hermetically (the hand-filled answers tables go); one pinned world for native tools (D192 + hvbox's synthetic root); a dependency's C is built when its first symbol is bound, one image per links component; no answer is None across a crate boundary (Known / Absent / Unknown(cause)); the emitter's scratch registers are typed and tests can run differentially against the LIR evaluator.",
+   "recommended": "Start (1) to (4) now in parallel; (5), D158's crate identity and (6) after tempo's ten packages are green.",
+   "why": "Each revision is the cause of a stop in a real run today: 10 of 148 turso modules unbuilt by the interim builder; six probes with no table row; `sh` not granted; 215 passing tests to none when a test program built its whole closure's C; three false errors from an unknown read as absent; 61 false overflow panics from a reused register.",
+   "state": "decided 2026-11-21 17:10 on the owner's ask; lanes started for (1) piece 0, (2), (3); (4) accepted with the run-side writer; nothing compiled"
+  },
+  {
+   "id": "D194",
+   "date": "2026-11-21",
+   "decision": "Making code never happens on the command thread. A request to make code (a test's roots before its start; a first call's publication) is a task on the worker pool, one instance per task, deduplicated by key while in flight; the command thread only relays. A test's deadline measures the test: its clock does not run while the child waits for code it asked for; that wait has its own deadline and typed error.",
+   "recommended": "Do it before the by-need component image, which rides the same path.",
+   "why": "`blaze test` serves every test child's code-making synchronously on one thread (test_drive.rs OneEach): one long turn (77 s measured on tempo-precompiles-macros) starves every other child past its 60 s allowance: the likely cause of tests 'killed past its deadline' and of 192 vs 194 passes on one binary.",
+   "state": "decided 2026-11-21 17:08; the run-side writer has it; needs a simulation test (rule 43)"
+  },
+  {
+   "id": "D195",
+   "date": "2026-11-21",
+   "decision": "The fast tier of D97 to D100 (backend-next.md) is built now: the lowest tier used for real work is the table-driven template composer (copy-and-patch with registers: one analysis pass, one emission pass with a greedy allocator, templates read only through the table's trait); crates/blaze-emit stays as the Reference oracle and as the first generator of table entries.",
+   "recommended": "As D99: the composer written once over the table; equality with the LIR evaluator and the Reference tier on generated programs and every ladder rung before it is the default.",
+   "why": "The owner asked whether stencils should be the lowest tier; the plan already says so and only the stand-in exists. Every value in a stack cell is the slowest code blaze can make; tests run it.",
+   "state": "decided 2026-11-21 17:10 (the owner: 'ok then do the proper way to do it iyo'); writer started; nothing compiled"
   }
  ]
 }

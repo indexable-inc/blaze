@@ -924,23 +924,81 @@ fn the_personality_routine_is_a_root_over_names_records() {
     let with = fixture(&std::format!("{PROGRAM}{PERSONALITY_ROUTINE}"));
     let names = reader(&with);
     let routine = fn_named(&with, "rust_eh_personality");
-    let got = run_roots(names.records, names.lang_crates, PanicStrategy::Unwind, names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("the run's roots: {e}"));
+    let got = run_roots(names.records, names.lang_crates, PanicStrategy::Unwind, &[], names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("the run's roots: {e}"));
     let last = got.root(got.len() - 1);
     assert_eq!(last.tabled, routine, "the last root row is not the routine");
     assert_eq!(got.head().personality, Some(last.symbol), "the head does not name the routine's row");
     assert_ne!(Some(got.head().line.symbol), got.head().personality, "the routine was named as the entry");
-    let abort = run_roots(names.records, names.lang_crates, PanicStrategy::Abort, names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("the run's roots, abort: {e}"));
+    let abort = run_roots(names.records, names.lang_crates, PanicStrategy::Abort, &[], names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("the run's roots, abort: {e}"));
     assert_eq!(abort.head().personality, None, "a program built to abort named a routine");
     assert_eq!(abort.len() + 1, got.len(), "built to abort, the routine is still a root");
 
     let without = fixture(PROGRAM);
     let names = reader(&without);
-    let unwinds = run_roots(names.records, names.lang_crates, PanicStrategy::Unwind, names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("a program with no routine, built to unwind, was refused at its start: {e}"));
+    let unwinds = run_roots(names.records, names.lang_crates, PanicStrategy::Unwind, &[], names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("a program with no routine, built to unwind, was refused at its start: {e}"));
     assert_eq!(unwinds.head().personality, None, "a program with no routine named one");
     assert_eq!(unwinds.len() + 1, got.len(), "a program with no routine has a root row for one");
-    let abort = run_roots(names.records, names.lang_crates, PanicStrategy::Abort, names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("the run's roots, abort, no routine: {e}"));
+    let abort = run_roots(names.records, names.lang_crates, PanicStrategy::Abort, &[], names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("the run's roots, abort, no routine: {e}"));
     assert_eq!(abort.head().personality, None);
     println!("d106 personality over names records: named {:x}; none declared: no routine named", routine.0);
+}
+
+/// Two fns no Rust body calls: `blaze_on_error`, exported under its C name (what a C library's
+/// callback is: secp256k1-sys's error callbacks), and `unexported`, of the same shape.
+const C_CALLED: &str = "
+#[unsafe(no_mangle)]
+pub extern \"C\" fn blaze_on_error() -> i32 {
+    7
+}
+
+pub extern \"C\" fn unexported() -> i32 {
+    8
+}
+";
+
+/// The library key of crate 0's fn named `name` (what a link table's export holds, native_links.rs
+/// `CrateExport::item`).
+fn lib_named(f: &Fixture, name: &str) -> LibKey {
+    let records = reader(f).records;
+    let mut found = None;
+    assert!(records.each_item(0, &mut |key, _| if found.is_none() && records.kind_of_item(key) == Some(ItemKind::Function) && records.name_of(key) == Some(name) {
+        found = Some(key);
+    }), "the program's items record lists its items");
+    found.unwrap_or_else(|| panic!("no fn named `{name}`: {:?}", logged(records)))
+}
+
+/// The run's roots hold each Rust fn the program's C calls (run/special.rs `push_exports`): an
+/// export handed in (the image's words, blaze-cli engine_native.rs `NativeSend::items`) is a root
+/// row at no arguments whose symbol is the word's (`fn_symbol` of `checker_of` the item, as
+/// `send_of` makes it), before the personality's row, which stays last. Twin: the unexported fn
+/// of the same shape, which no word names, is no root. Control (the cause removed): handed no
+/// export, the exported fn is no root either: no walk from `main` reaches it.
+///
+/// Prints: `d106 export roots: <n> rows with the export, <n-1> without`
+#[test]
+fn an_export_only_c_calls_is_a_root_and_an_unexported_fn_is_not() {
+    use blaze_ladder::code_records::PanicStrategy;
+    use blaze_ladder::run::special::run_roots;
+    let with = fixture(&std::format!("{PROGRAM}{PERSONALITY_ROUTINE}{C_CALLED}"));
+    let names = reader(&with);
+    let export = lib_named(&with, "blaze_on_error");
+    let (exported, unexported) = (fn_named(&with, "blaze_on_error"), fn_named(&with, "unexported"));
+    let tabled = |roots: &blaze_ladder::run::special::Roots<'_>, item: ItemKey| (0..roots.len()).find(|&i| roots.root(i).tabled == item);
+
+    let got = run_roots(names.records, names.lang_crates, PanicStrategy::Unwind, &[export], names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("the run's roots: {e}"));
+    let at = tabled(&got, exported).unwrap_or_else(|| panic!("the export C calls is no root row"));
+    let word = blaze_ladder::symbols::fn_symbol(exported, blaze_typeck::List::EMPTY, blaze_typeck::PTys::EMPTY, alloc()).expect("the word's symbol");
+    assert_eq!(got.root(at).symbol, word, "the export's row is not at the word's symbol");
+    assert_eq!(got.head().personality, Some(got.root(got.len() - 1).symbol), "the personality's row is no longer last");
+    assert_eq!(tabled(&got, unexported), None, "an unexported fn no word names is a root");
+    // An export handed twice (two crates' tables naming one fn) is one row.
+    let twice = run_roots(names.records, names.lang_crates, PanicStrategy::Unwind, &[export, export], names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("the run's roots, twice: {e}"));
+    assert_eq!(twice.len(), got.len(), "one export handed twice is two rows");
+
+    let none = run_roots(names.records, names.lang_crates, PanicStrategy::Unwind, &[], names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("the run's roots, no export: {e}"));
+    assert_eq!(tabled(&none, exported), None, "handed no export, the exported fn is a root anyway: the test does not see the cause");
+    assert_eq!(none.len() + 1, got.len(), "the export is not exactly one row more");
+    println!("d106 export roots: {} rows with the export, {} without", got.len(), none.len());
 }
 
 /// Two structs no body of [`PROGRAM`] names: `Lone`, holding `Inner` by value.

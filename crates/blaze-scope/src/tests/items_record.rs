@@ -250,10 +250,24 @@ fn ask(fresh: &Names<'static>, read: &RecordItems<'static, Loaded>, all: &[&'sta
         same(n.tables.members.len(), n.tables.members.keys().filter(|o| read.members(**o).is_ok_and(|m| m.is_some())).count(), &format!("`{c}`'s member owners"))?;
 
         // Question 14: the crate's impls, each with the facts of its header.
-        same(n.tables.impls.len(), r.impls(), &format!("`{c}`'s impl rows"))?;
+        // And a row per refused derive, its gap (D193 point 5), as the solve's values give it.
+        let mut gaps: Vec<crate::items_record::ImplRow<'_>> = Vec::new();
+        crate::items_record::each_refused_impl_row(n, &mut |row| gaps.push(row));
+        same(n.tables.impls.len() + gaps.len(), r.impls(), &format!("`{c}`'s impl rows"))?;
         let mut before: Option<(&str, ItemKey, ItemKey)> = None;
         for i in 0..r.impls() {
             let row = rec(r.impl_at(i), "an impl row")?.ok_or_else(|| differs(format!("`{c}`: impl row {i} is missing")))?;
+            if row.refused_call {
+                if !gaps.contains(&row) {
+                    return Err(differs(format!("`{c}`: impl row {i} is a refused derive's gap the solve's values do not give: {row:?}")));
+                }
+                let sort = (row.trait_path.unwrap_or(""), row.module, row.key);
+                if before.is_some_and(|b| (b.0.as_bytes(), b.1, b.2) > (sort.0.as_bytes(), sort.1, sort.2)) {
+                    return Err(differs(format!("`{c}`: impl rows are not sorted at row {i}")));
+                }
+                before = Some(sort);
+                continue;
+            }
             let src = n.tables.impls.iter().find(|s| s.key == row.key).ok_or_else(|| differs(format!("`{c}`: impl row {i} names {:?}, no impl of the solve", row.key)))?;
             let what = format!("`{c}` `{}`", src.header);
             same(src.module, row.module, &format!("{what}: module"))?;

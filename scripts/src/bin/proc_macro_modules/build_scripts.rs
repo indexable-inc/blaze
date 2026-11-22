@@ -197,14 +197,34 @@ fn library(tool: &Toolchain, tree: &Path, _work: &Path) -> Result<(PathBuf, Stri
 /// `cfg!(feature = ...)` in the script sees exactly them), each with its entries that name a
 /// build-dependency or a feature (`script_features`, D112 N6: `bindgen-runtime =
 /// ["bindgen/runtime"]` stays, so bindgen is built with `runtime`), its build-dependencies as
-/// dependencies, and its script as the one binary.
-pub(super) fn script_manifest(original: &str, script: &Path, name: &str, version: &str, features: &[String]) -> String {
+/// dependencies, and its script as the one binary. A feature of the unit that is an optional
+/// build-dependency's implicit feature ([`super::member_dependencies::implicit_features`]) is
+/// not written: it stays implicit, as the package's manifest has it (libsqlite3-sys 0.35.0's
+/// `cc`, `pkg-config`, `vcpkg`: written `"cc" = []`, cargo refused the manifest, "optional
+/// dependency `cc` is not included in any feature"). `path` is the package's manifest, named
+/// in a refusal.
+pub(super) fn script_manifest(
+    original: &str,
+    path: &Path,
+    script: &Path,
+    name: &str,
+    version: &str,
+    features: &[String],
+    alloc: blaze_own::Alloc<'_>,
+) -> Result<String, Failure> {
+    let doc = super::member_dependencies::parse(original, path, alloc)?;
+    // Only the build-dependencies are in the script's manifest: an optional normal dependency's
+    // implicit feature names nothing there, so it is declared empty (`cfg!(feature)` holds).
+    let implicit = super::member_dependencies::implicit_features(&doc, &["build-dependencies"], alloc);
     let edition = table_value(original, "package", "edition").map_or("2015", |it| it.trim_matches('"'));
     let mut out = format!(
         "[package]\nname = {name:?}\nversion = {version:?}\nedition = {edition:?}\npublish = false\nautobins = false\nautoexamples = false\nautotests = false\nautobenches = false\n\n[[bin]]\nname = \"build-script-build\"\npath = {:?}\n\n[features]\n",
         script.display().to_string()
     );
     for feature in features {
+        if implicit.contains(feature.as_str()) {
+            continue;
+        }
         out.push_str(&super::script_features::script_feature_line(original, feature));
     }
     let mut keep = false;
@@ -230,7 +250,7 @@ pub(super) fn script_manifest(original: &str, script: &Path, name: &str, version
             out.push('\n');
         }
     }
-    out
+    Ok(out)
 }
 
 /// `manifest` (with what it inherits written in) cut to its package's name, version, edition
@@ -402,7 +422,7 @@ impl Plan<'_> {
         write(&ws.join("Cargo.toml"), "[workspace]\nmembers = [\"script\"]\nresolver = \"2\"\n\n[profile.release]\ndebug = false\nincremental = false\npanic = \"abort\"\ncodegen-units = 16\n")?;
         let path = source.join("Cargo.toml");
         let manifest = super::member_dependencies::filtered_manifest(&script_only(&original), &path, &features, alloc)?;
-        write(&ws.join("script/Cargo.toml"), script_manifest(manifest.as_str(), &script, &wanted.name, &wanted.version, &features))?;
+        write(&ws.join("script/Cargo.toml"), script_manifest(manifest.as_str(), &path, &script, &wanted.name, &wanted.version, &features, alloc)?)?;
         write(&ws.join("Cargo.lock"), member_lock(&read(&self.work.join("fetch/Cargo.lock"))?, &wanted.name, &wanted.version))?;
         write(
             &ws.join(".cargo/config.toml"),

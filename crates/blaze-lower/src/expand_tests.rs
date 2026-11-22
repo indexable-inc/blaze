@@ -1372,7 +1372,7 @@ fn a_copied_items_local_keeps_its_binding_through_an_inner_calls_input() {
         let rows = |text: &str| if marked { starts_of(text, &["config", "$crate"]) } else { StdVec::new() };
         // (1) Without marks a `$crate` is `$` and `crate` (the d1 twin): the control's shape 1
         // has no `$crate`.
-        let one = if marked { shape1.to_string() } else { shape1.replace("$crate::", "") };
+        let one = if marked { String::from(shape1) } else { shape1.replace("$crate::", "") };
         let l = expanding_marked(&[id], &one, &rows(&one));
         let (whys, dump) = outcome(&l);
         assert!(whys.is_empty(), "{how} (1): {whys:?}\n{dump}");

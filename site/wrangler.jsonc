@@ -8,7 +8,7 @@
   "main": "worker/index.ts",
   // `wrangler dev` rebuilds dist/ and .gen/ when a page, style or client script changes. The renderer's wasm modules
   // come from renderer/fetch.py or renderer/build.py (README.md), which this does not run.
-  "build": { "command": "bun gen/build.ts", "watch_dir": ["content", "gen", "client", "styles", "static"] },
+  "build": { "command": "bun gen/build.ts", "watch_dir": ["content", "gen", "client", "explore", "styles", "static"] },
   "assets": {
     "directory": "dist",
     "binding": "ASSETS",

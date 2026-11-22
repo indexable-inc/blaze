@@ -11,8 +11,8 @@
 //!
 //! Three tests: the tail inside the counted instructions, before the data
 //! (`the_probe_tail_is_inside_the_record_instructions`); a slot's alignment counted in the drop
-//! (`an_over_aligned_frame_counts_its_rounding`); the Fast tier's refusal by name
-//! (`the_fast_tier_refuses_a_frame_past_a_page`). pass/probe.rs's sequence itself is
+//! (`an_over_aligned_frame_counts_its_rounding`); the Fast tier's probe from its table
+//! (`the_fast_tier_probes_a_frame_past_a_page`). pass/probe.rs's sequence itself is
 //! probe_tests.rs's.
 
 use std::alloc::Global;
@@ -23,14 +23,14 @@ use blaze_lir::{
     func::{BlockKind, Conv, Func, SlotKind},
 };
 use blaze_own::Alloc;
-use blaze_tier::{ARM64, Named, Names, Outside, Table, Tier, TierError, TierName};
+use blaze_tier::{ARM64, Named, Names, Outside, Table, Tier};
 
 use crate::{
     BULK_INLINE_MOST,
     compose::Fast,
     enc::{self, SP},
     enc_probe,
-    pass::probe::{FAST_FRAME_PAST_A_PAGE, PROBE_STEP},
+    pass::probe::PROBE_STEP,
     record::emit_record_up_to,
     table_gen::EncodedTable,
     tests::{ISA, emitted, one},
@@ -199,29 +199,40 @@ fn an_over_aligned_frame_counts_its_rounding() {
     println!("an over-aligned frame counts its rounding");
 }
 
-/// The Fast tier's frame steps are table templates with no probe: a frame whose drop under the
-/// saved registers passes one page is refused by name (the Reference tier serves it); one at the
-/// bound is not refused for its frame. A 4096-byte slot: frame 4096, `16 + 4096 > 4096`; a
-/// 4064-byte slot: frame 4064. Prints "the fast tier refuses a frame past a page".
+/// The Fast tier probes a frame whose drop under the saved registers passes one page with the
+/// table's `glue::PROBE` template (this file's sequence, its count in a lent scratch register),
+/// and keeps the two `sub`s at the bound. A 4096-byte slot: frame 4096, `16 + 4096 > 4096`, so
+/// the code holds the probe's `str xzr, [sp]` and `sub sp, sp, #1, lsl #12`; a 4064-byte slot:
+/// frame 4064, neither. Running a probed Fast function is tier_tests/directed.rs's
+/// (`a_far_frame_with_a_flag_live_across_stores_agrees`). Prints "the fast tier probes a frame
+/// past a page". Fails with `TableError::Missing` for `stack_pointer` variant 8 until the table
+/// is made again (`cargo run -p blaze-emit --example gen_table`).
 #[test]
-fn the_fast_tier_refuses_a_frame_past_a_page() {
+fn the_fast_tier_probes_a_frame_past_a_page() {
     let table = match EncodedTable::read(include_bytes!("../table/arm64.bztab"), Alloc::global()) {
         Ok(table) => table,
         Err(error) => panic!("the committed table does not read: {error}"),
     };
     let fast = Fast { table: &table, regs: &ARM64 };
     let machine = table.head().machine;
-    let large_func = framed(4096, 4);
-    let large = fast.emit(blaze_lir::verify(large_func.view()).expect("the test's function is LIR"), &Nameless, machine, Alloc::global());
-    match large {
-        Err(TierError::Refused { tier: TierName::Fast, inst: None, what }) => assert_eq!(what, FAST_FRAME_PAST_A_PAGE),
-        Err(other) => panic!("a 4096-byte frame is refused for another reason: {other:?}"),
-        Ok(_) => panic!("the Fast tier composed a 4096-byte frame with no probe"),
+    let touch = enc::str(enc::Size::X, enc::ZR, SP, 0);
+    let step = enc::sub_imm(SP, SP, 1, true);
+    let words = |code: &[u8]| -> Vec<u32> { code.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect() };
+    for slot in [4096u32, 40 * 1024, 1 << 20] {
+        let func = framed(slot, 4);
+        let large = fast.emit(blaze_lir::verify(func.view()).expect("the test's function is LIR"), &Nameless, machine, Alloc::global());
+        let e = match large {
+            Ok(e) => e,
+            Err(error) => panic!("the Fast tier refused a {slot}-byte slot's frame: {error}"),
+        };
+        let w = words(&e.code[..]);
+        assert!(w.contains(&touch) && w.contains(&step), "a {slot}-byte slot's prologue probes: {w:x?}");
+        assert!(e.frame >= slot, "a {slot}-byte slot's frame is {}", e.frame);
     }
     let bound_func = framed(4064, 4);
-    let at_bound = fast.emit(blaze_lir::verify(bound_func.view()).expect("the test's function is LIR"), &Nameless, machine, Alloc::global());
-    if let Err(TierError::Refused { what, .. }) = at_bound {
-        assert_ne!(what, FAST_FRAME_PAST_A_PAGE, "a 4064-byte frame is within the bound");
+    match fast.emit(blaze_lir::verify(bound_func.view()).expect("the test's function is LIR"), &Nameless, machine, Alloc::global()) {
+        Ok(e) => assert!(!words(&e.code[..]).contains(&touch), "a 4064-byte frame is within the bound: no probe"),
+        Err(error) => panic!("the Fast tier refused a 4064-byte frame: {error}"),
     }
-    println!("the fast tier refuses a frame past a page");
+    println!("the fast tier probes a frame past a page");
 }

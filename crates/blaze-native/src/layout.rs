@@ -33,8 +33,9 @@ use crate::unwind::{self, Row, UnwindInfoError};
 
 /// The version of what `lay` produces for an unchanged plan (region order, stubs, the
 /// descriptor, the unwind index's form). The program's native library record (NATIVE.md 3.1,
-/// W7) folds it into its key; bump it with any change to an image's bytes.
-pub const LAYOUT_VERSION: u32 = 1;
+/// W7) folds it into its key; bump it with any change to an image's bytes. 2: the linker's own
+/// names (synthetic.rs) are laid in the image (a pointer to `___dso_handle` was an import).
+pub const LAYOUT_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Layout { pub page: u64, pub header_reserve: u64 } // macOS: 0x4000, 0x4000; Linux: 0x10000, 0x10000
@@ -64,7 +65,10 @@ pub enum LayoutError<'a> {
     Section { from: Origin<'a>, segment: &'a [u8], name: &'a [u8] },     // SectionKind::Other
     TermFunctions { from: Origin<'a> }, TlsLocalExec { from: Origin<'a> },
     RustDirectAddress { name: &'a [u8], from: Origin<'a> },
-    OutOfRange { kind: RelocKind, from: Origin<'a>, offset: u32 },
+    /// A field that cannot hold its target, every part named ([`Far`]).
+    OutOfRange(Far<'a>),
+    /// A name the linker defines (synthetic.rs) that has no address in this image ([`Unmade`]).
+    Linker(Unmade<'a>),
     Unwind { from: Origin<'a>, why: &'static str }, Alloc,
     Unplaced { name: &'a [u8], from: Origin<'a> },
     UnknownLayout { page: u64, header_reserve: u64 },
@@ -72,6 +76,159 @@ pub enum LayoutError<'a> {
     /// word) and relocation made `found` `FixTo::Word` fixups: the count's test and `apply`'s
     /// disagree (BNL2, descriptor.rs).
     PointerRows { counted: u32, found: u32 },
+}
+
+/// A relocation whose field cannot hold its target (rule 19): its kind, the member and section
+/// it is in, its offset there, the name it targets as its object spells it, and why the field
+/// cannot reach it ([`Reach`]). A field the layout writes itself (a stub, a veneer, a thread
+/// local's GOT entry) has no member: `member` and `section` are the layout's words for it.
+/// Its `Debug` is its words: the image's caller prints the refusal's chain by `Debug`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Far<'a> {
+    pub kind: RelocKind,
+    pub from: Origin<'a>,
+    pub member: &'a [u8],
+    pub segment: &'a [u8],
+    pub section: &'a [u8],
+    pub offset: u32,
+    /// The targeted symbol's name, a section's name for a section-relative relocation; empty
+    /// when the relocation is the layout's own.
+    pub symbol: &'a [u8],
+    pub reach: Reach,
+}
+
+/// Why a field cannot hold its target.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reach {
+    /// Both ends are image-relative addresses, too far apart for the field (or, for a branch,
+    /// not 4-byte aligned).
+    Distance { place: u64, to: u64 },
+    /// An add or load's low 12 bits of `to` are not a multiple of its access size.
+    Misaligned { to: u64, scale_log2: u8 },
+    /// The name is defined by no object of the image, so it is an import, whose address only
+    /// the loader knows: only a GOT load or a branch through a stub reaches one, never a
+    /// direct page, offset or 32-bit reference, nor a branch with an addend. A direct one
+    /// means its object was compiled for a definition inside the same image (a hidden name):
+    /// the member or archive that defines it is not in the link.
+    Import,
+    /// The name is an absolute symbol of this value: not a place of the image.
+    Absolute(u64),
+    /// The target is a place the layout did not lay (a dropped piece, a section not laid).
+    NotLaid,
+    /// A branch to a place that is not code.
+    NotCode,
+    /// The stub, veneer or GOT cell the layout counted for it was not made: the layout's own
+    /// counting and its relocation disagree (a bug of this file's).
+    NoCell,
+    /// A 32-bit absolute field: it cannot hold a position-independent image's addresses.
+    Abs32,
+    /// A thread-local whose definition is outside the image: its GOT entry holds an offset in
+    /// this image's template, which has none for it.
+    ThreadLocalOutside,
+}
+
+impl core::fmt::Display for Reach {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Reach::Distance { place, to } => write!(f, "the place {place:#x} and its target {to:#x} are too far apart for the field (or misaligned)"),
+            Reach::Misaligned { to, scale_log2 } => write!(f, "the target {to:#x}'s low 12 bits are not a multiple of the access size {}", 1u32 << scale_log2),
+            Reach::Import => f.write_str(
+                "no object of the image defines the name, so it is an import, which only a GOT load or a branch through a stub reaches; this direct reference was compiled for a definition inside the image (a hidden name): the member or archive defining it is not in the link",
+            ),
+            Reach::Absolute(value) => write!(f, "the name is an absolute symbol ({value:#x}), not a place of the image"),
+            Reach::NotLaid => f.write_str("the target is a place the layout did not lay (a dropped piece or section)"),
+            Reach::NotCode => f.write_str("the branch's target is not code"),
+            Reach::NoCell => f.write_str("the stub, veneer or GOT cell the layout counted for it was not made (blaze-native layout.rs's own bug)"),
+            Reach::Abs32 => f.write_str("a 32-bit absolute field cannot hold a position-independent image's address"),
+            Reach::ThreadLocalOutside => f.write_str("a thread-local defined outside the image: its GOT entry has no offset in this image's template"),
+        }
+    }
+}
+
+/// A linker-defined name (synthetic.rs) a relocation of `from` reaches, which this image cannot
+/// give an address (rule 19: the name, the input, and why). Its `Debug` is its words.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Unmade<'a> {
+    pub name: &'a [u8],
+    pub from: Origin<'a>,
+    pub why: NoAddress<'a>,
+}
+
+/// Why a linker-defined name has no address here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NoAddress<'a> {
+    /// The header of an image of another kind (`kind`: "an executable", "a bundle"): this image
+    /// is a dylib, whose header is `__mh_dylib_header` (and `___dso_handle`).
+    OtherKind { kind: &'static str },
+    /// No laid section of the image is `segment,section` (lld would make an empty one; a
+    /// boundary of nothing is refused here, rule 3).
+    NoSection,
+    /// The image's sections named `segment,section` are not one run: the section `other_segment,
+    /// other_section` lies between them, so no `[start, end)` holds exactly them.
+    Split { other_segment: &'a [u8], other_section: &'a [u8] },
+    /// The written dylib has no such segment (native_dylib.rs: `__TEXT`, `__DATA_CONST` when
+    /// the GOT is not empty, `__DATA`).
+    NoSegment,
+    /// The table names a linker name of another platform's images.
+    Platform,
+}
+
+impl core::fmt::Display for Unmade<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "`{}`, a name the linker defines, referenced by `{}` of `{}`: ", Text(self.name), self.from.file, self.from.package)?;
+        match self.why {
+            NoAddress::OtherKind { kind } => write!(f, "it is the header of {kind}, and this image is a dylib (its header is `__mh_dylib_header`)")?,
+            NoAddress::NoSection => f.write_str("no section of that name is laid in the image")?,
+            NoAddress::Split { other_segment, other_section } => {
+                write!(f, "the image's sections of that name are not one run: `{},{}` lies between them", Text(other_segment), Text(other_section))?
+            }
+            NoAddress::NoSegment => f.write_str("the written dylib has no such segment (its segments: `__TEXT`, `__DATA_CONST` when it has a GOT, `__DATA`)")?,
+            NoAddress::Platform => f.write_str("it is not a linker name of this image's platform")?,
+        }
+        f.write_str(" (blaze-native layout.rs `linker_at`, synthetic.rs, rule 19)")
+    }
+}
+
+impl core::fmt::Debug for Unmade<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(self, f)
+    }
+}
+
+/// Bytes as text where they are UTF-8, else as a byte list.
+struct Text<'b>(&'b [u8]);
+
+impl core::fmt::Display for Text<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match core::str::from_utf8(self.0) {
+            Ok(text) => f.write_str(text),
+            Err(_) => write!(f, "{:?}", self.0),
+        }
+    }
+}
+
+impl core::fmt::Display for Far<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "the {:?} relocation at offset {} of section {},{} of `{}` (`{}` of `{}`), to `{}`: {} (blaze-native layout.rs `lay`, rule 19)",
+            self.kind,
+            self.offset,
+            Text(self.segment),
+            Text(self.section),
+            Text(self.member),
+            self.from.file,
+            self.from.package,
+            Text(self.symbol),
+            self.reach,
+        )
+    }
+}
+
+impl core::fmt::Debug for Far<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(self, f)
+    }
 }
 
 /// An allocation the caller's allocator refused.
@@ -132,6 +289,9 @@ enum Target {
     Absolute(u64),
     Rust { word: u32 },
     Import { index: u32, addend: i64 },
+    /// A name the linker defines (synthetic.rs), by its entry in `Plan::names`: its address is
+    /// read from the laid image ([`Lay::linker_at`]).
+    Linker { entry: u32, offset: i64 },
 }
 
 /// A GOT entry: a pointer cell, an ELF TLS descriptor pair, an ELF initial-exec offset cell.
@@ -171,6 +331,45 @@ const X16_ADRP: u32 = 0x9000_0010; // adrp x16, 0
 const X16_LDR: u32 = 0xF940_0210; // ldr x16, [x16, #0]
 const X16_ADD: u32 = 0x9100_0210; // add x16, x16, #0
 const BR_X16: u32 = 0xD61F_0200; // br x16
+
+/// The page (ADRP) or low-12 (ADD, LDR/STR) field of a `kind` relocation at `place` reaching
+/// `to`, written into `insn`, or why it cannot hold it. A kind with no such field is never
+/// asked (`apply` matches each to its own arm): it is refused as the layout's own bug.
+fn page_field(kind: RelocKind, insn: u32, place: u64, to: u64) -> Result<u32, Reach> {
+    let scale_log2 = match kind {
+        RelocKind::Page21 | RelocKind::GotPage21 | RelocKind::TlvPage21 | RelocKind::TlsDescPage21 | RelocKind::TlsIePage21 => {
+            return adrp(insn, place, to).ok_or(Reach::Distance { place, to });
+        }
+        RelocKind::PageOff12 { scale_log2 } => scale_log2,
+        RelocKind::GotPageOff12 | RelocKind::TlvPageOff12 | RelocKind::TlsDescLo12 | RelocKind::TlsIeLo12 => 3,
+        RelocKind::TlsDescAdd => 0,
+        RelocKind::Abs64
+        | RelocKind::Abs32
+        | RelocKind::Rel32
+        | RelocKind::Rel64
+        | RelocKind::Delta32 { .. }
+        | RelocKind::Delta64 { .. }
+        | RelocKind::Branch26
+        | RelocKind::CondBranch19
+        | RelocKind::TestBranch14
+        | RelocKind::GotRel32
+        | RelocKind::TlsDescCall
+        | RelocKind::TlsLeHi12
+        | RelocKind::TlsLeLo12 => return Err(Reach::NoCell),
+    };
+    lo12(insn, to, scale_log2).ok_or(Reach::Misaligned { to, scale_log2 })
+}
+
+/// Why a target with no image address cannot be reached by a direct field.
+fn unreached(t: Target) -> Reach {
+    match t {
+        Target::Import { .. } => Reach::Import,
+        Target::Absolute(value) => Reach::Absolute(value),
+        Target::Rust { .. } => Reach::NoCell,
+        // A linker name's refusal is its own (`Lay::reached` gives `linker_at`'s).
+        Target::Place { .. } | Target::Common { .. } | Target::Linker { .. } => Reach::NotLaid,
+    }
+}
 
 /// ADRP's page delta into `insn` (A64 "ADRP": `Xd = (PC & ~0xFFF) + (imm21 << 12)`).
 fn adrp(insn: u32, place: u64, to: u64) -> Option<u32> {
@@ -257,6 +456,24 @@ struct Lay<'p, 'a> {
 impl<'p, 'a> Lay<'p, 'a> {
     fn origin(&self, o: u32) -> Origin<'a> {
         self.inputs[self.plan.objects[o as usize].input as usize].from
+    }
+
+    /// The refusal of relocation `r` of section (o, s): its member, section and target named.
+    fn far(&self, o: u32, s: u32, r: &Reloc, reach: Reach) -> LayoutError<'a> {
+        let pulled = &self.plan.objects[o as usize];
+        let obj = &pulled.object;
+        let none: &'a [u8] = &[];
+        let (segment, section) = obj.sections.get(s as usize).map_or((none, none), |x| (x.segment, x.name));
+        let symbol = match r.to {
+            RelocTo::Symbol(i) => obj.symbols.get(i as usize).map_or(none, |x| x.name),
+            RelocTo::Section(t) => obj.sections.get(t as usize).map_or(none, |x| x.name),
+        };
+        LayoutError::OutOfRange(Far { kind: r.kind, from: self.origin(o), member: pulled.name, segment, section, offset: r.offset, symbol, reach })
+    }
+
+    /// The refusal of a field the layout writes itself (`what`: a stub, a veneer, a GOT entry).
+    fn far_own(&self, kind: RelocKind, what: &'static [u8], reach: Reach) -> LayoutError<'a> {
+        LayoutError::OutOfRange(Far { kind, from: self.origin(0), member: what, segment: b"", section: b"", offset: 0, symbol: b"", reach })
     }
 
     fn sec(&self, o: u32, s: u32) -> Option<Sec> {
@@ -362,6 +579,7 @@ impl<'p, 'a> Lay<'p, 'a> {
                     Resolution::Rust { word } if addend == 0 => Target::Rust { word },
                     Resolution::Rust { .. } => return Err(LayoutError::RustDirectAddress { name, from }),
                     Resolution::Import { index, .. } => Target::Import { index, addend },
+                    Resolution::Linker => Target::Linker { entry: k as u32, offset: addend },
                 };
                 Ok((t, name))
             }
@@ -585,7 +803,7 @@ impl<'p, 'a> Lay<'p, 'a> {
     fn collect(&mut self) -> Result<(), LayoutError<'a>> {
         let mut stubs: AVec<'a, Target> = Vec::new_in(self.alloc);
         let mut cells: AVec<'a, Cell> = Vec::new_in(self.alloc);
-        self.each_reloc(|me, o, _, _, r| {
+        self.each_reloc(|me, o, s, _, r| {
             match r.kind {
                 RelocKind::Branch26 | RelocKind::CondBranch19 | RelocKind::TestBranch14 => {
                     let (t, _) = me.target(o, r.to, r.addend)?;
@@ -595,10 +813,9 @@ impl<'p, 'a> Lay<'p, 'a> {
                             push(&mut stubs, t)?;
                             push(&mut cells, Cell::Plain(t))?;
                         }
-                        Target::Import { .. } | Target::Absolute(_) => {
-                            return Err(LayoutError::OutOfRange { kind: r.kind, from: me.origin(o), offset: r.offset });
-                        }
-                        Target::Place { .. } | Target::Common { .. } => {}
+                        Target::Import { .. } | Target::Absolute(_) => return Err(me.far(o, s, r, unreached(t))),
+                        // A linker name is no code: `branch_dest` refuses it by name.
+                        Target::Place { .. } | Target::Common { .. } | Target::Linker { .. } => {}
                     }
                 }
                 RelocKind::GotPage21 | RelocKind::GotPageOff12 | RelocKind::GotRel32 | RelocKind::TlvPage21 | RelocKind::TlvPageOff12 => {
@@ -713,7 +930,85 @@ impl<'p, 'a> Lay<'p, 'a> {
                 let k = self.commons.binary_search_by_key(&entry, |c| c.0).map_err(|_| none)?;
                 Ok(self.commons[k].1.wrapping_add(offset as u64))
             }
+            Target::Linker { entry, offset } => Ok(self.linker_at(entry, o)?.wrapping_add(offset as u64)),
             Target::Absolute(_) | Target::Rust { .. } | Target::Import { .. } => Err(none),
+        }
+    }
+
+    /// The image address of linker-defined name `entry` of `Plan::names` (synthetic.rs), read
+    /// from the laid image; asked only once every region is placed (`apply`, `fill_got`). `o`
+    /// names the input in a refusal.
+    ///
+    /// - The header names: address 0, where the writer's Mach-O header is (image.rs: the first
+    ///   `header_reserve` bytes are the writer's); a fixup rebases a pointer to it to the base
+    ///   dyld mapped the image at, which is the header's address in the process.
+    /// - A section boundary: the first byte of, and the byte past, the laid sections of that
+    ///   segment and name; they must be one run (no other laid bytes between them).
+    /// - A segment boundary: the written dylib's segments (native_dylib.rs): `__TEXT` from the
+    ///   header to the writable page, `__DATA_CONST` the GOT, `__DATA` from the data to the end
+    ///   of zero-fill.
+    fn linker_at(&self, entry: u32, o: u32) -> Result<u64, LayoutError<'a>> {
+        use crate::synthetic::{self, Synthetic};
+        let none: &'a [u8] = &[];
+        let name = self.plan.names.get(entry as usize).map_or(none, |n| n.0);
+        let refuse = |why| LayoutError::Linker(Unmade { name, from: self.origin(o), why });
+        match synthetic::of(self.platform, name).ok_or(refuse(NoAddress::Platform))? {
+            Synthetic::DsoHandle | Synthetic::DylibHeader => Ok(0),
+            Synthetic::OtherHeader { kind } => Err(refuse(NoAddress::OtherKind { kind })),
+            Synthetic::Section { segment, section, end } => {
+                let mut run: Option<(u64, u64)> = None;
+                self.each_laid(|seg, sect, at, size| {
+                    if seg == segment && sect == section {
+                        run = Some(run.map_or((at, at + size), |(lo, hi)| (lo.min(at), hi.max(at + size))));
+                    }
+                });
+                let (lo, hi) = run.ok_or(refuse(NoAddress::NoSection))?;
+                let mut between = None;
+                self.each_laid(|seg, sect, at, size| {
+                    if between.is_none() && (seg != segment || sect != section) && size > 0 && at < hi && at + size > lo {
+                        between = Some((seg, sect));
+                    }
+                });
+                if let Some((other_segment, other_section)) = between {
+                    return Err(refuse(NoAddress::Split { other_segment, other_section }));
+                }
+                Ok(if end { hi } else { lo })
+            }
+            Synthetic::Segment { segment, end } => {
+                let got = self.regions[ri(Region::Got)];
+                let zero = self.regions[ri(Region::Zero)];
+                let (lo, hi) = match segment {
+                    b"__TEXT" => (0, got.0),
+                    b"__DATA_CONST" if got.1 > 0 => (got.0, got.0 + got.1),
+                    b"__DATA" => (self.region_at(Region::Data), zero.0 + zero.1),
+                    _ => return Err(refuse(NoAddress::NoSegment)),
+                };
+                Ok(if end { hi } else { lo })
+            }
+        }
+    }
+
+    /// Each laid input section: its segment and name, its image address and its size.
+    fn each_laid(&self, mut f: impl FnMut(&'a [u8], &'a [u8], u64, u64)) {
+        let plan = self.plan;
+        for (o, pulled) in plan.objects.iter().enumerate() {
+            for (s, sec) in pulled.object.sections.iter().enumerate() {
+                if let Some(Sec { class: Class::Lay(_), at }) = self.sec(o as u32, s as u32)
+                    && at != NOT_PLACED
+                {
+                    f(sec.segment, sec.name, at, sec.size);
+                }
+            }
+        }
+    }
+
+    /// The address a direct field of relocation `r` of section (o, s) reaches for `t`: a
+    /// linker name's, refused by its own words ([`Unmade`]); any other target with no address
+    /// refused naming the relocation and why ([`unreached`]).
+    fn reached(&self, t: Target, o: u32, s: u32, r: &Reloc, name: &'a [u8]) -> Result<u64, LayoutError<'a>> {
+        match t {
+            Target::Linker { .. } => self.address(t, o, name),
+            _ => self.address(t, o, name).map_err(|_| self.far(o, s, r, unreached(t))),
         }
     }
 
@@ -727,15 +1022,15 @@ impl<'p, 'a> Lay<'p, 'a> {
 
     /// Where a branch to `t` lands before any veneer: a stub for a word or an import, else
     /// the place (code only: a branch into data is refused).
-    fn branch_dest(&self, o: u32, r: &Reloc) -> Result<u64, LayoutError<'a>> {
+    fn branch_dest(&self, o: u32, s: u32, r: &Reloc) -> Result<u64, LayoutError<'a>> {
         let (t, name) = self.target(o, r.to, r.addend)?;
-        let far = LayoutError::OutOfRange { kind: r.kind, from: self.origin(o), offset: r.offset };
         match t {
-            Target::Rust { .. } | Target::Import { .. } => self.stub(t).ok_or(far),
+            Target::Rust { .. } | Target::Import { .. } => self.stub(t).ok_or_else(|| self.far(o, s, r, Reach::NoCell)),
             Target::Place { object, section, .. } if self.sec(object, section).map(|x| x.class) == Some(Class::Lay(Region::Text)) => {
                 self.address(t, o, name)
             }
-            _ => Err(far),
+            Target::Absolute(value) => Err(self.far(o, s, r, Reach::Absolute(value))),
+            Target::Place { .. } | Target::Common { .. } | Target::Linker { .. } => Err(self.far(o, s, r, Reach::NotCode)),
         }
     }
 
@@ -752,7 +1047,7 @@ impl<'p, 'a> Lay<'p, 'a> {
         self.each_reloc(|me, o, s, _, r| {
             if r.kind == RelocKind::Branch26 {
                 let place = me.site(o, s, r)?;
-                let dest = me.branch_dest(o, r)?;
+                let dest = me.branch_dest(o, s, r)?;
                 if branch(0x9400_0000, place, dest, 26, 0).is_none() {
                     push(&mut far, dest)?;
                 }
@@ -907,9 +1202,10 @@ impl<'p, 'a> Lay<'p, 'a> {
     /// Applies relocation `r` of section (o, s) to the bytes, or records its fixup.
     fn apply(&mut self, o: u32, s: u32, r: &Reloc) -> Result<(), LayoutError<'a>> {
         let from = self.origin(o);
-        let far = LayoutError::OutOfRange { kind: r.kind, from, offset: r.offset };
+        // The refusal naming this relocation's member, section and target (rule 19).
+        let far = |me: &Self, reach: Reach| me.far(o, s, r, reach);
         let place = self.site(o, s, r)?;
-        let sec = self.sec(o, s).ok_or(far)?;
+        let sec = self.sec(o, s).ok_or_else(|| far(self, Reach::NotLaid))?;
         let plan = self.plan;
         let obj = &plan.objects[o as usize].object;
         let section = &obj.sections[s as usize];
@@ -940,7 +1236,9 @@ impl<'p, 'a> Lay<'p, 'a> {
                     }
                 }
                 match t {
-                    Target::Place { .. } | Target::Common { .. } => {
+                    // A linker name's pointer is an image address too: `___dso_handle` is 0, the
+                    // header, rebased to the base dyld mapped the image at.
+                    Target::Place { .. } | Target::Common { .. } | Target::Linker { .. } => {
                         let v = self.address(t, o, name)?;
                         self.put64(place, v);
                         push(&mut self.fixups, Fixup { at: place, to: FixTo::Rebase { target: v } })?;
@@ -957,7 +1255,7 @@ impl<'p, 'a> Lay<'p, 'a> {
                 }
             }
             // A 32-bit absolute address cannot hold a position-independent image's addresses.
-            RelocKind::Abs32 => return Err(far),
+            RelocKind::Abs32 => return Err(far(self, Reach::Abs32)),
             RelocKind::Rel32 | RelocKind::Rel64 | RelocKind::Delta32 { .. } | RelocKind::Delta64 { .. } => {
                 let in_eh = matches!(sec.class, Class::EhFrame);
                 let (to, minus) = match self.eh_delta(o, r)? {
@@ -972,11 +1270,11 @@ impl<'p, 'a> Lay<'p, 'a> {
                         if let Target::Rust { .. } = t {
                             return Err(LayoutError::RustDirectAddress { name, from });
                         }
-                        let to = self.address(t, o, name).map_err(|_| far)?;
+                        let to = self.reached(t, o, s, r, name)?;
                         let minus = match r.kind {
                             RelocKind::Delta32 { minus } | RelocKind::Delta64 { minus } => {
                                 let (m, mname) = self.target(o, minus, 0)?;
-                                self.address(m, o, mname).map_err(|_| far)?
+                                self.reached(m, o, s, r, mname)?
                             }
                             _ => place,
                         };
@@ -986,7 +1284,7 @@ impl<'p, 'a> Lay<'p, 'a> {
                 let v = to.wrapping_sub(minus);
                 let width: u8 = match r.kind {
                     RelocKind::Rel32 | RelocKind::Delta32 { .. } => {
-                        let v = i32::try_from(v as i64).map_err(|_| far)?;
+                        let v = i32::try_from(v as i64).map_err(|_| far(self, Reach::Distance { place: minus, to }))?;
                         self.put32(place, v as u32);
                         4
                     }
@@ -1002,7 +1300,7 @@ impl<'p, 'a> Lay<'p, 'a> {
                 }
             }
             RelocKind::Branch26 | RelocKind::CondBranch19 | RelocKind::TestBranch14 => {
-                let dest = self.branch_dest(o, r)?;
+                let dest = self.branch_dest(o, s, r)?;
                 let (bits, shift) = match r.kind {
                     RelocKind::Branch26 => (26, 0),
                     RelocKind::CondBranch19 => (19, 5),
@@ -1012,11 +1310,11 @@ impl<'p, 'a> Lay<'p, 'a> {
                 let patched = match branch(i, place, dest, bits, shift) {
                     Some(p) => p,
                     None if r.kind == RelocKind::Branch26 => {
-                        let k = self.veneers.binary_search(&dest).map_err(|_| far)?;
+                        let k = self.veneers.binary_search(&dest).map_err(|_| far(self, Reach::NoCell))?;
                         let veneer = self.veneers_at + STUB_LEN * k as u64;
-                        branch(i, place, veneer, bits, shift).ok_or(far)?
+                        branch(i, place, veneer, bits, shift).ok_or_else(|| far(self, Reach::Distance { place, to: veneer }))?
                     }
-                    None => return Err(far),
+                    None => return Err(far(self, Reach::Distance { place, to: dest })),
                 };
                 self.put32(place, patched);
             }
@@ -1025,53 +1323,42 @@ impl<'p, 'a> Lay<'p, 'a> {
                 if let Target::Rust { .. } = t {
                     return Err(LayoutError::RustDirectAddress { name, from });
                 }
-                // An import's or an absolute symbol's address is not a place of this image.
-                let to = self.address(t, o, name).map_err(|_| far)?;
+                // An import's or an absolute symbol's address is not a place of this image; a
+                // linker name's is (`___dso_handle`: the header, address 0).
+                let to = self.reached(t, o, s, r, name)?;
                 let i = insn(self);
-                let patched = match r.kind {
-                    RelocKind::PageOff12 { scale_log2 } => lo12(i, to, scale_log2),
-                    _ => adrp(i, place, to),
-                };
-                self.put32(place, patched.ok_or(far)?);
+                let patched = page_field(r.kind, i, place, to).map_err(|reach| far(self, reach))?;
+                self.put32(place, patched);
             }
             RelocKind::GotPage21 | RelocKind::GotPageOff12 | RelocKind::GotRel32 | RelocKind::TlvPage21 | RelocKind::TlvPageOff12 => {
                 let (t, _) = self.target(o, r.to, r.addend)?;
                 let cell = match t {
                     Target::Rust { word } => self.words_at + 8 * u64::from(word),
-                    _ => self.cell(Cell::Plain(t)).ok_or(far)?,
+                    _ => self.cell(Cell::Plain(t)).ok_or_else(|| far(self, Reach::NoCell))?,
                 };
                 let i = insn(self);
-                match r.kind {
-                    RelocKind::GotPage21 | RelocKind::TlvPage21 => self.put32(place, adrp(i, place, cell).ok_or(far)?),
-                    RelocKind::GotPageOff12 | RelocKind::TlvPageOff12 => self.put32(place, lo12(i, cell, 3).ok_or(far)?),
-                    _ => {
-                        let v = i32::try_from(cell.wrapping_sub(place) as i64).map_err(|_| far)?;
-                        self.put32(place, v as u32);
-                    }
-                }
+                let patched = match r.kind {
+                    RelocKind::GotRel32 => i32::try_from(cell.wrapping_sub(place) as i64).map(|v| v as u32).map_err(|_| Reach::Distance { place, to: cell }),
+                    _ => page_field(r.kind, i, place, cell),
+                };
+                let patched = patched.map_err(|reach| far(self, reach))?;
+                self.put32(place, patched);
             }
             RelocKind::TlsDescPage21 | RelocKind::TlsDescLo12 | RelocKind::TlsDescAdd => {
                 let (t, _) = self.target(o, r.to, r.addend)?;
-                let pair = self.cell(Cell::TlsDesc(t)).ok_or(far)?;
+                let pair = self.cell(Cell::TlsDesc(t)).ok_or_else(|| far(self, Reach::NoCell))?;
                 let i = insn(self);
-                let patched = match r.kind {
-                    RelocKind::TlsDescPage21 => adrp(i, place, pair),
-                    RelocKind::TlsDescLo12 => lo12(i, pair, 3),
-                    _ => lo12(i, pair, 0),
-                };
-                self.put32(place, patched.ok_or(far)?);
+                let patched = page_field(r.kind, i, place, pair).map_err(|reach| far(self, reach))?;
+                self.put32(place, patched);
             }
             // The `blr` of a TLS descriptor sequence: nothing to patch (no relaxation).
             RelocKind::TlsDescCall => {}
             RelocKind::TlsIePage21 | RelocKind::TlsIeLo12 => {
                 let (t, _) = self.target(o, r.to, r.addend)?;
-                let cell = self.cell(Cell::TlsIe(t)).ok_or(far)?;
+                let cell = self.cell(Cell::TlsIe(t)).ok_or_else(|| far(self, Reach::NoCell))?;
                 let i = insn(self);
-                let patched = match r.kind {
-                    RelocKind::TlsIePage21 => adrp(i, place, cell),
-                    _ => lo12(i, cell, 3),
-                };
-                self.put32(place, patched.ok_or(far)?);
+                let patched = page_field(r.kind, i, place, cell).map_err(|reach| far(self, reach))?;
+                self.put32(place, patched);
             }
             RelocKind::TlsLeHi12 | RelocKind::TlsLeLo12 => return Err(LayoutError::TlsLocalExec { from }),
         }
@@ -1091,7 +1378,7 @@ impl<'p, 'a> Lay<'p, 'a> {
                         self.put64(at, v);
                         push(&mut self.fixups, Fixup { at, to: FixTo::Rebase { target: v } })?;
                     }
-                    Target::Common { .. } => {
+                    Target::Common { .. } | Target::Linker { .. } => {
                         let v = self.address(t, 0, b"")?;
                         self.put64(at, v);
                         push(&mut self.fixups, Fixup { at, to: FixTo::Rebase { target: v } })?;
@@ -1106,7 +1393,7 @@ impl<'p, 'a> Lay<'p, 'a> {
                         // A thread-local another library defines (or a Rust or absolute name):
                         // `TlsReloc` holds an offset in this image's template, no symbol.
                         let kind = if let Cell::TlsDesc(_) = c { RelocKind::TlsDescPage21 } else { RelocKind::TlsIePage21 };
-                        return Err(LayoutError::OutOfRange { kind, from: self.origin(0), offset: 0 });
+                        return Err(self.far_own(kind, b"(a thread-local's GOT entry)", Reach::ThreadLocalOutside));
                     };
                     let offset = self.address(t, object, b"")?.wrapping_sub(self.tls_start);
                     let tls = match c {
@@ -1255,14 +1542,18 @@ pub fn lay<'a>(plan: &Plan<'a>, inputs: &[Input<'a>], layout: Layout, alloc: All
             // `collect` made a cell for every import a stub loads.
             _ => me.cell(Cell::Plain(t)).ok_or(LayoutError::Unplaced { name: b"", from: me.origin(0) })?,
         };
-        me.write_x16(stub_at, X16_LDR, cell, 3).ok_or(LayoutError::OutOfRange { kind: RelocKind::Page21, from: me.origin(0), offset: 0 })?;
+        if me.write_x16(stub_at, X16_LDR, cell, 3).is_none() {
+            return Err(me.far_own(RelocKind::Page21, b"(a stub)", Reach::Distance { place: stub_at, to: cell }));
+        }
     }
     let mut k = 0;
     while k < me.veneers.len() {
         let dest = me.veneers[k];
         let veneer_at = me.veneers_at + STUB_LEN * k as u64;
         k += 1;
-        me.write_x16(veneer_at, X16_ADD, dest, 0).ok_or(LayoutError::OutOfRange { kind: RelocKind::Page21, from: me.origin(0), offset: 0 })?;
+        if me.write_x16(veneer_at, X16_ADD, dest, 0).is_none() {
+            return Err(me.far_own(RelocKind::Page21, b"(a veneer)", Reach::Distance { place: veneer_at, to: dest }));
+        }
     }
     // The descriptor (BNL2, descriptor.rs): image-relative numbers, so it needs no fixup.
     let descriptor = Descriptor {
@@ -1367,7 +1658,9 @@ pub fn lay<'a>(plan: &Plan<'a>, inputs: &[Input<'a>], layout: Layout, alloc: All
                 }
             }
             Resolution::Common { .. } => Target::Common { entry: entry as u32, offset: 0 },
-            Resolution::Rust { .. } | Resolution::Import { .. } => continue,
+            // A linker name is the image's own, never an export (lld makes `___dso_handle`
+            // private extern).
+            Resolution::Rust { .. } | Resolution::Import { .. } | Resolution::Linker => continue,
         };
         let o = if let Target::Place { object, .. } = t { object } else { 0 };
         let at = me.address(t, o, *name)?;

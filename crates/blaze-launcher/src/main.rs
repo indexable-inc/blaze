@@ -223,6 +223,11 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         (Some(path), _) => Some(path),
     };
     let explore_auto = std::env::var_os("BLAZE_LAUNCH_EXPLORE").is_some_and(|v| v == "1");
+    if let Some(raw_stride) = std::env::var_os("BLAZE_ALLOC_SAMPLE_BYTES") {
+        if let Some(stride) = raw_stride.to_str().and_then(|s| s.parse::<u64>().ok()) {
+            blaze_launch_rt::telemetry::set_alloc_sample_bytes(stride);
+        }
+    }
     // SAFETY: one thread runs (nothing has been started yet), so nothing reads the environment
     // while it changes.
     unsafe {
@@ -233,6 +238,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         std::env::remove_var(grants::VAR);
         std::env::remove_var(telemetry::VAR);
         std::env::remove_var("BLAZE_LAUNCH_EXPLORE");
+        std::env::remove_var("BLAZE_ALLOC_SAMPLE_BYTES");
     }
     let telemetry_on = match telemetry_path {
         Some(path) => {

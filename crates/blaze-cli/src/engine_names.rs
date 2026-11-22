@@ -1542,12 +1542,12 @@ impl Job<'_> {
             Resolution::Made { resolved, ok, unresolved, oracle } => (resolved, ok, unresolved, oracle),
             Resolution::Need(keys) => return need(&keys),
         };
-        finish(task, resolved, ok, unresolved, oracle, &order, script_input, outlined, alloc, local, self.kept)
+        finish(task, input.name, resolved, ok, unresolved, oracle, &order, script_input, outlined, alloc, local, self.kept)
     }
 }
 
 #[expect(clippy::too_many_arguments, reason = "one resolved crate and the inputs it was handed")]
-fn finish<'a>(task: &EngineTask, resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate>, deps: &[Dependency<'_>], script: Option<Input>, outlined: &[Outlined<'_>], alloc: SharedAlloc<'a>, scratch: blaze_own::Alloc<'_>, heap: SharedAlloc<'static>) -> Result<WorkerAnswer<'a>, WorkerError> {
+fn finish<'a>(task: &EngineTask, krate: &str, resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate>, deps: &[Dependency<'_>], script: Option<Input>, outlined: &[Outlined<'_>], alloc: SharedAlloc<'a>, scratch: blaze_own::Alloc<'_>, heap: SharedAlloc<'static>) -> Result<WorkerAnswer<'a>, WorkerError> {
     let name = task.planned.name;
     let mut record = work::Record::new_in(name, heap);
     record.out = resolved.out;
@@ -1556,11 +1556,19 @@ fn finish<'a>(task: &EngineTask, resolved: Resolved, ok: bool, unresolved: u32, 
     let count = files.len() + absent.len() + data.len() + deps.len() + usize::from(script.is_some());
     record.reads.reserve(count);
     let mut reads = SVec::with_capacity_in(count, alloc);
+    // A file read the plan did not hand: named by the crate and the path (rule 19), the strings
+    // made only on that stop.
+    let unseen = |read: Name, path: &str| EngineCheckError::UnseenFile {
+        task: name,
+        read,
+        krate: blaze_own::String::from_str_in(krate, heap.clone()),
+        path: blaze_own::String::from_str_in(path, heap.clone()),
+    };
     for path in files {
         let file = Name::file(path.as_bytes());
         let surface = Name::new(Kind::Surface, file.subject);
         let digest = outline_of(outlined, file, path).and_then(crate::engine_tasks::surface_of)
-            .ok_or(EngineCheckError::Unseen { task: name, read: surface })?;
+            .ok_or_else(|| unseen(surface, path))?;
         record.reads.push((surface, digest));
         reads.push((CellId { of: file, cell: crate::engine_tasks::SURFACE }, digest));
     }
@@ -1573,7 +1581,7 @@ fn finish<'a>(task: &EngineTask, resolved: Resolved, ok: bool, unresolved: u32, 
     }
     for (path, _) in data {
         let file = Name::file(path.as_bytes());
-        let out = outline_of(outlined, file, path).ok_or(EngineCheckError::Unseen { task: name, read: file })?.out;
+        let out = outline_of(outlined, file, path).ok_or_else(|| unseen(file, path))?.out;
         record.reads.push((file, out));
         reads.push((CellId { of: file, cell: WHOLE }, out));
     }

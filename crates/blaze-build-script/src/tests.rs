@@ -639,7 +639,7 @@ fn the_compiler_answers_its_version_and_refuses_the_rest() {
     let ask = |args: &[&str]| -> Result<std::string::String, crate::probe_ask::Refused> {
         Ok(match crate::probe_ask::classify(args, alloc)? {
             Ask::Version { verbose } => std::format!("version verbose={verbose}"),
-            Ask::Print { what } => std::format!("print {what}"),
+            Ask::Print { what, .. } => std::format!("print {what}"),
             Ask::Compile(_) => std::format!("compile"),
         })
     };

@@ -519,6 +519,59 @@ fn git_follows_a_linked_worktree_to_its_common_folder() {
     assert_eq!(ask(&tree, "wt", &["rev-parse", "HEAD"]).0, Err(git::Refused::Outside(git::GitFile::Gitdir)));
 }
 
+/// turso_core's build.rs (2026-11-21) on a copy with no `.git`: it asks `rev-parse --git-dir`,
+/// then `rev-parse --git-common-dir`, `rev-parse HEAD` and `show -s --format=%ct HEAD`, and
+/// treats a failure as "no git" (its comment: "Silently ignored if git unavailable"); blaze
+/// stopped it with `CannotAnswerYet`. The real case, reduced: from the member folder `core` of a
+/// tree with no `.git`, every question gets git's own answer, exit 128 and "fatal: not a git
+/// repository", and the asking read `core/.git` and `.git` (each absent: a read of the record,
+/// so a repository made later changes the answer). Twin: the same tree with a `.git` answers
+/// `../.git` from `core`, `.git` from the top (git's own form there), and the commit. Control:
+/// `--version` needs no repository and is answered in both. Prints each answer.
+#[test]
+fn no_repository_is_gits_own_answer() {
+    let full = |tree: &Tree, folder: &str, args: &[&str]| {
+        let mut reads = Vec::new();
+        let answered = git::answer(git::question(args), folder, tree.vcs(), &mut GitView::new(tree, &mut reads, Alloc::global()), Alloc::global());
+        let answer = answered.unwrap_or_else(|why| panic!("git {args:?} in {folder:?}: {why}"));
+        (answer.code, answer.stdout.as_str().to_owned(), answer.stderr, reads)
+    };
+    let (_, bare) = checkout("git-none", &[("core/build.rs", "fn main() {}\n")]);
+    for args in [&["rev-parse", "--git-dir"][..], &["rev-parse", "--git-common-dir"], &["rev-parse", "HEAD"], &["show", "-s", "--format=%ct", "HEAD"]] {
+        let (code, stdout, stderr, reads) = full(&bare, "core", args);
+        println!("no repository, git {args:?}: {code} {stderr:?}");
+        assert_eq!((code, stdout.as_str(), stderr), (128, "", git::NOT_A_REPOSITORY));
+        let subjects: Vec<&str> = reads.iter().map(|read| read.subject.as_str()).collect();
+        for looked in ["core/.git", ".git"] {
+            assert!(subjects.contains(&format!("file:{looked}").as_str()), "{looked} is not among the reads {subjects:?}");
+        }
+    }
+
+    let (_, repo) = checkout(
+        "git-some",
+        &[("core/build.rs", "fn main() {}\n"), (".git/HEAD", "ref: refs/heads/main\n"), (".git/refs/heads/main", &format!("{COMMIT_A}\n"))],
+    );
+    assert_eq!(ask(&repo, "core", &["rev-parse", "--git-dir"]).0, Ok((0, "../.git\n".to_owned())));
+    assert_eq!(ask(&repo, "", &["rev-parse", "--git-dir"]).0, Ok((0, ".git\n".to_owned())));
+    assert_eq!(ask(&repo, "core", &["rev-parse", "--git-common-dir"]).0, Ok((0, "../.git\n".to_owned())));
+    assert_eq!(ask(&repo, "core", &["rev-parse", "HEAD"]).0, Ok((0, format!("{COMMIT_A}\n"))));
+    println!("a repository, git rev-parse --git-dir in core: ../.git");
+
+    for tree in [&bare, &repo] {
+        assert_eq!(ask(tree, "core", &["--version"]).0, Ok((0, format!("{}\n", git::VERSION))));
+    }
+    // `--format=` is `tformat:`, a newline after the commit; `--pretty=format:` has none.
+    let terminated = |args: &[&str]| match git::question(args) {
+        git::Question::Log(Ok(format)) => format.terminated(),
+        other => panic!("{args:?} read as {other:?}"),
+    };
+    assert!(terminated(&["show", "-s", "--format=%ct", "HEAD"]));
+    assert!(terminated(&["log", "-1", "--format=%H"]));
+    assert!(!terminated(&["log", "-1", "--pretty=format:%H"]));
+    assert_eq!(git::relative_to("a/b", "a/c/.git", Alloc::global()).as_str(), "../c/.git");
+    assert_eq!(git::relative_to(".git", ".git", Alloc::global()).as_str(), ".");
+}
+
 #[test]
 fn git_refuses_by_name_what_it_cannot_answer_exactly() {
     let (_, unborn) = checkout("git-refusals", &[(".git/HEAD", "ref: refs/heads/unborn\n")]);
@@ -533,8 +586,9 @@ fn git_refuses_by_name_what_it_cannot_answer_exactly() {
     assert_eq!(ask(&unborn, "", &["describe", "--always", "--tags"]).0, Err(git::Refused::NoCommit));
     assert_eq!(ask(&unborn, "", &["log", "-1", "--pretty=format:%cI"]).0, Err(git::Refused::NoCommit));
     assert_eq!(ask(&unborn, "", &["log", "-1", "--pretty=format:%an"]).0, Err(git::Refused::Placeholder(*b"an")));
-    assert_eq!(ask(&tree(0, 0), "", &["rev-parse", "HEAD"]).0, Err(git::Refused::NoRepository));
-    assert_eq!(ask(&tree(0, 0), "", &["status", "--porcelain"]).0, Err(git::Refused::NoRepository));
+    // No `.git` served: git's own failure, an answer (no_repository_is_gits_own_answer).
+    assert_eq!(ask(&tree(0, 0), "", &["rev-parse", "HEAD"]).0, Ok((128, String::new())));
+    assert_eq!(ask(&tree(0, 0), "", &["status", "--porcelain"]).0, Ok((128, String::new())));
     let words = |command: &str| git::shell_git(command, Alloc::global()).map(|words| words.iter().map(|w| w.as_str().to_owned()).collect::<Vec<_>>());
     assert_eq!(words("git rev-parse --abbrev-ref --symbolic-full-name HEAD").expect("plain"), ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "HEAD"]);
     // smolgen's quoted forms, read as `sh` reads them.

@@ -19,7 +19,8 @@
 //! - A common definition does not enter the lazy table (ranlib(1) leaves commons out of the
 //!   table of contents unless `-c`; lld's default `--no-fortran-common`).
 //! - An undefined name of a pulled member resolves to a pulled definition, else a Rust export (a
-//!   word, NATIVE.md 3.4), else an import (weak when every reference is weak). A root nothing
+//!   word, NATIVE.md 3.4), else a name the linker defines (synthetic.rs: `___dso_handle`, the
+//!   header names, ld64's boundary names), else an import (weak when every reference is weak). A root nothing
 //!   defines and no member references is not an import and is not in [`Plan::names`]: Rust binds
 //!   it at run through the image handle.
 //! - ELF COMDAT groups: the first group of a signature, in pull order, wins; the sections of the
@@ -73,6 +74,9 @@ pub struct Wanted<'a> {
 pub struct Pulled<'a> {
     pub input: u32,
     pub member: u32,
+    /// The member's name in its archive, or a plain object's file name: what a refusal about
+    /// one of its relocations names (layout.rs [`crate::layout::Far`]).
+    pub name: &'a [u8],
     pub object: Object<'a>,
 }
 
@@ -84,6 +88,10 @@ pub enum Resolution {
     Common { object: u32, symbol: u32, size: u64, align_log2: u8 },
     Rust { word: u32 },
     Import { index: u32, weak: bool },
+    /// A name the linker defines (synthetic.rs: `___dso_handle`, a header, a boundary): no
+    /// pulled member defines it and no Rust word is it; the layout gives its address from the
+    /// name (layout.rs `Target::Linker`).
+    Linker,
 }
 
 /// The resolved link: what the layout (W3) and the record's builder (W7) take.
@@ -227,6 +235,8 @@ const UNKNOWN: NameState<'static> = NameState { def: None, member_ref: false, st
 struct Slot<'a> {
     input: u32,
     member: u32,
+    /// [`Pulled::name`].
+    name: &'a [u8],
     object: Option<Object<'a>>,
 }
 
@@ -288,7 +298,7 @@ impl<'i, 'a> Resolver<'i, 'a> {
                         member: input.from.file.as_bytes(),
                         why,
                     })?;
-                    let slot = self.add_slot(Slot { input: input_index, member: u32::MAX, object: Some(object) }, too_many)?;
+                    let slot = self.add_slot(Slot { input: input_index, member: u32::MAX, name: input.from.file.as_bytes(), object: Some(object) }, too_many)?;
                     eager.try_push(slot).map_err(|_| ResolveError::Alloc)?;
                 }
                 InputKind::Archive { whole } => {
@@ -314,7 +324,7 @@ impl<'i, 'a> Resolver<'i, 'a> {
                                 }
                             }
                         }
-                        self.add_slot(Slot { input: input_index, member: member_index, object: Some(object) }, too_many)?;
+                        self.add_slot(Slot { input: input_index, member: member_index, name: member.name, object: Some(object) }, too_many)?;
                     }
                 }
             }
@@ -354,11 +364,11 @@ impl<'i, 'a> Resolver<'i, 'a> {
         let Some(object) = entry.object.take() else {
             return Ok(());
         };
-        let (input, member) = (entry.input, entry.member);
+        let (input, member, name) = (entry.input, entry.member, entry.name);
         let from = inputs[input as usize].from;
         let too_many = ResolveError::Ar { from, why: ArError::TooMany { most: u32::MAX } };
         let index = u32::try_from(objects.len()).map_err(|_| too_many)?;
-        objects.try_push(Pulled { input, member, object }).map_err(|_| ResolveError::Alloc)?;
+        objects.try_push(Pulled { input, member, name, object }).map_err(|_| ResolveError::Alloc)?;
         let object = &objects[index as usize].object;
 
         here.clear();
@@ -445,6 +455,9 @@ impl<'i, 'a> Resolver<'i, 'a> {
                     words.try_push(name).map_err(|_| ResolveError::Alloc)?;
                     Resolution::Rust { word: 0 }
                 }
+                // No member defines it: the linker does, when it is one of its names (lld adds a
+                // synthetic symbol only where the name is still undefined).
+                None if crate::synthetic::of(self.platform, name).is_some() => Resolution::Linker,
                 None => {
                     imports.try_push(name).map_err(|_| ResolveError::Alloc)?;
                     Resolution::Import { index: 0, weak: !state.strong_ref }
@@ -466,7 +479,7 @@ impl<'i, 'a> Resolver<'i, 'a> {
                     *index = next_import;
                     next_import += 1;
                 }
-                Resolution::Defined { .. } | Resolution::Common { .. } => {}
+                Resolution::Defined { .. } | Resolution::Common { .. } | Resolution::Linker => {}
             }
         }
         Ok(Plan { objects: self.objects, names, words, imports, dropped: self.dropped, libraries })

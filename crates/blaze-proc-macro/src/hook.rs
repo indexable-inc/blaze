@@ -430,7 +430,7 @@ impl<'r> ProcMacros<'r> {
         let mut mark = parts.start();
         let base = base_key(&module.wasm_sha256, export, edition, call);
         mark.lap(Part::Key);
-        let found = self.slot(package).and_then(|slot| Ok((slot.results.find(self.store, &base, package, &slot.verdicts, edition, alloc)?, slot)));
+        let found = self.slot(package).and_then(|slot| Ok((slot.results.find(self.store, &base, package, &slot.verdicts, call.file.ok(), edition, alloc)?, slot)));
         mark.lap(Part::Find);
         let slot = match found {
             Ok((Some(produced), _)) => return Ok(produced),

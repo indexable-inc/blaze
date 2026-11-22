@@ -226,6 +226,13 @@ pub struct ProcCall<'a> {
     pub input: &'a TokenStream<'a>,
     /// An attribute's arguments.
     pub attr_args: Option<&'a TokenStream<'a>>,
+    /// The file holding the call, as `file!()` shows it there ([`PlaceOf::File`], D96: a
+    /// member's workspace-relative path, a dependency's `<name>-<version>/<path>`), or why the
+    /// host does not answer it. What `Span::file` answers for a token written in that file
+    /// (blaze-proc-macro server.rs). Asked of the host before the run, but no read until the
+    /// macro asks it: the run records it then, and a kept answer that read it is taken for a
+    /// call only where it is answered the same (blaze-proc-macro table.rs).
+    pub file: Result<&'a str, HostError>,
 }
 
 /// What a proc macro gave back: its tokens, each one's origin, and the outside reads its run

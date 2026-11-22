@@ -78,7 +78,10 @@ const MAGIC: [u8; 4] = *b"BZIT";
 /// 12: the attribute value table ([`values`]: each `link_name`/`export_name` written as a macro
 /// call, as the solve expanded it; header fields 27 and 28, both 0 for a crate with none); a
 /// version-11 record is refused the same way.
-const VERSION: u32 = 12;
+/// 13: an impl row per REFUSED derive ([`each_refused_impl_row`], mark [`REFUSED_CALL`]: D193
+/// point 5): the gap its impls would have filled is a row a question finds, never an absence;
+/// a version-12 record is refused the same way.
+const VERSION: u32 = 13;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
 const KEYS_AT: usize = 160;
@@ -169,6 +172,8 @@ const BARE: u8 = 1 << 1;
 const HEADER_UNREAD: u8 = 1 << 2;
 /// The trait is not written as a plain path (`for<'a> Tr<'a>`, a macro call).
 const TRAIT_UNREAD: u8 = 1 << 3;
+/// The row of a refused derive call, not of an impl item ([`ImplRow::refused_call`]).
+const REFUSED_CALL: u8 = 1 << 4;
 
 // Module flags.
 const LISTED: u32 = 1;
@@ -691,6 +696,9 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
     for i in tables.impls.iter() {
         impls.push(impl_out(heads, names.key, names.edition, i, alloc)?);
     }
+    // Each refused derive's gap (D193 point 5): a row, so the questions it would have answered
+    // find it and answer "unknown", never "no impl".
+    each_refused_impl_row(names, &mut |row| impls.push(refused_impl_out(row)));
     impls.sort_by(|a, b| (a.trait_path.as_bytes(), a.module, a.key).cmp(&(b.trait_path.as_bytes(), b.module, b.key)));
     #[cfg(test)]
     if plant::is(plant::Plant::DropImpl) && !impls.is_empty() {
@@ -1058,6 +1066,63 @@ fn impl_out<'n, 'x: 'n, H: buckets::HeadNames>(heads: &H, krate: CrateItemKey, e
     Ok(ImplOut { key: i.key, module: i.module, trait_path, self_path: self_path.unwrap_or(""), flags: h.flags.bits(), head, marks, filing, trait_root, self_root })
 }
 
+/// D193 point 5, the one home of a refused call's impl gap: each derive call of `names` that
+/// the solve stored REFUSED, as the impl row of what it would have written
+/// ([`ImplRow::refused_call`]: keyed by the call, its trait unread, its self type the item the
+/// derive is on, read in the call's module), given to `each` in no order (a caller sorts). What
+/// the items record writes ([`encode_with`]) and what a reader of the solve's values files
+/// (blaze-ladder front2 `Buckets::new`), so the two file one gap (rule 30).
+///
+/// Only a derive: its self type is the item it is on. An attribute or function-like call
+/// refused in item position may have written impls too, of no self type its call names; that
+/// is a stated limit (such a call's items are already unknown to a path looked up behind it:
+/// [`crate::resolve::Expansion::refused`]).
+pub fn each_refused_impl_row<'n, 'x: 'n>(names: &'n CrateNames<'x>, each: &mut dyn FnMut(ImplRow<'n>)) {
+    for (call, expansion) in names.expansions.iter() {
+        if expansion.refused.is_none() {
+            continue;
+        }
+        // A refused call the lowering does not know has no shape to read: not a derive.
+        let Some(src) = names.tables.calls.get(call) else { continue };
+        if src.kind != CallShape::Derive || src.owner.is_some() {
+            continue;
+        }
+        let head = if src.on.is_some() { SelfHead::Path } else { SelfHead::Other };
+        each(ImplRow {
+            key: *call,
+            module: src.module,
+            trait_path: None,
+            has_trait: true,
+            bare: false,
+            flags: ImplFlags::NONE,
+            head,
+            self_path: src.on,
+            header_unread: false,
+            trait_unread: true,
+            refused_call: true,
+            trait_root: None,
+            self_root: None,
+        });
+    }
+}
+
+/// The items record's row of a refused derive's gap ([`each_refused_impl_row`]): unfiled by
+/// the bucket index ([`buckets::NotFiled::RefusedCall`]), so a reader files it by its row.
+fn refused_impl_out<'n>(row: ImplRow<'n>) -> ImplOut<'n> {
+    ImplOut {
+        key: row.key,
+        module: row.module,
+        trait_path: "",
+        self_path: row.self_path.unwrap_or(""),
+        flags: row.flags.bits(),
+        head: row.head,
+        marks: HAS_TRAIT | TRAIT_UNREAD | REFUSED_CALL,
+        filing: buckets::Filing::Not(buckets::NotFiled::RefusedCall),
+        trait_root: None,
+        self_root: None,
+    }
+}
+
 /// Where the bucket index files the impl `i` of crate `krate`, its header's paths resolved by
 /// `heads`: the one filing [`encode_with`] writes (D189 step 4's impl-table differential reads
 /// it for a body's impls, `crate::body_scope::impl_table`).
@@ -1285,7 +1350,7 @@ pub struct MemberRow<'a> {
 /// u32 (the self type's head path without arguments, for `Path` and `Param`); impl flags u32
 /// (`ImplFlags`: negative, unsafe, default, const); head u8 and arity u16 ([`SelfHead`]); marks
 /// u8 (has a trait; bare: the trait has no arguments, `Homes::bare`; header unread; trait not a
-/// plain path); roots u32 ([`ROOT_TRAIT`], [`ROOT_SELF`]); trait root key 32 and self root key 32
+/// plain path; a refused derive's row, [`ImplRow::refused_call`]); roots u32 ([`ROOT_TRAIT`], [`ROOT_SELF`]); trait root key 32 and self root key 32
 /// (zero unless its bit is set: token-mark-2 R2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ImplRow<'a> {
@@ -1306,6 +1371,16 @@ pub struct ImplRow<'a> {
     pub header_unread: bool,
     /// A trait impl whose trait is not a plain path.
     pub trait_unread: bool,
+    /// THE NAMED GAP OF A REFUSED DERIVE (D193 point 5: no answer is `None` across a crate
+    /// boundary): `key` is the derive call's, which no item has, and the row stands for every
+    /// impl the derive would have written, so a trait question at its self type (`self_path`,
+    /// the item the derive is on; [`SelfHead::Other`] when that item has no name) finds it,
+    /// and its header, which cannot be made, is the question's gap that names the refusal
+    /// (blaze-scope's names record `FailedRow`), never "no impl". Its trait is unread
+    /// (`trait_unread`): a derive's path names a macro, and a derive may write impls of any
+    /// trait (`derive(clap::Parser)` writes `Parser`, `CommandFactory`, `FromArgMatches` and
+    /// `Args`; `derive(PartialEq)` writes `StructuralPartialEq` too).
+    pub refused_call: bool,
     /// The crate `trait_path`'s first segment `crate` names when an expansion wrote it for
     /// another crate's `$crate` (token-mark-2 R2); `None`: as the text reads in this crate.
     pub trait_root: Option<CrateItemKey>,
@@ -1852,6 +1927,7 @@ impl<'a> ItemsRecord<'a> {
             self_path: (!self_path.is_empty()).then_some(self_path),
             header_unread: marks & HEADER_UNREAD != 0,
             trait_unread: marks & TRAIT_UNREAD != 0,
+            refused_call: marks & REFUSED_CALL != 0,
             trait_root: root(ROOT_TRAIT, 64),
             self_root: root(ROOT_SELF, 96),
         }))

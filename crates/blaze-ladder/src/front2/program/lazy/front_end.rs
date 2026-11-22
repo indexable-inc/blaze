@@ -57,7 +57,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     fn in_world<T>(&self, i: usize, f: impl FnOnce(&BodyWorld<'_, 'n, S>) -> T) -> Result<T, ResolveError> {
         let Some(live) = self.live_of(i) else {
             let key = self.rows.key[i];
-            return crate::front2::world_items::ctor_world(self.front.names, &self.front.keys, &self.front.index, &self.store, self.buckets.as_ref(), key, f);
+            return crate::front2::world_items::ctor_world(self.front.names, &self.front.keys, &self.front.index, &self.store, self.buckets.as_ref(), key, &self.asked, &self.asked_gaps, f);
         };
         let body = &live.made;
         let view = body.lowered.view();

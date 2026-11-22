@@ -5,7 +5,7 @@ use blaze_own::Alloc;
 use crate::{
     builtin,
     call::Call,
-    cx::{ExpandCx, ProcCall, ProcDiagnostic},
+    cx::{ExpandCx, HostAsk, HostError, HostWhy, Place, PlaceOf, ProcCall, ProcDiagnostic},
     def::{BuiltinAttr, LocalInner, MacroDefinition, MacroKind, ProcKind},
     derive,
     error::{ExpandError, Stream, Unbuilt},
@@ -102,7 +102,14 @@ fn proc_macro(
     out: &mut Out<'_, '_>,
     cx: &impl ExpandCx,
 ) -> Result<(), ExpandError> {
-    let call = ProcCall { kind, input: out.call.input(), attr_args: out.call.attr_args() };
+    // The call's file, for `Span::file` (D96: the same answer `file!()` gets here); a read of
+    // the run only if the macro asks it.
+    let file = match cx.place(PlaceOf::File) {
+        Ok(Place::Text(file)) => Ok(file),
+        Ok(Place::Number(_)) => Err(HostError { ask: HostAsk::Place, why: HostWhy::Unreadable }),
+        Err(error) => Err(error),
+    };
+    let call = ProcCall { kind, input: out.call.input(), attr_args: out.call.attr_args(), file };
     let produced = cx.run_proc_macro(out.def, call, out.alloc)?;
     let (tokens, origins) = (produced.tokens.len(), produced.origins.len());
     if tokens != origins {

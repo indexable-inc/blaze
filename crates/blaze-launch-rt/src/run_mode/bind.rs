@@ -186,62 +186,15 @@ impl<B: Bind> Bind for ObservedBind<B> {
     }
 }
 
-/// Byte-budget sampling rate for allocation telemetry (`0` = trace every allocation for exact
-/// live-heap tracking; `N > 0` = sample roughly every `N` allocated bytes like Go's
-/// `MemProfileRate` / YourKit allocation sampling).
-static ALLOC_SAMPLE_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Sets the allocation telemetry byte-sampling interval (`0` records every allocation).
+/// Sets the allocation telemetry byte-sampling interval (`0` records every allocation;
+/// `N > 0` samples roughly every `N` allocated bytes like Go's `MemProfileRate`).
 pub fn set_alloc_sample_bytes(bytes: u64) {
-    ALLOC_SAMPLE_BYTES.store(bytes, core::sync::atomic::Ordering::Relaxed);
+    crate::telemetry::set_alloc_sample_bytes(bytes);
 }
 
-#[inline]
-fn should_sample_alloc(bytes: usize) -> bool {
-    let rate = ALLOC_SAMPLE_BYTES.load(core::sync::atomic::Ordering::Relaxed);
-    if rate == 0 {
-        return true;
-    }
-    static COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    let prev = COUNTER.fetch_add(bytes as u64, core::sync::atomic::Ordering::Relaxed);
-    let next = prev.saturating_add(bytes as u64);
-    (prev / rate) != (next / rate)
-}
-
-/// Captures up to 3 return addresses by walking the current thread's frame-pointer chain
-/// (bounds-checked against `sys::stack()`, strictly increasing `fp`, zero allocations), so
-/// allocation events name not just `std::alloc::System::alloc` / `RawVec::grow` but the
-/// actual user call stack that triggered the allocation (YourKit-style attribution).
 #[inline(always)]
 fn caller_frames() -> [u64; 3] {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let mut out = [0u64; 3];
-        let Ok((low, high)) = crate::sys::stack() else {
-            return out;
-        };
-        let mut fp: usize;
-        // SAFETY: reads frame pointer register `x29`.
-        unsafe { core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack)) };
-        for slot in &mut out {
-            if fp == 0 || fp % 8 != 0 || fp < low || fp.saturating_add(16) > high {
-                break;
-            }
-            // SAFETY: `fp..fp + 16` is 8-aligned inside this thread's live stack.
-            let prev_fp = unsafe { (fp as *const usize).read() };
-            let lr = unsafe { ((fp + 8) as *const u64).read() };
-            *slot = lr;
-            if prev_fp <= fp {
-                break;
-            }
-            fp = prev_fp;
-        }
-        out
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        [0u64; 3]
-    }
+    crate::telemetry::capture_caller_frames(1)
 }
 
 /// Reads the immediate caller's return address from the current frame record.
@@ -251,9 +204,10 @@ fn caller_return_addr() -> u64 {
 }
 
 extern "C" fn traced_malloc(size: usize) -> *mut c_void {
+    let guard = crate::telemetry::try_enter_alloc_hook();
     // SAFETY: standard libc `malloc`.
     let ptr = unsafe { libc::malloc(size) };
-    if should_sample_alloc(size) {
+    if guard.is_some() && crate::telemetry::should_sample_alloc(size) {
         let frames = caller_frames();
         let _ = emit(Event::alloc(
             current_thread_id(),
@@ -268,10 +222,11 @@ extern "C" fn traced_malloc(size: usize) -> *mut c_void {
 }
 
 extern "C" fn traced_calloc(count: usize, size: usize) -> *mut c_void {
+    let guard = crate::telemetry::try_enter_alloc_hook();
     // SAFETY: standard libc `calloc`.
     let ptr = unsafe { libc::calloc(count, size) };
     let total = count.saturating_mul(size);
-    if should_sample_alloc(total) {
+    if guard.is_some() && crate::telemetry::should_sample_alloc(total) {
         let frames = caller_frames();
         let _ = emit(Event::alloc(
             current_thread_id(),
@@ -286,9 +241,10 @@ extern "C" fn traced_calloc(count: usize, size: usize) -> *mut c_void {
 }
 
 unsafe extern "C" fn traced_realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
+    let guard = crate::telemetry::try_enter_alloc_hook();
     // SAFETY: forwarded from caller with libc `realloc` contract.
     let out = unsafe { libc::realloc(ptr, size) };
-    if should_sample_alloc(size) {
+    if guard.is_some() && crate::telemetry::should_sample_alloc(size) {
         let frames = caller_frames();
         let _ = emit(Event::alloc(
             current_thread_id(),
@@ -307,9 +263,10 @@ unsafe extern "C" fn traced_posix_memalign(
     alignment: usize,
     size: usize,
 ) -> c_int {
+    let guard = crate::telemetry::try_enter_alloc_hook();
     // SAFETY: forwarded from caller with POSIX `posix_memalign` contract.
     let ret = unsafe { libc::posix_memalign(memptr, alignment, size) };
-    if ret == 0 && !memptr.is_null() && should_sample_alloc(size) {
+    if guard.is_some() && ret == 0 && !memptr.is_null() && crate::telemetry::should_sample_alloc(size) {
         // SAFETY: `ret == 0` guarantees `*memptr` was written by `posix_memalign`.
         let ptr = unsafe { *memptr };
         let frames = caller_frames();
@@ -326,7 +283,8 @@ unsafe extern "C" fn traced_posix_memalign(
 }
 
 unsafe extern "C" fn traced_free(ptr: *mut c_void) {
-    if ALLOC_SAMPLE_BYTES.load(core::sync::atomic::Ordering::Relaxed) == 0 && !ptr.is_null() {
+    let guard = crate::telemetry::try_enter_alloc_hook();
+    if guard.is_some() && crate::telemetry::alloc_sample_bytes() == 0 && !ptr.is_null() {
         let frames = caller_frames();
         let _ = emit(Event::alloc(
             current_thread_id(),

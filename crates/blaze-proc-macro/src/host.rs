@@ -949,6 +949,14 @@ impl Runtime {
             let answer = read.digest.map_or(ReadAnswer::Absent, ReadAnswer::Digest);
             reads.push(ReadKind::ProcMacro, &read.subject, answer).map_err(|e| failed(format!("its reads do not fit: {e:?}")))?;
         }
+        // `Span::file` answered (server.rs, only where the call's file is known): the call's
+        // file is a read of the run, last, so a kept answer is taken only for a call whose
+        // file is shown the same (table.rs `list_holds`). Moving the call to another file
+        // runs it again; an edit elsewhere in its file does not.
+        if let (true, Ok(file)) = (host.server.asked_file, call.file) {
+            let answer = ReadAnswer::Digest(crate::sandbox::call_file_digest(file));
+            reads.push(ReadKind::ProcMacro, crate::sandbox::CALL_FILE, answer).map_err(|e| failed(format!("its reads do not fit: {e:?}")))?;
+        }
         mark.lap(Part::Reads);
         let (handle, panicked) = match &outcome {
             Outcome::Tokens(handle) => (*handle, None),
@@ -975,7 +983,9 @@ fn stopped_by(host: &mut Host, error: &wasmtime::Error, out_of_fuel: bool) -> Re
     if let Some(server_error) = host.server_error.take() {
         return Err(match server_error {
             ServerError::Limit(limit) => CallError::Limit { limit, why: server_error.to_string() },
-            ServerError::Position { .. } => CallError::Refused(server_error.to_string()),
+            ServerError::Position { .. } | ServerError::FileUnknown { .. } | ServerError::FileOfSite | ServerError::FileOfMadeToken => {
+                CallError::Refused(server_error.to_string())
+            }
             _ => CallError::Failed(format!("its request was not the bridge's: {server_error}")),
         });
     }

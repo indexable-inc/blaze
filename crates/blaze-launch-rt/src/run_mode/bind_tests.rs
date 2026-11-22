@@ -68,6 +68,8 @@ fn launcher_own_intercepts_threads_and_unwind_without_touching_ordinary_symbols(
 #[test]
 fn observed_bind_traces_malloc_and_free_without_user_instrumentation() {
     let _guard = crate::telemetry::TEST_GLOBAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev_stride = crate::telemetry::alloc_sample_bytes();
+    crate::telemetry::set_alloc_sample_bytes(0);
 
     let cap = 64u32;
     let bytes = Telemetry::bytes_for(cap).expect("bytes");
@@ -101,6 +103,7 @@ fn observed_bind_traces_malloc_and_free_without_user_instrumentation() {
     assert_eq!(events[1].slot_or_op, AllocOp::Free as u32);
     assert_eq!(events[1].a, ptr as usize as u64);
 
+    crate::telemetry::set_alloc_sample_bytes(prev_stride);
     clear_global();
     unsafe { std::alloc::dealloc(raw, layout) };
 }

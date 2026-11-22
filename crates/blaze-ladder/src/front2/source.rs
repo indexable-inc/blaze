@@ -1864,6 +1864,11 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         }
         for i in 0..record.impls() {
             let Some(Some(row)) = self.read(krate, record.impl_at(i)) else { continue };
+            // A refused derive's gap has no impl item and no header text: it is filed from its
+            // row alone (buckets.rs `file_rows`, D193 point 5), never read as text.
+            if row.refused_call {
+                continue;
+            }
             // At item grain (item_grain.rs): a body edit in the impl's file leaves its header.
             let Some(now) = self.row_now(krate, row.key) else { continue };
             let header = match now.impl_header {

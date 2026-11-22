@@ -73,15 +73,9 @@ use crate::{
 
 /// The step the probes walk down by, and the most `sp` may drop below the prologue's saved
 /// `fp`/`lr` (those 16 bytes included) and pay nothing: the smallest page among the hosts. The
-/// Fast tier (compose/emit.rs, `prologue`) refuses a frame past it by this same bound.
+/// Fast tier (compose/emit.rs, `prologue`) probes a frame past it by this same bound, with this
+/// file's sequence as the table's `glue::PROBE` template (table_gen/arm64_glue.rs).
 pub(crate) const PROBE_STEP: u32 = 4096;
-
-/// The Fast tier's refusal (compose/emit.rs, `prologue`) of a frame that drops `sp` more than
-/// [`PROBE_STEP`] below its last saved pair: its table has no stack-probe template yet, so it
-/// cannot touch each page on the way down. The Reference tier serves such a function and
-/// probes it here (`TierError::Refused` routes it there, as every other refusal of the tier).
-pub(crate) const FAST_FRAME_PAST_A_PAGE: &str =
-    "a frame past one page under the saved registers (16 + frame > 4096 bytes): no stack-probe template in the table";
 
 impl<A: Allocator> Pass<'_, '_, A> {
     /// Where the `byval` copies' stretch starts from `sp`: after the staging words, at 16.

@@ -14,7 +14,8 @@
 //!   Reference refusal is a finding, not a count; the Fast tier's refusals are counted.
 //! - The control (rule 8): a `Table` wrapper whose `add` templates have their bytes' bit 30 set
 //!   (arm64 `add` becomes `sub`) is served to the Fast tier, and the run must catch it with "differs
-//!   from the evaluator" (`blaze_sim::control`).
+//!   from the evaluator" (`blaze_sim::control`). A second control keeps the bytes and renumbers
+//!   one field (`WrongField`: an `add`'s second input filled from its first), caught the same way.
 //!
 //! The ladder's rungs are not here: blaze-ladder exposes no rung's LIR, and it depends on this
 //! crate (a dev-dependency on it would be a cycle).
@@ -30,7 +31,10 @@ use blaze_lir::{Block, Op, Value, View};
 use blaze_own::{ASortedMap, AString, AVec, Alloc, SortedMap, Vec, format_in};
 use blaze_sim::{Broke, Config, Tape};
 use blaze_tier::record::{encode, place, read, seal};
-use blaze_tier::{ARM64, Arch, Emitted, Machine, Named, Names, Os, Outside, Pattern, Table, TableHead, Template, Tier, TierError, TierName};
+use blaze_tier::{
+    ARM64, Arch, Emitted, Field, FieldKind, Form, Machine, Named, Names, Os, Outside, Pattern, Table, TableHead, Template, Tier, TierError,
+    TierName,
+};
 
 use crate::compose::emit::POLL_PAGE;
 use crate::table_gen::EncodedTable;
@@ -39,6 +43,10 @@ use crate::{Fast, Reference};
 
 /// Register pressure and the 1-bit templates in the Fast tier (fast-evict-1).
 mod pressure;
+
+/// The Fast tier's directed cases (D195 item 4): far frames, a loop's back edge, a call with
+/// live caller-saved registers, a flag across stores, and the scratch pool's control.
+mod directed;
 
 /// One tier as the harness calls it: piece 0's `Tier::emit` as a plain function, so the list can
 /// hold tiers whose state (a table) the function makes itself.
@@ -65,18 +73,28 @@ const PLANTED: [Row; 2] = [
     Row { name: TierName::Fast, emit: fast_planted, covers_the_generator: false },
 ];
 
+/// [`TIERS`] with the Fast tier over the table with one field renumbered.
+const PLANTED_FIELD: [Row; 2] = [
+    Row { name: TierName::Reference, emit: reference, covers_the_generator: true },
+    Row { name: TierName::Fast, emit: fast_planted_field, covers_the_generator: false },
+];
+
 /// The control's plants.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Plant {
     None,
     /// The Fast tier's `add` templates with bit 30 of their bytes set ([`WrongTemplate`]).
     WrongTemplate,
+    /// The Fast tier's register-register `add` templates with the field of their second input
+    /// naming the first: one patched field off by one operand ([`WrongField`]).
+    WrongField,
 }
 
 fn tiers(plant: Plant) -> &'static [Row; 2] {
     match plant {
         Plant::None => &TIERS,
         Plant::WrongTemplate => &PLANTED,
+        Plant::WrongField => &PLANTED_FIELD,
     }
 }
 
@@ -105,6 +123,67 @@ fn fast_planted<'a>(func: View<'_>, names: &dyn Names, machine: Machine, alloc: 
     let table = EncodedTable::read(TABLE, Alloc::global()).map_err(|error| TierError::Table { tier: TierName::Fast, error })?;
     let planted = WrongTemplate::over(&table);
     Fast { table: &planted, regs: &ARM64 }.emit(blaze_lir::verify(func).expect("the harness's function is LIR"), names, machine, alloc)
+}
+
+fn fast_planted_field<'a>(func: View<'_>, names: &dyn Names, machine: Machine, alloc: Alloc<'a>) -> Result<Emitted<'a>, TierError> {
+    let table = EncodedTable::read(TABLE, Alloc::global()).map_err(|error| TierError::Table { tier: TierName::Fast, error })?;
+    let planted = WrongField::over(&table);
+    Fast { table: &planted, regs: &ARM64 }.emit(blaze_lir::verify(func).expect("the harness's function is LIR"), names, machine, alloc)
+}
+
+/// The planted wrong field: every `add` template of `inner` whose second operand is a register,
+/// with that operand's register field renumbered to operand 0 (the bytes unchanged), so the
+/// composer fills `add d, a, a` for `add d, a, b`. A field holds an operand's bits, so "one
+/// register off" in the field's own data is its operand number off by one; a register number
+/// plus one is no field edit (piece 0's `Field` copies bits, it adds nothing). Every other
+/// pattern is served by `inner` unchanged.
+struct WrongField<'t> {
+    inner: &'t EncodedTable<'static>,
+    /// `(pattern, first field in fields, count)`, sorted by pattern (the table's order).
+    adds: AVec<'static, (Pattern, u32, u32)>,
+    fields: AVec<'static, Field>,
+}
+
+impl<'t> WrongField<'t> {
+    fn over(inner: &'t EncodedTable<'static>) -> WrongField<'t> {
+        let mut adds: AVec<'static, (Pattern, u32, u32)> = Vec::new_in(Alloc::global());
+        let mut fields: AVec<'static, Field> = Vec::new_in(Alloc::global());
+        for pattern in inner.patterns() {
+            if pattern.op != Op::Add || !matches!(pattern.operands[1], Form::Reg(_)) || pattern.inner.is_some() {
+                continue;
+            }
+            let Some(template) = inner.find(pattern) else {
+                panic!("the table lists `add` at width {} and has no template for it", pattern.width);
+            };
+            let at = fields.len();
+            let mut renumbered = 0;
+            for field in template.fields {
+                let mut field = *field;
+                if field.operand == 1 && matches!(field.kind, FieldKind::Reg) {
+                    field.operand = 0;
+                    renumbered += 1;
+                }
+                fields.push(field);
+            }
+            assert!(renumbered > 0, "an `add` at width {} has no register field for its second input", pattern.width);
+            adds.push((*pattern, at as u32, template.fields.len() as u32));
+        }
+        assert!(!adds.is_empty(), "the committed table has no register `add` template: the plant would plant nothing");
+        WrongField { inner, adds, fields }
+    }
+}
+
+impl Table for WrongField<'_> {
+    fn head(&self) -> TableHead {
+        self.inner.head()
+    }
+
+    fn find(&self, pattern: &Pattern) -> Option<Template<'_>> {
+        let template = self.inner.find(pattern)?;
+        let Ok(i) = self.adds.binary_search_by(|row| row.0.cmp(pattern)) else { return Some(template) };
+        let (_, at, len) = self.adds[i];
+        Some(Template { fields: &self.fields[at as usize..(at + len) as usize], ..template })
+    }
 }
 
 /// The planted wrong template: every `add` template of `inner` with its bytes' bit 30 set (in the
@@ -375,6 +454,22 @@ fn plant_wrong_template_is_caught() {
         tiers_agree(tape, plant, machine, &tally)
     });
     tally.into_inner().print("the control, clean and planted runs together");
+}
+
+/// The control for one wrong FIELD (D195 item 4): the Fast tier over a table whose register
+/// `add` templates fill their second input's field from the first operand is caught by the run
+/// (any generated `add` of two different values differs), and the clean run passes.
+/// Expected: passes; blaze-sim prints "plant WrongField: caught at case k of 512" on standard
+/// error.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn plant_wrong_field_is_caught() {
+    let machine = table().head().machine;
+    let tally = RefCell::new(Tally::new());
+    blaze_sim::control(Config::cases(512), Plant::None, Plant::WrongField, "differs from the evaluator", |tape: &Tape, plant: Plant| {
+        tiers_agree(tape, plant, machine, &tally)
+    });
+    tally.into_inner().print("the field control, clean and planted runs together");
 }
 
 /// `sum(n)` (tests.rs `sum_func`: a loop, block parameters) through every tier, against the

@@ -9,6 +9,12 @@
 //!   packed ref or a detached head, in a checkout or a linked worktree (`gitdir:` and
 //!   `commondir` followed inside the served tree);
 //! - `rev-parse --is-inside-work-tree`: `true` when a `.git` is found from the script's folder up;
+//! - `rev-parse --git-dir` and `--git-common-dir`: the folder, relative to the one asked in
+//!   ([`relative_to`]);
+//! - `log -1` and `show -s` of HEAD with a `--pretty=format:` or `--format=` string of the
+//!   placeholders [`Placeholder`] names;
+//! - with no `.git` from the script's folder up to the served tree's root: every question but
+//!   `--version` gets git's own failure, exit 128 and [`NOT_A_REPOSITORY`];
 //! - the branch: `rev-parse --abbrev-ref [--symbolic-full-name] HEAD`, `branch --show-current`,
 //!   `symbolic-ref HEAD` (on a detached head: git's own exit 128 and message).
 //!
@@ -21,7 +27,6 @@
 //!   `--dirty=<mark>` other than `-dirty`);
 //! - an abbreviated commit (`--short`, with or without a length): git lengthens the prefix until
 //!   it is unique among the repository's objects, so its length needs the object store;
-//! - a checkout with no `.git` served (a fetched package's record carries none);
 //! - every other question (`describe`, `log`, `rev-list`, ...): "cannot answer yet".
 //!
 //! The clock is not git's to answer: a build timestamp is the sandbox's fixed instant.
@@ -124,13 +129,27 @@ pub const MOST_FORMAT: usize = 32;
 pub struct LogFormat {
     pieces: [Piece; MOST_FORMAT],
     len: u8,
+    /// `tformat:` (what `--format=<f>` means): a newline after the commit. `format:` separates
+    /// commits instead, so the one commit gets none.
+    terminated: bool,
 }
 
 impl LogFormat {
-    /// `text` read: plain bytes and the [`Placeholder`]s; an unknown placeholder is refused
-    /// naming its first two bytes, a longer string as [`Refused::FormatTooLong`].
+    /// `text` read as `--pretty=format:<text>`: plain bytes and the [`Placeholder`]s; an
+    /// unknown placeholder is refused naming its first two bytes, a longer string as
+    /// [`Refused::FormatTooLong`].
     pub fn parse(text: &str) -> Result<LogFormat, Refused> {
-        let mut out = LogFormat { pieces: [Piece::Byte(0); MOST_FORMAT], len: 0 };
+        LogFormat::read(text, false)
+    }
+
+    /// `text` read as `--format=<text>`, which is `--pretty=tformat:<text>` (git-log(1),
+    /// "PRETTY FORMATS"): the same pieces, then a newline.
+    pub fn parse_terminated(text: &str) -> Result<LogFormat, Refused> {
+        LogFormat::read(text, true)
+    }
+
+    fn read(text: &str, terminated: bool) -> Result<LogFormat, Refused> {
+        let mut out = LogFormat { pieces: [Piece::Byte(0); MOST_FORMAT], len: 0, terminated };
         let bytes = text.as_bytes();
         let mut at = 0;
         while at < bytes.len() {
@@ -161,13 +180,19 @@ impl LogFormat {
     pub fn pieces(&self) -> &[Piece] {
         &self.pieces[..usize::from(self.len)]
     }
+
+    /// Whether a newline follows the commit ([`LogFormat::parse_terminated`]).
+    pub fn terminated(&self) -> bool {
+        self.terminated
+    }
 }
 
 /// Where a script's `git` answers come from (D54).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Vcs {
-    /// A `.git` in the served tree, from the script's folder up (a workspace checkout); a
-    /// registry crate has none, so its questions are [`Refused::NoRepository`].
+    /// A `.git` in the served tree, from the script's folder up (a workspace checkout). A tree
+    /// with none (a registry crate, a checkout copied without its `.git`) gets git's own answer
+    /// outside a repository, [`NOT_A_REPOSITORY`] with exit 128.
     Served,
     /// A fetched git source: the lock's commit, whose tree is exactly the served files
     /// (digest-verified at fetch), with no `.git` and no history beyond the commit.
@@ -181,6 +206,12 @@ pub enum Question {
     InsideWorkTree,
     /// The full commit HEAD names.
     Head,
+    /// `rev-parse --git-dir`: the repository's own git folder, as a path from the folder asked
+    /// in ([`relative_to`]).
+    GitDir,
+    /// `rev-parse --git-common-dir`: the folder holding refs and objects (a linked worktree's
+    /// `commondir`), from the folder asked in.
+    CommonDir,
     /// The branch's short name, `HEAD` when detached.
     Branch,
     /// The branch's short name, empty when detached.
@@ -196,8 +227,8 @@ pub enum Question {
     /// Whether the tree is dirty, asked another way (`diff-index`, another `status` form, a
     /// `describe --dirty=<mark>` with a mark other than git's own `-dirty`).
     Dirty,
-    /// `log -1` with a `--pretty=format:` or `--format=` string: the HEAD commit object. The
-    /// format as read, or why it is refused.
+    /// `log -1` with a `--pretty=format:` or `--format=` string, or `show -s` (`--no-patch`)
+    /// with one, of HEAD: the HEAD commit object. The format as read, or why it is refused.
     Log(Result<LogFormat, Refused>),
     /// `describe` with only `--always`, `--tags`, `--match` and `--dirty`: a walk of history to
     /// a tag; with `always`, the abbreviated commit when no tag is found; with `dirty`, `-dirty`
@@ -213,6 +244,8 @@ pub fn question(args: &[&str]) -> Question {
         ["--version"] | ["version"] => Question::Version,
         ["rev-parse", "--is-inside-work-tree"] => Question::InsideWorkTree,
         ["rev-parse", "HEAD"] | ["rev-parse", "--verify", "HEAD"] => Question::Head,
+        ["rev-parse", "--git-dir"] => Question::GitDir,
+        ["rev-parse", "--git-common-dir"] => Question::CommonDir,
         ["rev-parse", "--abbrev-ref", "HEAD"]
         | ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "HEAD"]
         | ["rev-parse", "--symbolic-full-name", "--abbrev-ref", "HEAD"] => Question::Branch,
@@ -224,11 +257,69 @@ pub fn question(args: &[&str]) -> Question {
         ["status", "--porcelain", "--untracked-files=all"] | ["status", "--porcelain", "-uall"] => Question::Status { untracked: true, all: true },
         ["status", ..] | ["diff-index", ..] => Question::Dirty,
         ["describe", rest @ ..] => describe(rest),
-        ["log", "-1", format] if format.starts_with("--pretty=format:") => Question::Log(LogFormat::parse(&format["--pretty=format:".len()..])),
-        // `--format=<f>` is `--pretty=tformat:<f>`: a newline after the commit.
-        ["log", "-1", format] if format.starts_with("--format=") => Question::Other,
+        ["log", "-1", format] => log_format(format),
+        // `show` of one commit with its diff off: the commit's line in the format (turso_core's
+        // build.rs: `show -s --format=%ct HEAD`).
+        ["show", "-s" | "--no-patch", format] | ["show", "-s" | "--no-patch", format, "HEAD"] => log_format(format),
         _ => Question::Other,
     }
+}
+
+/// A `log`/`show` format argument: `--pretty=format:<f>` (no newline after the one commit),
+/// `--format=<f>` (`--pretty=tformat:<f>`: a newline after it); any other is
+/// [`Question::Other`].
+fn log_format(format: &str) -> Question {
+    if let Some(text) = format.strip_prefix("--pretty=format:") {
+        Question::Log(LogFormat::parse(text))
+    } else if let Some(text) = format.strip_prefix("--format=") {
+        Question::Log(LogFormat::parse_terminated(text))
+    } else {
+        Question::Other
+    }
+}
+
+/// git's own answer to a question that needs a repository, asked where there is none (setup.c
+/// `setup_git_directory_gently`: `die(_("not a git repository (or any of the parent
+/// directories): %s"), DEFAULT_GIT_DIR_ENVIRONMENT)`), exit 128.
+pub const NOT_A_REPOSITORY: &str = "fatal: not a git repository (or any of the parent directories): .git\n";
+
+/// `target` (from the served tree's root) as a path from `folder` (from the same root): `..`
+/// per part of `folder` below the parts they share, then the rest of `target`; `.` when they are
+/// one folder. git prints `--git-dir` relative "to the current working directory" (git-rev-parse(1));
+/// at a worktree's top that is `.git`, exactly git's answer. Below the top git prints the
+/// absolute path, which in the sandbox is the mount (`/workspace/..`), not the host's; the
+/// relative form names the same folder from the script's folder and holds nothing of the
+/// machine (rule 25), so it is the answer in every folder.
+pub fn relative_to<'a>(folder: &str, target: &str, alloc: Alloc<'a>) -> AString<'a> {
+    let parts = |path: &'_ str| path.split('/').filter(|part| !part.is_empty()).count();
+    let mut from = folder.split('/').filter(|part| !part.is_empty()).peekable();
+    let mut to = target.split('/').filter(|part| !part.is_empty()).peekable();
+    let mut shared = 0;
+    while let (Some(a), Some(b)) = (from.peek(), to.peek()) {
+        if a != b {
+            break;
+        }
+        from.next();
+        to.next();
+        shared += 1;
+    }
+    let mut out = String::new_in(alloc);
+    for _ in shared..parts(folder) {
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str("..");
+    }
+    for part in to {
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(part);
+    }
+    if out.is_empty() {
+        out.push('.');
+    }
+    out
 }
 
 /// The most bytes of a `sh -c` command read as one `git` call; a longer one is refused as the
@@ -330,7 +421,9 @@ pub enum Refused {
     Dirty,
     /// An abbreviated commit, whose length git makes unique among the objects.
     Short,
-    /// No `.git` from the script's folder up to the served tree's root.
+    /// No `.git` from the script's folder up to the served tree's root. [`answer`] turns it into
+    /// git's own failure ([`NOT_A_REPOSITORY`]); it stops a script only when the spawn's folder
+    /// is outside the served tree (script_sandbox.rs).
     NoRepository,
     /// HEAD names no commit: an unborn branch or a ref in neither a loose file nor `packed-refs`.
     NoCommit,
@@ -402,7 +495,7 @@ impl core::fmt::Display for Refused {
         match self {
             Refused::Dirty => f.write_str("whether the tree is dirty, asked in a form not answered (`diff-index`, a `status` form other than `--porcelain` with `-uno`/`-uall`, a `--dirty=<mark>` other than `-dirty`); `status --porcelain` and `describe --dirty` are"),
             Refused::Short => f.write_str("an abbreviated commit: git lengthens it until it is unique among the repository's objects, which needs the object store"),
-            Refused::NoRepository => f.write_str("no `.git` is served from the script's folder up (a fetched package's record carries none)"),
+            Refused::NoRepository => f.write_str("the script asked from a folder outside the served tree, where no `.git` can be looked for"),
             Refused::NoCommit => f.write_str("HEAD names no commit (an unborn branch, or a ref neither loose nor packed)"),
             Refused::Malformed(file) => write!(f, "the {file:?} file of `.git` is not what git writes"),
             Refused::Outside(file) => write!(f, "the {file:?} file of `.git` leads outside the served tree"),
@@ -495,7 +588,9 @@ pub fn answer<'a>(question: Question, folder: &str, vcs: Vcs, files: &mut impl G
             // Clean, as for `status`: no `-dirty` mark.
             Question::Describe { always: false, .. } => Ok(Answer { code: 128, stdout: String::new_in(alloc), stderr: NO_NAMES }),
             Question::Describe { always: true, .. } => Ok(ok(&hex[..FALLBACK_DEFAULT_ABBREV])),
-            Question::Dirty | Question::Other => Err(Refused::CannotAnswerYet),
+            // A fetched source serves no `.git` folder to name: a script would read files under
+            // it that are not there.
+            Question::GitDir | Question::CommonDir | Question::Dirty | Question::Other => Err(Refused::CannotAnswerYet),
         };
     }
     match question {
@@ -503,12 +598,24 @@ pub fn answer<'a>(question: Question, folder: &str, vcs: Vcs, files: &mut impl G
         Question::Short => return Err(Refused::Short),
         Question::Dirty => return Err(Refused::Dirty),
         Question::Other => return Err(Refused::CannotAnswerYet),
+        Question::Log(Err(why)) => return Err(why),
         _ => {}
     }
-    let repo = find(folder, files, alloc)?;
+    let repo = match find(folder, files, alloc) {
+        Ok(repo) => repo,
+        // git's own answer: every question left needs a repository ([`NOT_A_REPOSITORY`]).
+        // The served tree's root is the ceiling (as `GIT_CEILING_DIRECTORIES` makes one):
+        // nothing above it is served, so nothing above it is looked at. The answer is a fact of
+        // the run's record like any other (D54): `find` read `.git` and `.git/HEAD` at each
+        // folder up, a command recomputes the answer, and a repository made later changes it,
+        // which reruns the script.
+        Err(Refused::NoRepository) => return Ok(Answer { code: 128, stdout: String::new_in(alloc), stderr: NOT_A_REPOSITORY }),
+        Err(why) => return Err(why),
+    };
     match question {
         Question::InsideWorkTree => return Ok(ok("true")),
-        Question::Log(Err(why)) => return Err(why),
+        Question::GitDir => return Ok(ok(&relative_to(folder, &repo.gitdir, alloc))),
+        Question::CommonDir => return Ok(ok(&relative_to(folder, &repo.common, alloc))),
         Question::Log(Ok(format)) => {
             let commit = head_commit(&repo, files, alloc)?;
             let store = crate::git_objects::Store::open(&repo.common, files, alloc)?;
@@ -532,7 +639,11 @@ pub fn answer<'a>(question: Question, folder: &str, vcs: Vcs, files: &mut impl G
                 }
             }
             flush(&mut stdout, &mut run);
-            // `format:` separates commits: no newline after the one commit.
+            // `format:` separates commits: no newline after the one commit; `tformat:`
+            // (`--format=`) ends it with one.
+            if format.terminated() {
+                stdout.push('\n');
+            }
             return Ok(Answer { code: 0, stdout, stderr: "" });
         }
         Question::Status { untracked, all } => {

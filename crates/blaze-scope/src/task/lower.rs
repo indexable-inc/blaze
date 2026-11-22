@@ -1728,6 +1728,11 @@ pub struct CallSrc<'t> {
     /// names ([`Attrs::others`]) the calls before it answer; its expansion's
     /// [`Fragment::kept`]. 0 for every other call.
     pub answered: u32,
+    /// A derive call's: the name of the item it is written on (unraw), the self type of the
+    /// impls a derive writes. What its refusal leaves a named gap at (D193 point 5:
+    /// [`crate::items_record::each_refused_impl_row`], and the names record's failed row says
+    /// it). `None` for every other call.
+    pub on: Option<&'t str>,
 }
 
 /// The attribute macro a blaze-edition binary's root `fn main` is the input of when none is
@@ -2297,7 +2302,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0), role: CallRole::Call });
             // No input: a check is never `Called`, so never expanded; only its place is read
             // (an error's location, blaze-cli names.rs).
-            let src = CallSrc { module: self.module, owner: None, name: path, input: "", kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place: None, tokens: crate::nested_input::CallTokens::Text, answered: 0 };
+            let src = CallSrc { module: self.module, owner: None, name: path, input: "", kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place: None, tokens: crate::nested_input::CallTokens::Text, answered: 0, on: None };
             self.out.calls.push((call, src));
             self.checks_sent += 1;
         }
@@ -2440,6 +2445,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             place: None,
             tokens: crate::nested_input::CallTokens::Text,
             answered: 0,
+            on: None,
         };
         self.out.calls.push((call, src));
     }
@@ -2511,7 +2517,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0), role: CallRole::Call });
             let place = self.call_in_text(idx, item, whole);
             let tokens = self.call_tokens(whole, crate::nested_input::InputCut::Whole);
-        let src = CallSrc { module: self.module, owner: None, name: path, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit, place, tokens, answered: 0 };
+        let src = CallSrc { module: self.module, owner: None, name: path, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit, place, tokens, answered: 0, on: None };
             self.out.calls.push((call, src));
             // `#[global_allocator]` writes the static back first in its expansion, whose fragment
             // is owned by the call (resolve.rs `expand_decls`'s `Fragment::owner`), so the static's
@@ -2849,6 +2855,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             depth: self.depth,
             implicit: false,
             answered: 0,
+            on: None,
         };
         self.out.calls.push((call, src));
     }

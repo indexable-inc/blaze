@@ -409,6 +409,23 @@ pub fn is_error_record(bytes: &[u8]) -> bool {
     bytes.get(..4) == Some(&MAGIC[..]) && bytes.get(4..8) == Some(&VERSION.to_le_bytes()[..]) && bytes.get(ERRORED_AT) == Some(&ERRORED)
 }
 
+/// The crate an [`error_record`] is of, its key and its own name, read in place: what a
+/// dependent's reporter names a path behind it by ([`crate::waits_on`]). `None` for a record
+/// that is no error record, or one too short to hold its head.
+pub fn error_record_crate(bytes: &[u8]) -> Option<(CrateItemKey, &str)> {
+    if !is_error_record(bytes) {
+        return None;
+    }
+    let mut r = Reader::starting_at(bytes, 0).ok()?;
+    // The magic and version, checked above.
+    r.skip(8).ok()?;
+    let krate = CrateItemKey(ContentId(*r.array::<32>().ok()?));
+    // The root key, edition, has-proc, the errored flag and its pad byte, and the proc key.
+    r.skip(32 + 4 + 32).ok()?;
+    let name = r.str_u32().ok()?;
+    Some((krate, name))
+}
+
 /// A reporter's reading of a failed import, asked only once a lookup failed, never on the
 /// success path. A dependent reads only a crate's exports record, which leaves out each name
 /// it cannot see, so a path to another crate's private item fails there as `NotFound`. The

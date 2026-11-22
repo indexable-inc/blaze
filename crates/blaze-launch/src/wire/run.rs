@@ -52,20 +52,28 @@ pub enum HookKind {
     Hook,
     /// Entry+exit shadow-stack span hook stub (records duration and parent-child span tree).
     Span,
+    /// Rust global-allocator slot hook (`__rust_alloc*` / `__rdl_*`).
+    Alloc(crate::telemetry::AllocHookKind),
 }
 
 impl HookKind {
     fn name(self) -> &'static str {
+        use crate::telemetry::AllocHookKind;
         match self {
             HookKind::Plain => "plain",
             HookKind::Count => "count",
             HookKind::Mark => "mark",
             HookKind::Hook => "hook",
             HookKind::Span => "span",
+            HookKind::Alloc(AllocHookKind::Alloc) => "rust_alloc",
+            HookKind::Alloc(AllocHookKind::Dealloc) => "rust_dealloc",
+            HookKind::Alloc(AllocHookKind::Realloc) => "rust_realloc",
+            HookKind::Alloc(AllocHookKind::AllocZeroed) => "rust_alloc_zeroed",
         }
     }
 
     fn read(from: &mut Reader<'_>) -> Result<HookKind, WireError> {
+        use crate::telemetry::AllocHookKind;
         let at = from.at();
         match from.text()? {
             "plain" => Ok(HookKind::Plain),
@@ -73,6 +81,10 @@ impl HookKind {
             "mark" => Ok(HookKind::Mark),
             "hook" => Ok(HookKind::Hook),
             "span" => Ok(HookKind::Span),
+            "rust_alloc" => Ok(HookKind::Alloc(AllocHookKind::Alloc)),
+            "rust_dealloc" => Ok(HookKind::Alloc(AllocHookKind::Dealloc)),
+            "rust_realloc" => Ok(HookKind::Alloc(AllocHookKind::Realloc)),
+            "rust_alloc_zeroed" => Ok(HookKind::Alloc(AllocHookKind::AllocZeroed)),
             _ => Err(WireError::Variant { at }),
         }
     }

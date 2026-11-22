@@ -51,9 +51,25 @@ pub struct Row<A: Allocator> {
     pub upstream: String<A>,
     /// The upstream issue, empty while none is posted.
     pub issue: String<A>,
+    /// The bytes the row was checked against, by content. When the list is non-empty, each file
+    /// the row corrects must be one of these bytes for that version, or the correction is
+    /// [`Refused::Changed`]. An empty list (a version range: synstructure) is held only by the
+    /// predicate's match ([`Refused::Stale`]).
+    pub digests: Vec<FileDigest<A>, A>,
 }
 
-blaze_data::fields!(for<A> Row<A> { name, versions, files, find, replace, reason, decision, upstream, issue });
+blaze_data::fields!(for<A> Row<A> { name, versions, files, find, replace, reason, decision, upstream, issue, digests });
+
+/// One file's bytes a row was checked against: its SHA-256 in lowercase hex, as fetched.
+pub struct FileDigest<A: Allocator> {
+    /// The version, as a lock spells it.
+    pub version: String<A>,
+    /// The file, one the row lists.
+    pub file: String<A>,
+    pub sha256: String<A>,
+}
+
+blaze_data::fields!(for<A> FileDigest<A> { version, file, sha256 });
 
 /// The table.
 pub struct Table<A: Allocator> {
@@ -76,6 +92,10 @@ pub enum Refused<'t> {
     NotText { name: &'t str, version: &'t str, file: &'t str, decision: &'t str },
     /// A row matched nothing in a file of a version it names: a stale row.
     Stale { name: &'t str, version: &'t str, file: &'t str, decision: &'t str },
+    /// A row's digest names a file the row does not list, or is not 64 lowercase hex digits.
+    Digest { name: &'t str, decision: &'t str, file: &'t str },
+    /// A file's bytes are not ones the row's digests name: the row was checked against other text.
+    Changed { name: &'t str, version: &'t str, file: &'t str, decision: &'t str, found: [u8; 32] },
 }
 
 impl fmt::Display for Refused<'_> {
@@ -95,6 +115,17 @@ impl fmt::Display for Refused<'_> {
                 f,
                 "source correction {name} ({decision}) is stale: its predicate matches nothing in {name} {version} {file}; fix or remove the row"
             ),
+            Refused::Digest { name, decision, file } => write!(
+                f,
+                "source correction {name} ({decision}): its digest for {file} is not 64 lowercase hex digits of a file the row lists"
+            ),
+            Refused::Changed { name, version, file, decision, found } => {
+                write!(f, "source correction {name} ({decision}) was checked against other bytes: {name} {version} {file} has SHA-256 ")?;
+                for byte in found {
+                    write!(f, "{byte:02x}")?;
+                }
+                write!(f, ", which none of the row's `digests` names; check the predicate still means the same there, then fix the digest")
+            }
         }
     }
 }
@@ -180,6 +211,14 @@ fn closing(tokens: &[Sig], open: usize) -> Option<usize> {
     None
 }
 
+/// Whether `text` is `digest` in lowercase hex.
+fn hex_is(text: &str, digest: &[u8; 32]) -> bool {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let text = text.as_bytes();
+    text.len() == 64
+        && digest.iter().enumerate().all(|(i, b)| text[2 * i] == HEX[usize::from(b >> 4)] && text[2 * i + 1] == HEX[usize::from(b & 15)])
+}
+
 impl<A: Allocator + Clone> Row<A> {
     /// Whether the row names this crate version.
     pub fn applies<B: Allocator>(&self, name: &str, version: &Version<B>) -> bool {
@@ -216,6 +255,12 @@ impl<A: Allocator + Clone> Row<A> {
         field("decision", &self.decision, &mut hasher);
         field("upstream", &self.upstream, &mut hasher);
         field("issue", &self.issue, &mut hasher);
+        // An empty list hashes nothing: a row without digests keeps its key.
+        for pin in self.digests.iter() {
+            field("digest-version", &pin.version, &mut hasher);
+            field("digest-file", &pin.file, &mut hasher);
+            field("digest-sha256", &pin.sha256, &mut hasher);
+        }
         hasher.finish()
     }
 
@@ -224,6 +269,13 @@ impl<A: Allocator + Clone> Row<A> {
         let (name, decision) = (self.name.as_str(), self.decision.as_str());
         if self.files.is_empty() {
             return Err(Refused::NoFiles { name, decision });
+        }
+        for pin in self.digests.iter() {
+            let (file, hex) = (pin.file.as_str(), pin.sha256.as_bytes());
+            let listed = self.files.iter().any(|it| it.as_str() == file);
+            if !listed || hex.len() != 64 || !hex.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                return Err(Refused::Digest { name, decision, file });
+            }
         }
         let alloc = self.files.allocator().clone();
         if !balanced(&significant(&self.find, cpu, alloc.clone())) {
@@ -306,6 +358,15 @@ impl<A: Allocator + Clone> Row<A> {
         for file in self.files.iter() {
             let file = file.as_str();
             let bytes = files(file).ok_or(Refused::MissingFile { name, version, file, decision })?;
+            if !self.digests.is_empty() {
+                let mut hasher = blaze_sha256::Sha256::new();
+                hasher.update(bytes);
+                let found = hasher.finish();
+                let pinned = self.digests.iter().any(|pin| pin.version.as_str() == version && pin.file.as_str() == file && hex_is(&pin.sha256, &found));
+                if !pinned {
+                    return Err(Refused::Changed { name, version, file, decision, found });
+                }
+            }
             let text = core::str::from_utf8(bytes).map_err(|_| Refused::NotText { name, version, file, decision })?;
             let corrected = self.correct_text(text, cpu, alloc.clone());
             if corrected.replaced.is_empty() {

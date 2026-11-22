@@ -9,6 +9,7 @@ pub(crate) mod emit;
 mod fast;
 pub(crate) mod loop_map;
 pub(crate) mod reserve;
+pub(crate) mod scratch;
 
 pub use fast::Fast;
 
@@ -18,3 +19,5 @@ mod analysis_tests;
 mod fast_tests;
 #[cfg(test)]
 mod loop_map_tests;
+#[cfg(test)]
+mod scratch_tests;

@@ -62,6 +62,11 @@ pub enum EngineCheckError {
     /// A wrapped function answered `Need`: `task` reads `read`, which its plan did not hand it.
     /// The planner's bug, never a second entry (engine.md, "a task in the plan is entered once").
     Unseen { task: Name, read: Name },
+    /// [`EngineCheckError::Unseen`] of a file a crate's names task read (an `include!`, a
+    /// `mod`'s file, a data file) that the file walk did not outline: named by the crate and the
+    /// file's path in its tree, not by two hashes (rule 19; turso 2026-11-21 17:22: `core/io/unix.rs`,
+    /// a `mod unix;` that `cfg_block!`'s expansion writes in `turso_core`'s `core/io/mod.rs`).
+    UnseenFile { task: Name, read: Name, krate: blaze_own::String<SharedAlloc<'static>>, path: blaze_own::String<SharedAlloc<'static>> },
     /// A task was admitted twice or its result was filed twice in one request.
     Twice { task: Name },
     /// The crates' dependency edges do not settle to depths: a cycle through `krate`.
@@ -149,6 +154,10 @@ impl fmt::Display for EngineCheckError {
             EngineCheckError::Unseen { task, read } => {
                 write!(f, "{task:?} needs {read:?}, which its plan did not hand it: the planner did not see that read (engine_names.rs, engine_units.rs)")
             }
+            EngineCheckError::UnseenFile { task, read, krate, path } => write!(
+                f,
+                "crate `{krate}`'s names read the file `{path}` ({task:?} needs {read:?}), which its plan did not hand it: the file walk did not outline that file (engine_check.rs `plan`, engine_names.rs)"
+            ),
             EngineCheckError::Twice { task } => write!(f, "{task:?} was admitted or filed more than once in this request"),
             EngineCheckError::Cycle { krate } => write!(f, "the crates' dependencies do not settle to depths: a cycle, seen from {krate:?} (engine_names.rs `plan`)"),
             EngineCheckError::Levels { levels } => write!(f, "the dependency graph was not resolved in {levels} levels of the lock (engine_units.rs `LEVELS`)"),

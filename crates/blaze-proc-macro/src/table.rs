@@ -42,7 +42,7 @@ use super::{
 /// A pending row's canonical bytes: one block of exactly their length in the allocator the
 /// command handed the results ([`open`]).
 type Bytes = blaze_own::Vec<u8, SharedAlloc<'static>>;
-use crate::sandbox::{Package, answer_now};
+use crate::sandbox::{CALL_FILE, Package, answer_now, call_file_digest};
 
 /// The layout word a body starts with. 03: a kept answer's tokens are rows over the table's
 /// atoms ([`blaze_expand::atoms`], the token row form's one home) and its origins are runs
@@ -507,20 +507,38 @@ fn kept_part<'r>(bytes: &'r [u8], old: Option<&Atoms<'_>>, remap: &mut [u32], bu
     Ok(Part { tokens: count, runs, ids: first_id, tail: Tail::Kept(c.bytes) })
 }
 
-/// Whether each read of `list` is answered now, in `package`, as the list says; `valued`
-/// counts the reads asked.
-fn list_holds(list: &[u8], package: &Package, valued: &AtomicU64) -> Result<bool, Corrupt> {
+/// What valuing a read list found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Valued {
+    /// Each read is answered now as the list says.
+    holds: bool,
+    /// A read valued was the call's file ([`CALL_FILE`]): the verdict is the call's, not the
+    /// package's, and is not kept for the list.
+    of_call: bool,
+}
+
+/// Whether each read of `list` is answered now, in `package` and for a call in `file` (the
+/// call's [`blaze_expand::ProcCall::file`], `None` where the host does not answer it), as the
+/// list says; `valued` counts the reads asked.
+fn list_holds(list: &[u8], package: &Package, file: Option<&str>, valued: &AtomicU64) -> Result<Valued, Corrupt> {
     let mut c = Cursor { bytes: list };
+    let mut of_call = false;
     for _ in 0..c.u32("the read count")? {
         let subject = c.str("a read's subject")?;
         let held = c.answer()?;
         valued.fetch_add(1, Ordering::Relaxed);
-        let Ok(now) = answer_now(package, subject) else { return Ok(false) };
+        let now = if subject == CALL_FILE {
+            of_call = true;
+            Ok(file.map(call_file_digest))
+        } else {
+            answer_now(package, subject)
+        };
+        let Ok(now) = now else { return Ok(Valued { holds: false, of_call }) };
         if now.map_or(ReadAnswer::Absent, ReadAnswer::Digest) != held {
-            return Ok(false);
+            return Ok(Valued { holds: false, of_call });
         }
     }
-    Ok(true)
+    Ok(Valued { holds: true, of_call })
 }
 
 /// A row a command ran: its key, its read list and its answer, each in canonical bytes.
@@ -760,18 +778,22 @@ impl CrateResults {
     }
 
     /// Whether the table's read list `list` holds in `package`, whose verdicts on this table
-    /// `verdicts` are: valued the first time it is asked in this command, a load of its
-    /// verdict after.
-    fn current(&self, verdicts: &Verdicts, list: usize, package: &Package) -> Result<bool, Corrupt> {
+    /// `verdicts` are, for a call in `file`: valued the first time it is asked in this
+    /// command, a load of its verdict after. A verdict that valued the call's file is that
+    /// call's alone and is not kept: the list is valued again for the next call (two calls of
+    /// one key in two files are two rows).
+    fn current(&self, verdicts: &Verdicts, list: usize, package: &Package, file: Option<&str>) -> Result<bool, Corrupt> {
         match verdicts.lists[list].load(Ordering::Relaxed) {
             CURRENT => Ok(true),
             STALE => Ok(false),
             _ => {
-                let holds = list_holds(self.table.list(list), package, &self.valued)?;
+                let valued = list_holds(self.table.list(list), package, file, &self.valued)?;
                 // Two workers valuing one list store the same verdict: the package is the
                 // command's snapshot.
-                verdicts.lists[list].store(if holds { CURRENT } else { STALE }, Ordering::Relaxed);
-                Ok(holds)
+                if !valued.of_call {
+                    verdicts.lists[list].store(if valued.holds { CURRENT } else { STALE }, Ordering::Relaxed);
+                }
+                Ok(valued.holds)
             }
         }
     }
@@ -782,22 +804,25 @@ impl CrateResults {
         self.pending.lock(&cx).map_err(|_| RecordError::Files(FilesError::Stopped { name }))
     }
 
-    /// The answer of `base` under what its reads are in `package` now, decoded in `alloc`:
-    /// a row of the table whose read list holds by `verdicts` (this package's, made by
-    /// [`Verdicts::of`] this value), or a row this command ran whose reads hold in `package`.
+    /// The answer of `base` under what its reads are in `package` now, for a call in `file`
+    /// (its [`blaze_expand::ProcCall::file`], `None` where the host does not answer it),
+    /// decoded in `alloc`: a row of the table whose read list holds by `verdicts` (this
+    /// package's, made by [`Verdicts::of`] this value), or a row this command ran whose reads
+    /// hold in `package` and `file`.
     pub fn find<'a>(
         &self,
         store: &DirStore,
         base: &ContentId,
         package: &Package,
         verdicts: &Verdicts,
+        file: Option<&str>,
         edition: Edition,
         alloc: Alloc<'a>,
     ) -> Result<Option<Produced<'a>>, RecordError> {
         let corrupt = |Corrupt(what)| RecordError::Corrupt { base: *base, what };
         for at in self.table.rows_of(base) {
             let row = self.table.row(at);
-            if self.current(verdicts, row.list, package).map_err(corrupt)? {
+            if self.current(verdicts, row.list, package, file).map_err(corrupt)? {
                 return dense_produced(&self.table.atoms(), self.table.list(row.list), row.answer, edition, alloc).map(Some).map_err(corrupt);
             }
         }
@@ -809,7 +834,7 @@ impl CrateResults {
         // Another package of this name may have run the row: its reads are valued here, as a
         // table row's are (a call's own package's hold; a repeat inside one command is rare).
         for row in pending.rows[first..].iter().take_while(|row| row.key == *base) {
-            if list_holds(row.list.as_slice(), package, &self.valued).map_err(corrupt)? {
+            if list_holds(row.list.as_slice(), package, file, &self.valued).map_err(corrupt)?.holds {
                 return produced_of(row.list.as_slice(), row.answer.as_slice(), edition, alloc).map(Some).map_err(corrupt);
             }
         }

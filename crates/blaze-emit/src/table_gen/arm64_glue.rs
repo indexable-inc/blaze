@@ -23,8 +23,9 @@ use blaze_tier::{Form, ImmClass, Inner, Pattern, Reg, RegClass, RegSet};
 
 use super::{BLOCK, Each, GPR, NONE, WIDTHS, branch, frame, imm, narrow, one, pattern, r, reg, s, u};
 use crate::compose::emit::glue;
-use crate::enc::{self, FP, LR, SP, Size, X16, ZR};
-use crate::table_gen::{GenError, RES, Recipe};
+use crate::enc::{self, Cond, FP, LR, SP, Size, X16, ZR};
+use crate::enc_probe;
+use crate::table_gen::{GenError, RES, Recipe, Slot, SlotKind, T0, Vals};
 
 /// The variant of an unfused `br` that branches when its condition is ZERO (`cbz`): the else
 /// edge, so the composer can invert an unfused branch. Variant 0 (`cbnz`) is the then edge
@@ -39,7 +40,8 @@ pub(super) fn recipes(each: &mut Each<'_>) -> Result<(), GenError> {
     poll_and_return(each)?;
     xor_immediates(each)?;
     shifted_operands(each)?;
-    branch_if_zero(each)
+    branch_if_zero(each)?;
+    far_frame(each)
 }
 
 // ---- words enc.rs has no encoder for ----------------------------------------------------------
@@ -238,6 +240,66 @@ fn branch_if_zero(each: &mut Each<'_>) -> Result<(), GenError> {
     one(each, p, &[reg(0), branch(1, 19)], &|v, c| c.word(enc::cbz(r(v, 0), s(v, 1, 19))))
 }
 
+/// A frame offset of `bits` bits in units of `1 << scale` bytes: a far template splits it over
+/// two instructions (`add .., #hi, lsl #12` and the access at `#lo`), and the generator finds the
+/// two fields, `from_bit` 0 and the low part's width, by its flips like any other.
+const fn far(operand: u8, scale: u8, bits: u8) -> Slot {
+    Slot { operand, kind: SlotKind::Frame { scale }, bits }
+}
+
+/// The frame past the near forms' reach (compose/emit.rs, `glue::PROBE` and `glue::FAR`):
+///
+/// - the stack probe, pass/probe.rs's sequence with its count in TEMP0 (a lent scratch register,
+///   never x17 by name: the composer's pool hands it out) and no tail branch, as it runs in line;
+/// - a cell's load and store of a general or float register past 32 KiB: `add t, sp, #(u >> 9),
+///   lsl #12` and the access at `#(u & 0x1ff)` scaled by 8 (`u` the offset in 8-byte units, 21
+///   bits: up to 16 MiB), `t` the result itself for a general load, else TEMP0;
+/// - a slot's address past 4 KiB: `add RESULT, sp, #(f >> 12), lsl #12; add RESULT, RESULT,
+///   #(f & 0xfff)` (24 bits of bytes).
+fn far_frame(each: &mut Each<'_>) -> Result<(), GenError> {
+    let probe = glue::frame(glue::PROBE, [Form::Slot, NONE, NONE, NONE]);
+    one(each, probe, &[far(0, 0, 24), reg(T0)], &|v, c| {
+        let (f, t) = (u(v, 0, 24), r(v, T0));
+        c.word(enc::movz(t, f & 0xffff, 0));
+        c.word(enc::movk(t, f >> 16, 1));
+        // loop: one step down, touched; then the count down by one step while a whole step is
+        // left (`b.hs`, pass/probe.rs's doc says why not `b.hi`); then the rest.
+        c.word(enc::sub_imm(SP, SP, 1, true));
+        c.word(enc::str(Size::X, ZR, SP, 0));
+        c.word(enc::sub_imm(t, t, 1, true));
+        c.word(enc_probe::cmp_imm_lsl12(t, 1));
+        c.word(enc::b_cond(Cond::Hs, -4));
+        c.word(enc_probe::sub_ext_uxtx(SP, SP, t));
+    })?;
+    let hi = |v: &Vals, k: u8| u(v, k, 21) >> 9;
+    let lo = |v: &Vals, k: u8| u(v, k, 21) & 0x1ff;
+    one(each, glue::cell_load_far(RegClass::Gpr), &[far(2, 3, 21), reg(RES)], &|v, c| {
+        let d = r(v, RES);
+        c.word(enc::add_imm(d, SP, hi(v, 2), true));
+        c.word(enc::ldr(Size::X, d, d, lo(v, 2)));
+    })?;
+    one(each, glue::cell_load_far(RegClass::Fpr), &[far(2, 3, 21), reg(RES), reg(T0)], &|v, c| {
+        let t = r(v, T0);
+        c.word(enc::add_imm(t, SP, hi(v, 2), true));
+        c.word(ldr_d(r(v, RES), t, lo(v, 2)));
+    })?;
+    for class in [RegClass::Gpr, RegClass::Fpr] {
+        one(each, glue::cell_store_far(class), &[reg(0), far(3, 3, 21), reg(T0)], &|v, c| {
+            let t = r(v, T0);
+            c.word(enc::add_imm(t, SP, hi(v, 3), true));
+            c.word(match class {
+                RegClass::Gpr => enc::str(Size::X, r(v, 0), t, lo(v, 3)),
+                RegClass::Fpr => str_d(r(v, 0), t, lo(v, 3)),
+            });
+        })?;
+    }
+    one(each, glue::slot_address_far(), &[far(0, 0, 24), reg(RES)], &|v, c| {
+        let (d, f) = (r(v, RES), u(v, 0, 24));
+        c.word(enc::add_imm(d, SP, f >> 12, true));
+        c.word(enc::add_imm(d, d, f & 0xfff, false));
+    })
+}
+
 #[cfg(test)]
 mod tests {
     //! The glue recipes' tests: every composer pattern is in the generated table; each word this
@@ -252,7 +314,7 @@ mod tests {
     use super::{BR_IF_ZERO, eor_imm, fmov_d, ldp_d_post, ldr_d, shift_code, shifted, stp_d_pre, str_d};
     use crate::compose::emit::glue;
     use crate::enc;
-    use crate::table_gen::{EncodedTable, OPERANDS, RES, Vals, fill, generate};
+    use crate::table_gen::{EncodedTable, OPERANDS, RES, T0, Vals, fill, generate};
 
     const MACHINE: Machine = Machine { arch: Arch::Arm64, os: Os::MacOs, features: 0 };
     const N: Form = Form::None;
@@ -279,7 +341,7 @@ mod tests {
     }
 
     /// Every pattern compose/emit.rs's `glue` looks up is served by the generated table.
-    /// Expected: prints "glue: 37 composer patterns in the table" and passes. Fails with the first
+    /// Expected: prints "glue: 43 composer patterns in the table" and passes. Fails with the first
     /// pattern missing (the composer's `TableError::Missing`) if a recipe is dropped.
     #[test]
     fn every_composer_pattern_is_in_the_table() {
@@ -318,6 +380,12 @@ mod tests {
             glue::slot_address(),
             glue::compare_branch(64, IntCond::ALL[0], G),
             glue::compare_branch(32, IntCond::ALL[0], Form::Imm(ImmClass::U12)),
+            glue::frame(glue::PROBE, [Form::Slot, N, N, N]),
+            glue::cell_load_far(RegClass::Gpr),
+            glue::cell_load_far(RegClass::Fpr),
+            glue::cell_store_far(RegClass::Gpr),
+            glue::cell_store_far(RegClass::Fpr),
+            glue::slot_address_far(),
         ];
         for width in [1u8, 8, 16, 32] {
             wanted.push(glue::narrow(width));
@@ -484,5 +552,29 @@ mod tests {
         }
         let got = filled(&table, &cbz, &with(&[(0, 0), (1, 2)]));
         assert_eq!(&got[..], &[0xb400_0040], "cbz x0, #8: the template gives {got:08x?}");
+        // The far forms: one offset split over two words. A cell at 8-byte unit 4097 (byte
+        // 32776, one unit past the near reach) is `#8, lsl #12` (8 << 9 units) and `#1`.
+        let far = [
+            ("add x16, sp, #8, lsl #12; str x0, [x16, #8]", glue::cell_store_far(RegClass::Gpr), with(&[(0, 0), (3, 4097), (T0, 16)]), [0x9140_23f0u32, 0xf900_0600]),
+            ("add x1, sp, #8, lsl #12; ldr x1, [x1, #8]", glue::cell_load_far(RegClass::Gpr), with(&[(2, 4097), (RES, 1)]), [0x9140_23e1, 0xf940_0421]),
+            ("add x0, sp, #1, lsl #12; add x0, x0, #16", glue::slot_address_far(), with(&[(0, 4096 + 16), (RES, 0)]), [0x9140_07e0, 0x9100_4000]),
+        ];
+        for (name, pattern, vals, want) in far.iter() {
+            let got = filled(&table, pattern, vals);
+            assert_eq!(&got[..], &want[..], "{name}: the template gives {got:08x?}");
+        }
+        // The probe: pass/probe.rs's loop and rest with the count in x16, for a 1 MiB frame.
+        let got = filled(&table, &glue::frame(glue::PROBE, [Form::Slot, N, N, N]), &with(&[(0, 1 << 20), (T0, 16)]));
+        let want = [
+            enc::movz(16, 0, 0),
+            enc::movk(16, 16, 1),
+            enc::sub_imm(enc::SP, enc::SP, 1, true),
+            enc::str(enc::Size::X, enc::ZR, enc::SP, 0),
+            enc::sub_imm(16, 16, 1, true),
+            crate::enc_probe::cmp_imm_lsl12(16, 1),
+            enc::b_cond(enc::Cond::Hs, -4),
+            crate::enc_probe::sub_ext_uxtx(enc::SP, enc::SP, 16),
+        ];
+        assert_eq!(&got[..], &want[..], "the probe template gives {got:08x?}");
     }
 }

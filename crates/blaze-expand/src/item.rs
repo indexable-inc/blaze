@@ -455,18 +455,63 @@ fn derive_input<'a, E>(
     Ok(out)
 }
 
-/// Where the element from `at` ends: past the comma that ends it, or at its group's close.
+/// Where the element from `at` ends: past the comma that ends it, or at what closes the list
+/// it is in (its group's close, or the `>` of a generic parameter list).
+///
+/// The Reference, "Structs" (`StructField : OuterAttribute* Visibility? IDENTIFIER : Type`,
+/// `TupleField : OuterAttribute* Visibility? Type`), "Enumerations" (a variant's
+/// `= Expression` discriminant), "Generic parameters": an element is one field, variant or
+/// parameter, and the comma that ends it is outside every group AND every `<..>` of its type.
+/// `<` and `>` delimit no token tree, so `map: BTreeMap<&'static str, ForkCondition>,` holds
+/// a comma inside its type: counting groups alone, a false `cfg` on it removed only
+/// `map: BTreeMap<&'static str,` and left `ForkCondition>,` in the derive's input, which no
+/// derive reads (reth-ethereum-forks' `ChainHardforks`, its two `map` fields under opposite
+/// `cfg`s: every builtin derive of it refused, so `ChainHardforks: Default` met core's blanket
+/// impl alone, tempo-chainspec t1545). The angles are counted as adt.rs `split` counts them
+/// for the same pieces (`Angles::UntilEq`): until the element's first lone `=` (a
+/// discriminant or a field's default value, an expression whose `<` is a comparison or a
+/// shift), and never the `>` of `->`.
 fn element_end(list: &[crate::tokens::Token], mut at: usize) -> usize {
     let mut depth = 0u32;
+    let mut angles = 0u32;
+    let mut counting = true;
+    // The index of the last `>` that closed an angle: a `=` glued to it (`Vec<u8>= ..`, one
+    // `>=` as lexed) is lone all the same.
+    let mut closed_at = None;
     while at < list.len() {
         match list[at].kind {
             TokenKind::Open(_) => depth += 1,
             TokenKind::Close(_) if depth == 0 => return at,
             TokenKind::Close(_) => depth -= 1,
-            TokenKind::Punct { char: ',', .. } if depth == 0 => return at + 1,
+            TokenKind::Punct { char: ',', .. } if depth == 0 && angles == 0 => return at + 1,
+            TokenKind::Punct { char: '<', .. } if depth == 0 && counting => angles += 1,
+            TokenKind::Punct { char: '>', .. } if depth == 0 && counting && !arrow_end(list, at) => {
+                // A `>` closing no angle of the element closes the generic parameter list the
+                // element is in (`struct S<A, #[cfg(x)] B: Tr<C, D>>`).
+                let Some(less) = angles.checked_sub(1) else { return at };
+                angles = less;
+                closed_at = Some(at);
+            }
+            TokenKind::Punct { char: '=', .. } if depth == 0 && angles == 0 && counting && lone_eq(list, at, closed_at) => counting = false,
             _ => {}
         }
         at += 1;
     }
     at
+}
+
+/// Whether the `>` at `at` ends a `->` (adt.rs `arrow_end`).
+fn arrow_end(list: &[crate::tokens::Token], at: usize) -> bool {
+    at > 0 && matches!(list[at - 1].kind, TokenKind::Punct { char: '-', spacing: crate::tokens::Spacing::Joint })
+}
+
+/// Whether the `=` at `at` stands alone (adt.rs `lone_eq`): not of `==`, `=>`, `<=`, `!=`, `+=`
+/// and the like. A `>` glued before it that closed an angle (`closed_at`) is no operator.
+fn lone_eq(list: &[crate::tokens::Token], at: usize, closed_at: Option<usize>) -> bool {
+    let joint = |i: usize| matches!(list.get(i).map(|t| t.kind), Some(TokenKind::Punct { spacing: crate::tokens::Spacing::Joint, .. }));
+    let glued_after = joint(at) && matches!(list.get(at + 1).map(|t| t.kind), Some(TokenKind::Punct { char: '=' | '>', .. }));
+    let glued_before = at > 0
+        && closed_at != Some(at - 1)
+        && matches!(list[at - 1].kind, TokenKind::Punct { char, spacing: crate::tokens::Spacing::Joint } if "<>!=+-*/%^&|".contains(char));
+    !glued_after && !glued_before
 }

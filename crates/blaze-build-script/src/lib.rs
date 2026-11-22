@@ -43,6 +43,7 @@ pub mod outputs;
 pub mod pinned;
 pub mod probe;
 pub mod probe_ask;
+pub mod probe_check;
 pub mod shelf_pins;
 pub mod toolchain;
 
@@ -70,6 +71,8 @@ mod git_link_tests;
 mod git_tests;
 #[cfg(test)]
 mod probe_ask_tests;
+#[cfg(test)]
+mod probe_check_tests;
 #[cfg(test)]
 mod tests;
 

@@ -456,7 +456,9 @@ pub(crate) fn run_tests(
         // the C of every crate its test program links (a build script's deferred C built by
         // native_runner_c.rs), made once and found by its key after, told to every test's start
         // before any of its code (test_drive.rs `Launched`). One that cannot be had leaves that
-        // suite's tests NOT RUN naming why (test_drive.rs `EntryCheck`), the others run.
+        // suite's tests NOT RUN naming why (test_drive.rs `EntryCheck`), the others run. A crate
+        // whose C is refused does not stop the image: its archives are left out, said by name,
+        // and only a test whose code calls one of its C names stops (engine_native.rs `image_for`).
         // NOT DONE: a proc-macro crate's tests (the macro side, native_image.rs `linked`) get no
         // image, as `image_for` links target-side crates only; a C name one calls stays its
         // test's `dlsym` failure, named by the launcher.

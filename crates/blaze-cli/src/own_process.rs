@@ -270,25 +270,46 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
         .ok()
         .and_then(|name| env.get(&name).ok().flatten())
         .is_some();
-    let telem_path = if line.form != EntryForm::Comptime && !no_telemetry {
-        if let Ok(runs_rel) = Path::new(".blaze/v2/runs") {
-            let _ = fs.home(cx, home, &runs_rel);
-        }
+    let runs_dir = Path::new(".blaze/v2/runs").ok().and_then(|rel| fs.home(cx, home, &rel).ok());
+    let run_stem = if line.form != EntryForm::Comptime && !no_telemetry {
         let cert = today.certificate.prefix();
-        let run_tag = bstd::mem::format_in!(
+        Some(bstd::mem::format_in!(
             frame,
-            "{}/.blaze/v2/runs/{}-{:02x}{:02x}{:02x}{:02x}.telem",
-            home.trim_end_matches('/'),
+            "{}-{:02x}{:02x}{:02x}{:02x}",
             package,
             cert[0],
             cert[1],
             cert[2],
             cert[3],
-        );
-        Some(run_tag)
+        ))
     } else {
         None
     };
+    let telem_path = run_stem.as_ref().map(|stem| {
+        bstd::mem::format_in!(frame, "{}/.blaze/v2/runs/{}.telem", home.trim_end_matches('/'), stem.as_str())
+    });
+    if let (Some(dir), Some(stem)) = (runs_dir.as_ref(), run_stem.as_ref()) {
+        let reason = match listed {
+            run_parent::ListHeld::Today => "Certificate cache hit (start list pre-placed)",
+            run_parent::ListHeld::Other => "Certificate changed (source or dependency edit invalidated start list)",
+            run_parent::ListHeld::None => "Cold first build (no prior start list for this target)",
+            run_parent::ListHeld::Unread(_) => "Prior start list unreadable (rebuilding fresh list)",
+        };
+        let body = bstd::mem::format_in!(
+            frame,
+            "{{\"id\":\"{}\",\"package\":\"{}\",\"command\":\"blaze run\",\"status\":\"running\",\"exit_code\":null,\"errors\":0,\"warnings\":0,\"reached\":{},\"found\":{},\"made\":0,\"placed\":{},\"resolved\":0,\"frontend_built\":\"pending\",\"recompile_reason\":\"{}\",\"phases\":[]}}\n",
+            stem.as_str(),
+            package,
+            placed.len(),
+            placed.len(),
+            placed.len(),
+            reason,
+        );
+        let name = bstd::mem::format_in!(frame, "{}.build.json", stem.as_str());
+        if let Ok(rel) = Path::new(name.as_str()) {
+            let _ = dir.publish(cx, &rel, bstd::fs::Content::bytes(body.as_bytes()), bstd::fs::Durable::No);
+        }
+    }
     if let Some(ref path) = telem_path {
         vars.push((blaze_launch::telemetry::VAR, path.as_str()));
         if err.is_terminal() && !no_open {
@@ -305,7 +326,65 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
         run_loop::run_program(&cx, &spawner, &started, &mut needs, &mut lazy, &ahead, alloc)
     };
     let tally = lazy.tally();
-    *counted = Some(run_parent::RunTally { codes: tally, start: needs.start_tally(lazy.built(), listed), lowerings: lazy.lowering_counts(), walk: lazy.walk_counts() });
+    let start_tally = needs.start_tally(lazy.built(), listed);
+    *counted = Some(run_parent::RunTally { codes: tally, start: start_tally, lowerings: lazy.lowering_counts(), walk: lazy.walk_counts() });
+    if let (Some(dir), Some(stem)) = (runs_dir.as_ref(), run_stem.as_ref()) {
+        let exit_code = ran.as_ref().ok().map(|r| r.status);
+        let status_str = match exit_code {
+            Some(0) => "ok",
+            Some(_) | None => "failed",
+        };
+        let exit_json = match exit_code {
+            Some(code) => bstd::mem::format_in!(frame, "{code}"),
+            None => bstd::mem::format_in!(frame, "null"),
+        };
+        let (fe_built, reason) = match (start_tally.held, start_tally.built) {
+            (run_parent::ListHeld::Today, run_parent::Built::No) => (
+                "no",
+                "100% certificate cache hit — zero front-end work, all functions served from cache",
+            ),
+            (run_parent::ListHeld::Today, run_parent::Built::Need { .. }) => (
+                "lazy_need",
+                "Start list hit, but a newly reached code path triggered lazy front-end resolution",
+            ),
+            (run_parent::ListHeld::Other, _) => (
+                "head",
+                "Certificate changed (source or dependency edit) — re-resolved changed functions",
+            ),
+            (run_parent::ListHeld::None, _) => (
+                "head",
+                "Cold first run — compiled reached functions and recorded start list for next run",
+            ),
+            (run_parent::ListHeld::Unread(_), _) => (
+                "head",
+                "Prior start list schema changed — rebuilt fresh start list",
+            ),
+            (run_parent::ListHeld::Today, run_parent::Built::Head) => (
+                "head",
+                "Rebuilt start head under today's certificate",
+            ),
+        };
+        let body = bstd::mem::format_in!(
+            frame,
+            "{{\"id\":\"{}\",\"package\":\"{}\",\"command\":\"blaze run\",\"status\":\"{}\",\"exit_code\":{},\"errors\":{},\"warnings\":0,\"reached\":{},\"found\":{},\"made\":{},\"placed\":{},\"resolved\":{},\"frontend_built\":\"{}\",\"recompile_reason\":\"{}\",\"phases\":[]}}\n",
+            stem.as_str(),
+            package,
+            status_str,
+            exit_json.as_str(),
+            if exit_code == Some(0) { 0u32 } else { 1u32 },
+            tally.reached,
+            tally.found,
+            tally.made,
+            start_tally.placed,
+            start_tally.resolved,
+            fe_built,
+            reason,
+        );
+        let name = bstd::mem::format_in!(frame, "{}.build.json", stem.as_str());
+        if let Ok(rel) = Path::new(name.as_str()) {
+            let _ = dir.publish(cx, &rel, bstd::fs::Content::bytes(body.as_bytes()), bstd::fs::Durable::No);
+        }
+    }
     // A crash the program's handler told by place, named while the walk is alive (rule 19,
     // run_fault.rs): the fn by its path, the trap by the instruction in its record.
     let mut struck_in = bstd::mem::Bytes::new_in(frame, "the code record a crash struck in");

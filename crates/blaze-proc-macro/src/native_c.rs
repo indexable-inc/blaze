@@ -32,7 +32,7 @@
 use core::time::Duration;
 use std::io::Read as _;
 
-use blaze_build_script::c_tasks::{Area, CCompiler, Compile, CompilerKind, Compiled, ERROR_LINES, FactError, FileRef, GuestRoots, Refused, StoreFailed, Today};
+use blaze_build_script::c_tasks::{Area, CCompiler, Compile, CompilerKind, Compiled, ERROR_LINES, FactError, FileRef, GuestRoots, Lang, Refused, StoreFailed, Today};
 use blaze_build_script::native::Grant;
 use blaze_build_script::outputs::{FileLimits, Outputs};
 use blaze_core::lock::Lock;
@@ -299,6 +299,10 @@ pub struct Depfile;
 
 impl ReportParser for Depfile {
     fn paths<'t>(&self, text: &'t [u8], each: &mut dyn FnMut(&'t [u8]) -> Result<(), Fault>) -> Result<(), Fault> {
+        // No depfile written (CFiles `read_output`): no reads; `compile` refuses an exit 0 so.
+        if text.is_empty() {
+            return Ok(());
+        }
         let Some(colon) = text.windows(2).position(|w| w == b": ") else {
             return Err(Fault::Report(ReportError::Malformed { at: 0 }));
         };
@@ -351,7 +355,17 @@ impl RootFiles for CFiles<'_> {
         let refused = |code: u16| Fault::Files(FilesError { op: FilesOp::ReadOutput, root: self.out.root, code });
         let mut buf = [0u8; PATH_MOST];
         let host = join(&mut buf, &[self.out.folder, "/", path.as_str()]).ok_or(refused(TOO_LONG))?;
-        let mut opened = std::fs::File::open(host).map_err(|e| refused(os_code(&e)))?;
+        // The run reads the report on every exit; a clang that stopped before its depfile (an
+        // output it could not open, an argument it refused) left none. An absent depfile is an
+        // empty report, so the run ends and clang's own error is what the compile says
+        // (`Compiled::Failed`); an exit 0 with no read is refused by name in `compile`.
+        let mut opened = match std::fs::File::open(host) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && path.as_str() == DEPFILE => {
+                into.clear();
+                return Ok(());
+            }
+            opened => opened.map_err(|e| refused(os_code(&e)))?,
+        };
         let len = opened.metadata().map_err(|e| refused(os_code(&e)))?.len();
         if len > u64::from(most) {
             return Err(refused(0));
@@ -473,6 +487,15 @@ impl<'s> ShelfClang<'s> {
     }
 }
 
+/// The flags a source's language adds to every compile of it (see `compile`): `.S` keeps its
+/// preprocessed text in the task folder, never in a temporary folder the grant does not give.
+fn lang_flags(lang: Lang) -> &'static [&'static str] {
+    match lang {
+        Lang::AsmCpp => &["-save-temps=obj"],
+        Lang::C | Lang::Cxx | Lang::Asm => &[],
+    }
+}
+
 fn refused<'a>(alloc: Alloc<'a>, parts: &[&str]) -> Refused<'a> {
     let mut words = String::new_in(alloc);
     for part in parts {
@@ -528,6 +551,17 @@ impl CCompiler for ShelfClang<'_> {
         held.push(text(&["-MD"]));
         held.push(text(&["-MF"]));
         held.push(depfile.clone());
+        // Assembly through the preprocessor (`.S`: aws-lc's, ring's) is two jobs in one clang:
+        // the preprocessor writes its text to a TEMPORARY file, which the assembler reads. With
+        // no `TMPDIR` that file is under the user's temporary folder, which the grant does not
+        // let it write, so the preprocessor failed and wrote no depfile (the run's ReadOutput of
+        // `.c-task.d`, ENOENT). `-save-temps=obj` names it `<task>/<source stem>.s` instead: in
+        // the folder it may write, under a name of the source's (a random temporary name would
+        // be in the object's debug info: rule 25), mapped to the guest `OUT_DIR` by the prefix
+        // map below; it is not stored (only the object is).
+        for flag in lang_flags(unit.lang) {
+            held.push(text(&[flag]));
+        }
         held.push(text(&["-c"]));
         held.push(self.host(unit.source, alloc)?);
         held.push(text(&["-o"]));
@@ -608,9 +642,16 @@ impl CCompiler for ShelfClang<'_> {
             let Some(laid) = self.sources.get(entry.root.index()) else { continue };
             reads.push(text(&[laid.guest, "/", entry.path.as_str()]));
         }
+        // A compile reads its source at least: none read is a clang that wrote no depfile and
+        // still exited 0, whose object no read list could find again (rule 3).
+        if reads.is_empty() {
+            return Err(refused(alloc, &["clang exited 0 but wrote no depfile naming its reads: ", unit.source]));
+        }
         // The depfile was the report; the object alone goes to the file area, renamed in.
         std::fs::remove_file(depfile.as_str()).map_err(|_| refused(alloc, &["the depfile could not be removed: ", depfile.as_str()]))?;
-        let listed = listed_under(self.task_out).map_err(|e| refused(alloc, &["the task folder could not be listed: ", &e.to_string()]))?;
+        let mut listed = listed_under(self.task_out).map_err(|e| refused(alloc, &["the task folder could not be listed: ", &e.to_string()]))?;
+        // The object alone: `-save-temps=obj`'s preprocessed text is the compile's own step.
+        listed.retain(|entry| entry.name.as_str() == object_name);
         let mut stored = Outputs::new_in(self.roots.out, alloc);
         store_out_dir(self.task_out, self.area, &listed, &mut stored, FileLimits { bytes: u64::MAX, files: 1 }, alloc)
             .map_err(|e| refused(alloc, &["the object could not be stored: ", &e.to_string()]))?;
@@ -635,8 +676,20 @@ fn replace_all<'a>(text: &str, from: &str, to: &str, alloc: Alloc<'a>) -> AStrin
 
 #[cfg(test)]
 mod tests {
-    use super::{Depfile, Laid, PATH_MOST, join, laid_of};
+    use super::{Depfile, Laid, PATH_MOST, join, laid_of, lang_flags};
+    use blaze_build_script::c_tasks::Lang;
     use bstd::procs::hermetic::ReportParser;
+
+    /// aws-lc's and ring's `.S`: clang's preprocessor writes a temporary file the assembler reads;
+    /// in the grant's world only the task folder may be written, so `.S` names it there. Twin:
+    /// a C source makes no temporary and adds nothing (its argv, and so its object, unchanged).
+    #[test]
+    fn preprocessed_assembly_keeps_its_temporary_in_the_task_folder() {
+        assert_eq!(lang_flags(Lang::AsmCpp), ["-save-temps=obj"]);
+        assert!(lang_flags(Lang::C).is_empty() && lang_flags(Lang::Cxx).is_empty() && lang_flags(Lang::Asm).is_empty());
+        // A clang that stopped before its depfile: an empty report, so its own error is said.
+        assert!(Depfile.paths(b"", &mut |_| panic!("no read")).is_ok());
+    }
 
     #[test]
     fn a_depfile_gives_each_path() {

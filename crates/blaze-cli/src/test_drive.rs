@@ -323,6 +323,10 @@ fn refused_instance(cause: &ParentError) -> Option<([u8; 32], Option<(ItemKey, u
             // one symbol is tabled under two fns (an entry's declaration), or the walk's own
             // bound on its instances (rule 18).
             WalkError::Store(_) | WalkError::Entry { .. } | WalkError::TwoTabled { .. } | WalkError::Cap { .. } => return None,
+            // The relay's own protocol (D194: a row stepped while it is being made, a made entry
+            // handed back to a row not begun for it): a fault of blaze's driver, which no test's
+            // code can cause, so the suite's; as one test's NOT RUN it would hide the driver's bug.
+            WalkError::Making { .. } | WalkError::NotBegun { .. } => return None,
             WalkError::Make { tabled, why } => (*symbol, Some((*tabled, refused_at(why)?))),
             // That instance's: a bound the test's code passes (an instance name past its cap,
             // the walk's names past their arena, an item instantiating itself past
@@ -734,9 +738,64 @@ pub(crate) struct Signals {
     terminate: Cell<bool>,
     /// Only one child may block per sweep, for at most one drain interval in total.
     wait: Cell<Duration>,
+    /// What the child being polled last began ([`Doing`]): set by its run, read by
+    /// [`OneEach`] after each poll, so a turn that held the command thread is named by it.
+    doing: Cell<Doing>,
+}
+
+/// What one child's run was doing on the command thread. Every child is served by that one
+/// thread (its code made at its first calls, its pipes read), so while one turn runs no other
+/// child is answered and the runner's watch (test_run.rs `watch`) is not stepped: a turn longer
+/// than another run's allowance makes that run's zygote "silent". This names the turn.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) enum Doing {
+    #[default]
+    Idle,
+    /// Making the code of its roots before its process starts (run_parent.rs `ahead_of`): NOT
+    /// in the child's own allowance (counted from its start), but in the runner's (from the ask).
+    Roots,
+    /// Starting its sandboxed process.
+    Starting,
+    /// Answering a request of its process: a first call's code found or made (run_parent.rs
+    /// `Lazy::publication`).
+    Serving,
+    /// Reading its pipes and its deadline.
+    Relaying,
+}
+
+impl fmt::Display for Doing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Doing::Idle => "nothing named",
+            Doing::Roots => "making the code of its roots before its process started (run_parent.rs `ahead_of`)",
+            Doing::Starting => "starting its sandboxed process",
+            Doing::Serving => "making the code its process asked for at a first call (run_parent.rs `Lazy::publication`)",
+            Doing::Relaying => "reading its pipes",
+        })
+    }
+}
+
+/// The longest single poll of one child: the command thread's turn, which no other child's
+/// answer and no runner's watch could interrupt.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Turn {
+    /// The runner's (flat) row.
+    pub row: u32,
+    pub nanos: u64,
+    pub doing: Doing,
 }
 
 impl Signals {
+    /// The child being polled began `doing`. A poll holds at most one making of code (the
+    /// first holds `ahead_of`, a later one at most one served request), so that one is kept
+    /// over the light steps around it: it is what a long turn spent its time on.
+    fn begin(&self, doing: Doing) {
+        let heavy = |d: Doing| matches!(d, Doing::Roots | Doing::Serving);
+        if heavy(doing) || !heavy(self.doing.get()) {
+            self.doing.set(doing);
+        }
+    }
+
     fn terminate(&self, now: Duration) -> Result<bool, OneError> {
         let mut slot = self.held.borrow_mut();
         let held = match &mut *slot {
@@ -794,6 +853,9 @@ pub(crate) struct OneEach<'b, R: RunOne, C: Fn() -> Nanos> {
     /// The error that stopped a run in blaze, and the tests record row it was of: printed by
     /// [`run_suites`] as one line naming the test, before the command's own error line.
     pub failed: Option<(u32, OneError)>,
+    /// The longest turn any child's poll took ([`Turn`]): printed by [`run_suites`] when the
+    /// runner stops, so a zygote "silent" past an allowance says what held the thread.
+    pub longest: Option<Turn>,
 }
 
 impl<'b, R: RunOne, C: Fn() -> Nanos> OneEach<'b, R, C> {
@@ -804,7 +866,7 @@ impl<'b, R: RunOne, C: Fn() -> Nanos> OneEach<'b, R, C> {
         let running = std::vec::Vec::new_in(*proof.allocator());
         Ok(OneEach {
             runs, signals, now, heap, suite: SuiteId(0), width: 0,
-            pending: Vec::new_in(alloc), batch: Vec::new_in(alloc), running, failed: None,
+            pending: Vec::new_in(alloc), batch: Vec::new_in(alloc), running, failed: None, longest: None,
         })
     }
 }
@@ -856,7 +918,14 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
             self.signals.wait.set(interval.min(left));
             let mut at = 0;
             while at < self.running.len() {
-                let Poll::Ready(result) = self.running[at].child.as_mut().poll(&mut context) else { at += 1; continue };
+                self.signals.doing.set(Doing::Idle);
+                let turn = (self.now)();
+                let polled = self.running[at].child.as_mut().poll(&mut context);
+                let nanos = (self.now)().0.saturating_sub(turn.0);
+                if self.longest.is_none_or(|longest| nanos > longest.nanos) {
+                    self.longest = Some(Turn { row: self.running[at].row, nanos, doing: self.signals.doing.get() });
+                }
+                let Poll::Ready(result) = polled else { at += 1; continue };
                 let Running { row, test, began, .. } = self.running.swap_remove(at);
                 let item = match result {
                     Ok((how, output)) => Item::Ended { row, test, micros: (self.now)().0.saturating_sub(began.0) / 1_000, how, output },
@@ -963,16 +1032,59 @@ mod pool_tests {
             assert_eq!(end.test, TestId([end.row as u8; 32]));
         }
     }
+
+    /// A child whose first turn makes its roots' code for a long time (the clock moved 5000 in
+    /// that one poll), then starts its process: the pool's longest turn is that child's, named
+    /// by the code making, not by the light step after it. Twin: a light child's turns are
+    /// never the longest.
+    struct Slow<'t> {
+        tick: &'t Cell<u64>,
+    }
+
+    impl RunOne for Slow<'_> {
+        async fn run(&self, row: u32, _: Nanos, _: &mut Output<'_>, signals: &Signals) -> Result<How, OneError> {
+            if row == 5 {
+                signals.begin(Doing::Roots);
+                self.tick.set(self.tick.get() + 5_000);
+                signals.begin(Doing::Starting);
+            }
+            signals.begin(Doing::Relaying);
+            next_turn().await;
+            Ok(How::Reported(Said::Returned))
+        }
+    }
+
+    #[test]
+    fn a_long_turn_is_named_by_what_held_the_thread() {
+        let heap = blaze_own::testing::heap().alloc();
+        let signals = Signals::default();
+        let tick = Cell::new(0u64);
+        let children = Slow { tick: &tick };
+        let clock = || {
+            tick.set(tick.get() + 1);
+            Nanos(tick.get())
+        };
+        let mut pool = OneEach::new(&children, &signals, clock, heap, heap).expect("the process heap");
+        pool.start(SuiteId(0), 2).expect("two slots");
+        pool.ask(2, TestId([2; 32]), Nanos(100_000)).expect("light");
+        pool.ask(5, TestId([5; 32]), Nanos(100_000)).expect("slow");
+        pool.wait(Nanos(100_000)).expect("ready");
+        pool.clear();
+        pool.wait(Nanos(100_000)).expect("both end");
+        let turn = pool.longest.expect("a turn was timed");
+        assert_eq!((turn.row, turn.doing), (5, Doing::Roots));
+        assert!(turn.nanos >= 5_000, "the turn's length is not the clock's: {}", turn.nanos);
+    }
 }
 
-fn entry_roots<'a>(harness: bool, names: NamesRecords<'_>, test: LibKey, builder: Builder, tables: Alloc<'static>, alloc: Alloc<'a>)
+fn entry_roots<'a>(harness: bool, names: NamesRecords<'_>, test: LibKey, exports: &[LibKey], builder: Builder, tables: Alloc<'static>, alloc: Alloc<'a>)
     -> Result<Roots<'a>, blaze_ladder::run::special::RootsError>
 {
     let panic = builder.settings.panic;
     if harness {
-        test_roots(names.records, test, names.lang_crates, panic, names.frame, tables, alloc)
+        test_roots(names.records, test, names.lang_crates, panic, exports, names.frame, tables, alloc)
     } else {
-        blaze_ladder::run::special::run_roots(names.records, names.lang_crates, panic, names.frame, tables, alloc)
+        blaze_ladder::run::special::run_roots(names.records, names.lang_crates, panic, exports, names.frame, tables, alloc)
     }
 }
 
@@ -984,22 +1096,26 @@ pub(crate) struct EntryCheck<'c, 'h> {
     pub names: NamesRecords<'h>,
     pub builder: Builder,
     pub tables: Alloc<'static>,
-    /// Why its suite's native image could not be had ([`Suite::native`]): every row's refusal.
-    pub image: Result<(), &'c str>,
+    /// Its suite's native image's exports (`NativeSend::items`, roots of every row), else why the
+    /// image could not be had ([`Suite::native`]): every row's refusal.
+    pub image: Result<&'c [LibKey], &'c str>,
     said: AString<'c>,
 }
 
 impl Refuse for EntryCheck<'_, '_> {
     fn refusal(&mut self, row: u32) -> Result<Option<&str>, OneError> {
-        if let Err(why) = self.image {
-            self.said.clear();
-            write!(self.said, "its test program's native image: {why}").map_err(|_| OneError::Profile { why: Box::from("a refusal's words did not fit in memory") })?;
-            return Ok(Some(self.said.as_str()));
-        }
+        let exports = match self.image {
+            Ok(exports) => exports,
+            Err(why) => {
+                self.said.clear();
+                write!(self.said, "its test program's native image: {why}").map_err(|_| OneError::Profile { why: Box::from("a refusal's words did not fit in memory") })?;
+                return Ok(Some(self.said.as_str()));
+            }
+        };
         let test = key_of(&self.tests, row)?;
         let frame = Frame::new(bstd::mem::Tag::Other).map_err(OneError::Frame)?;
         let erased = blaze_own::Erased::new(&frame);
-        let made = entry_roots(self.tests.harnessed(), self.names, test, self.builder, self.tables, erased.handle());
+        let made = entry_roots(self.tests.harnessed(), self.names, test, exports, self.builder, self.tables, erased.handle());
         let Err(why) = made else { return Ok(None) };
         self.said.clear();
         write!(self.said, "{why}").map_err(|_| OneError::Profile { why: Box::from("a refusal's words did not fit in memory") })?;
@@ -1179,7 +1295,8 @@ impl Launched<'_, '_> {
         self.temps.make_dir(cx, &named, Durable::No).map_err(OneError::Temp)?;
         let temp = bstd::mem::format_in!(frame, "{}/{row}", self.temp);
         // 2. The lazy parent with the test's roots; nothing built yet.
-        let front = TestFront { names: self.names, ids: self.ids, builder: self.builder, tables: self.tables, alloc, test, harness: self.tests.harnessed(), watch: self.watch };
+        let exports = self.native.map_or(&[][..], |send| send.items);
+        let front = TestFront { names: self.names, ids: self.ids, builder: self.builder, tables: self.tables, alloc, test, exports, harness: self.tests.harnessed(), watch: self.watch };
         let mut codes = HomeCodeStore::new(self.lent);
         let mut lazy = Lazy::new(cx, front, RecordsDir { cx, dir: self.records }, &mut codes, self.builder, alloc);
         let mut needs = Needs::new(alloc);
@@ -1190,6 +1307,7 @@ impl Launched<'_, '_> {
         if let Some(send) = self.native {
             needs.tell_native(send.library, send.words, &mut ahead).map_err(|cause| test_parent_error(&mut lazy, cause))?;
         }
+        signals.begin(Doing::Roots);
         let head = run_parent::ahead_of(None, &mut lazy, &mut needs, &mut placed, &mut ahead)
             .map_err(|cause| test_parent_error(&mut lazy, cause))?;
         let line = head.line;
@@ -1214,6 +1332,7 @@ impl Launched<'_, '_> {
         args.extend_from_slice(self.args);
         // Its working directory: its package's root, as `cargo test` runs it (`PackageRun`).
         let spec = RunSpec { program: SANDBOX_EXEC, arg0: None, args: args.as_slice(), env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
+        signals.begin(Doing::Starting);
         let Started { child: mut run, pipes: given } = self.spawner.start_served(cx, &spec).map_err(OneError::Start)?;
         let until = Deadline::after(run.now(), Duration::from_nanos(budget.0));
         let stdout = given.stdout.ok_or(OneError::MissingPipe { stream: "stdout" })?;
@@ -1233,6 +1352,7 @@ impl Launched<'_, '_> {
         let (ended, mut over) = loop {
             next_turn().await;
             let _span = cx.span("blaze test: service one child's pipes, requests and deadline");
+            signals.begin(Doing::Relaying);
             let now = run.now();
             if until.passed(now) {
                 let killed = run.kill().map_err(child_error)?;
@@ -1263,6 +1383,7 @@ impl Launched<'_, '_> {
                 match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, poll) {
                     Ok(Message::Whole { len }) => {
                         self.watch.see(blaze_screen::Step::Waits);
+                        signals.begin(Doing::Serving);
                         let serving = run.now();
                         let before = lazy.tally();
                         let mut resolver = TestResolve { parent: &mut lazy, requested: None };
@@ -1481,6 +1602,8 @@ pub(crate) struct TestFront<'s, 'h, 'r> {
     pub tables: Alloc<'static>,
     pub alloc: Alloc<'r>,
     pub test: LibKey,
+    /// The Rust fns the test binary's C calls (its image's words, `NativeSend::items`): roots.
+    pub exports: &'s [LibKey],
     pub watch: &'s dyn Watch,
 }
 
@@ -1490,7 +1613,7 @@ impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
     type Maker = RunMaker<'h>;
 
     fn start(&mut self) -> Result<Roots<'r>, ParentError> {
-        entry_roots(self.harness, self.names, self.test, self.builder, self.tables, self.alloc).map_err(ParentError::Roots)
+        entry_roots(self.harness, self.names, self.test, self.exports, self.builder, self.tables, self.alloc).map_err(ParentError::Roots)
     }
 
     fn ids(&mut self) -> Result<&'s RunIds<'h>, ParentError> {
@@ -1820,7 +1943,7 @@ pub(crate) fn run_suites<'h>(
             args: if tests.harnessed() { &[] } else { args },
             native: suite.native.ok().flatten(),
         });
-        checks.push(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, image: suite.native.map(|_| ()), said: String::new_in(alloc) });
+        checks.push(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, image: suite.native.map(|native| native.map_or(&[][..], |send| send.items)), said: String::new_in(alloc) });
         for at in 0..tests.len() {
             let mut row = asked(unit, record_row(tests, at)?, args);
             // Custom harnesses receive the raw arguments themselves.
@@ -1864,6 +1987,19 @@ pub(crate) fn run_suites<'h>(
         let path = record_row(tests, location.row as usize)?.path;
         err.line(&cx, format_args!("blaze test: the test `{}/{}/{path}` could not be run: {failed}", unit.package, unit.target)).map_err(|_| DriveError::Print)?;
         return Err(DriveError::OneStopped);
+    }
+    // A zygote "silent" past a run's allowance: what held the command thread, which serves every
+    // child, said before the runner's own line (stop 3 of the first real run: tempo's
+    // `tempo-precompiles-macros` row 7, five runs in a row). The longest turn names its test,
+    // its length and what it was doing; it may be another test's turn than the silent row's.
+    if let (Err(DriveError::Run(RunError::ZygoteSilent { .. })), Some(turn)) = (&status, runner.zygotes().longest) {
+        let location = locations.get(turn.row as usize).ok_or(one(OneError::NoRow { row: turn.row }))?;
+        let unit = suites[location.suite.0 as usize].unit;
+        let path = record_row(unit.tests, location.row as usize)?.path;
+        err.line(&cx, format_args!(
+            "blaze test: the command thread, which serves every test's process, was held {}.{} s in one turn of `{}/{}/{path}` (row {}): {}; while a turn runs no test is answered (test_drive.rs `OneEach`)",
+            turn.nanos / 1_000_000_000, turn.nanos % 1_000_000_000 / 100_000_000, unit.package, unit.target, turn.row, turn.doing,
+        )).map_err(|_| DriveError::Print)?;
     }
     let status = status?;
     if unkept != Unkept::default() {
@@ -1936,7 +2072,7 @@ mod native_tests {
     const HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     fn send(hex: &'static str) -> NativeSend<'static> {
-        NativeSend { library: blaze_launch::wire::RecordId([7; 32]), hex, words: &[] }
+        NativeSend { library: blaze_launch::wire::RecordId([7; 32]), hex, words: &[], items: &[] }
     }
 
     /// A test program whose image holds C gets one grant more than the test profile: its

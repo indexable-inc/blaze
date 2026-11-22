@@ -9,8 +9,10 @@
 //!
 //! A span is a handle into [`Server::spans`]: where it points (a token of the call's input or
 //! of its attribute's arguments, or none) and whose hygiene it has. Nothing in a span is a
-//! position in a file: `line`, `column` and `file` are answered from the item alone, and
-//! `source_text` prints the tokens it covers. The output's spans become
+//! position in a file: `line`, `column`, `local_file` and `byte_range` are refused
+//! ([`ServerError::Position`], rule 71), `source_text` prints the tokens it covers, and `file`
+//! is answered for a token written in the file holding the call ([`ProcCall::file`]) and is a
+//! read of the run ([`Server::asked_file`]). The output's spans become
 //! [`TokenOrigin`]s: the input's token for a span of the input, [`TokenOrigin::Made`] of the
 //! site's transparency for `call_site` (transparent), `mixed_site` (semi-opaque) and `def_site`
 //! (opaque). `resolved_at` keeps the location of one span and the hygiene of the other, and the
@@ -19,7 +21,7 @@
 use std::alloc::Global;
 
 use blaze_expand::{
-    Ctx, Delim, Edition, LitKind, ProcCall, ProcDiagnostic, ProcKind, ProcLevel, ProcLimit, Produced, Raw, Reads,
+    Ctx, Delim, Edition, HostError, LitKind, ProcCall, ProcDiagnostic, ProcKind, ProcLevel, ProcLimit, Produced, Raw, Reads,
     Spacing, Text, TokenKind, TokenOrigin, TokenStream, Transparency, lex,
 };
 use blaze_own::{AVec, Alloc};
@@ -63,9 +65,19 @@ pub enum ServerError {
     Limit(ProcLimit),
     /// Bytes after a request's last argument.
     Trailing { method: Method },
-    /// A question about where a span sits in its file (`line`, `column`, `file`,
-    /// `local_file`, `byte_range`), which is not served.
+    /// A question about where a span sits in its file (`line`, `column`, `local_file`,
+    /// `byte_range`), which is not served.
     Position { method: Method },
+    /// `file` of a call whose file the host does not answer (a toolchain crate's, a host told
+    /// no file): `why`, as the host gave it. No path is made up (rule 3).
+    FileUnknown { why: HostError },
+    /// `file` of a site span (`call_site`, `mixed_site`, `def_site`): the file holding the
+    /// call's own text or the macro's definition is not told to the server, only the file
+    /// holding the call's item.
+    FileOfSite,
+    /// `file` of a token an expansion made (no root context): its file is where the macro
+    /// that wrote it is defined, which the server is not told.
+    FileOfMadeToken,
     /// Attribute arguments given to a call of `kind`, which takes none.
     ArgumentsOnNonAttribute { kind: ProcKind },
 }
@@ -91,6 +103,17 @@ impl std::fmt::Display for ServerError {
                 f,
                 "asked `{}`, where a span sits in its file, which blaze does not answer: an expansion is keyed by its item, not its place (rule 71)",
                 method.name()
+            ),
+            ServerError::FileUnknown { why } => {
+                write!(f, "asked `span_file` of a call whose file the host does not answer ({why}): no path is made up (rule 3)")
+            }
+            ServerError::FileOfSite => write!(
+                f,
+                "asked `span_file` of a site span (`call_site`, `mixed_site`, `def_site`), which blaze does not answer: only the file of a token written in the call's item is told to the macro"
+            ),
+            ServerError::FileOfMadeToken => write!(
+                f,
+                "asked `span_file` of a token a macro wrote, which blaze does not answer: its file is where that macro is defined, which is not told to the macro"
             ),
             ServerError::ArgumentsOnNonAttribute { kind } => write!(f, "was given attribute arguments on a {kind:?} call, which takes none"),
         }
@@ -186,6 +209,18 @@ pub struct Server {
     diags: Vec<Diag, Global>,
     diag_text: Vec<u8, Global>,
     pub(crate) tracked: Vec<Tracked, Global>,
+    /// The call's file as the host shows it ([`ProcCall::file`]), a range of `text`, or why
+    /// the host does not answer it.
+    file: Result<Sym, HostError>,
+    /// Whether each token of the input, and of the attribute's arguments, was written in the
+    /// file holding the call: a root context, no expansion made it. Only such a token's
+    /// `file` is the call's.
+    written_input: AVec<'static, bool>,
+    written_attr: AVec<'static, bool>,
+    /// Whether `span_file` was answered: the driver then records the call's file as a read of
+    /// the run (host.rs, sandbox.rs `CALL_FILE`), so a kept answer is taken only for a call
+    /// whose file is shown the same.
+    pub(crate) asked_file: bool,
     /// Requests answered: the expansion's span says how many.
     pub requests: u64,
     /// The allocator `ts_from_str` lexes in: the runner's scratch.
@@ -311,6 +346,25 @@ impl Server {
                 Some(_) => return Err(ServerError::ArgumentsOnNonAttribute { kind: call.kind }),
             },
         };
+        // The call's file is the text's first symbol: a path past the text limit stops the
+        // expansion as any symbol past it does.
+        let mut text = Vec::new_in(Global);
+        let file = match call.file {
+            Ok(file) if file.len() > limits.text => return Err(ServerError::Limit(ProcLimit::Output)),
+            Ok(file) => {
+                text.extend_from_slice(file.as_bytes());
+                Ok(Sym { at: 0, len: file.len() as u32 })
+            }
+            Err(why) => Err(why),
+        };
+        let written = |stream: &TokenStream<'_>| {
+            let mut out = AVec::with_capacity_in(stream.tokens().len(), scratch);
+            for token in stream.tokens() {
+                out.push(token.ctx.root_edition().is_some());
+            }
+            out
+        };
+        let (written_input, written_attr) = (written(input), attr.map_or_else(|| AVec::new_in(scratch), written));
         let mut server = Server {
             edition,
             limits,
@@ -318,12 +372,16 @@ impl Server {
             live: 0,
             tokens: 0,
             spans: Vec::new_in(Global),
-            text: Vec::new_in(Global),
+            text,
             input: Vec::new_in(Global),
             attr: Vec::new_in(Global),
             diags: Vec::new_in(Global),
             diag_text: Vec::new_in(Global),
             tracked: Vec::new_in(Global),
+            file,
+            written_input,
+            written_attr,
+            asked_file: false,
             requests: 0,
             scratch,
         };
@@ -366,6 +424,22 @@ impl Server {
             .checked_sub(1)
             .and_then(|at| self.spans.get(at as usize).copied())
             .ok_or(ServerError::NoSuchSpan { method, handle })
+    }
+
+    /// What `span_file` answers for `span`: the file holding the call, for a span whose first
+    /// token was written in it (rustc's `Span::file` of a joined or resolved span is its first
+    /// token's place's file). A site's file, a made token's, or a call whose file the host
+    /// does not answer is refused by name.
+    fn file_of(&self, span: SpanData) -> Result<Sym, ServerError> {
+        let written = match span.place {
+            Place::Input { lo, .. } => self.written_input.get(lo as usize) == Some(&true),
+            Place::Attr { lo, .. } => self.written_attr.get(lo as usize) == Some(&true),
+            Place::Site => return Err(ServerError::FileOfSite),
+        };
+        if !written {
+            return Err(ServerError::FileOfMadeToken);
+        }
+        self.file.map_err(|why| ServerError::FileUnknown { why })
     }
 
     fn sym(&mut self, text: &str) -> Result<Sym, ServerError> {
@@ -583,10 +657,19 @@ impl Server {
                 self.span_data(method, handle)?;
                 w.handle(handle);
             }
-            Method::SpanByteRange | Method::SpanLine | Method::SpanColumn | Method::SpanFile | Method::SpanLocalFile => {
+            Method::SpanFile => {
+                // The file holding the call (turso_macros' `get_caller_file` asks it of its
+                // input's first token): a read of the run, not of the item's place in the file.
+                let span = self.span_data(method, r.handle().map_err(bad)?)?;
+                let file = self.file_of(span)?;
+                self.asked_file = true;
+                w.str(self.sym_text(file));
+            }
+            Method::SpanByteRange | Method::SpanLine | Method::SpanColumn | Method::SpanLocalFile => {
                 // Where the item sits in its file is not an input of an expansion (rule 71):
                 // answering it would need a keyed read of the position, which the host does
-                // not serve yet. Refused, never answered with a made-up place.
+                // not serve. Refused, never answered with a made-up place. `local_file` is a
+                // path on this machine (rule 25), never answered.
                 self.span_data(method, r.handle().map_err(bad)?)?;
                 return Err(ServerError::Position { method });
             }
@@ -1028,13 +1111,81 @@ mod tests {
     fn produce_literal(kind: LitKind, text: &str) -> blaze_expand::TokenStream<'static> {
         let alloc = Alloc::global();
         let input = lex("input", Edition::E2021, alloc).expect("the test input lexes");
-        let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None };
+        let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok("src/lib.rs") };
         let mut run_input = Vec::new();
         let mut server = Server::new(Edition::E2021, ServerLimits::STANDARD, &call, alloc, &mut run_input).expect("the server starts");
         let sym = server.sym(text).expect("the literal text fits");
         let span = server.spans.len() as SpanId;
         let handle = server.hold(vec![Tok::Literal { kind, sym, suffix: None, span }]).expect("the output stream is held");
         server.produce(Some(handle), None, Reads::new_in(alloc), alloc).expect("the output is produced").tokens
+    }
+
+    /// What `span_file` of the span `pick` chooses answers, for the input `input` of a call in
+    /// `file`: the string, or why it was refused; and whether the server then records the
+    /// call's file as a read.
+    fn span_file(
+        input: &blaze_expand::TokenStream<'_>,
+        file: Result<&str, blaze_expand::HostError>,
+        method: crate::protocol::Method,
+        pick: impl Fn(&Server) -> SpanId,
+    ) -> (Result<String, super::ServerError>, bool) {
+        let call = ProcCall { kind: ProcKind::FnLike, input, attr_args: None, file };
+        let mut run_input = Vec::new();
+        let mut server = Server::new(Edition::E2021, ServerLimits::STANDARD, &call, Alloc::global(), &mut run_input).expect("the server starts");
+        let mut request = vec![method as u8];
+        crate::wire::Writer { out: &mut request }.handle(pick(&server));
+        let mut reply = Vec::new();
+        let answered = server.dispatch(&request, &mut reply).map(|()| {
+            let mut r = crate::wire::Reader::new(&reply);
+            assert_eq!(r.u8().expect("the reply's tag"), 0, "an `Ok` reply");
+            r.str().expect("a string").to_owned()
+        });
+        (answered, server.asked_file)
+    }
+
+    fn span_of(server: &Server, at: usize) -> SpanId {
+        match server.input[at] {
+            Tok::Ident { span, .. } | Tok::Punct { span, .. } | Tok::Literal { span, .. } => span,
+            Tok::Open { open, .. } => open,
+            Tok::Close { .. } => panic!("a close has no span of its own"),
+        }
+    }
+
+    /// turso_macros' `get_caller_file` (macros/src/lib.rs:1690) asks
+    /// `first_token.span().start().file()` of its input: 25 of turso's errors (c1647
+    /// check.out) were its refusal. A token written in the call's file answers the call's
+    /// file as the host shows it, and the run records it as a read. The twin: a host that does
+    /// not answer the file refuses it, naming why, and records nothing. The controls: a site
+    /// span, a token an expansion made, and `line` stay refused.
+    #[test]
+    fn span_file_answers_the_calls_file_for_a_token_written_in_it() {
+        use crate::protocol::Method;
+        use blaze_expand::{Ctx, CtxNode, DefSite, HostAsk, HostError, HostWhy, Mark, MarkOf, Transparency};
+
+        let mut input = lex("x > 0", Edition::E2021, Alloc::global()).expect("the input lexes");
+        let site = DefSite { krate: crate::hook::crate_key("m"), module: None };
+        let mark = Mark { of: MarkOf::This, transparency: Transparency::SemiOpaque, edition: Edition::E2021, site };
+        let made = input.context(CtxNode { parent: Ctx::root(Edition::E2021), mark }).expect("a context");
+        input.ident("y", made).expect("a made token");
+        let file = Ok("crates/core/src/lib.rs");
+
+        let first = span_file(&input, file, Method::SpanFile, |s| span_of(s, 0));
+        assert_eq!(first, (Ok("crates/core/src/lib.rs".to_owned()), true), "the real case: the call's file, recorded");
+        // Any token written in the item answers the same (`span_start` gives back the handle it
+        // is passed, so `span().start().file()` asks this same span).
+        let punct = span_file(&input, file, Method::SpanFile, |s| span_of(s, 1));
+        assert_eq!(punct, (Ok("crates/core/src/lib.rs".to_owned()), true));
+
+        let refused = HostError { ask: HostAsk::Place, why: HostWhy::Refused };
+        let twin = span_file(&input, Err(refused), Method::SpanFile, |s| span_of(s, 0));
+        assert_eq!(twin, (Err(super::ServerError::FileUnknown { why: refused }), false), "no file known: refused, no read");
+
+        let site = span_file(&input, file, Method::SpanFile, |_| super::CALL_SITE);
+        assert_eq!(site, (Err(super::ServerError::FileOfSite), false));
+        let made = span_file(&input, file, Method::SpanFile, |s| span_of(s, 3));
+        assert_eq!(made, (Err(super::ServerError::FileOfMadeToken), false));
+        let line = span_file(&input, file, Method::SpanLine, |s| span_of(s, 0));
+        assert_eq!(line, (Err(super::ServerError::Position { method: Method::SpanLine }), false), "`line` stays refused (rule 71)");
     }
 
     #[test]

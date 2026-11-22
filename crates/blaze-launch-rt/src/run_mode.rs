@@ -117,6 +117,13 @@ pub const TICK_MS: i32 = 250;
 pub trait RecordSource {
     /// The bytes of record `id`, whole, checked to be that record's (once, when first read).
     fn bytes(&self, id: RecordId) -> Result<&[u8], RunModeError>;
+
+    /// Reads record `id` into `scratch` when backed by files, or borrows directly when in-memory.
+    /// Avoids leaking a permanent `mmap` VMA per loaded function record.
+    fn read_into<'a>(&'a self, id: RecordId, scratch: &'a mut std::vec::Vec<u8>) -> Result<&'a [u8], RunModeError> {
+        let _ = scratch;
+        self.bytes(id)
+    }
 }
 
 /// What the run mode is told.
@@ -999,10 +1006,13 @@ impl<'a> RunMode<'a> {
     /// each is filled against the run's words and published ([`Memory::publish_static`]: the
     /// bytes, then the word).
     pub fn place_statics(&mut self, source: &impl RecordSource, memory: &mut impl Memory) -> Result<(), RunModeError> {
-        let mut rows: AVec<'_, (CodeSymbol, RecordId, DatumView<'_>, StaticAt, Room)> = Vec::with_capacity_in(self.told.len(), self.alloc);
-        for i in 0..self.told.len() {
+        let count = self.told.len();
+        let mut scratch: std::vec::Vec<std::vec::Vec<u8>> = (0..count).map(|_| std::vec::Vec::new()).collect();
+        let mut metas: AVec<'_, (CodeSymbol, RecordId, StaticAt, Room)> = Vec::with_capacity_in(count, self.alloc);
+        for i in 0..count {
             let (symbol, record) = self.told[i];
-            let view = DatumView::read(source.bytes(record)?).map_err(|why| RunModeError::Datum { record, why })?;
+            let raw = source.read_into(record, &mut scratch[i])?;
+            let view = DatumView::read(raw).map_err(|why| RunModeError::Datum { record, why })?;
             let index = u32::try_from(self.statics.len()).ok().filter(|&n| n < MOST_STATICS).ok_or(RunModeError::StaticsFull)?;
             // `DatumView::read` checked the length fits a u32, and the alignment a page.
             let (len, align) = (view.len() as usize, view.align() as usize);
@@ -1016,10 +1026,12 @@ impl<'a> RunMode<'a> {
                 Ok(_) => return Err(RunModeError::StaticTwice { symbol: WireSymbol(symbol.0) }),
                 Err(pos) => self.statics.insert_shift(pos, (symbol, row)),
             }
-            rows.push((symbol, record, view, row, room));
+            metas.push((symbol, record, row, room));
         }
         self.told.clear();
-        for &(symbol, record, view, row, room) in rows.iter() {
+        for (i, &(symbol, record, row, room)) in metas.iter().enumerate() {
+            let raw = if scratch[i].is_empty() { source.bytes(record)? } else { scratch[i].as_slice() };
+            let view = DatumView::read(raw).map_err(|why| RunModeError::Datum { record, why })?;
             let mut bytes: AVec<'_, u8> = Vec::from_elem_in(0, view.bytes().len(), self.alloc);
             {
                 let mut binder = Binder {
@@ -1057,12 +1069,13 @@ impl<'a> RunMode<'a> {
             HookKind::Plain => {
                 self.observe.plain(&[obs_slot], &mut writes);
             }
-            HookKind::Count | HookKind::Mark | HookKind::Hook | HookKind::Span => {
+            HookKind::Count | HookKind::Mark | HookKind::Hook | HookKind::Span | HookKind::Alloc(_) => {
                 let obs_kind = match kind {
                     HookKind::Count => ObserveKind::Count,
                     HookKind::Mark => ObserveKind::Mark,
                     HookKind::Hook => ObserveKind::Hook,
                     HookKind::Span => ObserveKind::Span,
+                    HookKind::Alloc(ak) => ObserveKind::Alloc(ak),
                     HookKind::Plain => unreachable!(),
                 };
                 if self.observe.body(obs_slot).is_some() {
@@ -1093,7 +1106,8 @@ impl<'a> RunMode<'a> {
             return Err(RunModeError::PositionOrder { placement, queued });
         }
         let (_, values, inlined) = self.position_inputs.pop_front().expect("the placement at the front was just checked");
-        let bytes = source.bytes(record)?;
+        let mut scratch = std::vec::Vec::new();
+        let bytes = source.read_into(record, &mut scratch)?;
         let view = CodeView::read(bytes).map_err(|why| RunModeError::Decode { record, why })?;
         let unwind = blaze_code::unwind::read(view).map_err(|why| RunModeError::Unwind { record, why })?;
         let code_at = match region {
@@ -1573,6 +1587,59 @@ impl RecordSource for Folder<'_> {
         }
         Ok(bytes)
     }
+
+    /// Reads record `id` into `scratch` via `read(2)` and closes the descriptor immediately —
+    /// avoiding leaking a permanent `mmap` VMA and 16 KiB macOS page entry per loaded function.
+    fn read_into<'a>(&'a self, id: RecordId, scratch: &'a mut std::vec::Vec<u8>) -> Result<&'a [u8], RunModeError> {
+        let mut path = [0u8; PATH_MOST];
+        crate::native_lib::record_path(self.path, id, &mut path)?;
+        let missing = |errno| RunModeError::Missing { record: id, errno };
+        // SAFETY: `path` is a NUL-terminated C string.
+        let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(missing(errno()));
+        }
+        // SAFETY: zeroed `stat` filled by `fstat`.
+        let mut stat: libc::stat = unsafe { core::mem::zeroed() };
+        let statted = unsafe { libc::fstat(fd, &mut stat) };
+        let size = usize::try_from(stat.st_size).unwrap_or(0);
+        if statted != 0 || size == 0 {
+            let err = if statted != 0 { errno() } else { libc::EINVAL };
+            // SAFETY: closes the descriptor opened above.
+            unsafe { libc::close(fd) };
+            return Err(missing(err));
+        }
+        scratch.resize(size, 0);
+        let mut filled = 0usize;
+        let mut read_err = 0i32;
+        while filled < size {
+            // SAFETY: `scratch[filled..size]` is live writable memory.
+            let n = unsafe { libc::read(fd, scratch.as_mut_ptr().add(filled).cast(), size - filled) };
+            if n > 0 {
+                filled += n as usize;
+            } else if n == 0 {
+                read_err = libc::EIO;
+                break;
+            } else {
+                let e = errno();
+                if e == libc::EINTR {
+                    continue;
+                }
+                read_err = e;
+                break;
+            }
+        }
+        // SAFETY: closes the descriptor opened above.
+        unsafe { libc::close(fd) };
+        if filled != size {
+            return Err(missing(read_err));
+        }
+        let got = blaze_blake3::hash(scratch.as_slice());
+        if got != id.0 {
+            return Err(RunModeError::Hash { record: id, got });
+        }
+        Ok(scratch.as_slice())
+    }
 }
 
 fn errno() -> i32 {
@@ -1643,10 +1710,11 @@ struct NativeMemory<'a, B: Bind> {
     /// The program's native library once loaded (`Act::Native`): from then on every C name not
     /// claimed by [`Bind::intercept`] is bound through its handle (`native_lib::bind`).
     natives: Option<crate::native_lib::DlNatives>,
-    /// Shared veneers for `observe::hook_entry` and `observe::span_entry` (reachable within
-    /// ±128 MiB from every observe stub placed in the code area).
+    /// Shared veneers for `observe::hook_entry`, `observe::span_entry`, and `observe::alloc_entry`
+    /// (reachable within ±128 MiB from every observe stub placed in the code area).
     hook_veneer: u64,
     span_veneer: u64,
+    alloc_veneer: u64,
     /// Emitted observe stubs per `(slot, kind)` with their run-view address (each emitted once;
     /// its trailing `.quad body` is updated atomically by `store_body_word`).
     observe_stubs: AVec<'a, (SlotId, ObserveKind, u64)>,
@@ -1689,7 +1757,7 @@ impl<'a, B: Bind> NativeMemory<'a, B> {
         code.write(layout.stubs, &crate::arch::stub_head(context, entry)).map_err(RunModeError::Sys)?;
         let mut next = layout.area;
         #[cfg(target_arch = "aarch64")]
-        let (hook_veneer, span_veneer) = {
+        let (hook_veneer, span_veneer, alloc_veneer) = {
             let hv_off = next;
             code.write(hv_off, &crate::observe::veneer(crate::observe::hook_entry as *const () as usize as u64))
                 .map_err(RunModeError::Sys)?;
@@ -1698,10 +1766,14 @@ impl<'a, B: Bind> NativeMemory<'a, B> {
             code.write(sv_off, &crate::observe::veneer(crate::observe::span_entry as *const () as usize as u64))
                 .map_err(RunModeError::Sys)?;
             next += crate::observe::VENEER;
-            ((base + hv_off) as u64, (base + sv_off) as u64)
+            let av_off = next;
+            code.write(av_off, &crate::observe::veneer(crate::observe::alloc_entry as *const () as usize as u64))
+                .map_err(RunModeError::Sys)?;
+            next += crate::observe::VENEER;
+            ((base + hv_off) as u64, (base + sv_off) as u64, (base + av_off) as u64)
         };
         #[cfg(not(target_arch = "aarch64"))]
-        let (hook_veneer, span_veneer) = (0u64, 0u64);
+        let (hook_veneer, span_veneer, alloc_veneer) = (0u64, 0u64, 0u64);
         let hot_next = layout.hot;
         let at = |offset: usize| (base + offset) as u64;
         let regions = fault_report::Regions {
@@ -1736,6 +1808,7 @@ impl<'a, B: Bind> NativeMemory<'a, B> {
             natives: None,
             hook_veneer,
             span_veneer,
+            alloc_veneer,
             observe_stubs: Vec::new_in(alloc),
         })
     }
@@ -1937,9 +2010,15 @@ impl<B: Bind> Memory for NativeMemory<'_, B> {
                         .map_err(RunModeError::Reach)?;
                     (bytes, at)
                 }
+                ObserveKind::Alloc(ak) => {
+                    let at = self.reserve(crate::observe::ALLOC_STUB, 8)?;
+                    let bytes = crate::observe::alloc_stub(at, self.alloc_veneer, ak, 0)
+                        .map_err(RunModeError::Reach)?;
+                    (bytes, at)
+                }
                 ObserveKind::Count | ObserveKind::Mark => {
                     return Err(RunModeError::NotBuilt {
-                        what: "count/mark observe stubs in run_mode (use Hook or Span)",
+                        what: "count/mark observe stubs in run_mode (use Hook, Span, or Alloc)",
                     });
                 }
             };
@@ -1965,6 +2044,7 @@ impl<B: Bind> Memory for NativeMemory<'_, B> {
                         ObserveKind::Mark => crate::observe::Kind::Mark,
                         ObserveKind::Hook => crate::observe::Kind::Hook,
                         ObserveKind::Span => crate::observe::Kind::Span,
+                        ObserveKind::Alloc(_) => crate::observe::Kind::Alloc,
                     };
                     let body_off = self.offset(at) + crate::observe::body_offset(rt_kind);
                     self.code.store(body_off, body).map_err(RunModeError::Sys)?;

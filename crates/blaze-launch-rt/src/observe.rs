@@ -79,6 +79,7 @@ pub enum Kind {
     Mark,
     Hook,
     Span,
+    Alloc,
 }
 
 /// The bytes of a count stub (AArch64), including its trailing body-word `.quad`.
@@ -93,6 +94,9 @@ pub const HOOK_STUB: usize = 24;
 /// The bytes of a span stub (AArch64): `adr x16, .; b span_entry; .quad slot; .quad body`.
 #[cfg(target_arch = "aarch64")]
 pub const SPAN_STUB: usize = 24;
+/// The bytes of a Rust global-allocator stub (AArch64): `adr x16, .; b alloc_entry; .quad op; .quad body`.
+#[cfg(target_arch = "aarch64")]
+pub const ALLOC_STUB: usize = 24;
 /// The bytes of a veneer (AArch64): `ldr x17, .+8; br x17; .quad target`.
 #[cfg(target_arch = "aarch64")]
 pub const VENEER: usize = 16;
@@ -109,8 +113,7 @@ pub const fn body_offset(kind: Kind) -> usize {
     match kind {
         Kind::Count => 56,
         Kind::Mark => 40,
-        Kind::Hook => 16,
-        Kind::Span => 16,
+        Kind::Hook | Kind::Span | Kind::Alloc => 16,
     }
 }
 
@@ -329,6 +332,114 @@ pub fn hook_stub_slot(at: u64, entry: u64, slot: u32, body: u64) -> Result<[u8; 
 #[cfg(target_arch = "aarch64")]
 pub fn span_stub(at: u64, entry: u64, slot: u32, body: u64) -> Result<[u8; SPAN_STUB], OutOfReach> {
     hook_stub_slot(at, entry, slot, body)
+}
+
+/// A Rust global-allocator slot stub at `at` carrying its [`blaze_launch::telemetry::AllocHookKind`]
+/// at offset 8: `adr x16, .; b entry; .quad kind; .quad body`, where `entry` is [`alloc_entry`] or
+/// a veneer. Wraps `__rust_alloc`, `__rust_dealloc`, `__rust_realloc`, or `__rust_alloc_zeroed`
+/// (and their `__rdl_*` defaults) so every Rust allocator — `System`, `jemalloc`, `mimalloc`, or
+/// custom `#[global_allocator]` — emits live telemetry with zero code changes.
+#[cfg(target_arch = "aarch64")]
+pub fn alloc_stub(
+    at: u64,
+    entry: u64,
+    kind: blaze_launch::telemetry::AllocHookKind,
+    body: u64,
+) -> Result<[u8; ALLOC_STUB], OutOfReach> {
+    hook_stub_slot(at, entry, kind as u32, body)
+}
+
+/// Naked AArch64 entry for [`alloc_stub`]: preserves the allocator's 2..4 scalar arguments in
+/// `x0..x3`, establishes a standard frame record `(x29, x30)` so frame-pointer stack walks attribute
+/// directly to the caller, passes the stub address (`x16`) in `x4`, and returns `x0` unchanged.
+///
+/// # Safety
+///
+/// Reached only by a branch from [`alloc_stub`] (directly or via [`veneer`]) with `x16 = stub`.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn alloc_entry() {
+    core::arch::naked_asm!(
+        "stp x29, x30, [sp, #-16]!",
+        "mov x29, sp",
+        "mov x4, x16",
+        "bl {dispatch}",
+        "ldp x29, x30, [sp], #16",
+        "ret",
+        dispatch = sym alloc_dispatch,
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+extern "C" fn alloc_dispatch(a0: usize, a1: usize, a2: usize, a3: usize, stub: usize) -> usize {
+    use blaze_launch::telemetry::{AllocHookKind, AllocOp, Event};
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    // SAFETY: `stub` is an 8-aligned live `ALLOC_STUB` with `kind` at +8 and atomic `body` at +16.
+    let kind_raw = unsafe { *((stub + 8) as *const u64) } as u8;
+    let body = unsafe { &*((stub + 16) as *const AtomicU64) }.load(Ordering::Acquire) as usize;
+    let Some(kind) = AllocHookKind::from_raw(kind_raw) else {
+        return 0;
+    };
+
+    // Shared re-entrancy guard: if `body` is `std::alloc::System` calling `ObservedBind::malloc`,
+    // `traced_malloc` sees `try_enter_alloc_hook() == None` and skips double-counting!
+    let guard = crate::telemetry::try_enter_alloc_hook();
+
+    match kind {
+        AllocHookKind::Alloc | AllocHookKind::AllocZeroed => {
+            // SAFETY: `__rust_alloc(size, align) -> *mut u8` / `__rust_alloc_zeroed(size, align)`.
+            let f: unsafe extern "C" fn(usize, usize) -> *mut u8 = unsafe { core::mem::transmute(body) };
+            let ptr = unsafe { f(a0, a1) };
+            if guard.is_some() && crate::telemetry::should_sample_alloc(a0) {
+                let frames = crate::telemetry::capture_caller_frames(2);
+                let _ = crate::telemetry::emit(Event::alloc(
+                    crate::telemetry::current_thread_id(),
+                    kind.alloc_op(),
+                    crate::telemetry::now_ns(),
+                    ptr as usize as u64,
+                    a0 as u64,
+                    frames,
+                ));
+            }
+            ptr as usize
+        }
+        AllocHookKind::Dealloc => {
+            // SAFETY: `__rust_dealloc(ptr, size, align)`.
+            let f: unsafe extern "C" fn(*mut u8, usize, usize) = unsafe { core::mem::transmute(body) };
+            unsafe { f(a0 as *mut u8, a1, a2) };
+            if guard.is_some() && crate::telemetry::alloc_sample_bytes() == 0 && a0 != 0 {
+                let frames = crate::telemetry::capture_caller_frames(2);
+                let _ = crate::telemetry::emit(Event::alloc(
+                    crate::telemetry::current_thread_id(),
+                    AllocOp::RustDealloc,
+                    crate::telemetry::now_ns(),
+                    a0 as u64,
+                    a1 as u64,
+                    frames,
+                ));
+            }
+            0
+        }
+        AllocHookKind::Realloc => {
+            // SAFETY: `__rust_realloc(ptr, old_size, align, new_size) -> *mut u8`.
+            let f: unsafe extern "C" fn(*mut u8, usize, usize, usize) -> *mut u8 =
+                unsafe { core::mem::transmute(body) };
+            let ptr = unsafe { f(a0 as *mut u8, a1, a2, a3) };
+            if guard.is_some() && crate::telemetry::should_sample_alloc(a3) {
+                let frames = crate::telemetry::capture_caller_frames(2);
+                let _ = crate::telemetry::emit(Event::alloc(
+                    crate::telemetry::current_thread_id(),
+                    AllocOp::RustRealloc,
+                    crate::telemetry::now_ns(),
+                    ptr as usize as u64,
+                    a3 as u64,
+                    frames,
+                ));
+            }
+            ptr as usize
+        }
+    }
 }
 
 /// A veneer: `ldr x17, .+8; br x17; .quad target`, for a branch whose target is beyond
@@ -966,6 +1077,7 @@ mod tests {
                     assert_eq!(&veneer[..2], &[0x5800_0051, 0xd61f_0220], "the span veneer as it will run");
                     self.span
                 }
+                Kind::Alloc => panic!("alloc_stub is tested directly in the_alloc_stub_tracks_custom_global_allocator_and_dedups_system_malloc"),
             }
         }
 
@@ -1249,6 +1361,135 @@ mod tests {
         // Subsequent normal call after caught panic still works cleanly!
         assert_eq!(panic_call(0), 99);
 
+        crate::telemetry::clear_global();
+        unsafe { std::alloc::dealloc(raw, layout) };
+    }
+
+    /// Proves on real AArch64 hardware that [`alloc_stub`] + [`alloc_entry`]:
+    /// 1. Tracks a completely custom bump/arena `#[global_allocator]` that NEVER touches libc
+    ///    `malloc` across all 4 Rust allocator entry points (`__rust_alloc`, `__rust_alloc_zeroed`,
+    ///    `__rust_realloc`, `__rust_dealloc`), capturing exact `(ptr, size, caller_frames)`.
+    /// 2. Deduplicates `System`-style allocators calling `ObservedBind::malloc` underneath via
+    ///    the shared `try_enter_alloc_hook` guard (emits 1 `RustAlloc` event, NOT 2).
+    #[test]
+    fn the_alloc_stub_tracks_custom_global_allocator_and_dedups_system_malloc() {
+        use blaze_launch::telemetry::{AllocHookKind, AllocOp, EventKind};
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        let _guard = crate::telemetry::TEST_GLOBAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_stride = crate::telemetry::alloc_sample_bytes();
+        crate::telemetry::set_alloc_sample_bytes(0); // exact mode for assertion
+
+        let ring_bytes = crate::telemetry::Telemetry::bytes_for(64).expect("bytes");
+        let layout = std::alloc::Layout::from_size_align(ring_bytes, 128).expect("layout");
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        let base = core::ptr::NonNull::new(raw).expect("non-null");
+        let ring = unsafe { crate::telemetry::Telemetry::init(base, ring_bytes, 64) }.expect("init");
+        crate::telemetry::install_global(base, ring_bytes).expect("install");
+
+        let mut code = crate::sys::Code::map(1 << 16).expect("code mapping");
+        let cbase = code.base() as u64;
+        let v = veneer(alloc_entry as *const () as usize as u64);
+        code.write(0, &v).expect("write alloc veneer");
+
+        // 1. Custom bump allocator (never touches libc malloc!).
+        static BUMP_BUF: [u8; 4096] = [0; 4096];
+        static BUMP_OFF: AtomicUsize = AtomicUsize::new(0);
+        static FREED_SUM: AtomicUsize = AtomicUsize::new(0);
+
+        extern "C" fn custom_alloc(size: usize, align: usize) -> *mut u8 {
+            let cur = BUMP_OFF.load(Ordering::Relaxed);
+            let aligned = (cur + align.max(1) - 1) & !(align.max(1) - 1);
+            BUMP_OFF.store(aligned + size, Ordering::Relaxed);
+            unsafe { BUMP_BUF.as_ptr().add(aligned) as *mut u8 }
+        }
+        extern "C" fn custom_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
+            custom_alloc(size, align)
+        }
+        extern "C" fn custom_realloc(_ptr: *mut u8, _old: usize, align: usize, new_size: usize) -> *mut u8 {
+            custom_alloc(new_size, align)
+        }
+        extern "C" fn custom_dealloc(_ptr: *mut u8, size: usize, _align: usize) {
+            FREED_SUM.fetch_add(size, Ordering::Relaxed);
+        }
+
+        code.write(32, &alloc_stub(cbase + 32, cbase, AllocHookKind::Alloc, custom_alloc as *const () as usize as u64).expect("s1")).expect("w1");
+        code.write(64, &alloc_stub(cbase + 64, cbase, AllocHookKind::AllocZeroed, custom_alloc_zeroed as *const () as usize as u64).expect("s2")).expect("w2");
+        code.write(96, &alloc_stub(cbase + 96, cbase, AllocHookKind::Realloc, custom_realloc as *const () as usize as u64).expect("s3")).expect("w3");
+        code.write(128, &alloc_stub(cbase + 128, cbase, AllocHookKind::Dealloc, custom_dealloc as *const () as usize as u64).expect("s4")).expect("w4");
+
+        let f_alloc: extern "C" fn(usize, usize) -> *mut u8 = unsafe { core::mem::transmute((cbase + 32) as usize) };
+        let f_zeroed: extern "C" fn(usize, usize) -> *mut u8 = unsafe { core::mem::transmute((cbase + 64) as usize) };
+        let f_realloc: extern "C" fn(*mut u8, usize, usize, usize) -> *mut u8 = unsafe { core::mem::transmute((cbase + 96) as usize) };
+        let f_dealloc: extern "C" fn(*mut u8, usize, usize) = unsafe { core::mem::transmute((cbase + 128) as usize) };
+
+        let p1 = f_alloc(128, 16);
+        let p2 = f_zeroed(256, 32);
+        let p3 = f_realloc(p1, 128, 16, 512);
+        f_dealloc(p3, 512, 16);
+        assert_eq!(FREED_SUM.load(Ordering::Relaxed), 512);
+
+        let my_tid = crate::telemetry::current_thread_id();
+        let mut events = Vec::new();
+        ring.drain(64, |e| {
+            if e.thread == my_tid {
+                events.push(e);
+            }
+        });
+        assert_eq!(events.len(), 4, "expected 4 custom allocator events: {events:?}");
+        assert_eq!(events[0].event_kind(), Some(EventKind::Alloc));
+        assert_eq!(events[0].slot_or_op, AllocOp::RustAlloc as u32);
+        assert_eq!(events[0].a, p1 as usize as u64);
+        assert_eq!(events[0].b, 128);
+        assert_ne!(events[0].c, 0, "must capture caller return address");
+
+        assert_eq!(events[1].slot_or_op, AllocOp::RustAllocZeroed as u32);
+        assert_eq!(events[1].a, p2 as usize as u64);
+        assert_eq!(events[1].b, 256);
+
+        assert_eq!(events[2].slot_or_op, AllocOp::RustRealloc as u32);
+        assert_eq!(events[2].a, p3 as usize as u64);
+        assert_eq!(events[2].b, 512);
+
+        assert_eq!(events[3].event_kind(), Some(EventKind::Free));
+        assert_eq!(events[3].slot_or_op, AllocOp::RustDealloc as u32);
+        assert_eq!(events[3].a, p3 as usize as u64);
+        assert_eq!(events[3].b, 512);
+
+        // 2. System-style allocator calling ObservedBind's `malloc` underneath: MUST NOT double-count!
+        use crate::run_mode::{Bind, Dlsym, ObservedBind};
+        let mut obs = ObservedBind::new(Dlsym);
+        let traced_malloc_addr = obs.intercept("malloc").expect("ObservedBind intercepts malloc");
+        static TRACED_MALLOC_PTR: AtomicUsize = AtomicUsize::new(0);
+        TRACED_MALLOC_PTR.store(traced_malloc_addr as usize, Ordering::Release);
+
+        extern "C" fn system_like_alloc(size: usize, _align: usize) -> *mut u8 {
+            let m: extern "C" fn(usize) -> *mut core::ffi::c_void =
+                unsafe { core::mem::transmute(TRACED_MALLOC_PTR.load(Ordering::Acquire)) };
+            m(size) as *mut u8
+        }
+        code.write(160, &alloc_stub(cbase + 160, cbase, AllocHookKind::Alloc, system_like_alloc as *const () as usize as u64).expect("s5")).expect("w5");
+        let f_sys: extern "C" fn(usize, usize) -> *mut u8 = unsafe { core::mem::transmute((cbase + 160) as usize) };
+
+        events.clear();
+        let sys_ptr = f_sys(384, 8);
+        assert!(!sys_ptr.is_null());
+        unsafe { libc::free(sys_ptr.cast()) };
+
+        ring.drain(64, |e| {
+            if e.thread == my_tid {
+                events.push(e);
+            }
+        });
+        assert_eq!(
+            events.len(),
+            1,
+            "Rust __rust_alloc -> ObservedBind::malloc must emit EXACTLY 1 event (no double-counting!): {events:?}"
+        );
+        assert_eq!(events[0].slot_or_op, AllocOp::RustAlloc as u32);
+        assert_eq!(events[0].b, 384);
+
+        crate::telemetry::set_alloc_sample_bytes(prev_stride);
         crate::telemetry::clear_global();
         unsafe { std::alloc::dealloc(raw, layout) };
     }

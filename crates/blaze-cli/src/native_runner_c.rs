@@ -30,9 +30,10 @@
 //!   tree is the checkout's folder, not a pack).
 //!
 //! A `links` dependency's trees a request names (c_tasks.rs `dep_roots`: librocksdb-sys reads
-//! lz4-sys's and zstd-sys's) are laid read-only beside the package: a producer's `OUT_DIR` from
-//! its script record as the reader's script saw it (`<work>/dep/<key>`), its served tree
-//! (`/deps/<links>`) from its pack; each joins the built key by its digest ([`Producers`]).
+//! lz4-sys's and zstd-sys's) are laid read-only beside the package: a producer's `OUT_DIR` as its
+//! own C step left it (its process tree's headers included; its C runs first, [`Producers`]),
+//! by the content of its files (`<work>/dep/<digest>`, [`dep_out`]), its served tree
+//! (`/deps/<links>`) from its pack; each joins the built key by its digest.
 //!
 //! Process-tree requests (tikv-jemalloc-sys's `sh configure`, `make`) run as one task before
 //! the compiles (native_c_tasks.rs `ShelfTree`, blaze-build-script c_tasks_tree.rs): the host
@@ -271,7 +272,7 @@ pub(crate) fn built_for<'s, 'm: 's>(
     r: usize,
     package: &'s str,
     script: ScriptIn<'m>,
-    producers: &Producers<'_, 'm>,
+    producers: &Producers<'_>,
     scratch: &'s Frame,
 ) -> Result<(ScriptIn<'s>, Option<Report>), CTaskWhy<'s>> {
     let cx = cx.span("native: a crate's deferred C requests");
@@ -304,7 +305,11 @@ pub(crate) fn built_for<'s, 'm: 's>(
         false => None,
         true => {
             let shelf = c.setup(scratch)?.setting.shelf.as_str();
-            let tools = native_c_tasks::tree_tools(package, crate::graph::TRIPLE, shelf, alloc)
+            // The table's `needed_by` names PACKAGES (`tikv-jemalloc-sys`), as the script
+            // runner's grant does (native_unit.rs): never the crate's name (`tikv_jemalloc_sys`,
+            // which `package` is here, for messages), which matched no row (the first real run:
+            // "`sh` is not a host tool the table grants this package", with `sh` in the table).
+            let tools = native_c_tasks::tree_tools(list.package(r), crate::graph::TRIPLE, shelf, alloc)
                 .map_err(|words| CTaskWhy::Setup { words: kept(scratch, format_args!("the C of {package}: its process tree's host tools: {}", words.as_str())) })?;
             Some(tools)
         }
@@ -315,7 +320,7 @@ pub(crate) fn built_for<'s, 'm: 's>(
     // `/deps/zstd`), found and keyed before anything is laid: a hit lays nothing.
     let named = c_tasks::dep_roots(&outputs, &roots, alloc);
     let mut graph_links: Option<AVec<'_, (AString<'_>, AString<'_>, AString<'_>)>> = None;
-    let mut deps: AVec<'_, DepTree<'m>> = Vec::with_capacity_in(named.len(), alloc);
+    let mut deps: AVec<'_, DepTree<'_>> = Vec::with_capacity_in(named.len(), alloc);
     for guest in named.iter().copied() {
         deps.push(dep_tree(list, producers, guest, &mut graph_links, alloc, scratch)?);
     }
@@ -392,52 +397,102 @@ pub(crate) fn built_for<'s, 'm: 's>(
 }
 
 /// What the image holds for its readers' `links` trees (engine_native.rs `image_for`): every
-/// crate's script record as it ran (the deferred one when its C was deferred: what a reader's
-/// script saw), and the unit graph record (graph_payload.rs `Sections::graph`), whose units name
-/// each package's `links`; it is decoded only when a reader names `/deps/<links>`.
-pub(crate) struct Producers<'p, 'm> {
-    pub(crate) scripts: &'p [(usize, ScriptIn<'m>)],
+/// crate's script record as its script ran (`scripts`), the record each crate's C step has
+/// already given (`done`: the built record when its C ran, else the run's own), and the unit
+/// graph record (graph_payload.rs `Sections::graph`), whose units name each package's `links`; it
+/// is decoded only when a reader names `/deps/<links>`.
+///
+/// THE ORDER: `image_for` runs the C step over its closure REVERSED (native_image.rs `closure`
+/// is a post-order of the crate list's dependency edges, reversed), so each crate's C runs after
+/// every crate it depends on; a `links` producer whose `DEP_<LINKS>_*` a reader's script read is
+/// one of the reader's direct dependencies (the cargo book, "links": the metadata goes to the
+/// dependents' scripts), so it is in `done` when its reader asks. One that is not is refused by
+/// name ([`DepOut::NotYet`]), never laid from its deferred record.
+///
+/// `refused`: the crates whose C step was refused (engine_native.rs `image_for` leaves their C
+/// out of the image): a reader of one's `OUT_DIR` is refused naming it ([`DepOut::Refused`]),
+/// so its C is left out too, never built against a deferred record.
+pub(crate) struct Producers<'p> {
+    pub(crate) scripts: &'p [(usize, ScriptIn<'p>)],
+    pub(crate) done: &'p [(usize, ScriptIn<'p>)],
+    pub(crate) refused: &'p [usize],
     pub(crate) graph: &'p [u8],
 }
 
 /// One `links` dependency's tree a reader's requests name: its guest spelling, what names it
 /// in the built key, and where its files come from.
-struct DepTree<'m> {
-    guest: &'m str,
+struct DepTree<'d> {
+    guest: &'d str,
     digest: [u8; 32],
-    source: DepSource<'m>,
+    source: DepSource<'d>,
 }
 
 #[derive(Clone, Copy)]
-enum DepSource<'m> {
-    /// A producer's `OUT_DIR` (`<builds>/<name>-<config>/out`): its script record's files, the
-    /// record by its key.
-    Out { script: ScriptIn<'m> },
+enum DepSource<'d> {
+    /// A producer's `OUT_DIR` (`<builds>/<name>-<config>/out`) as its C step left it: its built
+    /// record's files (what its process tree made: configure's and make's headers among them).
+    Out { script: ScriptIn<'d> },
     /// The tree a producer was served (`/deps/<links>`): crate `r`'s package, by its files.
     Tree { r: usize, files: [u8; 32] },
+}
+
+/// Why no producer's `OUT_DIR` is found for a reader's spelling ([`dep_out`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DepOut {
+    /// No build script the program links ran with that `OUT_DIR`.
+    NoProducer,
+    /// Crate `r`'s script ran with it, and its C step has not run yet: the order broke
+    /// ([`Producers`]), and its deferred record lacks what its C makes.
+    NotYet { r: usize },
+    /// Crate `r`'s C step ran and was refused: what its reader needs of it was never made.
+    Refused { r: usize },
+    /// The producer's record does not open as a script's outputs.
+    Record { r: usize },
+}
+
+/// The producer of the `OUT_DIR` spelled `guest` as its C step left it, and the digest that names
+/// it in a reader's built key: the record's `crate_digest` (its `OUT_DIR`, cfgs, env and files,
+/// each stored file by its SHA-256), the CONTENT of what the reader is laid, not the producer's
+/// key. So a producer whose C reran to equal files keeps its readers' built records, and one
+/// whose files moved (a header its `configure` wrote) moves them (rule 21). Sans IO: the records
+/// are read in place.
+pub(crate) fn dep_out<'p>(producers: &Producers<'p>, guest: &str) -> Result<(ScriptIn<'p>, [u8; 32]), DepOut> {
+    let out_dir_of = |script: &ScriptIn<'p>| crate::scripts::payload_parts(script.payload).and_then(|(_, record)| OutputsRef::open(record).ok());
+    let Some(&(r, _)) = producers.scripts.iter().find(|(_, script)| out_dir_of(script).is_some_and(|opened| opened.out_dir() == guest)) else {
+        return Err(DepOut::NoProducer);
+    };
+    if producers.refused.contains(&r) {
+        return Err(DepOut::Refused { r });
+    }
+    let Some(&(_, built)) = producers.done.iter().find(|(at, _)| *at == r) else { return Err(DepOut::NotYet { r }) };
+    let opened = out_dir_of(&built).ok_or(DepOut::Record { r })?;
+    Ok((built, opened.crate_digest().0))
 }
 
 /// The producer of `guest` (c_tasks.rs `dep_roots`), keyed: an `OUT_DIR` by the script record
 /// whose `OUT_DIR` it is (one per package and config), a `/deps/<links>` tree by the package
 /// whose `links` it is (one per graph, the cargo book's "links"). None, or a producer whose
 /// files can change, is refused naming the spelling (rule 3); nothing is guessed.
-fn dep_tree<'m, 's, 'a>(
+fn dep_tree<'d, 's, 'a>(
     list: &CrateList<'_>,
-    producers: &Producers<'_, 'm>,
-    guest: &'m str,
+    producers: &Producers<'d>,
+    guest: &'d str,
     graph_links: &mut Option<AVec<'a, (AString<'a>, AString<'a>, AString<'a>)>>,
     alloc: Alloc<'a>,
     scratch: &'s Frame,
-) -> Result<DepTree<'m>, CTaskWhy<'s>> {
+) -> Result<DepTree<'d>, CTaskWhy<'s>> {
     let lay = |what: fmt::Arguments<'_>| CTaskWhy::Lay { words: kept(scratch, what) };
     let Some(links) = guest.strip_prefix(DEPS_ROOT).and_then(|rest| rest.strip_prefix('/')) else {
-        let found = producers.scripts.iter().find(|(_, script)| {
-            crate::scripts::payload_parts(script.payload).and_then(|(_, record)| OutputsRef::open(record).ok()).is_some_and(|opened| opened.out_dir() == guest)
-        });
-        let Some((_, script)) = found else {
-            return Err(lay(format_args!("a request names `{guest}`, the OUT_DIR of no build script this program links")));
+        return match dep_out(producers, guest) {
+            Ok((script, digest)) => Ok(DepTree { guest, digest, source: DepSource::Out { script } }),
+            Err(DepOut::NoProducer) => Err(lay(format_args!("a request names `{guest}`, the OUT_DIR of no build script this program links"))),
+            Err(DepOut::NotYet { r }) => Err(lay(format_args!(
+                "a request names `{guest}`, the OUT_DIR of `{}`, whose C step has not run before its reader's (engine_native.rs `image_for` runs dependencies first)",
+                list.name(r)
+            ))),
+            Err(DepOut::Refused { r }) => Err(lay(format_args!("a request names `{guest}`, the OUT_DIR of `{}`, whose own C step was refused (said above)", list.name(r)))),
+            Err(DepOut::Record { r }) => Err(lay(format_args!("a request names `{guest}`, and the record `{}` left does not open as a script's outputs", list.name(r)))),
         };
-        return Ok(DepTree { guest, digest: script.out.0, source: DepSource::Out { script: *script } });
     };
     if graph_links.is_none() {
         let decoded = blaze_unit_graph::record::decode(producers.graph, alloc).map_err(|why| lay(format_args!("the unit graph, for `{guest}`: {why:?}")))?;
@@ -472,7 +527,8 @@ fn dep_tree<'m, 's, 'a>(
     Ok(DepTree { guest, digest: package_digest(list, at, files).0, source: DepSource::Tree { r: at, files } })
 }
 
-/// A producer's `OUT_DIR` laid read-only from its script record (`<work>/dep/<key>`, made once:
+/// A producer's `OUT_DIR` laid read-only from the record its C step left ([`dep_out`]:
+/// `<work>/dep/<its content digest>`, made once:
 /// written beside and renamed into place), its real path.
 fn lay_dep_out<'s>(c: &CTasks<'_>, script: ScriptIn<'_>, key: [u8; 32], scratch: &'s Frame) -> Result<&'s str, CTaskWhy<'s>> {
     let lay = |what: fmt::Arguments<'_>| CTaskWhy::Lay { words: kept(scratch, what) };
@@ -589,4 +645,71 @@ fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_>, list: &CrateList<'_>, r: usize, 
     let real = std::fs::canonicalize(folder).map_err(|e| lay(format_args!("{folder}: {e}")))?;
     let real = real.to_str().ok_or_else(|| lay(format_args!("{folder}: its real path is not UTF-8")))?;
     Ok((crate::work::held_str(real, scratch), digest.0))
+}
+
+#[cfg(test)]
+mod dep_out_tests {
+    //! A reader's `OUT_DIR` producer as [`dep_out`] finds it: the record its C step left, by the
+    //! content of its files. Records are real outputs records (blaze-build-script `Outputs`).
+
+    use blaze_build_script::outputs::{FileLimits, Outputs};
+    use blaze_drive::{Kind, Name};
+
+    use super::*;
+
+    const OUT: &str = "/target/debug/build/zstd-sys-1/out";
+
+    /// A `Script` payload (scripts.rs `payload_parts`) of a run with `OUT_DIR` [`OUT`] holding
+    /// `files`.
+    fn payload(files: &[(&str, &[u8])]) -> &'static [u8] {
+        let frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("the outputs' frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let mut outputs = Outputs::new_in(OUT, alloc);
+        for (name, bytes) in files {
+            outputs.add_file(name, bytes, FileLimits::DEFAULT, alloc).expect("a small file");
+        }
+        let mut record = AVec::new_in(alloc);
+        outputs.encode(&mut record);
+        let mut bytes = std::vec![1u8];
+        bytes.extend_from_slice(&record);
+        std::boxed::Box::leak(bytes.into_boxed_slice())
+    }
+
+    fn script(n: u8, payload: &'static [u8]) -> ScriptIn<'static> {
+        ScriptIn { name: Name::new(Kind::Script, ContentId([n; 32])), out: ContentId([n; 32]), payload }
+    }
+
+    /// The producer's C step ran first: the reader is laid what it left (the generated header
+    /// `zstd_config.h` its tree made, which the deferred record lacks), named by those files'
+    /// content. Twice built to equal files under two keys: one digest (the reader's built record
+    /// stays). A header changed: another digest. Control (the order removed): the producer's C
+    /// not yet run is refused naming it, never laid from its deferred record; no producer at all
+    /// is refused too.
+    #[test]
+    fn a_reader_is_laid_its_producers_out_dir_after_the_producers_c_ran() {
+        let deferred = script(1, payload(&[("include/zstd.h", b"zstd")]));
+        let built = script(2, payload(&[("include/zstd.h", b"zstd"), ("include/zstd_config.h", b"#define ZSTD_MT 1")]));
+        let scripts = [(4usize, deferred)];
+        let done = [(4usize, built)];
+        let producers = Producers { scripts: &scripts, done: &done, refused: &[], graph: &[] };
+        let (laid, digest) = dep_out(&producers, OUT).expect("the producer is found");
+        assert_eq!(laid.out, built.out, "the reader is not laid the record the producer's C step left");
+        let opened = OutputsRef::open(crate::scripts::payload_parts(laid.payload).expect("a run").1).expect("outputs");
+        assert!(opened.all_files().any(|(name, _)| name == "include/zstd_config.h"), "the tree's header is not laid");
+
+        let again = [(4usize, script(3, payload(&[("include/zstd.h", b"zstd"), ("include/zstd_config.h", b"#define ZSTD_MT 1")])))];
+        let equal = dep_out(&Producers { scripts: &scripts, done: &again, refused: &[], graph: &[] }, OUT).expect("found").1;
+        assert_eq!(equal, digest, "a producer rebuilt to equal files moved its reader's key");
+        let moved = [(4usize, script(5, payload(&[("include/zstd.h", b"zstd"), ("include/zstd_config.h", b"#define ZSTD_MT 0")])))];
+        let other = dep_out(&Producers { scripts: &scripts, done: &moved, refused: &[], graph: &[] }, OUT).expect("found").1;
+        assert_ne!(other, digest, "a changed generated header did not move its reader's key");
+
+        let early = Producers { scripts: &scripts, done: &[], refused: &[], graph: &[] };
+        assert_eq!(dep_out(&early, OUT).map(|(_, d)| d), Err(DepOut::NotYet { r: 4 }), "a producer whose C has not run was laid");
+        // A producer whose C was refused: its reader is refused naming it, never laid.
+        let failed = Producers { scripts: &scripts, done: &[], refused: &[4], graph: &[] };
+        assert_eq!(dep_out(&failed, OUT).map(|(_, d)| d), Err(DepOut::Refused { r: 4 }));
+        assert_eq!(dep_out(&producers, "/target/debug/build/lz4-sys-9/out").map(|(_, d)| d), Err(DepOut::NoProducer));
+    }
 }

@@ -558,9 +558,13 @@ pub(crate) struct CommandFront<'h, 'c, 'r> {
     tables: Alloc<'static>,
     alloc: Alloc<'r>,
     watch: &'c dyn Watch,
+    /// The Rust fns the program's C calls (engine_native.rs `NativeSend::items`): roots of the
+    /// walk (blaze-ladder run/special.rs `run_roots`).
+    exports: &'c [blaze_id::ItemKey],
 }
 
 impl<'h, 'c, 'r> CommandFront<'h, 'c, 'r> {
+    #[expect(clippy::too_many_arguments, reason = "each is one input of the run's front, named at the call")]
     pub(crate) fn new(
         names: &'c mut dyn FnMut() -> Result<NamesRecords<'h>, ParentError>,
         ids: &'c mut dyn FnMut() -> Result<RunIds<'h>, ParentError>,
@@ -568,8 +572,9 @@ impl<'h, 'c, 'r> CommandFront<'h, 'c, 'r> {
         tables: Alloc<'static>,
         alloc: Alloc<'r>,
         watch: &'c dyn Watch,
+        exports: &'c [blaze_id::ItemKey],
     ) -> CommandFront<'h, 'c, 'r> {
-        CommandFront { names, ids, kept: None, builder, tables, alloc, watch }
+        CommandFront { names, ids, kept: None, builder, tables, alloc, watch, exports }
     }
 
     fn names(&mut self) -> Result<NamesRecords<'h>, ParentError> {
@@ -597,7 +602,7 @@ impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
     fn start(&mut self) -> Result<Roots<'r>, ParentError> {
         let names = self.names()?;
         self.watch.see(Step::Began(Stage::Roots));
-        special::run_roots(names.records, names.lang_crates, self.builder.settings.panic, names.frame, self.tables, self.alloc).map_err(ParentError::Roots)
+        special::run_roots(names.records, names.lang_crates, self.builder.settings.panic, self.exports, names.frame, self.tables, self.alloc).map_err(ParentError::Roots)
     }
 
     fn ids(&mut self) -> Result<RunIds<'h>, ParentError> {

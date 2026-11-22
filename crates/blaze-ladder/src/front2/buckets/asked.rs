@@ -77,7 +77,7 @@ pub(super) struct Indexed {
     /// How many questions were asked by bucket ([`Buckets::bucket_asks`]).
     pub(super) asks: u32,
     /// How many unfiled impls were met, by [`NotFiled`] as `usize`.
-    not_filed: [u32; 10],
+    not_filed: [u32; NOT_FILED.len()],
 }
 
 impl Indexed {
@@ -91,7 +91,7 @@ impl Indexed {
             from_index: 0,
             lookups: 0,
             asks: 0,
-            not_filed: [0; 10],
+            not_filed: [0; NOT_FILED.len()],
         }
     }
 }
@@ -118,9 +118,9 @@ fn first16(id: ContentId) -> u128 {
 /// The heads the index files an impl at `shape` under, each with the shape such an impl has
 /// (`AnyInt` is every integer type's head). Empty for a shape the index names no head for (a
 /// fn item, a fn pointer, an opaque type, a closure, a trait object, a pattern type: an impl
-/// on one is unfiled or under "any"). `None`: a nominal type whose library key the key map
-/// and the records do not give (the caller files the gap).
-fn heads_of<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Option<Vec<(Head, Shape), Global>> {
+/// on one is unfiled or under "any"). Refused: a nominal type whose library key the key map
+/// and the records do not give.
+fn heads_of<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Result<Vec<(Head, Shape), Global>, TablesReadError> {
     let mut out = Vec::new_in(Global);
     match shape {
         Shape::Bool | Shape::Char | Shape::Str | Shape::Int(_) | Shape::Uint(_) | Shape::Float(_) | Shape::AnyInt | Shape::AnyFloat => {
@@ -145,10 +145,13 @@ fn heads_of<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Opti
         Shape::Ptr(Mutbl::Mut) => out.push((Head::PtrMut, shape)),
         Shape::Array => out.push((Head::Array, shape)),
         Shape::Slice => out.push((Head::Slice, shape)),
-        Shape::Adt(k) => out.push((Head::Named(keys.library_in(names, k)?), shape)),
+        Shape::Adt(k) => {
+            let lib = keys.library_in(names, k).ok_or(TablesReadError::NoLibraryKey { of: "the nominal type an impl question is about", key: k })?;
+            out.push((Head::Named(lib), shape));
+        }
         _ => {}
     }
-    Some(out)
+    Ok(out)
 }
 
 impl BucketIndex {
@@ -156,10 +159,12 @@ impl BucketIndex {
     /// nothing over the solved names, over a source with no bucket index, or with the rows
     /// planted off ([`Buckets::admit`] then files whole crates). Call it after
     /// [`Buckets::admit`] and before the question's candidates are read. Returns how many
-    /// impls this call filed.
-    pub fn admit_asked<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask) -> usize {
+    /// impls this call filed; refused by name where a bucket the question reads cannot be
+    /// asked (no library key for its trait or self type, a crate with no key), never an empty
+    /// filing that would answer "no impl" (D193 point 5).
+    pub fn admit_asked<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask) -> Result<usize, TablesReadError> {
         if !self.is_lazy() || self.no_rows || !names.has_buckets() {
-            return 0;
+            return Ok(0);
         }
         // Every field: a new kind of home is a compile error here, not a crate left unasked.
         // `local` judges filed impls, never which crates are asked.
@@ -191,19 +196,13 @@ impl BucketIndex {
             Ask::Trait(t, shape) => (Some(t), shape),
             Ask::Inherent(shape) => (None, shape),
         };
-        let Some(heads) = heads_of(names, keys, shape) else {
-            names.gap("the library key of the nominal type an impl question is about", None);
-            return 0;
-        };
+        let heads = heads_of(names, keys, shape)?;
         // A builtin the checker has no shape for is filed with no constructor (`file_row`).
         let shapeless = blaze_scope::BUILTIN_TYPES.iter().filter(|name| prim_shape(name).is_none()).filter_map(|name| blaze_scope::builtin_type(name)).map(|def| (Head::Named(def.key), None));
         let all_heads = heads.iter().map(|(head, of)| (*head, Some(*of))).chain(core::iter::once((Head::Any, None))).chain(shapeless);
         match trait_ {
             Some(t) => {
-                let Some(lib) = keys.library_in(names, t) else {
-                    names.gap("the library key of the trait an impl question is about", None);
-                    return 0;
-                };
+                let lib = keys.library_in(names, t).ok_or(TablesReadError::NoLibraryKey { of: "the trait an impl question is about", key: t })?;
                 trait_krate = names.crate_of(lib);
                 wanted.extend(all_heads.map(|(head, of)| (BucketKey::of_trait(lib, head), Under::Trait(of), head == Head::Any)));
                 wanted.push((BucketKey::negatives(lib), Under::Negative, false));
@@ -221,7 +220,8 @@ impl BucketIndex {
             if !crate::front2::linked::links_unit(krate == 0, names.proc_macro(krate) == Some(true)) {
                 continue;
             }
-            let Some(crate_key) = names.crate_key(krate) else { continue };
+            // Never skipped without a word: an admitted crate not asked leaves its impls out.
+            let crate_key = names.crate_key(krate).ok_or(TablesReadError::NoCrateKey { krate })?;
             let krate_id = first16(crate_key.0);
             // The crate's unfiled list, the first time the crate is asked anything.
             let unfiled = match self.indexed.unfiled.get(&krate).copied() {
@@ -280,7 +280,7 @@ impl BucketIndex {
             Ask::Trait(t, shape) => self.indexed.trait_reads.insert((t, shape), reads),
             Ask::Inherent(shape) => self.indexed.inherent_reads.insert(shape, reads),
         };
-        filed
+        Ok(filed)
     }
 
     /// Files the impls of crate `krate` its record's writer filed under no bucket, as
@@ -350,8 +350,8 @@ impl BucketIndex {
 
     /// The unfiled impls met in the crates asked, by why their record's writer did not file
     /// them: (class, count), in [`NotFiled`]'s order.
-    pub fn not_filed(&self) -> [(&'static str, u32); 10] {
-        let mut out = [("", 0u32); 10];
+    pub fn not_filed(&self) -> [(&'static str, u32); NOT_FILED.len()] {
+        let mut out = [("", 0u32); NOT_FILED.len()];
         for (i, slot) in out.iter_mut().enumerate() {
             *slot = (NOT_FILED[i], self.indexed.not_filed[i]);
         }

@@ -4477,7 +4477,23 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             self.mark_last_unreachable(TrapKind::Intrinsic, Some(e))?;
         }
         let v = match out {
-            Out::None => V::None,
+            // No value (intrinsics.rs `Out::None`: `()`, or a zero-sized result). A zero-sized
+            // result that `repr` holds in memory (`Layout::placed`: a part needs drop, as core's
+            // `transmute_unchecked::<[T; 0], [MaybeUninit<T>; 0]>` in `<[T; N] as
+            // IntoIterator>::into_iter` at a `T` that needs drop, clap's `Id`, t1545) is still a
+            // value the body binds and moves: a fresh zero-sized temporary, of which the
+            // intrinsic writes no byte (it has none). A result with bytes, or a scalar, with no
+            // value in live code is refused here, by name, not at the later read (rule 3).
+            Out::None => match rrepr {
+                Repr::None => V::None,
+                _ if !self.live => V::None,
+                Repr::Agg(l) if self.layouts[l as usize].size == 0 => {
+                    let at = self.temp(rrepr);
+                    V::Place(at.0, at.1)
+                }
+                Repr::Agg(_) => return Err(malformed("an intrinsic with no value whose result type has bytes")),
+                _ => return Err(malformed("an intrinsic with no value whose result type is a scalar")),
+            },
             Out::Diverges => {
                 self.dead_block();
                 V::None

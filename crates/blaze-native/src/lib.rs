@@ -31,6 +31,7 @@ pub mod libraries;
 pub mod macho;
 pub mod object;
 pub mod resolve;
+pub mod synthetic;
 pub mod tbd;
 pub mod unwind;
 

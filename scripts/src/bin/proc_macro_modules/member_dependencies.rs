@@ -25,6 +25,48 @@ fn optional(dep: Node<'_, '_, '_>) -> bool {
     dep.get("optional").and_then(|value| value.as_bool()) == Some(true)
 }
 
+/// The dependency tables an optional dependency can be declared in (dev-dependencies cannot be
+/// optional).
+pub(super) const ALL_KINDS: [&str; 2] = ["dependencies", "build-dependencies"];
+
+/// The implicit features of a manifest: THE rule every manifest this builder writes keeps its
+/// package's features by. The Cargo Book, "Features", "Optional dependencies": an optional
+/// dependency "implicitly defines a feature" of its name, and "If you specify the optional
+/// dependency with the `dep:` prefix anywhere in the `[features]` table, that disables the
+/// implicit feature"; a feature the table declares under that name is that name's feature. So:
+/// each optional key of the dependency tables `kinds` names (`dependencies`,
+/// `build-dependencies`; their `[target.*]` forms too) that no `dep:` entry names and the table
+/// does not declare. A written manifest keeps
+/// each: implicit while its dependency stays (declared, `"cc" = []` hides the dependency and
+/// cargo refuses the manifest: "optional dependency `cc` is not included in any feature"), and
+/// declared empty once the dependency is removed (dropped, a dependent's `phf_shared/unicase`
+/// names a feature that is not there, and cargo refuses the resolve).
+pub(super) fn implicit_features<'d, 't, 'a>(doc: &'d Document<'t, Alloc<'a>>, kinds: &[&str], alloc: Alloc<'a>) -> ASortedSet<'a, &'d str> {
+    let root = doc.root();
+    let features = root.get("features");
+    let mut hidden = ASortedSet::new_in(alloc);
+    for feature in features.into_iter().flat_map(|table| table.children()) {
+        for entry in feature.children().filter_map(|value| value.as_str()) {
+            if let Some(key) = entry.strip_prefix("dep:") {
+                hidden.insert(key);
+            }
+        }
+    }
+    let mut out = ASortedSet::new_in(alloc);
+    let targets = root.get("target").into_iter().flat_map(|table| table.children());
+    for scope in std::iter::once(root).chain(targets) {
+        for table in kinds.iter().filter_map(|kind| scope.get(kind)) {
+            for dep in table.children() {
+                let declared = features.and_then(|table| table.get(dep.key())).is_some();
+                if optional(dep) && !hidden.contains(dep.key()) && !declared {
+                    out.insert(dep.key());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// A declaration's package name in the lock: `package = ".."` where renamed, else its key.
 fn package_of<'d>(dep: Node<'d, '_, '_>) -> &'d str {
     dep.get("package").and_then(|value| value.as_str()).unwrap_or_else(|| dep.key())
@@ -297,8 +339,21 @@ fn written<'d, 't, 'a>(doc: &'d Document<'t, Alloc<'a>>, selected: &MemberDepend
         edit.remove(table).map_err(refuse)?;
     }
     let mut out = edit.finish().map_err(refuse)?;
-    if let Some(table) = features {
+    // The package's features as its own manifest has them ([`implicit_features`]): the implicit
+    // feature of an optional dependency the decision removed is written declared and empty, so
+    // what forwards to it still resolves (cargo resolves a member's lock with every feature on:
+    // phf_macros' `unicase = ["phf_shared/unicase"]` against phf_shared with `unicase` cut); one
+    // whose dependency stays stays implicit.
+    let mut implicit = implicit_features(doc, &ALL_KINDS, alloc);
+    implicit.retain(|key| !selected.kept.iter().any(|dep| dep.key() == *key));
+    if features.is_some() || !implicit.is_empty() {
         out.push_str("\n[features]\n");
+    }
+    for &key in implicit.iter() {
+        blaze_toml::write_string(key, &mut out);
+        out.push_str(" = []\n");
+    }
+    if let Some(table) = features {
         for feature in table.children() {
             blaze_toml::write_string(feature.key(), &mut out);
             out.push_str(" = [");
@@ -371,6 +426,51 @@ mod tests {
         assert_eq!(globset.enabled_by, Some("include-exclude"));
         assert_eq!(globset.features.as_slice(), ["default"]);
         println!("u keeps globset");
+    }
+
+    /// phf_shared 0.11.3 as its record has it: `unicase` and `uncased` optional, neither named by
+    /// a `dep:` entry, so each defines an implicit feature (its Cargo.toml.orig).
+    const PHF_SHARED: &str = "[package]\nname = \"phf_shared\"\nversion = \"0.11.3\"\nedition = \"2021\"\n\n[dependencies.siphasher]\nversion = \"1.0\"\n\n[dependencies.uncased]\nversion = \"0.9.9\"\noptional = true\ndefault-features = false\n\n[dependencies.unicase]\nversion = \"2.4.0\"\noptional = true\n\n[features]\ndefault = [\"std\"]\nstd = []\n";
+
+    /// turso's phf_macros 0.11.3 (2026-11-21): phf_macros requests nothing of phf_shared
+    /// (`default-features = false`), so the vendored phf_shared lost `unicase`, and with it its
+    /// implicit feature, while phf_macros keeps `unicase = ["phf_shared/unicase"]`: cargo refused
+    /// ("depends on `phf_shared` with feature `unicase` but `phf_shared` does not have that
+    /// feature"). The written manifest keeps the package's features: `unicase` and `uncased`
+    /// declared empty, the dependencies gone. Twin: requesting `unicase` keeps the dependency and
+    /// the bytes (both implicit features requested, nothing removed). Control: a package whose
+    /// `dep:unicase` entry disables the implicit feature gets no `unicase` feature when the
+    /// dependency goes. Prints "phf_shared: ..".
+    #[test]
+    fn a_removed_optional_dependency_keeps_its_implicit_feature() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let path = Path::new("phf_shared-0.11.3/Cargo.toml");
+        let none: [&str; 0] = [];
+        let written = rewritten_manifest(PHF_SHARED, path, &none, alloc).unwrap_or_else(|failure| panic!("{failure}")).unwrap_or_else(|| panic!("unicase was kept"));
+        let doc = parse(written.as_str(), path, alloc).unwrap_or_else(|failure| panic!("{failure}"));
+        let deps = doc.root().get("dependencies").unwrap_or_else(|| panic!("no dependencies: {}", written.as_str()));
+        assert!(deps.get("unicase").is_none() && deps.get("uncased").is_none(), "{}", written.as_str());
+        let features = doc.root().get("features").unwrap_or_else(|| panic!("no features: {}", written.as_str()));
+        for name in ["unicase", "uncased", "std", "default"] {
+            assert!(features.get(name).is_some(), "{name} is gone: {}", written.as_str());
+        }
+        assert_eq!(features.get("unicase").map(|it| it.children().count()), Some(0));
+        assert!(implicit_features(&doc, &ALL_KINDS, alloc).is_empty(), "{}", written.as_str());
+
+        let both = ["unicase", "uncased"];
+        let kept = rewritten_manifest(PHF_SHARED, path, &both, alloc).unwrap_or_else(|failure| panic!("{failure}"));
+        assert!(kept.is_none(), "{:?}", kept.as_ref().map(|it| it.as_str()));
+        let original = parse(PHF_SHARED, path, alloc).unwrap_or_else(|failure| panic!("{failure}"));
+        let implicit: Vec<&str> = implicit_features(&original, &ALL_KINDS, alloc).iter().copied().collect();
+        assert_eq!(implicit, ["uncased", "unicase"]);
+
+        let hidden = PHF_SHARED.replace("std = []\n", "std = []\nfold = [\"dep:unicase\"]\n");
+        let cut = rewritten_manifest(&hidden, path, &none, alloc).unwrap_or_else(|failure| panic!("{failure}")).unwrap_or_else(|| panic!("unicase was kept"));
+        let cut_doc = parse(cut.as_str(), path, alloc).unwrap_or_else(|failure| panic!("{failure}"));
+        let cut_features = cut_doc.root().get("features").unwrap_or_else(|| panic!("no features: {}", cut.as_str()));
+        assert!(cut_features.get("unicase").is_none(), "{}", cut.as_str());
+        assert!(cut_features.get("uncased").is_some(), "{}", cut.as_str());
+        println!("phf_shared: written {:?} | requested unicase and uncased: unchanged | dep:unicase: no unicase feature", written.as_str());
     }
 
     /// What an edge requests of its package: its `features`, `default` unless

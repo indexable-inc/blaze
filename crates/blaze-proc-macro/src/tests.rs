@@ -34,8 +34,12 @@ fn keep(store: &DirStore, base: blaze_ids::ContentId, package: &Package, produce
 
 /// What a later command finds for `base` in `package`'s crate: its table opened again.
 fn find<'a>(store: &DirStore, base: &blaze_ids::ContentId, package: &Package, edition: Edition, alloc: Alloc<'a>) -> Result<Option<Produced<'a>>, RecordError> {
-    { let results = table::open(store, table::crate_name(package), blaze_own::testing::heap().shared())?; results.find(store, base, package, &table::Verdicts::of(&results), edition, alloc) }
+    let results = table::open(store, table::crate_name(package), blaze_own::testing::heap().shared())?;
+    results.find(store, base, package, &table::Verdicts::of(&results), Some(CALL_FILE_SHOWN), edition, alloc)
 }
+
+/// The file the tests' calls are written in, as a host shows it (blaze-expand `ProcCall::file`).
+const CALL_FILE_SHOWN: &str = "src/lib.rs";
 
 /// The expansion records under the folder `store`, through a world over that folder.
 fn records_at(store: &Path) -> DirStore {
@@ -282,7 +286,7 @@ fn package(root: &Path, env: &[(&str, &str)]) -> Arc<Package> {
 
 fn run<'a>(setup: &Setup, index: u32, package: Arc<Package>, limits: Limits, alloc: Alloc<'a>) -> Result<Produced<'a>, CallError> {
     let input = lex("struct A;", EDITION, alloc).expect("the input lexes");
-    let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None };
+    let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok(CALL_FILE_SHOWN) };
     setup.runtime.expand(&setup.loaded, &setup.module.macros[index as usize], &call, EDITION, package, limits, alloc).map(|ran| ran.produced).map_err(|e| e.error)
 }
 
@@ -397,7 +401,7 @@ fn invalidation(setup: &Setup, tape: &Tape, plant: Plant) -> Result<(), Broke> {
     write(&values)?;
     let before = package_of(&values);
     let input = lex("struct A;", EDITION, Alloc::global()).map_err(|e| harness(&e))?;
-    let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None };
+    let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok(CALL_FILE_SHOWN) };
     for index in 0..4u32 {
         let mut produced = run(setup, index, before.clone(), Limits::STANDARD, Alloc::global()).map_err(|e| harness(&e))?;
         let read: Vec<&str> = produced.reads.list().iter().map(|it| produced.reads.subject(it)).collect();
@@ -663,7 +667,7 @@ fn control_a_reused_instance_is_caught() {
 fn a_module_that_traps_fails_its_call_with_a_typed_error() {
     let setup = setup(&[op::UNREACHABLE], 1);
     let input = lex("struct A;", EDITION, Alloc::global()).expect("the input lexes");
-    let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None };
+    let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok(CALL_FILE_SHOWN) };
     let error = setup
         .runtime
         .expand(&setup.loaded, &setup.module.macros[0], &call, EDITION, package(&folder("trap"), &[]), Limits::STANDARD, Alloc::global())
@@ -696,7 +700,7 @@ fn an_attribute_without_arguments_gets_an_empty_stream() {
     let empty = blaze_expand::TokenStream::new_in(Alloc::global());
     let served = |kind, attr_args| {
         let mut run_input = Vec::new();
-        let call = ProcCall { kind, input: &item, attr_args };
+        let call = ProcCall { kind, input: &item, attr_args, file: Ok(CALL_FILE_SHOWN) };
         crate::server::Server::new(EDITION, crate::server::ServerLimits::STANDARD, &call, Alloc::global(), &mut run_input).expect("served");
         run_input
     };
@@ -705,7 +709,7 @@ fn an_attribute_without_arguments_gets_an_empty_stream() {
     assert_ne!(bare, served(ProcKind::FnLike, None), "control: one stream, the planted bug, reads differently");
     // Arguments on a call that takes none are refused, not dropped.
     let mut run_input = Vec::new();
-    let call = ProcCall { kind: ProcKind::Derive, input: &item, attr_args: Some(&empty) };
+    let call = ProcCall { kind: ProcKind::Derive, input: &item, attr_args: Some(&empty), file: Ok(CALL_FILE_SHOWN) };
     let refused = crate::server::Server::new(EDITION, crate::server::ServerLimits::STANDARD, &call, Alloc::global(), &mut run_input).err();
     assert!(matches!(refused, Some(crate::server::ServerError::ArgumentsOnNonAttribute { kind: ProcKind::Derive })), "{refused:?}");
 }
@@ -718,7 +722,7 @@ fn an_answer_of_another_host_version_is_not_read() {
     let root = folder("host-version");
     let pkg = package(&root, &[]);
     let input = lex("struct A;", EDITION, Alloc::global()).expect("the input lexes");
-    let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None };
+    let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok(CALL_FILE_SHOWN) };
     let produced = run(&setup, 0, Arc::clone(&pkg), Limits::STANDARD, Alloc::global()).expect("it runs");
     let export = &setup.module.macros[0];
     let old = crate::record::base_key_under(crate::record::HOST_VERSION - 1, &setup.module.wasm_sha256, export, EDITION, &call);
@@ -730,6 +734,50 @@ fn an_answer_of_another_host_version_is_not_read() {
     let store = records_at(&folder("host-version-now"));
     keep(&store, now, &pkg, &produced).expect("kept under this version");
     assert!(find(&store, &now, &pkg, EDITION, Alloc::global()).expect("read").is_some(), "control: this version's answer is found");
+}
+
+/// `Span::file`'s read (sandbox.rs `CALL_FILE`) is the call's, not the package's: an answer
+/// that read `crates/a/src/lib.rs` is found for a call of the same key in that file, and not
+/// for one in another (the item moved to `b`: run again), nor where the host answers no file.
+/// In one command, with one package's verdicts, the list is valued per call: the planted bug
+/// of keeping the first call's verdict as the package's is caught both ways (`b` after `a`
+/// would be found; `a` after `b` would not). The control: an answer that did not read the
+/// file is found in both files, as an edit to another line of the file leaves the key and
+/// the file the same.
+#[test]
+fn a_kept_answer_that_read_the_calls_file_is_found_only_in_that_file() {
+    use blaze_expand::{ReadAnswer, ReadKind};
+    use crate::sandbox::{CALL_FILE, call_file_digest};
+
+    let setup = setup(&[], 1);
+    let pkg = package(&folder("call-file"), &[]);
+    let input = lex("struct A;", EDITION, Alloc::global()).expect("the input lexes");
+    let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok("crates/a/src/lib.rs") };
+    let base = base_key(&setup.module.wasm_sha256, &setup.module.macros[0], EDITION, &call);
+    let mut reads = Reads::new_in(Alloc::global());
+    reads.push(ReadKind::ProcMacro, CALL_FILE, ReadAnswer::Digest(call_file_digest("crates/a/src/lib.rs"))).expect("the read fits");
+    let read_file = Produced { reads, ..run(&setup, 0, Arc::clone(&pkg), Limits::STANDARD, Alloc::global()).expect("it runs") };
+    let store = records_at(&folder("call-file-store"));
+    keep(&store, base, &pkg, &read_file).expect("kept");
+
+    let results = table::open(&store, table::crate_name(&pkg), blaze_own::testing::heap().shared()).expect("the table opens");
+    let verdicts = table::Verdicts::of(&results);
+    let found = |file: Option<&str>| results.find(&store, &base, &pkg, &verdicts, file, EDITION, Alloc::global()).expect("read").is_some();
+    assert!(found(Some("crates/a/src/lib.rs")), "the real case: a call in the file the answer read");
+    assert!(!found(Some("crates/b/src/lib.rs")), "the twin: the call moved to another file runs again");
+    assert!(found(Some("crates/a/src/lib.rs")), "a's verdict again: b's was not kept as the package's");
+    assert!(!found(None), "a host that answers no file finds nothing that read it");
+
+    // Control: the answer read nothing of the call; found wherever the call is.
+    let plain = run(&setup, 0, Arc::clone(&pkg), Limits::STANDARD, Alloc::global()).expect("it runs");
+    assert!(plain.reads.list().iter().all(|read| plain.reads.subject(read) != CALL_FILE), "the module asks no file");
+    let plain_store = records_at(&folder("call-file-plain"));
+    keep(&plain_store, base, &pkg, &plain).expect("kept");
+    let results = table::open(&plain_store, table::crate_name(&pkg), blaze_own::testing::heap().shared()).expect("the table opens");
+    let verdicts = table::Verdicts::of(&results);
+    for file in [Some("crates/a/src/lib.rs"), Some("crates/b/src/lib.rs")] {
+        assert!(results.find(&plain_store, &base, &pkg, &verdicts, file, EDITION, Alloc::global()).expect("read").is_some(), "{file:?}");
+    }
 }
 
 /// `0..=1` reaches a macro as rustc gives it: `0`, then `.` `.` joint and `=` alone, then `1`.
@@ -771,7 +819,7 @@ fn a_missing_module_is_one_finding_per_crate() {
     let missing = crate::module::ModuleError::Missing { name: "gone-macros".to_owned(), version: "1.2.3".to_owned(), key: "absent".to_owned() };
     procs.add_crate(key, "gone-macros", "1.2.3", Err(missing));
     let input = lex("x", EDITION, Alloc::global()).expect("the input lexes");
-    let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None };
+    let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok(CALL_FILE_SHOWN) };
     let def = proc_def(key, "m0");
     for _ in 0..5 {
         let host = procs.run(&def, &call, EDITION, &package(&store_dir, &[]), Alloc::global()).err().expect("refused");
@@ -806,7 +854,7 @@ fn hook_command(setup: &Setup, store_dir: &Path, packages: &[Arc<Package>; 2], o
     let mut procs = crate::hook::ProcMacros::new(&setup.runtime, &records, limits);
     procs.add_crate(key, "test-macros", "0.0.0", Ok(reader_in(&setup.module.dir)));
     let input = lex("struct A;", EDITION, Alloc::global()).expect("the input lexes");
-    let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None };
+    let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok(CALL_FILE_SHOWN) };
     let mut rows = vec![None; 8];
     for (package, index) in order {
         let def = proc_def(key, &format!("m{index}"));

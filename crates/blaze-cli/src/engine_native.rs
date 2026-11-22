@@ -183,6 +183,9 @@ pub(crate) struct NativeSend<'w> {
     /// arguments: an exported fn is not generic). One symbol, one slot: a Rust caller of the
     /// same fn and C's word share its thunk, so the function has one address.
     pub(crate) words: &'w [blaze_launch::wire::run::Symbol],
+    /// Each word's export by its library item, in word order: what the run's roots root
+    /// (blaze-ladder run/special.rs `run_roots`'s `exports`), as no Rust record need call it.
+    pub(crate) items: &'w [blaze_id::ItemKey],
 }
 
 /// The program's image as `blaze run` hands it on: its key (the start list is rooted beside
@@ -274,6 +277,7 @@ fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platfo
         }
     }
     let mut words: Vec<blaze_launch::wire::run::Symbol, &'w Frame> = Vec::with_capacity_in(names.len(), ask.words);
+    let mut items: Vec<blaze_id::ItemKey, &'w Frame> = Vec::with_capacity_in(names.len(), ask.words);
     for i in 0..names.len() {
         let Some(name) = names.get(i) else { return Err(refused("a word's name is past its table")) };
         let found = exports.iter().find(|(spelled, _)| *spelled == name).map(|(_, item)| *item);
@@ -284,6 +288,7 @@ fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platfo
         let symbol = blaze_ladder::symbols::fn_symbol(checker, blaze_typeck::List::EMPTY, blaze_typeck::PTys::EMPTY, alloc)
             .map_err(|why| refused(bstd::mem::format_in!(scratch, "word {i}'s symbol: {why:?}").as_str()))?;
         words.push(blaze_launch::wire::run::Symbol(symbol.0));
+        items.push(item);
     }
     // The file the child opens, under the command's own home (a folder only its user writes).
     let Some(home) = ask.home else { return Err(refused("HOME is not set, so the records folder has no place")) };
@@ -294,7 +299,7 @@ fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platfo
     if dir.stat(cx, &name).map_err(|why| refused(bstd::mem::format_in!(scratch, "{why}").as_str()))?.is_none() {
         dir.publish(cx, &name, bstd::fs::Content::bytes(payload), bstd::fs::Durable::No).map_err(|why| refused(bstd::mem::format_in!(scratch, "the library's file: {why}").as_str()))?;
     }
-    Ok(Some(NativeSend { library: blaze_launch::wire::RecordId(key.0.0), hex: held(hex.as_str(), ask), words: words.leak() }))
+    Ok(Some(NativeSend { library: blaze_launch::wire::RecordId(key.0.0), hex: held(hex.as_str(), ask), words: words.leak(), items: items.leak() }))
 }
 
 /// 32 bytes as 64 lowercase hex digits.
@@ -488,48 +493,83 @@ pub(crate) fn image_for<'r>(cx: &Cx, standing: &mut Standing<'r, '_>, closure: &
 
     let order = native_image::closure(&list, root, &handed, &scratch);
     // Each crate's script as it ran (the deferred record, when its C was deferred), read in
-    // place before any crate's C runs: a reader's `links` trees are its producers' records as
-    // its script saw them, and `order` puts a producer after its readers
-    // (native_runner_c.rs `Producers`).
+    // place before any crate's C runs: a reader's `OUT_DIR` spellings are found among them
+    // (native_runner_c.rs `dep_out`).
     let mut ran: Vec<(usize, ScriptIn<'_>), &Frame> = Vec::with_capacity_in(order.len(), &scratch);
     for r in order.iter().copied() {
-        let Some(bytes) = list.script(r) else { continue };
         let package = list.name(r);
+        if handed.binary_search(&list.key(r).0.0).is_err() {
+            return Err(NativeError::NotHanded { package: held(package, ask) });
+        }
+        let Some(bytes) = list.script(r) else { continue };
         let Some(name) = native_image::script_name(bytes) else { return Err(NativeError::ScriptKind { package: held(package, ask) }) };
         let Some(run) = names(name) else { return Err(NativeError::NoScript { package: held(package, ask), script: name }) };
         let payload = native_image::payload_in_place(&cx, store, &run).map_err(NativeError::Store)?;
         ran.push((r, ScriptIn { name, out: run.out, payload }));
     }
-    let producers = crate::native_runner_c::Producers { scripts: &ran, graph: sections.graph };
-    let mut crates: Vec<CrateIn<'_>, &Frame> = Vec::with_capacity_in(order.len(), &scratch);
-    for r in order.iter().copied() {
-        let (package, key) = (list.name(r), list.key(r));
-        if handed.binary_search(&key.0.0).is_err() {
-            return Err(NativeError::NotHanded { package: held(package, ask) });
-        }
-        let scope = blaze_drive::key::crate_scope_name(&key);
-        let Some(scope_in) = names(scope) else { return Err(NativeError::NoNames { package: held(package, ask) }) };
-        let table = table_of(&cx, store, &scope_in, package, ask)?;
-        let script = match ran.iter().find(|(at, _)| *at == r).map(|(_, script)| *script) {
-            None => None,
-            Some(script) => {
-                // The built record's in place of one whose C requests were deferred: its out is
-                // the built key, so the image's key moves with the compiles' inputs.
-                match c_tasks.as_mut() {
-                    None => Some(script),
-                    Some(c) => {
-                        let (script, report) = crate::native_runner_c::built_for(&cx, c, store, &list, r, package, script, &producers, &scratch).map_err(|why| NativeError::CTasks {
-                            package: held(package, ask),
-                            words: held(bstd::mem::format_in!(&scratch, "{why}").as_str(), ask),
-                        })?;
+    // THE C STEP, dependencies first: `order` reversed is a post-order of the crate list's
+    // dependency edges (native_image.rs `closure`), so a `links` producer's C (jemalloc's
+    // configure and make, zstd-sys's compiles) has run, and its `OUT_DIR` is what that left,
+    // before any crate that depends on it asks for it (native_runner_c.rs `Producers`). The
+    // built record's in place of one whose C requests were deferred: its out is the built key,
+    // so the image's key moves with the compiles' inputs.
+    //
+    // A crate whose C step is refused costs only the code that calls it (stop 1 of the first
+    // real run: aws-lc's `.S` made EVERY test NOT RUN): the refusal is said here, naming the
+    // crate, and the crate is linked with no script outputs, so its archives are not in the
+    // image. Its C names then bind nowhere: blaze-native resolve.rs takes a root nothing defines
+    // as no import ("Rust binds it at run through the image handle"), and the child binds a C
+    // name when the code record that names it is placed (blaze-launch-rt native_lib.rs `bind`),
+    // that is at the first call of a Rust function that calls it. So exactly the tests (and the
+    // `run`) whose code reaches one of its C names stop, naming that name; the rest run. The
+    // image's key moves with it (the crate's script is absent from its inputs), and the next
+    // command asks the C step again (a built record is found by its key, never a refusal kept).
+    // A crate with deferred C that depends on a refused one is refused too (its C may call the
+    // refused archive's symbols, an import no library gives, which `dlopen`'s `RTLD_NOW` would
+    // refuse for the whole image); one that reads its `OUT_DIR` is refused by name
+    // (native_runner_c.rs `DepOut::Refused`).
+    let mut done: Vec<(usize, ScriptIn<'_>), &Frame> = Vec::with_capacity_in(ran.len(), &scratch);
+    let mut refused: Vec<usize, &Frame> = Vec::new_in(&scratch);
+    for r in order.iter().rev().copied() {
+        let Some(script) = ran.iter().find(|(at, _)| *at == r).map(|(_, script)| *script) else { continue };
+        let script = match c_tasks.as_mut() {
+            None => script,
+            Some(c) => {
+                let package = list.name(r);
+                let defers = crate::scripts::payload_parts(script.payload).and_then(|(_, record)| blaze_build_script::outputs::OutputsRef::open(record).ok()).is_some_and(|o| o.c_requests().next().is_some());
+                if defers && let Some(dep) = list.deps(r).find(|d| refused.contains(d)) {
+                    err.line(&cx, format_args!("the C of {package}: not built, as the C of {} it depends on was refused (said above); a call into either stops naming its C name ({RULE} `image_for`)", list.name(dep)))
+                        .map_err(|e| NativeError::Store(CliError::Out(e)))?;
+                    refused.push(r);
+                    continue;
+                }
+                let producers = crate::native_runner_c::Producers { scripts: &ran, done: &done, refused: &refused, graph: sections.graph };
+                match crate::native_runner_c::built_for(&cx, c, store, &list, r, package, script, &producers, &scratch) {
+                    Ok((script, report)) => {
                         if let Some(report) = report {
                             err.line(&cx, format_args!("{}", crate::native_runner_c::Said { package, report: &report })).map_err(|e| NativeError::Store(CliError::Out(e)))?;
                         }
-                        Some(script)
+                        script
+                    }
+                    Err(why) => {
+                        let refusal = NativeError::CTasks { package: held(package, ask), words: held(bstd::mem::format_in!(&scratch, "{why}").as_str(), ask) };
+                        err.line(&cx, format_args!("{refusal}; its archives are left out of this image, and only code that calls one of its C names stops, naming it"))
+                            .map_err(|e| NativeError::Store(CliError::Out(e)))?;
+                        refused.push(r);
+                        continue;
                     }
                 }
             }
         };
+        done.push((r, script));
+    }
+    let mut crates: Vec<CrateIn<'_>, &Frame> = Vec::with_capacity_in(order.len(), &scratch);
+    for r in order.iter().copied() {
+        let (package, key) = (list.name(r), list.key(r));
+        let scope = blaze_drive::key::crate_scope_name(&key);
+        let Some(scope_in) = names(scope) else { return Err(NativeError::NoNames { package: held(package, ask) }) };
+        let table = table_of(&cx, store, &scope_in, package, ask)?;
+        let script = done.iter().find(|(at, _)| *at == r).map(|(_, script)| *script);
         crates.push(CrateIn { package, links: Name::links_of(scope), table, script });
     }
     let image = image_in(&cx, &mut OnStore(store), program, &crates, platform, sdk, ask, &scratch)?;

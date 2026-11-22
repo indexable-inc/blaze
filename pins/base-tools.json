@@ -1,0 +1,61 @@
+{
+  "comment": "D192 (docs/v2/plan/design/base-tools.md): the one pinned base tool set per platform, the whole PATH of a sandboxed build step. Read by crates/blaze-base-tools (pins.rs states the schema; form 1). Per platform: `archive`, the archive's file name; `digest`, its SHA-256 (64 lower-case hex digits), and `size`, its bytes: both the string PENDING until CI has built and published it, and a PENDING set is a typed refusal naming the platform and this file, never a reach to the OS; `programs`, the names in the archive's bin/ folder by group (each name once across the groups; read sorted); `answers`, what the set's uname and hostname wrappers print (uname -n is the hostname), written into the archive as etc/answers. `release`: where the archives are fetched from, PENDING until the first is published.",
+  "form": 1,
+  "release": "PENDING",
+  "platforms": {
+    "aarch64-apple-darwin": {
+      "archive": "base-tools-aarch64-apple-darwin.tar.gz",
+      "digest": "PENDING",
+      "size": "PENDING",
+      "programs": {
+        "c_toolchain": ["clang", "clang++", "ld64.lld", "lld", "llvm-ar", "llvm-nm", "llvm-objcopy", "llvm-ranlib", "llvm-strip"],
+        "shell_and_core": ["basename", "cat", "chmod", "cp", "cut", "date", "dirname", "echo", "env", "expr", "false", "find", "head", "hostname", "install", "ln", "ls", "mkdir", "mktemp", "mv", "printf", "rm", "rmdir", "sh", "sleep", "sort", "tail", "tee", "test", "touch", "tr", "true", "uname", "uniq", "wc", "xargs"],
+        "text": ["awk", "cmp", "diff", "grep", "sed"],
+        "build_drivers": ["cmake", "make", "ninja", "pkg-config"],
+        "script_languages": ["perl", "python3"],
+        "archives": ["gzip", "tar", "unzip", "xz", "zstd"],
+        "generators": ["protoc"]
+      },
+      "answers": {
+        "hostname": "localhost",
+        "uname": {"m": "arm64", "o": "Darwin", "p": "arm", "r": "20.0.0", "s": "Darwin", "v": "Darwin Kernel Version 20.0.0"}
+      }
+    },
+    "aarch64-unknown-linux-gnu": {
+      "archive": "base-tools-aarch64-unknown-linux-gnu.tar.gz",
+      "digest": "PENDING",
+      "size": "PENDING",
+      "programs": {
+        "c_toolchain": ["clang", "clang++", "ld.lld", "lld", "llvm-ar", "llvm-nm", "llvm-objcopy", "llvm-ranlib", "llvm-strip"],
+        "shell_and_core": ["basename", "cat", "chmod", "cp", "cut", "date", "dirname", "echo", "env", "expr", "false", "find", "head", "hostname", "install", "ln", "ls", "mkdir", "mktemp", "mv", "printf", "rm", "rmdir", "sh", "sleep", "sort", "tail", "tee", "test", "touch", "tr", "true", "uname", "uniq", "wc", "xargs"],
+        "text": ["awk", "cmp", "diff", "grep", "sed"],
+        "build_drivers": ["cmake", "make", "ninja", "pkg-config"],
+        "script_languages": ["perl", "python3"],
+        "archives": ["gzip", "tar", "unzip", "xz", "zstd"],
+        "generators": ["protoc"]
+      },
+      "answers": {
+        "hostname": "localhost",
+        "uname": {"m": "aarch64", "o": "GNU/Linux", "p": "unknown", "r": "6.1.0", "s": "Linux", "v": "#1 SMP"}
+      }
+    },
+    "x86_64-unknown-linux-gnu": {
+      "archive": "base-tools-x86_64-unknown-linux-gnu.tar.gz",
+      "digest": "PENDING",
+      "size": "PENDING",
+      "programs": {
+        "c_toolchain": ["clang", "clang++", "ld.lld", "lld", "llvm-ar", "llvm-nm", "llvm-objcopy", "llvm-ranlib", "llvm-strip"],
+        "shell_and_core": ["basename", "cat", "chmod", "cp", "cut", "date", "dirname", "echo", "env", "expr", "false", "find", "head", "hostname", "install", "ln", "ls", "mkdir", "mktemp", "mv", "printf", "rm", "rmdir", "sh", "sleep", "sort", "tail", "tee", "test", "touch", "tr", "true", "uname", "uniq", "wc", "xargs"],
+        "text": ["awk", "cmp", "diff", "grep", "sed"],
+        "build_drivers": ["cmake", "make", "ninja", "pkg-config"],
+        "script_languages": ["perl", "python3"],
+        "archives": ["gzip", "tar", "unzip", "xz", "zstd"],
+        "generators": ["nasm", "protoc", "yasm"]
+      },
+      "answers": {
+        "hostname": "localhost",
+        "uname": {"m": "x86_64", "o": "GNU/Linux", "p": "unknown", "r": "6.1.0", "s": "Linux", "v": "#1 SMP"}
+      }
+    }
+  }
+}

@@ -56,6 +56,11 @@ pub const CLANG_JSON: &str = include_str!("../../../pins/clang.json");
 /// `pins/answers/clang.json` as checked in: read by blaze-build-script `c_tasks_probe`, whose
 /// digest is in every wasm build script's base key.
 pub const CLANG_ANSWERS_JSON: &str = include_str!("../../../pins/answers/clang.json");
+/// `pins/base-tools.json`: the pinned base tool set a sandboxed build step runs (D192).
+pub const BASE_TOOLS_PATH: &str = "pins/base-tools.json";
+/// `pins/base-tools.json` as checked in: read by blaze-base-tools `pins`, whose set's digest is
+/// in the key of every step that ran one of its programs.
+pub const BASE_TOOLS_JSON: &str = include_str!("../../../pins/base-tools.json");
 /// Read at compile time only; never in a value a program keeps (the facts below copy out the
 /// few bytes they need).
 const ANSWERS_JSON: &str = include_str!("../../../pins/answers/rustc.json");

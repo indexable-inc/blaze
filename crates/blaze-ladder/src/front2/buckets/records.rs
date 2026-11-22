@@ -268,7 +268,7 @@ pub fn row_digest(row: &ImplRow<'_>) -> ContentId {
     h.update(&row.key.0.0).update(&row.module.0.0);
     h.opt_part(row.trait_path).opt_part(row.self_path);
     h.update(&row.flags.bits().to_le_bytes());
-    h.update(&[u8::from(row.has_trait), u8::from(row.bare), u8::from(row.header_unread), u8::from(row.trait_unread)]);
+    h.update(&[u8::from(row.has_trait), u8::from(row.bare), u8::from(row.header_unread), u8::from(row.trait_unread), u8::from(row.refused_call)]);
     let (head, n) = match row.head {
         SelfHead::Path => (1u8, 0u16),
         SelfHead::Param => (2, 0),
@@ -522,14 +522,21 @@ const FLOAT_WIDTHS: [FloatWidth; 4] = [FloatWidth::F16, FloatWidth::F32, FloatWi
 
 /// The row shapes a question at the checker's `shape` reads: one, but every width for
 /// `{integer}` and `{float}`, and [`SelfShape::PLACEHOLDER`] (the blanket and unread buckets
-/// alone) for a shape no impl is filed at (a fn item, an opaque type, a parameter). `None`: a
-/// nominal type whose library key the key map and the records do not give.
-fn asked_shapes<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Option<Vec<SelfShape, Global>> {
+/// alone) for a shape no impl is filed at (a fn item, an opaque type, a parameter). Refused by
+/// name where the shape has no row shape: a nominal type whose library key the key map and the
+/// records do not give, or a shape blaze-surface refuses. Never an empty answer in its place:
+/// a question that reads no bucket answers "no impl", which is not what is known (D193 point 5).
+fn asked_shapes<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Result<Vec<SelfShape, Global>, TablesReadError> {
     let mut out: Vec<SelfShape, Global> = Vec::new_in(Global);
     let lib = |k: ItemKey| keys.library_in(names, k);
-    let mut put = |s: Shape| -> Option<()> {
-        out.push(self_shape(s, &lib).ok()?);
-        Some(())
+    let mut put = |s: Shape| -> Result<(), TablesReadError> {
+        let written = self_shape(s, &lib).map_err(|why| match why {
+            Unwritten::Lib(key) => TablesReadError::NoLibraryKey { of: "the nominal type an impl question is about", key },
+            Unwritten::Shape => TablesReadError::AskedShape { shape: s },
+            Unwritten::Refused(error) => TablesReadError::AskedShapeRefused { shape: s, error },
+        })?;
+        out.push(written);
+        Ok(())
     };
     match shape {
         Shape::AnyInt => {
@@ -548,7 +555,7 @@ fn asked_shapes<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> 
         Shape::FnDef(_) | Shape::Param | Shape::Opaque(_) => out.push(SelfShape::PLACEHOLDER),
         other => put(other)?,
     }
-    Some(out)
+    Ok(out)
 }
 
 /// What a reader could not have of a crate's impl tables.
@@ -572,6 +579,16 @@ pub enum TablesReadError {
     Shape { impl_: LibKey, shape: SelfShape },
     /// A row of a crate the question did not ask.
     Crate { impl_: LibKey },
+    /// A crate the question's home admits has no key in the source, so its tables cannot be
+    /// asked: its impls are unknown, never none (D193 point 5).
+    NoCrateKey { krate: usize },
+    /// The question names `key` (`of` says what it is), and the key map and the records give
+    /// no library key for it, so no bucket of it can be asked.
+    NoLibraryKey { of: &'static str, key: ItemKey },
+    /// The question's shape has no row shape ([`self_shape`]).
+    AskedShape { shape: Shape },
+    /// blaze-surface refused the question's shape as a row shape.
+    AskedShapeRefused { shape: Shape, error: surface::ShapeError },
 }
 
 impl fmt::Display for TablesReadError {
@@ -580,6 +597,10 @@ impl fmt::Display for TablesReadError {
             TablesReadError::Lookup(error) => write!(f, "an impl table lookup: {error}"),
             TablesReadError::Shape { impl_, shape } => write!(f, "the impl table row of {impl_:x} is at {shape:?}, which no table writer writes"),
             TablesReadError::Crate { impl_ } => write!(f, "the impl table row of {impl_:x} is of no crate the question asked"),
+            TablesReadError::NoCrateKey { krate } => write!(f, "crate {krate} may hold impls of the question, and the source names no key for it, so its impl tables cannot be asked"),
+            TablesReadError::NoLibraryKey { of, key } => write!(f, "{of} ({:x}) has no library key in the key map or the records, so no impl table of it can be asked", key.0),
+            TablesReadError::AskedShape { shape } => write!(f, "an impl question at {shape:?}, a shape no impl table row is written at"),
+            TablesReadError::AskedShapeRefused { shape, error } => write!(f, "an impl question at {shape:?}, which is no impl table row shape: {error}"),
         }
     }
 }
@@ -1263,18 +1284,12 @@ impl BucketIndex {
             Ask::Trait(t, shape) => (Some(t), shape),
             Ask::Inherent(shape) => (None, shape),
         };
-        let Some(shapes) = asked_shapes(names, keys, shape) else {
-            names.gap("the library key of the nominal type an impl question is about", None);
-            return Ok(0);
-        };
+        // A question no bucket of which can be asked is refused by name: answered from no
+        // bucket it would read "no impl", which is not what is known (D193 point 5). These were
+        // a names-log gap and `Ok(0)`, so the body went on to that wrong answer.
+        let shapes = asked_shapes(names, keys, shape)?;
         let lib_trait = match trait_ {
-            Some(t) => match keys.library_in(names, t) {
-                Some(lib) => Some(lib),
-                None => {
-                    names.gap("the library key of the trait an impl question is about", None);
-                    return Ok(0);
-                }
-            },
+            Some(t) => Some(keys.library_in(names, t).ok_or(TablesReadError::NoLibraryKey { of: "the trait an impl question is about", key: t })?),
             None => None,
         };
         // The crates asked, in index order: those `home` admits that the program links.
@@ -1287,7 +1302,9 @@ impl BucketIndex {
             if !crate::front2::linked::links_unit(krate == 0, names.proc_macro(krate) == Some(true)) {
                 continue;
             }
-            let Some(key) = names.crate_key(krate) else { continue };
+            // Never skipped without a word: a crate the home admits whose tables are not asked
+            // would leave its impls out of the answer unseen.
+            let key = names.crate_key(krate).ok_or(TablesReadError::NoCrateKey { krate })?;
             crates.push(key);
             indexes.push(krate);
         }
@@ -1391,7 +1408,7 @@ pub struct ItemsIndex;
 impl BucketSource for ItemsIndex {
     fn admit<'n, S: NamesSource<'n>>(&self, b: &mut Buckets, names: S, keys: &Keys, home: Homes, ask: Ask, _alloc: Alloc<'static>) -> Result<usize, TablesReadError> {
         let whole = b.admit(names, home);
-        Ok(whole + b.admit_asked(names, keys, home, ask))
+        Ok(whole + b.admit_asked(names, keys, home, ask)?)
     }
 }
 

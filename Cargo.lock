@@ -277,6 +277,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-base-tools"
+version = "0.0.0"
+dependencies = [
+ "blaze-blake3",
+ "blaze-data",
+ "blaze-json",
+ "blaze-own",
+ "blaze-pins",
+]
+
+[[package]]
 name = "blaze-base64"
 version = "0.0.0"
 dependencies = [

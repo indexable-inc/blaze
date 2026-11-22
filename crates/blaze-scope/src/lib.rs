@@ -99,6 +99,8 @@ pub mod task;
 pub mod tests_record;
 pub mod tree_record;
 pub mod units;
+// A path that failed behind a failed dependency: unknown, not absent (turso c1647).
+pub mod waits_on;
 mod work;
 
 #[cfg(test)]

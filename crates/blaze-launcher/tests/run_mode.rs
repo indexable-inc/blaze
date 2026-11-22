@@ -242,6 +242,7 @@ fn real_launcher_emits_zero_touch_spans_and_alloc_telemetry_over_shared_memory()
         .env("BLAZE_LAUNCH_STORE", &tmp)
         .env("BLAZE_LAUNCH_ENTRY", &entry_line)
         .env(blaze_launch::telemetry::VAR, &ring_path)
+        .env("BLAZE_ALLOC_SAMPLE_BYTES", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     unsafe {

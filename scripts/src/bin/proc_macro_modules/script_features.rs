@@ -148,9 +148,61 @@ default = [\n    \"static\",\n    # the runtime-linked libclang\n    \"bindgen/r
 static = []\n\
 native = [\"cc?/parallel\", \"dep:cc\", \"extra?/x\", \"dep:extra\"]\n";
 
-    fn written(features: &[&str]) -> String {
+    /// The script's manifest made from `package`, which the test requires to be written.
+    fn made(package: &str, name: &str, version: &str, features: &[&str]) -> String {
         let features: Vec<String> = features.iter().map(|it| (*it).to_owned()).collect();
-        script_manifest(PACKAGE, Path::new("/build/vendor/sys-0.1.0/build.rs"), "sys", "0.1.0", &features)
+        let alloc = blaze_own::testing::heap().alloc();
+        let dir = Path::new("/build/vendor").join(format!("{name}-{version}"));
+        script_manifest(package, &dir.join("Cargo.toml"), &dir.join("build.rs"), name, version, &features, alloc).unwrap_or_else(|failure| panic!("{failure}"))
+    }
+
+    fn written(features: &[&str]) -> String {
+        made(PACKAGE, "sys", "0.1.0", features)
+    }
+
+    /// libsqlite3-sys 0.35.0 as its record has it: `cc`, `pkg-config` and `vcpkg` optional
+    /// build-dependencies that no `dep:` entry names, so each is an implicit feature.
+    const LIBSQLITE3_SYS: &str = "[package]\nname = \"libsqlite3-sys\"\nversion = \"0.35.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n\n\
+[build-dependencies.cc]\nversion = \"1.1.6\"\noptional = true\n\n\
+[build-dependencies.pkg-config]\nversion = \"0.3.19\"\noptional = true\n\n\
+[build-dependencies.vcpkg]\nversion = \"0.2.15\"\noptional = true\n\n\
+[dependencies.openssl-sys]\nversion = \"0.9.103\"\noptional = true\n\n\
+[features]\n\
+\"bundled\" = [\"cc\", \"bundled_bindings\"]\n\
+\"bundled_bindings\" = []\n\
+\"default\" = [\"min_sqlite_version_3_14_0\"]\n\
+\"min_sqlite_version_3_14_0\" = [\"pkg-config\", \"vcpkg\"]\n";
+
+    /// turso's libsqlite3-sys 0.35.0 (2026-11-21): the unit's features name the implicit features
+    /// `cc`, `pkg-config` and `vcpkg`, and the script's manifest declared each (`"cc" = []`),
+    /// which hides the optional dependency's own feature: cargo refused it ("optional dependency
+    /// `cc` is not included in any feature"). Written as the package has them, they stay
+    /// implicit, and `bundled` keeps its `cc` entry. Twin: the unit without `bundled` keeps the
+    /// same rule for `pkg-config` and `vcpkg`. Control: `openssl-sys`, an optional NORMAL
+    /// dependency the script does not build with, is not in the script's manifest, so its
+    /// feature is declared empty. Prints the feature table.
+    #[test]
+    fn an_optional_build_dependencys_implicit_feature_stays_implicit() {
+        let unit = ["bundled", "bundled_bindings", "cc", "default", "min_sqlite_version_3_14_0", "pkg-config", "vcpkg"];
+        let manifest = made(LIBSQLITE3_SYS, "libsqlite3-sys", "0.35.0", &unit);
+        let table = manifest.split_once("[features]\n").expect("a features table").1.split_once("\n\n").expect("its end").0;
+        println!("libsqlite3-sys script features:\n{table}");
+        for name in ["cc", "pkg-config", "vcpkg"] {
+            assert!(!manifest.lines().any(|line| line.starts_with(&format!("\"{name}\" ="))), "{name} declared:\n{manifest}");
+        }
+        assert!(manifest.lines().any(|line| line == "\"bundled\" = [\"cc\", \"bundled_bindings\"]"), "{manifest}");
+        assert!(manifest.contains("[dependencies.cc]\nversion = \"1.1.6\"\noptional = true"), "{manifest}");
+        let alloc = blaze_own::testing::heap().alloc();
+        let doc = super::super::member_dependencies::parse(&manifest, Path::new("script/Cargo.toml"), alloc).unwrap_or_else(|failure| panic!("{failure}"));
+        let implicit: Vec<&str> = super::super::member_dependencies::implicit_features(&doc, &super::super::member_dependencies::ALL_KINDS, alloc).iter().copied().collect();
+        assert_eq!(implicit, ["cc", "pkg-config", "vcpkg"]);
+
+        let twin = made(LIBSQLITE3_SYS, "libsqlite3-sys", "0.35.0", &["default", "min_sqlite_version_3_14_0", "pkg-config", "vcpkg"]);
+        assert!(!twin.lines().any(|line| line.starts_with("\"pkg-config\" =") || line.starts_with("\"vcpkg\" =")), "{twin}");
+
+        let control = made(LIBSQLITE3_SYS, "libsqlite3-sys", "0.35.0", &["default", "min_sqlite_version_3_14_0", "openssl-sys", "pkg-config", "vcpkg"]);
+        assert!(control.lines().any(|line| line == "\"openssl-sys\" = []"), "{control}");
+        assert!(!control.contains("[dependencies.openssl-sys]"), "{control}");
     }
 
     /// The Cargo reference ("Features", "Dependency features"): `"dep/feat"` enables `feat` of
@@ -195,7 +247,9 @@ rpc = []\n\
 serde = [\"dep:serde\", \"serde?/derive\", \"other/serde\"]\n\
 test-utils = [\"dep:serde\", \"dep:serde_json\", \"serde_json\", \"rpc\"]\n";
         let features: Vec<String> = ["default", "rpc", "serde", "test-utils"].iter().map(|it| (*it).to_owned()).collect();
-        let manifest = script_manifest(BOTH, Path::new("/build/pre/build.rs"), "pre", "1.0.0", &features);
+        let alloc = blaze_own::testing::heap().alloc();
+        let manifest = script_manifest(BOTH, Path::new("/build/pre/Cargo.toml"), Path::new("/build/pre/build.rs"), "pre", "1.0.0", &features, alloc)
+            .unwrap_or_else(|failure| panic!("{failure}"));
         let line = |name: &str| manifest.lines().find(|line| line.starts_with(&format!("\"{name}\" ="))).expect("a feature line").to_owned();
         println!("script manifest serde: {} | test-utils: {}", line("serde"), line("test-utils"));
         assert_eq!(line("serde"), "\"serde\" = [\"serde/derive\"]");

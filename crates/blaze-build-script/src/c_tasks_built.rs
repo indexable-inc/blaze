@@ -16,9 +16,11 @@
 //! - the archives asked for (the demand), in order.
 //!
 //! - each `links` dependency's tree the requests name ([`crate::c_tasks::dep_roots`]), by its
-//!   guest spelling and what names its laid tree: a producer's `OUT_DIR` by its script record's
-//!   key, its served tree (`/deps/<links>`) by its package's files. The reader's out holds only
-//!   the spellings, so a producer bumped under equal text is another built record (rule 21).
+//!   guest spelling and what names its laid tree: a producer's `OUT_DIR` by the content of its
+//!   files as the producer's own C step left them (the command's native_runner_c.rs `dep_out`),
+//!   its served tree (`/deps/<links>`) by its package's files. The reader's out holds only the
+//!   spellings, so a producer bumped under equal text is another built record (rule 21), and one
+//!   whose C reran to equal files is the same one.
 //!
 //! A crate whose files can change (a workspace member, a path dependency) has no pinned key and
 //! no built record: its objects are found through their path sets, against today's files.

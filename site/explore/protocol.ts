@@ -67,8 +67,33 @@ export interface ViewerInfo {
 	webtransport_cert_sha256_b64?: string;
 }
 
+export interface BuildPhase {
+	name: string;
+	ns: number;
+}
+
+export interface BuildSummary {
+	id: string;
+	package: string;
+	command: string;
+	status: 'building' | 'running' | 'ok' | 'failed';
+	exit_code: number | null;
+	errors: number;
+	warnings: number;
+	reached: number;
+	found: number;
+	made: number;
+	placed: number;
+	resolved: number;
+	frontend_built: string;
+	recompile_reason: string;
+	phases: BuildPhase[];
+	slots?: Record<string, string>;
+}
+
 export type ServerMessage =
 	| { type: 'runs'; runs: RunSummary[] }
+	| { type: 'builds'; builds: BuildSummary[] }
 	| { type: 'run_started'; run: RunSummary }
 	| { type: 'run_ended'; id: string; status: number }
 	| { type: 'events'; events: TelemetryEvent[] };
@@ -244,12 +269,18 @@ export class LiveClient {
 	private connectWebSocket(): void {
 		const wsUrl = `${this.origin.replace(/^http/, 'ws')}/ws`;
 		const ws = new WebSocket(wsUrl);
+		ws.binaryType = 'arraybuffer';
 		this.ws = ws;
 		ws.addEventListener('open', () => {
 			this.backoffMs = 250;
-			this.handlers.onStatus('websocket', `Live · ${wsUrl}`);
+			this.handlers.onStatus('websocket', `Live · ${wsUrl} (binary)`);
 		});
 		ws.addEventListener('message', (ev) => {
+			if (ev.data instanceof ArrayBuffer) {
+				const msg = decodeBinaryEvents(ev.data);
+				if (msg) this.handlers.onMessage(msg);
+				return;
+			}
 			if (typeof ev.data !== 'string') return;
 			try {
 				this.handlers.onMessage(JSON.parse(ev.data) as ServerMessage);
@@ -265,4 +296,52 @@ export class LiveClient {
 			ws.close();
 		});
 	}
+}
+
+const EVENT_KIND_TABLE: Record<number, EventKindName> = {
+	1: 'span_enter',
+	2: 'span_exit',
+	3: 'span_unwound',
+	4: 'hook_hit',
+	5: 'alloc',
+	6: 'free',
+	7: 'io',
+	8: 'sync_wait',
+	9: 'thread_birth',
+	10: 'thread_end',
+	11: 'sample',
+};
+
+const utf8Decoder = new TextDecoder();
+
+/**
+ * Decodes a packed binary WebSocket event batch from `blaze-launcher --viewer` (zero JSON.parse):
+ *   [u8 magic='B', u8 ver=1, u16 run_id_len (LE), run_id bytes..., pad to 8B, N * 64B Event]
+ */
+export function decodeBinaryEvents(buf: ArrayBuffer): ServerMessage | null {
+	if (buf.byteLength < 8) return null;
+	const view = new DataView(buf);
+	if (view.getUint8(0) !== 0x42 || view.getUint8(1) !== 1) return null;
+	const idLen = view.getUint16(2, true);
+	const hdrLen = (4 + idLen + 7) & ~7;
+	if (hdrLen > buf.byteLength) return null;
+	const run = utf8Decoder.decode(new Uint8Array(buf, 4, idLen));
+	const count = Math.floor((buf.byteLength - hdrLen) / 64);
+	const events: TelemetryEvent[] = new Array(count);
+	for (let i = 0; i < count; i++) {
+		const off = hdrLen + i * 64;
+		events[i] = {
+			run,
+			kind: EVENT_KIND_TABLE[view.getUint8(off)] ?? 'sample',
+			thread: view.getUint32(off + 4, true),
+			slot_or_op: view.getUint32(off + 8, true),
+			ts_ns: Number(view.getBigUint64(off + 16, true)),
+			a: Number(view.getBigUint64(off + 24, true)),
+			b: Number(view.getBigUint64(off + 32, true)),
+			c: Number(view.getBigUint64(off + 40, true)),
+			d: Number(view.getBigUint64(off + 48, true)),
+			e: Number(view.getBigUint64(off + 56, true)),
+		};
+	}
+	return { type: 'events', events };
 }

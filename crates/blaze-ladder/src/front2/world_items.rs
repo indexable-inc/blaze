@@ -253,6 +253,12 @@ pub struct BodyWorld<'w, 'n, S = &'n Names<'n>> {
 /// question is at ground arguments) and every opaque is its hidden type, as in a built body's
 /// world after its check. A key that is no ctor, or whose ADT has no library key, is the
 /// world's own refusal naming the fn: no world is made for it.
+///
+/// What the questions found unmade (`fills`) or refused (`gaps`) is handed to the program's
+/// `asked` and `asked_gaps`, as a body's world hands its own (program.rs `in_world`). Before,
+/// this world was dropped with them: a ctor's `Missing` (an ADT's `Drop` bucket no check made)
+/// reached `make_asked` with nothing to make, and the instance was refused by the bare "the
+/// world has no answer to ..", which no round could fill (rule 3: nothing quietly dropped).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn ctor_world<'n, S: NamesSource<'n>, T>(
     names: S,
@@ -261,6 +267,8 @@ pub(super) fn ctor_world<'n, S: NamesSource<'n>, T>(
     store: &Store<'n>,
     buckets: Option<&Buckets>,
     ctor: ItemKey,
+    asked: &RefCell<Vec<Fill, Global>>,
+    asked_gaps: &RefCell<Vec<Gap, Global>>,
     f: impl FnOnce(&BodyWorld<'_, 'n, S>) -> T,
 ) -> Result<T, tc::ResolveError> {
     let refused = tc::ResolveError::Missing(tc::Question::FnSig(ctor));
@@ -287,7 +295,10 @@ pub(super) fn ctor_world<'n, S: NamesSource<'n>, T>(
         gaps: RefCell::new(Vec::new_in(Global)),
         reveal: super::opaque_auto::Reveal::All,
     };
-    Ok(f(&world))
+    let out = f(&world);
+    asked.borrow_mut().extend(world.fills.into_inner());
+    asked_gaps.borrow_mut().extend(world.gaps.into_inner());
+    Ok(out)
 }
 
 impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {

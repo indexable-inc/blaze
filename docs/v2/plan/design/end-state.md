@@ -1253,6 +1253,57 @@ Order (the tree compiles and tempo never gets worse):
 
 The floor: no refusal from this mechanism but `HigherRanked`, and no false finding from a call.
 
+## D193. What a day of real runs changed: six revisions, and the order (2026-11-21)
+
+The owner, 2026-11-21 17:03: "given all of these revise the architecture and implement in parallel
+what u think the best long term architecture is". Evidence: eleven real runs on tempo (check 0
+errors; 215 of 454 swept tests; `run` stops in C) and the first three on turso (2801, 1827, 115
+errors). Nothing above is withdrawn. These six follow from what stopped the runs, and each names
+what it deletes.
+
+1. COMPILE-TIME CODE RUNS AS BLAZE'S OWN CODE, NOW (D175 moves from "end state" to "next").
+   Evidence: on turso the interim module builder (cargo and rustc to wasm, rule 1's largest open
+   bug) failed 10 of 148 modules with four tool bugs, its keys hold the whole lock so two
+   projects share almost nothing (5 of 148 reused from tempo), and bindgen scripts cannot be wasm
+   at all. `blaze test` already runs std code natively from code records. A proc-macro crate is a
+   program; its `proc_macro` library is blaze's (tokens in, tokens out, spans as item-relative
+   values); a build script is a program whose system layer is the grants of D177. Deletes: the
+   interim builder, the module stores, Wasmtime, blaze-wasi, the wasm standard library.
+2. A PROBE IS ANSWERED BY THE THING IT ASKS ABOUT. A build script that runs `rustc` on a snippet
+   is asking blaze: the snippet is checked by blaze's front end for the asked target and the
+   answer is a record keyed by the snippet (autocfg, rustix, proc-macro2, thiserror). A script
+   that runs `cc` is asking the pinned clang: it runs, hermetically (D177), and the answer is a
+   record. Deletes: `pins/answers/*`, `CannotAnswerYet`, the harness that fills tables by hand.
+3. ONE PINNED WORLD FOR NATIVE TOOLS (D192): the base tool set by digest, seen through hvbox's
+   synthetic root (`/tools`, `/package`, `/out`, `/sdk`), `Level::Execution`. Seatbelt stays as
+   `Level::Inputs` until the owner's first hvbox run passes its checklist. Deletes: `host_tools`.
+4. NATIVE CODE OF A DEPENDENCY IS BUILT WHEN ITS FIRST SYMBOL IS BOUND, one image per links
+   component (measured: building a test program's whole closure took tempo from 215 passing
+   tests to none). The start image holds no deferred C.
+5. NO ANSWER IS `None` ACROSS A CRATE BOUNDARY. Three of today's false errors were an unknown
+   read as an absence (an impl that could not be filed; a glob import of a crate whose names
+   failed; a constant's proc macro with no runner). D161 already says a task that lacks a fact
+   waits; the guard is a type: a lookup that crosses a crate returns `Known(T)`, `Absent` or
+   `Unknown(Cause)`, and only `Absent` may become an error. `Option` is banned at those seams.
+6. THE EMITTER'S SCRATCH REGISTERS ARE TYPES. A flag register reused as an address scratch gave
+   61 false overflow panics. In blaze-emit and in the fast tier a scratch register is a value
+   taken from and returned to a small set, so two uses cannot overlap; every `test` run can be
+   asked to compare a function's result with the LIR evaluator (`--differential`).
+
+What `run` uses, stated (the owner asked): today the `Reference` tier, crates/blaze-emit: one
+forward pass, every value in a stack cell, no optimization. Copy-and-patch stencils are parked
+and their crate is deleted. The decided fast tier (D97 to D100, backend-next.md) is the
+stencil idea with registers: one analysis pass, one emission pass with a greedy allocator,
+composed from a table of templates that are data. It is not built. It becomes urgent only if
+the profile says test time is generated code (two tempo tests die at the 60 s deadline: sampled
+before anything is built for them).
+
+Order. In parallel now, disjoint files: (1) piece 0, the proc-macro program's interface crate and
+its oracle against today's expansions; (2) the rustc probe; (3) the base tool set and hvbox's
+root; (4) the component image. After tempo's ten packages are green: (5) as one port per seam;
+D158's crate identity (a dependency bump re-keys every dependent item today: handoff e1), as
+one port. (6) with the fast tier.
+
 ## Order
 
 Now, in parallel (no file in common): the driver's contract in blaze-engine (D157); the borrow

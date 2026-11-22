@@ -53,7 +53,7 @@ fn object<const S: usize, const Y: usize, const R: usize>(sections: [Section<'st
 
 fn plan<const N: usize, const W: usize, const I: usize>(object: Object<'static>, names: [(&'static [u8], Resolution); N], words: [&'static [u8]; W], imports: [&'static [u8]; I]) -> Plan<'static> {
     Plan {
-        objects: Vec::from_array_in([Pulled { input: 0, member: 0, object }], a()),
+        objects: Vec::from_array_in([Pulled { input: 0, member: 0, name: b"one.o", object }], a()),
         names: Vec::from_array_in(names, a()),
         words: Vec::from_array_in(words, a()),
         imports: Vec::from_array_in(imports, a()),
@@ -137,6 +137,129 @@ fn adrp_add_resolved() {
     assert_ne!(target & !0xfff, text & !0xfff, "the test wants a nonzero page delta");
     assert!(image.fixups.is_empty(), "a pc-relative pair needs no fixup");
     println!("adrp_add_resolved: target {target:#x} page delta {:#x}", (target & !0xfff) - (text & !0xfff));
+}
+
+/// The same `adrp; add` pair, its name now an import (no object of the image defines it, as a
+/// hidden name whose definer is not in the link): refused naming the member, section, offset,
+/// symbol and why (rule 19), not as a bare kind and offset. Twin: `adrp_add_resolved`.
+#[test]
+fn adrp_to_an_import_names_the_member_and_symbol() {
+    use blaze_native::layout::{Far, Reach};
+    let code = le(&[0xd503_201f, 0x9000_0000, 0x9100_0000]);
+    let p = plan(
+        object(
+            [section(b"__TEXT", b"__text", SectionKind::Code, 2, code, 0..2)],
+            [sym(b"_hidden_elsewhere", Def::Undefined, Bind::Global)],
+            [reloc(0, 4, RelocKind::Page21, 0), reloc(0, 8, RelocKind::PageOff12 { scale_log2: 0 }, 0)],
+        ),
+        [(&b"_hidden_elsewhere"[..], Resolution::Import { index: 0, weak: false })],
+        [],
+        [&b"_hidden_elsewhere"[..]],
+    );
+    let refused = match lay(&p, &inputs(), Layout::MACOS_ARM64, a()) {
+        Err(refused) => refused,
+        Ok(_) => panic!("a direct page reference to an import was laid"),
+    };
+    let want = Far {
+        kind: RelocKind::Page21,
+        from: ORIGIN,
+        member: b"one.o",
+        segment: b"__TEXT",
+        section: b"__text",
+        offset: 4,
+        symbol: b"_hidden_elsewhere",
+        reach: Reach::Import,
+    };
+    assert_eq!(refused, LayoutError::OutOfRange(want));
+    let words = std::format!("{refused:?}");
+    assert!(words.contains("`one.o`") && words.contains("`_hidden_elsewhere`") && words.contains("__TEXT,__text"), "{words}");
+    println!("adrp_to_an_import_names_the_member_and_symbol: {words}");
+}
+
+/// aws-lc's bcm.o shape: `__TEXT,__StaticInit` takes `___dso_handle` by `adrp; add` to hand it
+/// to `__cxa_atexit`. No object defines the name: the linker does (synthetic.rs), as the
+/// image's Mach-O header, which the writer puts at address 0 of the image (image.rs:
+/// `file_start` = `header_reserve`, the bytes before it the writer's header). So the pair makes
+/// address 0, with no fixup (pc-relative: the header moves with the code), and a pointer to it
+/// is 0 rebased to the image's load address. Twin: `adrp_to_an_import_names_the_member_and_symbol`
+/// (the same pair to a name nobody defines is refused).
+/// Prints "dso_handle_is_the_header: adrp page 0x0 add 0x0, pointer 0x0 rebased".
+#[test]
+fn dso_handle_is_the_header() {
+    let code = le(&[0xd503_201f, 0x9000_0000, 0x9100_0000]);
+    let p = plan(
+        object(
+            [section(b"__TEXT", b"__StaticInit", SectionKind::Code, 2, code, 0..2), section(b"__DATA", b"__data", SectionKind::Data, 3, zeros(8), 2..3)],
+            [sym(b"___dso_handle", Def::Undefined, Bind::Global)],
+            [reloc(0, 4, RelocKind::Page21, 0), reloc(0, 8, RelocKind::PageOff12 { scale_log2: 0 }, 0), reloc(1, 0, RelocKind::Abs64, 0)],
+        ),
+        [(&b"___dso_handle"[..], Resolution::Linker)],
+        [],
+        [],
+    );
+    let image = laid(&p);
+    assert!(image.file_start > 0, "the header is the writer's, before the file bytes");
+    let (text, _) = at(&image, Region::Text);
+    let (data, _) = at(&image, Region::Data);
+    let header = 0u64;
+    let page = adrp_page(word(&image, text + 4), text + 4);
+    let low = imm12(word(&image, text + 8));
+    assert_eq!(page + low, header, "adrp; add make the header's address");
+    let pointer = data + 48;
+    assert_eq!(dword(&image, pointer), header);
+    assert!(image.fixups.contains(&Fixup { at: pointer, to: FixTo::Rebase { target: header } }));
+    assert_eq!(image.fixups.len(), 1, "the pc-relative pair needs no fixup");
+    println!("dso_handle_is_the_header: adrp page {page:#x} add {low:#x}, pointer {:#x} rebased", dword(&image, pointer));
+}
+
+/// ld64's boundary names: `section$start$__DATA$__data` is the first byte of the laid
+/// `__DATA,__data`, `section$end$...` the byte past its last (`__DATA,__data` starts after the
+/// 48-byte BNL2 descriptor, as in `adrp_add_resolved`). Both are pointers, rebased.
+#[test]
+fn section_bounds_are_the_laid_section() {
+    let p = plan(
+        object(
+            [section(b"__DATA", b"__data", SectionKind::Data, 3, zeros(0x20), 0..2)],
+            [sym(b"section$start$__DATA$__data", Def::Undefined, Bind::Global), sym(b"section$end$__DATA$__data", Def::Undefined, Bind::Global)],
+            [reloc(0, 0, RelocKind::Abs64, 0), reloc(0, 8, RelocKind::Abs64, 1)],
+        ),
+        [(&b"section$end$__DATA$__data"[..], Resolution::Linker), (&b"section$start$__DATA$__data"[..], Resolution::Linker)],
+        [],
+        [],
+    );
+    let image = laid(&p);
+    let (data, _) = at(&image, Region::Data);
+    let start = data + 48;
+    assert_eq!(dword(&image, start), start);
+    assert_eq!(dword(&image, start + 8), start + 0x20);
+    assert!(image.fixups.contains(&Fixup { at: start + 8, to: FixTo::Rebase { target: start + 0x20 } }));
+}
+
+/// A linker name this image has no address for is refused by its own words (rule 3: lld would
+/// make an empty section; rule 19: the name, the input, why): a boundary of a section that is
+/// not laid, and an executable's header in a dylib image.
+#[test]
+fn a_linker_name_with_no_address_is_refused_by_name() {
+    use blaze_native::layout::{NoAddress, Unmade};
+    let refused = |name: &'static [u8]| {
+        let p = plan(
+            object([section(b"__DATA", b"__data", SectionKind::Data, 3, zeros(8), 0..1)], [sym(name, Def::Undefined, Bind::Global)], [reloc(0, 0, RelocKind::Abs64, 0)]),
+            [(name, Resolution::Linker)],
+            [],
+            [],
+        );
+        match lay(&p, &inputs(), Layout::MACOS_ARM64, a()) {
+            Err(e) => e,
+            Ok(_) => panic!("`{}` was laid", core::str::from_utf8(name).unwrap_or("?")),
+        }
+    };
+    let none = refused(b"section$start$__DATA$__mod_init_func");
+    assert_eq!(none, LayoutError::Linker(Unmade { name: b"section$start$__DATA$__mod_init_func", from: ORIGIN, why: NoAddress::NoSection }));
+    let words = std::format!("{none:?}");
+    assert!(words.contains("section$start$__DATA$__mod_init_func") && words.contains("no section"), "{words}");
+    let exe = refused(b"__mh_execute_header");
+    assert_eq!(exe, LayoutError::Linker(Unmade { name: b"__mh_execute_header", from: ORIGIN, why: NoAddress::OtherKind { kind: "an executable" } }));
+    println!("a_linker_name_with_no_address_is_refused_by_name: {words}");
 }
 
 /// NATIVE.md 3.4: a branch from C to a Rust export goes through a 12-byte stub `adrp x16,

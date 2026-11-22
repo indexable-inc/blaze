@@ -25,8 +25,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use blaze_launch::telemetry::{Event, EventKind};
-
 use crate::telemetry::MappedRing;
 
 /// Default loopback port matching `site/explore/protocol.ts` and `blaze_run::viewer::DEFAULT_VIEWER_PORT`.
@@ -42,7 +40,11 @@ const MAX_HTTP_HEADER_BYTES: usize = 8192;
 const MAX_CLIENTS: usize = 32;
 const MAX_DRAIN_PER_RUN_PER_TICK: usize = 256;
 const MAX_RUNS_TRACKED: usize = 64;
-const TICK_INTERVAL: Duration = Duration::from_millis(25);
+const ACTIVE_TICK: Duration = Duration::from_millis(15);
+const MAX_IDLE_TICK: Duration = Duration::from_millis(200);
+const DIR_SCAN_INTERVAL: Duration = Duration::from_millis(200);
+const BIN_EVENT_MAGIC: u8 = b'B';
+const BIN_EVENT_VERSION: u8 = 1;
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /// Typed error for viewer startup and loopback operations.
@@ -89,6 +91,7 @@ struct RunMeta {
     pid: u32,
     package: String,
     started_ms: u64,
+    slots: BTreeMap<u32, String>,
 }
 
 struct TrackedRun {
@@ -105,6 +108,7 @@ struct SharedState {
     stop: AtomicBool,
     clients: Mutex<Vec<TcpStream>>,
     runs_snapshot: Mutex<String>,
+    builds_snapshot: Mutex<String>,
 }
 
 /// Running local viewer server handle (for both CLI `--viewer` and tests).
@@ -171,6 +175,7 @@ pub fn start(config: ViewerConfig) -> Result<ViewerHandle, ViewerError> {
         stop: AtomicBool::new(false),
         clients: Mutex::new(Vec::new()),
         runs_snapshot: Mutex::new(String::from(r#"{"type":"runs","runs":[]}"#)),
+        builds_snapshot: Mutex::new(String::from(r#"{"type":"builds","builds":[]}"#)),
     });
 
     let accept_shared = Arc::clone(&shared);
@@ -298,9 +303,13 @@ fn handle_connection(mut stream: TcpStream, shared: &Arc<SharedState>) {
             return;
         }
         let _ = stream.set_nonblocking(true);
-        // Send initial runs snapshot immediately.
+        // Send initial runs and builds snapshots immediately.
         if let Ok(snap) = shared.runs_snapshot.lock() {
             let frame = ws_text_frame(&snap);
+            let _ = stream.write_all(&frame);
+        }
+        if let Ok(bsnap) = shared.builds_snapshot.lock() {
+            let frame = ws_text_frame(&bsnap);
             let _ = stream.write_all(&frame);
         }
         if let Ok(mut clients) = shared.clients.lock() {
@@ -322,6 +331,14 @@ fn handle_connection(mut stream: TcpStream, shared: &Arc<SharedState>) {
                 .lock()
                 .map(|s| s.clone())
                 .unwrap_or_else(|_| String::from(r#"{"type":"runs","runs":[]}"#));
+            write_http(&mut stream, "200 OK", "application/json", cors_origin, &body);
+        }
+        ("GET", "/api/builds") => {
+            let body = shared
+                .builds_snapshot
+                .lock()
+                .map(|s| s.clone())
+                .unwrap_or_else(|_| String::from(r#"{"type":"builds","builds":[]}"#));
             write_http(&mut stream, "200 OK", "application/json", cors_origin, &body);
         }
         ("POST", "/api/toggle") => {
@@ -363,73 +380,114 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 
 fn pump_loop(config: ViewerConfig, shared: Arc<SharedState>) {
     let mut tracked: BTreeMap<String, TrackedRun> = BTreeMap::new();
+    let mut builds: BTreeMap<String, (SystemTime, String)> = BTreeMap::new();
     let mut idle_since: Option<Instant> = None;
+    let mut last_dir_scan = Instant::now() - DIR_SCAN_INTERVAL;
+    let mut sleep_dur = ACTIVE_TICK;
     let mut tick: u64 = 0;
+    let mut bin_scratch: Vec<u8> = Vec::with_capacity(4096);
 
     while !shared.stop.load(Ordering::Acquire) {
         tick = tick.wrapping_add(1);
+        let now = Instant::now();
         let mut runs_changed = false;
+        let mut builds_changed = false;
+        let mut any_events = false;
 
         // 1. Poll existing clients for disconnect / ping / close frames so `active_viewers` stays exact.
         poll_clients(&shared);
 
-        // 2. Discover new `*.telem` rings under `config.runs_dir`.
-        if let Ok(entries) = std::fs::read_dir(&config.runs_dir) {
-            for entry in entries.flatten() {
-                if tracked.len() >= MAX_RUNS_TRACKED {
-                    break;
+        // 2. Discover new `*.telem` rings and `*.build.json` snapshots under `config.runs_dir` (~5 Hz).
+        if now.duration_since(last_dir_scan) >= DIR_SCAN_INTERVAL {
+            last_dir_scan = now;
+            if let Ok(entries) = std::fs::read_dir(&config.runs_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if name.ends_with(".build.json") && builds.len() < MAX_RUNS_TRACKED {
+                        let mtime = entry
+                            .metadata()
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .unwrap_or(UNIX_EPOCH);
+                        let changed = match builds.get(name) {
+                            Some((prev, _)) => *prev != mtime,
+                            None => true,
+                        };
+                        if changed {
+                            if let Ok(raw) = std::fs::read_to_string(&path) {
+                                let trimmed = raw.trim();
+                                if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                                    builds.insert(String::from(name), (mtime, String::from(trimmed)));
+                                    builds_changed = true;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if tracked.len() >= MAX_RUNS_TRACKED {
+                        continue;
+                    }
+                    if path.extension().and_then(|s| s.to_str()) != Some("telem") {
+                        continue;
+                    }
+                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    if tracked.contains_key(stem) {
+                        continue;
+                    }
+                    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+                        continue;
+                    };
+                    let Ok(ring) = MappedRing::attach_file(&cpath) else {
+                        continue;
+                    };
+                    let meta = read_meta(&config.runs_dir.join(format!("{stem}.meta")), stem);
+                    let alive = meta.pid == 0 || pid_alive(meta.pid);
+                    let run = TrackedRun {
+                        id: String::from(stem),
+                        meta,
+                        ring,
+                        alive,
+                        ended_notified: false,
+                        dead_since: if alive { None } else { Some(now) },
+                    };
+                    let started_msg = format!(r#"{{"type":"run_started","run":{}}}"#, format_run_json(&run));
+                    tracked.insert(String::from(stem), run);
+                    broadcast_text(&shared, &started_msg);
+                    runs_changed = true;
                 }
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("telem") {
-                    continue;
-                }
-                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                if tracked.contains_key(stem) {
-                    continue;
-                }
-                let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
-                    continue;
-                };
-                let Ok(ring) = MappedRing::attach_file(&cpath) else {
-                    continue;
-                };
-                let meta = read_meta(&config.runs_dir.join(format!("{stem}.meta")), stem);
-                let alive = meta.pid == 0 || pid_alive(meta.pid);
-                let run = TrackedRun {
-                    id: String::from(stem),
-                    meta,
-                    ring,
-                    alive,
-                    ended_notified: false,
-                    dead_since: if alive { None } else { Some(Instant::now()) },
-                };
-                let started_msg = format!(r#"{{"type":"run_started","run":{}}}"#, format_run_json(&run));
-                tracked.insert(String::from(stem), run);
-                broadcast_text(&shared, &started_msg);
-                runs_changed = true;
             }
         }
 
-        // 3. Drain events from all tracked runs and detect exited processes.
-        let mut events_batch = String::new();
-        let mut event_count = 0usize;
+        // 3. Drain events from all tracked runs as packed 64-byte binary WebSocket frames (zero JSON!).
         let mut to_remove: Vec<String> = Vec::new();
-        let now = Instant::now();
 
         for (id, run) in tracked.iter_mut() {
+            bin_scratch.clear();
+            let id_bytes = id.as_bytes();
+            let id_len = u16::try_from(id_bytes.len()).unwrap_or(u16::MAX);
+            let hdr_len = (4 + usize::from(id_len) + 7) & !7;
+            bin_scratch.push(BIN_EVENT_MAGIC);
+            bin_scratch.push(BIN_EVENT_VERSION);
+            bin_scratch.extend_from_slice(&id_len.to_le_bytes());
+            bin_scratch.extend_from_slice(&id_bytes[..usize::from(id_len)]);
+            bin_scratch.resize(hdr_len, 0);
+
             let mut drained = 0usize;
             while drained < MAX_DRAIN_PER_RUN_PER_TICK {
                 let Some(ev) = run.ring.ring().pop() else {
                     break;
                 };
-                if event_count > 0 {
-                    events_batch.push(',');
-                }
-                push_event_json(&mut events_batch, id, &ev);
-                event_count += 1;
+                // SAFETY: `Event` is `#[repr(C, align(8))]`, 64 bytes, all plain integer fields.
+                let raw: [u8; 64] = unsafe { core::mem::transmute(ev) };
+                bin_scratch.extend_from_slice(&raw);
                 drained += 1;
+            }
+            if drained > 0 {
+                any_events = true;
+                broadcast_binary(&shared, &bin_scratch);
             }
 
             if run.alive && run.meta.pid != 0 && !pid_alive(run.meta.pid) {
@@ -458,13 +516,21 @@ fn pump_loop(config: ViewerConfig, shared: Arc<SharedState>) {
             runs_changed = true;
         }
 
-        // 4. Broadcast drained event batch.
-        if event_count > 0 {
-            let msg = format!(r#"{{"type":"events","events":[{events_batch}]}}"#);
-            broadcast_text(&shared, &msg);
+        // 4. Refresh runs and builds snapshots periodically or on changes.
+        if builds_changed {
+            let mut bmsg = String::from(r#"{"type":"builds","builds":["#);
+            for (idx, (_, raw)) in builds.values().enumerate() {
+                if idx > 0 {
+                    bmsg.push(',');
+                }
+                bmsg.push_str(raw);
+            }
+            bmsg.push_str("]}");
+            if let Ok(mut guard) = shared.builds_snapshot.lock() {
+                *guard = bmsg.clone();
+            }
+            broadcast_text(&shared, &bmsg);
         }
-
-        // 5. Refresh runs snapshot periodically or on changes.
         if runs_changed || tick % 20 == 0 {
             let snap = format_runs_message(&tracked);
             if let Ok(mut guard) = shared.runs_snapshot.lock() {
@@ -475,7 +541,7 @@ fn pump_loop(config: ViewerConfig, shared: Arc<SharedState>) {
             }
         }
 
-        // 6. Idle expiry check (rule 70: never linger forever with 0 runs and 0 viewers).
+        // 5. Idle expiry check (rule 70: never linger forever with 0 runs and 0 viewers).
         let active_viewers = shared.active_viewers.load(Ordering::Acquire);
         let active_runs = tracked.values().filter(|r| r.alive).count();
         if active_viewers > 0 || active_runs > 0 {
@@ -488,7 +554,13 @@ fn pump_loop(config: ViewerConfig, shared: Arc<SharedState>) {
             }
         }
 
-        std::thread::sleep(TICK_INTERVAL);
+        // Adaptive backoff: 15ms while streaming, smoothly backing off to 200ms when quiet.
+        if any_events || runs_changed {
+            sleep_dur = ACTIVE_TICK;
+        } else {
+            sleep_dur = (sleep_dur * 2).min(MAX_IDLE_TICK);
+        }
+        std::thread::sleep(sleep_dur);
     }
 }
 
@@ -524,14 +596,13 @@ fn poll_clients(shared: &Arc<SharedState>) {
     shared.active_viewers.store(u32::try_from(clients.len()).unwrap_or(u32::MAX), Ordering::Release);
 }
 
-fn broadcast_text(shared: &Arc<SharedState>, text: &str) {
-    let frame = ws_text_frame(text);
+fn broadcast_frame(shared: &Arc<SharedState>, frame: &[u8]) {
     let Ok(mut clients) = shared.clients.lock() else {
         return;
     };
     let mut i = 0;
     while i < clients.len() {
-        let ok = match clients[i].write_all(&frame) {
+        let ok = match clients[i].write_all(frame) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
             Err(_) => false,
@@ -545,6 +616,16 @@ fn broadcast_text(shared: &Arc<SharedState>, text: &str) {
     shared.active_viewers.store(u32::try_from(clients.len()).unwrap_or(u32::MAX), Ordering::Release);
 }
 
+fn broadcast_text(shared: &Arc<SharedState>, text: &str) {
+    let frame = ws_frame(0x81, text.as_bytes());
+    broadcast_frame(shared, &frame);
+}
+
+fn broadcast_binary(shared: &Arc<SharedState>, payload: &[u8]) {
+    let frame = ws_frame(0x82, payload);
+    broadcast_frame(shared, &frame);
+}
+
 fn read_meta(path: &Path, fallback_id: &str) -> RunMeta {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -554,6 +635,7 @@ fn read_meta(path: &Path, fallback_id: &str) -> RunMeta {
         pid: 0,
         package: String::from(fallback_id),
         started_ms: now_ms,
+        slots: BTreeMap::new(),
     };
     let Ok(text) = std::fs::read_to_string(path) else {
         return meta;
@@ -568,6 +650,12 @@ fn read_meta(path: &Path, fallback_id: &str) -> RunMeta {
         } else if let Some(v) = line.strip_prefix("started_ms=") {
             if let Ok(t) = v.trim().parse::<u64>() {
                 meta.started_ms = t;
+            }
+        } else if let Some(v) = line.strip_prefix("slot=") {
+            if let Some((k, name)) = v.split_once(':') {
+                if let Ok(slot_id) = k.trim().parse::<u32>() {
+                    meta.slots.insert(slot_id, String::from(name.trim()));
+                }
             }
         }
     }
@@ -603,8 +691,16 @@ fn format_runs_message(tracked: &BTreeMap<String, TrackedRun>) -> String {
 
 fn format_run_json(run: &TrackedRun) -> String {
     let stats = run.ring.ring().stats();
+    let mut slots_json = String::from("{");
+    for (idx, (k, v)) in run.meta.slots.iter().enumerate() {
+        if idx > 0 {
+            slots_json.push(',');
+        }
+        let _ = write!(slots_json, r#""{}":"{}""#, k, escape_json(v));
+    }
+    slots_json.push('}');
     format!(
-        r#"{{"id":"{}","pid":{},"package":"{}","alive":{},"started_ms":{},"stats":{{"cap":{},"pushed":{},"popped":{},"dropped":{},"shadow_overflows":{},"unwound_spans":{}}},"slots":{{}}}}"#,
+        r#"{{"id":"{}","pid":{},"package":"{}","alive":{},"started_ms":{},"stats":{{"cap":{},"pushed":{},"popped":{},"dropped":{},"shadow_overflows":{},"unwound_spans":{}}},"slots":{slots_json}}}"#,
         escape_json(&run.id),
         run.meta.pid,
         escape_json(&run.meta.package),
@@ -617,36 +713,6 @@ fn format_run_json(run: &TrackedRun) -> String {
         stats.shadow_overflows,
         stats.unwound_spans,
     )
-}
-
-fn push_event_json(out: &mut String, run_id: &str, ev: &Event) {
-    let kind = match EventKind::from_raw(ev.kind) {
-        Some(EventKind::SpanEnter) => "span_enter",
-        Some(EventKind::SpanExit) => "span_exit",
-        Some(EventKind::SpanUnwound) => "span_unwound",
-        Some(EventKind::HookHit) => "hook_hit",
-        Some(EventKind::Alloc) => "alloc",
-        Some(EventKind::Free) => "free",
-        Some(EventKind::Io) => "io",
-        Some(EventKind::SyncWait) => "sync_wait",
-        Some(EventKind::ThreadBirth) => "thread_birth",
-        Some(EventKind::ThreadEnd) => "thread_end",
-        Some(EventKind::Sample) | None => "sample",
-    };
-    let _ = write!(
-        out,
-        r#"{{"run":"{}","kind":"{}","thread":{},"slot_or_op":{},"ts_ns":{},"a":{},"b":{},"c":{},"d":{},"e":{}}}"#,
-        escape_json(run_id),
-        kind,
-        ev.thread,
-        ev.slot_or_op,
-        ev.ts_ns,
-        ev.a,
-        ev.b,
-        ev.c,
-        ev.d,
-        ev.e,
-    );
 }
 
 fn escape_json(s: &str) -> String {
@@ -701,12 +767,11 @@ pub fn open_browser_url(url: &str) -> bool {
         .is_ok()
 }
 
-/// Encodes a server-to-client (unmasked) RFC 6455 text frame.
-pub fn ws_text_frame(text: &str) -> Vec<u8> {
-    let bytes = text.as_bytes();
+/// Encodes a server-to-client (unmasked) RFC 6455 frame (`0x81` text, `0x82` binary).
+pub fn ws_frame(fin_opcode: u8, bytes: &[u8]) -> Vec<u8> {
     let len = bytes.len();
     let mut out = Vec::with_capacity(len + 10);
-    out.push(0x81); // FIN | text opcode
+    out.push(fin_opcode);
     if len <= 125 {
         out.push(u8::try_from(len).unwrap_or(0));
     } else if len <= 65535 {
@@ -720,6 +785,11 @@ pub fn ws_text_frame(text: &str) -> Vec<u8> {
     }
     out.extend_from_slice(bytes);
     out
+}
+
+/// Encodes a server-to-client (unmasked) RFC 6455 text frame.
+pub fn ws_text_frame(text: &str) -> Vec<u8> {
+    ws_frame(0x81, text.as_bytes())
 }
 
 /// RFC 6455 `Sec-WebSocket-Accept = base64(SHA-1(key || GUID))`.
@@ -833,7 +903,7 @@ ws.onmessage=(e)=>{log.textContent=e.data+'\n'+log.textContent.slice(0,24000);};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blaze_launch::telemetry::{AllocOp, Event};
+    use blaze_launch::telemetry::{AllocOp, Event, EventKind};
 
     #[test]
     fn rfc6455_accept_key_matches_spec_vector() {
@@ -876,11 +946,17 @@ mod tests {
         // 3. While the tab is connected: active_viewers == 1 -> blaze run skips opening duplicate tab!
         assert_eq!(probe_active_viewers(port), Some(1));
 
-        // 4. Create a shared-memory telemetry ring in `runs_dir` and push live Span + Alloc events.
+        // 4. Create a shared-memory telemetry ring + build snapshot in `runs_dir` and push live Span + Alloc events.
         let telem_path = dir.join("run-live-test.telem");
         let meta_path = dir.join("run-live-test.meta");
+        let build_path = dir.join("run-live-test.build.json");
         std::fs::write(&meta_path, format!("pid={}\npackage=demo-app\nstarted_ms=12345\n", std::process::id()))
             .expect("write meta");
+        std::fs::write(
+            &build_path,
+            r#"{"id":"run-live-test","package":"demo-app","command":"blaze run","status":"running","exit_code":null,"errors":0,"warnings":1,"reached":40,"found":36,"made":4,"placed":36,"resolved":4,"frontend_built":"no","recompile_reason":"Certificate changed","phases":[]}"#,
+        )
+        .expect("write build json");
         let telem_cpath = std::ffi::CString::new(telem_path.as_os_str().as_encoded_bytes()).expect("cpath");
         let ring = MappedRing::create(&telem_cpath, 64).expect("create ring");
         assert!(ring.ring().try_push(Event::span_enter(
@@ -900,25 +976,46 @@ mod tests {
             [0x1000, 0x2000, 0x3000],
         )));
 
-        // 5. Read WebSocket frames until we see our streamed `events` batch.
-        let mut received = String::new();
+        // 5. Read WebSocket frames until we see both our `run_started` text frame and the
+        //    packed binary event batch frame (`0x82`, magic `'B'`, version `1`, 2 x 64B Events).
+        let mut raw_stream: Vec<u8> = Vec::new();
         let mut buf = [0u8; 4096];
         let deadline = Instant::now() + Duration::from_secs(3);
+        let mut saw_binary_events = false;
+        let mut saw_builds = false;
         while Instant::now() < deadline {
             match ws.read(&mut buf) {
                 Ok(0) => break,
                 Ok(k) => {
-                    received.push_str(&String::from_utf8_lossy(&buf[..k]));
-                    if received.contains(r#""kind":"span_enter""#) && received.contains(r#""kind":"alloc""#) {
+                    raw_stream.extend_from_slice(&buf[..k]);
+                    if !saw_builds && raw_stream.windows(19).any(|w| w == br#"Certificate changed"#) {
+                        saw_builds = true;
+                    }
+                    // Locate binary batch header: [b'B', 1, 13, 0, b"run-live-test"...]
+                    if !saw_binary_events {
+                        if let Some(pos) = raw_stream.windows(17).position(|w| {
+                            w[0] == BIN_EVENT_MAGIC && w[1] == BIN_EVENT_VERSION && &w[4..17] == b"run-live-test"
+                        }) {
+                            let hdr_len = (4 + 13 + 7) & !7; // 24 bytes
+                            if raw_stream.len() >= pos + hdr_len + 128 {
+                                let ev_bytes = &raw_stream[pos + hdr_len..pos + hdr_len + 128];
+                                assert_eq!(ev_bytes[0], EventKind::SpanEnter as u8, "first binary event must be SpanEnter");
+                                assert_eq!(ev_bytes[64], EventKind::Alloc as u8, "second binary event must be Alloc");
+                                let alloc_size = u64::from_le_bytes(ev_bytes[64 + 32..64 + 40].try_into().expect("8 bytes"));
+                                assert_eq!(alloc_size, 512, "binary Alloc event size must match 512");
+                                saw_binary_events = true;
+                            }
+                        }
+                    }
+                    if saw_binary_events && saw_builds {
                         break;
                     }
                 }
                 Err(_) => break,
             }
         }
-        assert!(received.contains(r#""kind":"span_enter""#), "missing span_enter in ws stream: {received}");
-        assert!(received.contains(r#""kind":"alloc""#), "missing alloc in ws stream: {received}");
-        assert!(received.contains("demo-app") || received.contains("run-live-test"), "missing run id: {received}");
+        assert!(saw_binary_events, "did not receive packed binary event batch in ws stream");
+        assert!(saw_builds, "did not receive live build.json snapshot in ws stream");
 
         // 6. Close client -> active_viewers drops back to 0.
         drop(ws);

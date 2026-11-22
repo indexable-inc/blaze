@@ -2059,6 +2059,16 @@ fn lower_heads<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H
         if heads.store().impls.contains_key(&checker_of(k)) || b.has_failed(k) {
             continue;
         }
+        // A refused derive's gap (D193 point 5: buckets.rs `file_rows`): a candidate whose
+        // header no text makes, so the question's answer is unknown, by the refusal's own
+        // words, never "no impl". Only an unread candidate can be one (its row's trait is
+        // unread), and the names say which calls were refused.
+        if b.is_unread(k)
+            && let Some(row) = names.failed_call(k, heads.store().tys.alloc())
+        {
+            b.fail(k, refused_derive_words(&row));
+            continue;
+        }
         let made = heads.make(Want::Impl(k));
         if !matches!(made, Ok(Made::Later(_))) {
             b.count_lowered();
@@ -2082,4 +2092,16 @@ fn lower_heads<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H
         Some((_, e)) => Err(MakeFail::Head(e)),
         None => Ok(Made::Made),
     }
+}
+
+/// The words of a refused derive's gap ([`lower_heads`]): which derive, on which item, in which
+/// file, and why the names record says it was refused (rule 19). Never its key: two units of
+/// one package refuse one derive under two keys and say one cause in equal words.
+fn refused_derive_words(row: &blaze_scope::names_record::FailedRow<'_>) -> Box<str> {
+    let on = if row.on.is_empty() { "an item with no name" } else { row.on };
+    format!(
+        "unknown: the derive of `{}` on `{on}` in {} was refused, so no impl it would have written is known: {}",
+        row.path, row.file, row.why
+    )
+    .into_boxed_str()
 }

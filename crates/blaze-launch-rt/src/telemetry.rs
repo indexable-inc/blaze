@@ -564,31 +564,178 @@ pub fn record_unwound_span() {
     }
 }
 
-/// Monotonic timestamp in nanoseconds (`CLOCK_MONOTONIC`, zero allocation).
+#[cfg(target_arch = "aarch64")]
+static CNTFRQ_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic timestamp in nanoseconds (zero allocation).
+/// On AArch64 reads the 1-cycle userspace hardware counter `cntvct_el0` scaled by cached
+/// `cntfrq_el0`, avoiding `clock_gettime` syscall/vDSO overhead on every telemetry event.
 #[inline]
 pub fn now_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: `ts` is valid writable memory.
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
-        (ts.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec as u64)
-    } else {
-        0
+    #[cfg(target_arch = "aarch64")]
+    {
+        let ticks: u64;
+        // SAFETY: `cntvct_el0` is an unprivileged read-only architectural counter on AArch64.
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) ticks, options(nomem, nostack, preserves_flags)) };
+        let mut freq = CNTFRQ_HZ.load(Ordering::Relaxed);
+        if freq == 0 {
+            let f: u64;
+            // SAFETY: `cntfrq_el0` is an unprivileged read-only architectural register on AArch64.
+            unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+            freq = if f == 0 { 1 } else { f };
+            CNTFRQ_HZ.store(freq, Ordering::Relaxed);
+        }
+        ((u128::from(ticks) * 1_000_000_000u128) / u128::from(freq)) as u64
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `ts` is valid writable memory.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
+            (ts.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec as u64)
+        } else {
+            0
+        }
     }
 }
 
-/// Compact per-thread identifier for telemetry events (zero allocations, async-signal-safe,
-/// safe to call inside `malloc`/`free` wrappers).
+/// Compact per-thread identifier for telemetry events (zero allocations, cached in TLS after
+/// first call, safe to call inside `malloc`/`free` wrappers).
 #[inline]
 pub fn current_thread_id() -> u32 {
-    #[cfg(target_os = "macos")]
-    let raw = blaze_sys::posix::thread::pthread_self() as usize as u64;
-    #[cfg(not(target_os = "macos"))]
-    // SAFETY: `pthread_self` returns the calling thread's opaque handle.
-    let raw = unsafe { libc::pthread_self() } as u64;
-    // Mix high and low halves into a non-zero compact u32.
-    let mixed = ((raw >> 32) ^ raw).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    let id = (mixed >> 32) as u32;
-    if id == 0 { 1 } else { id }
+    std::thread_local! {
+        static CACHED_TID: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    }
+    CACHED_TID.with(|cell| {
+        let cached = cell.get();
+        if cached != 0 {
+            return cached;
+        }
+        #[cfg(target_os = "macos")]
+        let raw = blaze_sys::posix::thread::pthread_self() as usize as u64;
+        #[cfg(not(target_os = "macos"))]
+        // SAFETY: `pthread_self` returns the calling thread's opaque handle.
+        let raw = unsafe { libc::pthread_self() } as u64;
+        let mixed = ((raw >> 32) ^ raw).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let id = ((mixed >> 32) as u32) | 1;
+        cell.set(id);
+        id
+    })
+}
+
+/// Default Go/YourKit-style allocation byte-sampling stride (64 KiB). Set to `0` for exact
+/// 100% live-heap tracking (every alloc/free recorded).
+pub const DEFAULT_ALLOC_SAMPLE_BYTES: u64 = 64 * 1024;
+
+static ALLOC_SAMPLE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_ALLOC_SAMPLE_BYTES);
+
+/// Configures allocation sampling stride in bytes (`0` = exact tracking of every allocation).
+pub fn set_alloc_sample_bytes(stride: u64) {
+    ALLOC_SAMPLE_BYTES.store(stride, Ordering::Relaxed);
+}
+
+/// Current allocation sampling stride in bytes.
+#[inline]
+pub fn alloc_sample_bytes() -> u64 {
+    ALLOC_SAMPLE_BYTES.load(Ordering::Relaxed)
+}
+
+std::thread_local! {
+    /// Shared per-thread re-entrancy guard across both Rust `__rust_alloc*` slot hooks and
+    /// `ObservedBind` C `malloc`/`free` wrappers so Rust -> `System` -> `malloc` is counted
+    /// once (never double-counted) and internal hook code never recurses.
+    static IN_ALLOC_HOOK: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static ALLOC_SAMPLE_BUDGET: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// RAII re-entrancy guard for allocation hooks (returns `None` when already inside an alloc hook).
+pub struct AllocHookGuard {
+    _private: (),
+}
+
+impl Drop for AllocHookGuard {
+    #[inline]
+    fn drop(&mut self) {
+        IN_ALLOC_HOOK.with(|flag| flag.set(false));
+    }
+}
+
+/// Enters an allocation hook on this thread. Returns `None` if already inside a hook (e.g.
+/// `__rust_alloc` calling `std::alloc::System` → libc `malloc`, preventing double-counting).
+#[inline]
+pub fn try_enter_alloc_hook() -> Option<AllocHookGuard> {
+    IN_ALLOC_HOOK.with(|flag| {
+        if flag.get() {
+            None
+        } else {
+            flag.set(true);
+            Some(AllocHookGuard { _private: () })
+        }
+    })
+}
+
+/// Byte-budget sampling decision shared by `__rust_alloc*` slot hooks and `ObservedBind`.
+/// Always returns `true` when `alloc_sample_bytes() == 0` (exact mode).
+#[inline]
+pub fn should_sample_alloc(bytes: usize) -> bool {
+    let stride = ALLOC_SAMPLE_BYTES.load(Ordering::Relaxed);
+    if stride == 0 {
+        return true;
+    }
+    ALLOC_SAMPLE_BUDGET.with(|budget| {
+        let acc = budget.get().saturating_add(bytes as u64);
+        if acc >= stride {
+            budget.set(acc % stride);
+            true
+        } else {
+            budget.set(acc);
+            false
+        }
+    })
+}
+
+/// Captures up to 3 return-address frames by walking the AArch64 `x29` frame-pointer chain
+/// strictly within this thread's stack bounds (zero allocation, bounded to 3 frames).
+/// Skips `skip` immediate frames (e.g. wrapper + trampoline).
+#[inline(never)]
+pub fn capture_caller_frames(skip: usize) -> [u64; 3] {
+    let mut out = [0u64; 3];
+    #[cfg(target_arch = "aarch64")]
+    {
+        let Ok((low, high)) = crate::sys::stack() else {
+            return out;
+        };
+        let mut fp: usize;
+        // SAFETY: reading the current frame pointer register `x29` is read-only.
+        unsafe { core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags)) };
+        let mut idx = 0usize;
+        let mut skipped = 0usize;
+        for _ in 0..(skip + 4) {
+            if idx >= 3 || fp < low || fp + 16 > high || (fp & 7) != 0 {
+                break;
+            }
+            // SAFETY: `fp` is 8-aligned and strictly inside `[low, high - 16]`.
+            let next_fp = unsafe { *(fp as *const usize) };
+            let lr = unsafe { *((fp + 8) as *const u64) };
+            if lr != 0 {
+                if skipped < skip {
+                    skipped += 1;
+                } else {
+                    out[idx] = lr;
+                    idx += 1;
+                }
+            }
+            if next_fp <= fp {
+                break;
+            }
+            fp = next_fp;
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = skip;
+    }
+    out
 }
 
 #[cfg(test)]

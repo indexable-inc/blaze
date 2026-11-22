@@ -147,8 +147,28 @@ const SHORT: &[(u8, Flag, bool)] = &[
     (b'g', Flag::Debuginfo, false),
 ];
 
-/// The `--emit` kinds rustc takes (each may be `kind=path`).
-const EMIT_KINDS: &[&str] = &["asm", "dep-info", "link", "llvm-bc", "llvm-ir", "metadata", "mir", "obj"];
+/// The `--emit` kinds rustc takes (each may be `kind=path`), in [`Emits`]' bit order.
+pub const EMIT_KINDS: &[&str] = &["asm", "dep-info", "link", "llvm-bc", "llvm-ir", "metadata", "mir", "obj"];
+
+/// The `--emit` kinds a line asks, one bit per [`EMIT_KINDS`] entry; none given is rustc's
+/// `link` ([`Emits::LINK_ONLY`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Emits(pub u8);
+
+impl Emits {
+    /// What rustc emits with no `--emit`: the linked output alone.
+    pub const LINK_ONLY: Emits = Emits(1 << 2);
+
+    /// Whether `kind` (an [`EMIT_KINDS`] name) is asked.
+    pub fn has(self, kind: &str) -> bool {
+        EMIT_KINDS.iter().position(|k| *k == kind).is_some_and(|at| self.0 & (1 << at) != 0)
+    }
+
+    /// How many kinds are asked: `-o` names one output only when this is one.
+    pub fn count(self) -> u32 {
+        self.0.count_ones()
+    }
+}
 
 /// Why the arguments are not an ask blaze reads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -159,6 +179,9 @@ pub enum Why {
     NoValue,
     /// A flag rustc takes once, given again.
     Repeated,
+    /// A flag rustc takes again (`--cap-lints`), given again with another value: which one it
+    /// applies is not read.
+    Differs,
     /// A second input.
     TwoInputs,
     /// A compile with no input.
@@ -180,6 +203,7 @@ impl core::fmt::Display for Why {
             Why::UnknownFlag => "a flag blaze's reader of a probe's compiler line does not know",
             Why::NoValue => "a flag whose value is missing",
             Why::Repeated => "a flag rustc takes once, given twice",
+            Why::Differs => "a flag given again with another value (`--cap-lints`): which one rustc applies is not read",
             Why::TwoInputs => "a second input",
             Why::NoInput => "a compile with no input",
             Why::Emit => "an --emit kind rustc does not have",
@@ -192,8 +216,9 @@ impl core::fmt::Display for Why {
 pub enum Ask<'a, 's> {
     /// `--version`, `-V`, `-vV`, `--version --verbose`: `verbose` for the long form.
     Version { verbose: bool },
-    /// `--print <what>` (the first one asked).
-    Print { what: &'s str },
+    /// `--print <what>` (the first one asked), with the line's `--target` (rustc prints the
+    /// host's when none).
+    Print { what: &'s str, target: Option<&'s str> },
     /// A try-compile.
     Compile(Compile<'a, 's>),
 }
@@ -218,6 +243,14 @@ pub struct Compile<'a, 's> {
     pub codegen: bool,
     /// `--test`: the test harness's crate.
     pub test: bool,
+    /// The `--emit` kinds asked ([`Emits::LINK_ONLY`] when none is given).
+    pub emits: Emits,
+    /// `--crate-name`'s value: never in [`Compile::key`] (autocfg numbers each probe's), read
+    /// by blaze-build-script `probe_check` for what the name can change.
+    pub crate_name: Option<&'s str>,
+    /// `-o`'s value: where the output goes (`-` is the child's standard output), never in the
+    /// key; `probe_check` refuses a line whose output the script reads.
+    pub out: Option<&'s str>,
 }
 
 /// One argument, read.
@@ -296,6 +329,8 @@ pub fn classify<'a, 's>(args: &[&'s str], alloc: Alloc<'a>) -> Result<Ask<'a, 's
     let mut check_cfgs: AVec<'a, &'s str> = Vec::new_in(alloc.clone());
     let mut flags: AVec<'a, (u8, &'s str)> = Vec::new_in(alloc);
     let (mut emitted, mut codegen, mut test) = (false, false, false);
+    let mut emits = Emits(0);
+    let (mut crate_name, mut out): (Option<&'s str>, Option<&'s str>) = (None, None);
     let mut at = 0;
     while at < args.len() {
         let (arg, took) = read(args, at)?;
@@ -337,10 +372,24 @@ pub fn classify<'a, 's>(args: &[&'s str], alloc: Alloc<'a>) -> Result<Ask<'a, 's
                     if core::mem::replace(&mut once[slot], true) {
                         return Err(Refused { at, why: Why::Repeated });
                     }
+                    match flag {
+                        Flag::CrateName => crate_name = Some(value),
+                        Flag::Out => out = Some(value),
+                        _ => {}
+                    }
                 }
                 Flag::Target => single(&mut target, value)?,
                 Flag::Edition => single(&mut edition, value)?,
-                Flag::CapLints => single(&mut cap_lints, value)?,
+                // rustc takes `--cap-lints` again (thiserror 2.0.16's build/probe.rs passes
+                // `--cap-lints=allow` twice, and its probe passes under cargo): the same level
+                // again is the same question, keyed as one. Two levels are refused by name:
+                // which one rustc applies is not read here (getopts' `opt_str` gives the first,
+                // getopts 0.2.24 lib.rs:900; rustc's reading of it is not quoted), so no guess.
+                Flag::CapLints => match cap_lints {
+                    Some(held) if held == value => {}
+                    Some(_) => return Err(Refused { at, why: Why::Differs }),
+                    None => cap_lints = Some(value),
+                },
                 Flag::CrateType => crate_types.extend(value.split(',').filter(|kind| !kind.is_empty())),
                 Flag::Cfg => cfgs.push(value),
                 Flag::CheckCfg => check_cfgs.push(value),
@@ -348,9 +397,10 @@ pub fn classify<'a, 's>(args: &[&'s str], alloc: Alloc<'a>) -> Result<Ask<'a, 's
                     emitted = true;
                     for kind in value.split(',') {
                         let kind = kind.split_once('=').map_or(kind, |(kind, _)| kind);
-                        if !EMIT_KINDS.contains(&kind) {
+                        let Some(bit) = EMIT_KINDS.iter().position(|k| *k == kind) else {
                             return Err(Refused { at, why: Why::Emit });
-                        }
+                        };
+                        emits.0 |= 1 << bit;
                         codegen |= !matches!(kind, "metadata" | "dep-info");
                     }
                 }
@@ -370,7 +420,7 @@ pub fn classify<'a, 's>(args: &[&'s str], alloc: Alloc<'a>) -> Result<Ask<'a, 's
     }
     // rustc answers a print request, then a version, before it reads any input.
     if let Some(what) = print {
-        return Ok(Ask::Print { what });
+        return Ok(Ask::Print { what, target });
     }
     if version {
         return Ok(Ask::Version { verbose });
@@ -390,6 +440,9 @@ pub fn classify<'a, 's>(args: &[&'s str], alloc: Alloc<'a>) -> Result<Ask<'a, 's
         flags,
         codegen: codegen || !emitted,
         test,
+        emits: if emitted { emits } else { Emits::LINK_ONLY },
+        crate_name,
+        out,
     }))
 }
 

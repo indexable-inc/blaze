@@ -1,7 +1,7 @@
 ---
 status: plan
 summary: hvbox, an experimental sandbox that runs a macOS build step's Mach-O as a Hypervisor.framework guest with no guest kernel, every system call and fault answered by a host-side Sentry that names each refusal and records every read, miss and listing.
-date: 2026-11-16
+date: 2026-11-21
 ---
 # hvbox: a kernel-less sandbox for macOS build steps
 
@@ -182,14 +182,63 @@ Linux host must emulate is the table, not a discovery.
 
 ## File view
 
-A `Grant` is a read set and a write set of absolute prefixes. A path is resolved by the Sentry
-one component at a time (lexical `..`, each symlink read and its target resolved again, a work
-list, a hop limit), every intermediate and final path checked against the grant; the final open
-then passes `O_NOFOLLOW_ANY` so a symlink raced in afterwards fails in the kernel. A refusal
-names the path and the rule: `refused: /Users/x/.ssh/id (not under the read set)`. The write set
-is one scratch directory; no create, write, unlink, rename, chmod or truncate elsewhere. Later:
-a chroot-like rewrite (`/out` to the step's `OUT_DIR`), case-insensitive lookup kept as the host
-file system does it.
+One synthetic root, nothing of the host's file system in it (`core/src/root.rs`). The root is a
+mount table, `Root { mounts: sorted [(guest prefix, Source)] }`, checked once (normal, sorted,
+none under another, at most 16):
+
+| guest | `Source` | key holds |
+|---|---|---|
+| `/tools` | `Record` (the base set) | its tree digest |
+| `/package` | `Record` (the sources) | its tree digest |
+| `/sdk` | `FromMachine(AppleSdk)` | the SDK identity and its tree digest |
+| `/out` | `Scratch`, starting as the request's `present` | that tree's digest |
+| `/tmp` | `Scratch`, empty | nothing |
+| `/bin/sh`, `/usr/bin/env` | `Link` to `/tools/bin/sh`, `/tools/bin/env` | the target |
+
+A read-only mount is a manifest (`Tree`): breadth-first, sorted by `(parent, name)`, digested
+once at the check. The Sentry resolves every path against these manifests and its own model
+of the scratch trees, and never asks the host:
+
+- Symlinks resolve inside the guest namespace: a link's target is a guest path, `..` stops
+  at the guest root, 32 links at most (`ELOOP`).
+- Every other path is `ENOENT`, and the trace records it as a miss. That includes the rest of
+  `/bin` and `/usr/bin`: `/bin/ls` is `ENOENT` even when `ls` is in the set, which is found
+  through `PATH=/tools/bin` alone. Only names that programs hard-code are mirrored: `#!/bin/sh`
+  and `#!/usr/bin/env` shebangs, libSystem's `system()`/`popen()` (`/bin/sh`), and make's
+  default `SHELL`. A link mount is an `lstat`-visible symlink, where macOS has a file. No
+  other hard-coded name is known (Readiness). Seatbelt cannot do this; it is why hvbox owns
+  the view.
+- Names are exact bytes, so lookups are case-sensitive on a case-insensitive host. The host
+  never resolves a guest name:
+  - a record's file is opened as `<blobs>/<hex digest>`;
+  - an SDK file by the exact names its manifest recorded;
+  - a scratch file as `<host>/<n>`, its number in the model.
+  A guest rename or unlink changes only the model, so APFS case folding and normalization
+  never apply. The open passes `O_NOFOLLOW_ANY`.
+- Listings come from the manifest or the model, sorted by name bytes. Inodes are a function of
+  the mount and entry, and times, owner and group are fixed, so a host's numbering never
+  reaches the guest.
+- Writes go to `Scratch` only. Elsewhere it is `EROFS`; a rename across mounts is `EXDEV`.
+
+The step key is BLAKE3 over: the model version; the system libraries' identity (dyld and the
+cache, copied in); each mount's guest prefix, kind and the column above; argv, env, cwd and
+stdin; and the declared machine. It holds no host path. The trace's read and miss rows are the
+finer read list that revalidates a step after a record changes in files it never opened.
+
+`uname`, `hostname` and `date` need no wrapper programs here. Each is an answer from the Sentry:
+- `uname(3)` reads `kern.ostype`, `kern.hostname`, `kern.osrelease`, `kern.version` and
+  `hw.machine` through `sysctl`;
+- `gethostname(3)` reads `kern.hostname`;
+- `date` reads `gettimeofday`/`clock_gettime`.
+
+The libSystem side of this is UNVERIFIED. These answers must come from the same data as the
+base set's `etc/answers` (blaze-base-tools `Answers`), filled into `machine::Machine` by the
+executor. Today `Machine::V1` says `blaze` where `Answers` says `localhost`, and `kern.version`,
+`hw.machine` and `gettimeofday` are not answered yet (Readiness).
+
+Superseded here: `Grant` (prefix sets checked on host paths) and the unwired `mounts.rs`. Both
+go when the Sentry's path rows move to `Namespace` (`walk`, `meta`, `list`, `host_path`,
+`create`/`remove`/`rename`).
 
 ## Network
 

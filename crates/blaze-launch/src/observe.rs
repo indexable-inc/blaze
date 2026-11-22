@@ -70,6 +70,10 @@ pub enum Kind {
     /// Entry+exit span hook: saves the return address on a per-thread shadow stack to record
     /// exact function durations and hierarchical parent-child span trees without touching `sp`.
     Span,
+    /// Rust global-allocator shim hook (`__rust_alloc*` / `__rdl_*`): profiles every Rust
+    /// allocator (`System`, `jemalloc`, `mimalloc`, custom `#[global_allocator]`) with exact
+    /// `(size, align)` and zero overhead when switched back to `Plain`.
+    Alloc(crate::telemetry::AllocHookKind),
 }
 
 /// An address in the launcher's one mapping, as the driver would store it. The core moves no

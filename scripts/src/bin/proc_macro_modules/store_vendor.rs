@@ -848,8 +848,9 @@ version = "1"
 
     /// Cargo's feature resolution: an optional dependency is built only when an enabled
     /// feature of its package turns it on, and `m` requests no feature of `utils` (`default`
-    /// only, which `utils` does not declare). So the vendored `utils` declares no `globset`,
-    /// its feature keeps its name with no entry, and the checksum file hashes the bytes
+    /// only, which `utils` does not declare). So the vendored `utils` declares no `globset`
+    /// dependency, its feature keeps its name with no entry, `globset`'s implicit feature is
+    /// declared empty, and the checksum file hashes the bytes
     /// written. Prints "vendored utils without globset".
     #[test]
     fn an_optional_dependency_of_a_vendored_package_outside_its_closure_is_removed() {
@@ -857,9 +858,12 @@ version = "1"
         assert_eq!(result.unwrap_or_else(|failure| panic!("refused: {failure}")), Vendored { packages: 1, std_only: 0 });
         let folder = dir.join("work/vendor/utils-0.1.0");
         let manifest = std::fs::read_to_string(folder.join("Cargo.toml")).expect("utils' Cargo.toml");
-        assert!(!manifest.contains("globset"), "{manifest}");
+        assert!(!manifest.contains("[dependencies.globset]"), "{manifest}");
         let alloc = blaze_own::testing::heap().alloc();
         let doc = member_dependencies::parse(&manifest, Path::new("Cargo.toml"), alloc).unwrap_or_else(|failure| panic!("{failure}"));
+        // globset's implicit feature stays, declared empty (member_dependencies::implicit_features).
+        let implicit = doc.root().get("features").and_then(|table| table.get("globset")).unwrap_or_else(|| panic!("the implicit feature is gone: {manifest}"));
+        assert_eq!(implicit.children().count(), 0, "{manifest}");
         let feature = doc.root().get("features").and_then(|table| table.get("include-exclude")).unwrap_or_else(|| panic!("the feature is gone: {manifest}"));
         assert_eq!(feature.children().count(), 0, "{manifest}");
         let checksums = std::fs::read_to_string(folder.join(".cargo-checksum.json")).expect("the checksum file");

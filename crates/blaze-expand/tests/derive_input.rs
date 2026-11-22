@@ -75,6 +75,59 @@ fn a_cfg_false_field_goes_with_every_attribute_it_carries() {
     assert_eq!(input("#[derive(X)] enum E { #[a] #[cfg(windows)] V(u8), W(#[b] #[cfg(windows)] u8, u16) }"), "enum E { W ( u16 ) }");
 }
 
+/// tempo-chainspec t1545 (18-30 tests): reth-ethereum-forks' `ChainHardforks`, `#[derive(Default,
+/// Clone, PartialEq, Eq)]` over two fields named `map` under opposite `cfg`s, each a map type
+/// whose arguments hold a comma. The Reference, "Structs": a field is `IDENTIFIER : Type`, and
+/// the comma inside `<..>` is the type's, not the field list's (`<` and `>` delimit no token
+/// tree). The false `cfg` removed only `map: BTreeMap<&'static str,` and left
+/// `ForkCondition>,` in the derive's input, which adt.rs refused, so no derive of the type
+/// wrote its impl and `ChainHardforks: Default` met core's `impl<T: ArbitraryInt> Default for
+/// T` alone ("`ChainHardforks: ArbitraryInt` because `ChainHardforks: Default`").
+/// The site (the false `cfg` second), its twin (the false `cfg` first), and the CONTROL: a
+/// removed field whose type holds no comma inside `<..>`, which the walk counting groups only
+/// removed whole before the fix too (the cause removed, the effect gone: rule 23).
+#[test]
+fn a_cfg_false_field_whose_type_holds_a_comma_inside_angles_goes_whole() {
+    let site = input(
+        "#[derive(Default, Clone, PartialEq, Eq)]
+        pub struct ChainHardforks {
+            forks: Vec<(Box<dyn Hardfork>, ForkCondition)>,
+            #[cfg(unix)]
+            map: FxHashMap<&'static str, ForkCondition>,
+            #[cfg(not(unix))]
+            map: alloc::collections::BTreeMap<&'static str, ForkCondition>,
+        }",
+    );
+    assert_eq!(
+        site,
+        "pub struct ChainHardforks { forks : Vec < ( Box < dyn Hardfork > , ForkCondition ) > , map : FxHashMap < & ' static str , ForkCondition > , }"
+    );
+    let twin = input(
+        "#[derive(Default)] struct S {
+            #[cfg(not(unix))]
+            map: alloc::collections::BTreeMap<&'static str, ForkCondition>,
+            #[cfg(unix)]
+            map: FxHashMap<&'static str, ForkCondition>,
+        }",
+    );
+    assert_eq!(twin, "struct S { map : FxHashMap < & ' static str , ForkCondition > , }");
+    let control = input("#[derive(Default)] struct S { #[cfg(not(unix))] map: Single<u8>, g: u8 }");
+    assert_eq!(control, "struct S { g : u8 }");
+    std::println!("derive input: a removed `map: BTreeMap<&'static str, ForkCondition>,` goes whole; site {site:?}");
+}
+
+/// What else the element's end is read through, each as adt.rs `split` reads the same pieces:
+/// a `->` closes no angle (`fn(u8) -> HashMap<u8, u16>`); after a lone `=` the element is an
+/// expression whose `<` is a shift (`A = 1 << 2`), counted as no angle; a `>` closing no angle
+/// of the element closes the generic parameter list it is in.
+#[test]
+fn an_element_end_reads_arrows_discriminants_and_generic_lists() {
+    assert_eq!(input("#[derive(X)] struct S { #[cfg(windows)] f: fn(u8) -> HashMap<u8, u16>, g: u8 }"), "struct S { g : u8 }");
+    assert_eq!(input("#[derive(X)] enum E { #[cfg(windows)] A = 1 << 2, B = 3 }"), "enum E { B = 3 }");
+    assert_eq!(input("#[derive(X)] struct S<A, #[cfg(windows)] B: Tr<C, D>> { a: A }"), "struct S < A , > { a : A }");
+    assert_eq!(input("#[derive(X)] struct T(#[cfg(windows)] HashMap<u8, u16>, u32);"), "struct T ( u32 ) ;");
+}
+
 /// A `cfg` a `#[cfg_attr]` leaves removes the field the same way: the attributes written
 /// before the `cfg_attr` go too; one that holds leaves them, and its other metas, in place.
 #[test]

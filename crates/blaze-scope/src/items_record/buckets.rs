@@ -196,10 +196,13 @@ pub enum NotFiled {
     /// The self type's path names an item whose kind the writer did not hold (another crate's
     /// items).
     SelfKindNotHeld = 9,
+    /// The row of a refused derive's gap ([`crate::items_record::ImplRow::refused_call`]):
+    /// no impl item, so no bucket; every reader files it by its row (D193 point 5).
+    RefusedCall = 10,
 }
 
 /// The classes of [`NotFiled`], by byte: for a count per class.
-pub const NOT_FILED: [&str; 10] = [
+pub const NOT_FILED: [&str; 11] = [
     "header unread",
     "trait not a path",
     "trait's names not held",
@@ -210,6 +213,7 @@ pub const NOT_FILED: [&str; 10] = [
     "self type's names not held",
     "self type an alias",
     "self type's kind not held",
+    "a refused derive's gap",
 ];
 
 impl NotFiled {
@@ -225,6 +229,7 @@ impl NotFiled {
             7 => NotFiled::SelfNotRead,
             8 => NotFiled::SelfAlias,
             9 => NotFiled::SelfKindNotHeld,
+            10 => NotFiled::RefusedCall,
             _ => return None,
         })
     }

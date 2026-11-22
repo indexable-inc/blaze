@@ -116,6 +116,37 @@ fn probe_ask_a_type_error_is_never_accepted_and_what_blaze_decides_is_exact() {
     println!("probe_ask: decided and left");
 }
 
+/// turso's thiserror 2.0.16 (2026-11-21): its build/probe.rs passes `--cap-lints=allow` twice
+/// (build.rs:121 and :123), and blaze stopped it with `RustcLine { at: 5, why: Repeated }`. The
+/// real line, reduced to the two flags: read, and keyed exactly as the line with one (so a row
+/// made for thiserror 2.0.21's one-flag line answers it when the snippet is the same). Twin:
+/// `--edition` twice is still `Repeated`. Control: two different levels are refused by name
+/// (`Differs`), never one picked. Prints "probe_ask: --cap-lints again".
+#[test]
+fn probe_ask_cap_lints_given_twice_is_one_question() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let twice = [
+        "--edition=2018",
+        "--crate-name=thiserror",
+        "--crate-type=lib",
+        "--cap-lints=allow",
+        "--emit=dep-info,metadata",
+        "--cap-lints=allow",
+        "--out-dir",
+        "/target/debug/build/thiserror-115620d781064c78/out/probe",
+        "build/probe.rs",
+        "--target",
+        "wasm32-wasip1",
+    ];
+    let (a, b) = (compile(&twice, alloc.clone()), compile(THISERROR, alloc.clone()));
+    assert_eq!(a.cap_lints, Some("allow"));
+    assert_eq!(a.key(HOST, THISERROR_2_PROBE.as_bytes()), b.key(HOST, THISERROR_2_PROBE.as_bytes()), "the flag again is the same question");
+    let refused = |args: &[&str]| classify(args, alloc.clone()).err();
+    assert_eq!(refused(&["--edition=2018", "--edition=2018", "-"]), Some(Refused { at: 1, why: Why::Repeated }));
+    assert_eq!(refused(&["--cap-lints=allow", "--cap-lints", "warn", "-"]), Some(Refused { at: 1, why: Why::Differs }));
+    println!("probe_ask: --cap-lints again");
+}
+
 /// An argument the reader does not know is refused by its index, never skipped.
 /// Prints "probe_ask: refused by name".
 #[test]
@@ -130,7 +161,7 @@ fn probe_ask_an_unknown_flag_is_refused_by_name() {
     assert_eq!(refused(&["a.rs", "-"]), Some(Refused { at: 1, why: Why::TwoInputs }));
     assert_eq!(refused(&["--crate-type=lib"]), Some(Refused { at: 1, why: Why::NoInput }));
     assert_eq!(refused(&["--emit=wasm", "-"]), Some(Refused { at: 0, why: Why::Emit }));
-    assert!(matches!(classify(&["--print", "cfg", "--target", WASM], alloc.clone()), Ok(Ask::Print { what: "cfg" })));
+    assert!(matches!(classify(&["--print", "cfg", "--target", WASM], alloc.clone()), Ok(Ask::Print { what: "cfg", target: Some(WASM) })));
     assert!(matches!(classify(&["-vV"], alloc), Ok(Ask::Version { verbose: true })));
     println!("probe_ask: refused by name");
 }

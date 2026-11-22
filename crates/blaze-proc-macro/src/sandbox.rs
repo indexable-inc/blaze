@@ -233,6 +233,19 @@ fn stat_of(path: &Path) -> Option<(Filetype, u64)> {
     Some((filetype, meta.len()))
 }
 
+/// The subject of the read `Span::file` makes (server.rs): the file holding the call, as the
+/// host shows it (blaze-expand `ProcCall::file`, D96). A fact of the call, not of the package:
+/// [`answer_now`] knows no answer to it, and the table values it against the call it finds a
+/// row for (table.rs `list_holds`).
+pub const CALL_FILE: &str = "place:file";
+
+/// What the read [`CALL_FILE`] is answered by: the shown path's bytes. The path is the
+/// member's workspace-relative one or a dependency's `<name>-<version>/<path>`, never the
+/// machine's folder (rule 25).
+pub fn call_file_digest(shown: &str) -> ContentId {
+    digest(shown.as_bytes())
+}
+
 /// Why a read's subject has no answer now: a subject of no known form, or a variable whose
 /// value this build does not know in the package (package_env.rs).
 #[derive(Clone, PartialEq, Eq, Debug)]

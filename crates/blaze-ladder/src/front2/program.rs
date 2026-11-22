@@ -1233,7 +1233,7 @@ impl<'n> Front2Program<'n> {
     fn in_world<T>(&self, i: usize, f: impl FnOnce(&BodyWorld<'_, 'n>) -> T) -> Result<T, ResolveError> {
         let key = self.fns[i].key;
         let Some(body) = self.fns[i].body.as_ref() else {
-            return super::world_items::ctor_world(self.front.names, &self.front.keys, &self.front.index, &self.store, self.buckets.as_ref(), key, f);
+            return super::world_items::ctor_world(self.front.names, &self.front.keys, &self.front.index, &self.store, self.buckets.as_ref(), key, &self.asked, &self.asked_gaps, f);
         };
         let view = body.lowered.view();
         // A function of the lowering alone, made once when the body was checked.

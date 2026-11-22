@@ -98,6 +98,12 @@ impl ExpandCx for TestCx {
         call: ProcCall<'_>,
         alloc: Alloc<'a>,
     ) -> Result<Produced<'a>, HostError> {
+        // The call carries the file `file!()` is answered with here ([`TestCx::place`]): what
+        // `Span::file` answers (blaze-proc-macro server.rs). Every proc-macro test below
+        // passing through here checks it.
+        if call.file != Ok("src/lib.rs") {
+            return Err(FAILED);
+        }
         let mut tokens = TokenStream::new_in(alloc);
         let mut origins = OwnVec::new_in(alloc);
         for at in 0..call.input.len() {

@@ -17,7 +17,7 @@
 use blaze_own::AVec;
 use blaze_surface::{AttrKind, CallRole, CallShape, Item, ItemDetail, ItemIndex, MacroCallDecl};
 
-use super::{AttrOrder, Attrs, CallSrc, Lower, LowerNoteKind, Walked, parse_path};
+use super::{AttrOrder, Attrs, CallSrc, Lower, LowerNoteKind, Walked, parse_path, unraw};
 
 /// The path of a keep call: never resolved (the cells answer it from its item's other calls,
 /// `Cells::item_fate`), only written, so it names what the call stands for.
@@ -29,6 +29,9 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
     pub(super) fn derive_calls(&mut self, idx: ItemIndex, item: &Item, at: u32, derives: &[&'t str], input: &'t str) {
         let place = self.call_in_text(idx, item, input);
         let tokens = self.call_tokens(input, crate::nested_input::InputCut::Whole);
+        // The item the derives are on: the self type of the impls they write (`CallSrc::on`).
+        let text = self.text;
+        let on = item.name.map(|r| unraw(item.text(text, r)));
         for &path in derives {
             let call = self.key(self.owner, "derive", path);
             let Some(parsed) = parse_path(path, self.krate, self.alloc) else {
@@ -37,7 +40,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             };
             let pos = self.next_pos();
             self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Derive, pos, item: Some(idx.0), role: CallRole::Call });
-            let src = CallSrc { module: self.module, owner: None, name: path, input, kind: CallShape::Derive, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place, tokens, answered: 0 };
+            let src = CallSrc { module: self.module, owner: None, name: path, input, kind: CallShape::Derive, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place, tokens, answered: 0, on };
             self.out.calls.push((call, src));
         }
     }
@@ -117,7 +120,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             let call = self.key(self.owner, "attr after derive", name);
             let pos = self.next_pos();
             self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0), role });
-            let src = CallSrc { module: self.module, owner: None, name, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place, tokens, answered: 0 };
+            let src = CallSrc { module: self.module, owner: None, name, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place, tokens, answered: 0, on: None };
             self.out.calls.push((call, src));
         }
         let Some(parsed) = parse_path(KEEP_PATH, self.krate, self.alloc) else {
@@ -128,7 +131,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         let pos = self.next_pos();
         self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0), role: CallRole::Keep });
         let answered_here = u32::try_from(end).expect("an item's attributes are counted in u32");
-        let src = CallSrc { module: self.module, owner: None, name: KEEP_PATH, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place, tokens, answered: answered_here };
+        let src = CallSrc { module: self.module, owner: None, name: KEEP_PATH, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place, tokens, answered: answered_here, on: None };
         self.out.calls.push((call, src));
         if upto == attrs.derives.len() {
             let mut uses: AVec<'a, (&'t str, u32)> = AVec::new_in(self.alloc);
@@ -187,7 +190,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0), role: CallRole::Call });
             // No input: a check is never expanded (`Cells::called` refuses an attribute macro in
             // a helper's place); only its place is read, for an error's location.
-            let src = CallSrc { module: self.module, owner: None, name, input: "", kind: CallShape::Attr, loc: self.loc(offset), written: self.written, depth: self.depth, implicit: false, place: None, tokens: crate::nested_input::CallTokens::Text, answered: 0 };
+            let src = CallSrc { module: self.module, owner: None, name, input: "", kind: CallShape::Attr, loc: self.loc(offset), written: self.written, depth: self.depth, implicit: false, place: None, tokens: crate::nested_input::CallTokens::Text, answered: 0, on: None };
             self.out.calls.push((call, src));
             // A check, not a call that can grow the textual scope (`Lower::attr_checks`' span).
             self.checks_sent += 1;

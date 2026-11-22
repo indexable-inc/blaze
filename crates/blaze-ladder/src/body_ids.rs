@@ -409,8 +409,75 @@ pub enum Unkeyed {
 pub enum How {
     /// Not reached by the loop yet.
     Waiting,
+    /// Begun ([`Walk::begin`]): keyed and not found, its entry being made by whoever holds its
+    /// [`Pending`]; neither stepped again nor begun again until [`Walk::finish`] or
+    /// [`Walk::abandon`] takes the pending.
+    Making,
     /// Stepped ([`Walk::one`]): what was done for it, its key with it when it has one.
     Done(Stepped),
+}
+
+/// A row begun ([`Walk::begin`]) whose entry is to be made: what the make is ([`Pending::order`])
+/// and what [`Walk::finish`] needs after it (the key, or why there is none; the class the put
+/// files it under). Its fields are private and its only maker is `begin`, so a finish is
+/// always of a row this walk keyed and did not find (rule 76); not `Copy` or `Clone`, so one
+/// begun row is finished once (D194).
+#[must_use = "a begun row is finished (`Walk::finish`) or abandoned (`Walk::abandon`)"]
+#[derive(Debug, PartialEq, Eq)]
+pub struct Pending {
+    row: u32,
+    order: Order,
+    keyed: Result<CodeKey, Unkeyed>,
+    class: CodeClass,
+}
+
+impl Pending {
+    /// The row being made.
+    pub fn row(&self) -> usize {
+        self.row as usize
+    }
+
+    /// The make, apart from the walk: what a worker runs ([`Order::make`]).
+    pub fn order(&self) -> Order {
+        self.order
+    }
+
+    /// The key the made entry will be put under; `None` for an unkeyed instance (made, never
+    /// put: its make is its own task, D194).
+    pub fn key(&self) -> Option<CodeKey> {
+        self.keyed.ok()
+    }
+}
+
+/// One make, apart from the walk ([`Pending::order`]): the row's tabled fn and kind. With the
+/// row's name (its walk's [`Walk::name`], copied by the caller) it is all a worker needs to make
+/// the entry, so the make runs off the walk's thread (D194) and the walk stays the relay's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Order {
+    pub tabled: ItemKey,
+    pub kind: RowKind,
+}
+
+impl Order {
+    /// The entry of this order's row appended to `entry` by `make`, under `grant` (the row's
+    /// proof, unread here). `name` is the row's instance name (ignored for a static or a
+    /// thread-local, whose item is `tabled`).
+    pub fn make<M: Make>(self, make: &mut M, grant: &M::Grant, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), WalkError<M::Error>> {
+        match self.kind {
+            RowKind::Instance => make.make(grant, self.tabled, name, entry),
+            RowKind::Static => make.make_static(grant, self.tabled, entry),
+            RowKind::ThreadLocal => make.make_thread_local(grant, self.tabled, entry),
+        }
+        .map_err(|why| WalkError::Make { tabled: self.tabled, why })
+    }
+}
+
+/// What [`Walk::begin`] answered: the row stepped (found under its key, or done before), or
+/// begun, its entry to be made ([`Pending`]).
+#[derive(Debug)]
+pub enum Begun<'w> {
+    Stepped(One<'w>),
+    Make(Pending),
 }
 
 /// What one step did with its instance, each answer carrying what it holds: a found or made
@@ -441,6 +508,14 @@ impl Stepped {
 pub enum WalkError<E> {
     /// The command has no fn for `tabled`, which an entry (or the caller) names.
     NoBody { tabled: ItemKey },
+    /// The row of an instance of `tabled` was stepped or begun while it was being made
+    /// ([`How::Making`]): its [`Pending`] is held elsewhere, and only `finish` or `abandon` takes
+    /// it (D194: one make per row).
+    Making { tabled: ItemKey },
+    /// A [`Pending`] of an instance of `tabled` handed to [`Walk::finish`] or [`Walk::abandon`]
+    /// of a walk whose row it names is not being made for that fn: another walk's, or finished
+    /// already (D194).
+    NotBegun { tabled: ItemKey },
     /// The command has no crate fact for `item`, which the instance of `tabled` names.
     NoCrateFact { tabled: ItemKey, item: ItemKey },
     /// An instance's name does not list.
@@ -474,6 +549,16 @@ impl<E: fmt::Display> fmt::Display for WalkError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WalkError::NoBody { tabled } => write!(f, "the record walk reached fn {:#x}, and the command's body ids hold no such fn (blaze-ladder body_ids.rs `BodyIds::body_check`)", tabled.0),
+            WalkError::Making { tabled } => write!(
+                f,
+                "the record walk's row of an instance of fn {:#x} was stepped while its entry was being made (body_ids.rs `Walk::begin`: one make per row until `finish` or `abandon`, D194)",
+                tabled.0
+            ),
+            WalkError::NotBegun { tabled } => write!(
+                f,
+                "a made entry of an instance of fn {:#x} was handed back to a record walk whose row is not being made for it: another walk's, or finished already (body_ids.rs `Walk::finish`, D194)",
+                tabled.0
+            ),
             WalkError::NoCrateFact { tabled, item } => write!(f, "an instance of fn {:#x} names item {:#x}, whose crate has no fact (body_ids.rs `BodyIds::crate_fact`): its record's key would miss that crate (rule 21)", tabled.0, item.0),
             WalkError::Name { tabled, why } => write!(f, "an instance of fn {:#x}: {why}", tabled.0),
             WalkError::TwoTabled { symbol, first, second } => {
@@ -729,7 +814,7 @@ impl<'a> Walk<'a> {
     pub fn key(&self, row: usize) -> Option<CodeKey> {
         match self.how[row] {
             How::Done(stepped) => stepped.key(),
-            How::Waiting => None,
+            How::Waiting | How::Making => None,
         }
     }
 
@@ -751,7 +836,7 @@ impl<'a> Walk<'a> {
         let mut c = Counts { reached: self.len(), longest_name, most_name_items: self.most_name_items, arena: self.arena.len(), ..Counts::default() };
         for how in self.how.iter() {
             match how {
-                How::Waiting => {}
+                How::Waiting | How::Making => {}
                 How::Done(Stepped::Found(_)) => c.found += 1,
                 How::Done(Stepped::Made(_)) => c.made += 1,
                 How::Done(Stepped::Unkeyed(Unkeyed::NoRecord)) => c.no_record += 1,

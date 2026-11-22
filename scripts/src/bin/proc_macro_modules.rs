@@ -2214,7 +2214,10 @@ default-features = false
 version = "2.3.1"
 "#;
         let none = generated_member(manifest, &[]);
-        assert!(!none.contains("shellexpand"), "{none}");
+        assert!(!none.contains("[dependencies.shellexpand]"), "{none}");
+        // The removed dependency's implicit feature is kept, declared empty
+        // (member_dependencies::implicit_features).
+        assert_eq!(feature_line(&none, "shellexpand"), "\"shellexpand\" = []");
         assert_eq!(feature_line(&none, "interpolate-folder-path"), "\"interpolate-folder-path\" = []");
         assert_eq!(feature_line(&none, "include-exclude"), "\"include-exclude\" = [\"rust-embed-utils/include-exclude\"]");
         for name in ["mime_guess", "proc-macro2", "quote", "rust-embed-utils", "syn", "walkdir"] {
@@ -2255,9 +2258,12 @@ version = "1"
 version = "1"
 "#;
         let none = generated_member(manifest, &[]);
-        for fragment in ["alias", "only-in-alias", "inline", "other", "dev-dependencies"] {
+        for fragment in ["dependencies.\"alias\"", "package = \"real\"", "only-in-alias", "inline", "other", "dev-dependencies"] {
             assert!(!none.contains(fragment), "{none}");
         }
+        // `alias` is an implicit feature (no `dep:alias`), kept declared empty once its dependency
+        // is cut; `inline`'s is disabled by `dep:inline`, so none is written.
+        assert_eq!(feature_line(&none, "alias"), "\"alias\" = []");
         let enabled = generated_member(manifest, &["render"]);
         assert!(enabled.contains("package = \"real\""), "{enabled}");
         assert!(enabled.contains("\"only-in-alias\""), "{enabled}");

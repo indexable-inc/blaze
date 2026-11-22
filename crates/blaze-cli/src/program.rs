@@ -100,7 +100,9 @@ pub(crate) fn run<'h>(
     // program's, unchanged; a failure of the parent's own is `CliError::OwnProcess`, which
     // `run` ends with `NOT_RUN` (main.rs).
     let roots = blaze_own::Erased::new(frame);
-    let front = crate::run_parent::CommandFront::new(names, ids, builder, heap.alloc(), roots.handle(), watch);
+    // The Rust fns the program's C calls are roots of its walk (run_parent.rs `CommandFront`).
+    let exports = native.map_or(&[][..], |send| send.items);
+    let front = crate::run_parent::CommandFront::new(names, ids, builder, heap.alloc(), roots.handle(), watch, exports);
     crate::own_process::run_own(&cx, launch, package, builder, front, native, lent, today, counted, frame).map_err(move |error| CliError::OwnProcess(blaze_own::Box::new_in(error, heap.alloc())))
 }
 

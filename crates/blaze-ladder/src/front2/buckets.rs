@@ -852,6 +852,14 @@ pub(crate) fn file_rows<'n, S: NamesSource<'n>>(names: S, krate: usize, rows: &[
     let mut kept = RowNames { run: None, selves: HashMap::new_in(Global) };
     let mut impls: Vec<super::index::ImplAt<'n>, Global> = Vec::new_in(Global);
     for row in rows.iter() {
+        // A refused derive's gap (D193 point 5, blaze-scope `ImplRow::refused_call`): no impl
+        // item, so no text to read; filed by what its row reads (`textless`: a trait impl of an
+        // unread trait at its self type's shape), its header the gap that names the refusal
+        // (check.rs `lower_heads`).
+        if row.refused_call {
+            each(textless(names, row, &mut kept));
+            continue;
+        }
         match file_row(names, row, &mut kept) {
             Ok((filed, blanket, path_self)) => {
                 counts.from_rows += 1;
@@ -1354,6 +1362,19 @@ impl Buckets {
         // read; a mention anywhere in that text keeps the crate on the wide side.
         b.incoherent.extend(names.crates().iter().map(|c| blaze_scope::items_record::root_may_write_incoherent(c)));
         b.file_all(names, &index.impls);
+        // Each refused derive's gap (D193 point 5), as the items record writes it: the solve's
+        // values give the same rows (blaze-scope `each_refused_impl_row`, the one home).
+        for (krate, c) in names.crates().iter().enumerate() {
+            let mut gaps: Vec<ImplRow<'_>, Global> = Vec::new_in(Global);
+            blaze_scope::items_record::each_refused_impl_row(c, &mut |row| gaps.push(row));
+            if gaps.is_empty() {
+                continue;
+            }
+            // By key: the order impls are filed in is a function of the names.
+            gaps.sort_unstable_by_key(|row| row.key);
+            let counts = file_rows(names, krate, &gaps, &mut |f| b.take(names, krate, f));
+            b.count(counts);
+        }
         Buckets::of(b)
     }
 
@@ -1406,7 +1427,7 @@ impl Buckets {
     }
 
     /// [`BucketIndex::admit_asked`], through `&mut self`.
-    pub fn admit_asked<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask) -> usize {
+    pub fn admit_asked<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask) -> Result<usize, TablesReadError> {
         self.index_get_mut().admit_asked(names, keys, home, ask)
     }
 
@@ -1427,7 +1448,7 @@ impl Buckets {
             Some(tables) => ix.admit_tables(names, keys, home, ask, tables, alloc),
             None => {
                 let whole = ix.admit(names, home);
-                Ok(whole + ix.admit_asked(names, keys, home, ask))
+                Ok(whole + ix.admit_asked(names, keys, home, ask)?)
             }
         }
     }
@@ -1539,7 +1560,7 @@ impl Buckets {
         self.index().crates_asked_sorted()
     }
 
-    pub fn not_filed(&self) -> [(&'static str, u32); 10] {
+    pub fn not_filed(&self) -> [(&'static str, u32); blaze_scope::items_record::buckets::NOT_FILED.len()] {
         self.index().not_filed()
     }
 }

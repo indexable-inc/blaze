@@ -114,6 +114,27 @@ fn rust_word_for_c_callback() {
     assert!(plan.imports.is_empty());
 }
 
+/// aws-lc's bcm.o shape: a member references `___dso_handle`, which no member defines. The
+/// linker defines it (synthetic.rs), so it is the image's own name, not an import a library
+/// must supply. Twin: a member that does define it wins, as a definition does in lld (a
+/// synthetic symbol is added only where the name is still undefined).
+#[test]
+fn dso_handle_is_the_linkers_not_an_import() {
+    let bcm = macho(&[Sym::Def("_aws_lc_init"), Sym::Undef("___dso_handle")]);
+    let lib = archive(&[("bcm.o", &bcm)]);
+    let inputs = [Input { from: origin("aws-lc-sys@0.47.0"), bytes: &lib, kind: InputKind::Archive { whole: false } }];
+    let roots: [&[u8]; 1] = [b"_aws_lc_init"];
+    let plan = run(&inputs, &roots, &[]).expect("resolves");
+    assert_eq!(resolution_of(&plan, b"___dso_handle"), Some(Resolution::Linker));
+    assert!(plan.imports.is_empty(), "imports {:?}", plan.imports);
+
+    let own = macho(&[Sym::Def("_aws_lc_init"), Sym::Def("___dso_handle")]);
+    let lib = archive(&[("own.o", &own)]);
+    let inputs = [Input { from: origin("aws-lc-sys@0.47.0"), bytes: &lib, kind: InputKind::Archive { whole: false } }];
+    let plan = run(&inputs, &roots, &[]).expect("resolves");
+    assert!(matches!(resolution_of(&plan, b"___dso_handle"), Some(Resolution::Defined { object: 0, .. })));
+}
+
 /// <mach-o/nlist.h>: a `N_WEAK_REF` undefined symbol "is allowed to be missing": when nothing
 /// defines it, it is an import of the image, weak (every reference to it is weak); a strong
 /// reference nothing defines is a strong import. Prints `imports [[95, 119], [95, 122]]`.

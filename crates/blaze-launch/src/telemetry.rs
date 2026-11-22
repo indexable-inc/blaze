@@ -91,6 +91,46 @@ pub enum AllocOp {
     Realloc = 3,
     Free = 4,
     PosixMemalign = 5,
+    /// Rust `#[global_allocator]` or `std::alloc::System` `__rust_alloc` / `__rdl_alloc`.
+    RustAlloc = 6,
+    /// Rust `__rust_dealloc` / `__rdl_dealloc` (carries exact freed `size` in `b`).
+    RustDealloc = 7,
+    /// Rust `__rust_realloc` / `__rdl_realloc`.
+    RustRealloc = 8,
+    /// Rust `__rust_alloc_zeroed` / `__rdl_alloc_zeroed`.
+    RustAllocZeroed = 9,
+}
+
+/// Which of the 4 Rust global-allocator entry slots an `AllocHook` stub wraps
+/// (`__rust_alloc`, `__rust_dealloc`, `__rust_realloc`, `__rust_alloc_zeroed`, or `__rdl_*`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
+pub enum AllocHookKind {
+    Alloc = 1,
+    Dealloc = 2,
+    Realloc = 3,
+    AllocZeroed = 4,
+}
+
+impl AllocHookKind {
+    pub const fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Alloc),
+            2 => Some(Self::Dealloc),
+            3 => Some(Self::Realloc),
+            4 => Some(Self::AllocZeroed),
+            _ => None,
+        }
+    }
+
+    pub const fn alloc_op(self) -> AllocOp {
+        match self {
+            Self::Alloc => AllocOp::RustAlloc,
+            Self::Dealloc => AllocOp::RustDealloc,
+            Self::Realloc => AllocOp::RustRealloc,
+            Self::AllocZeroed => AllocOp::RustAllocZeroed,
+        }
+    }
 }
 
 /// Operation tag in [`Event::slot_or_op`] for [`EventKind::Io`] / [`EventKind::SyncWait`].
@@ -255,10 +295,14 @@ impl Event {
         caller_frames: [u64; 3],
     ) -> Event {
         let kind = match op {
-            AllocOp::Free => EventKind::Free as u8,
-            AllocOp::Malloc | AllocOp::Calloc | AllocOp::Realloc | AllocOp::PosixMemalign => {
-                EventKind::Alloc as u8
-            }
+            AllocOp::Free | AllocOp::RustDealloc => EventKind::Free as u8,
+            AllocOp::Malloc
+            | AllocOp::Calloc
+            | AllocOp::Realloc
+            | AllocOp::PosixMemalign
+            | AllocOp::RustAlloc
+            | AllocOp::RustRealloc
+            | AllocOp::RustAllocZeroed => EventKind::Alloc as u8,
         };
         Event {
             kind,
