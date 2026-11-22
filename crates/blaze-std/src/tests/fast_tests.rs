@@ -271,3 +271,72 @@ fn comptime_enum_tags_and_discriminant_tag_need_no_proc_macro() {
     assert_eq!(Color::Blue.variant_name(), "Blue");
     assert_ne!(discriminant_tag(&Color::Red), discriminant_tag(&Color::Blue));
 }
+
+#[test]
+fn type_set_order_independent_disjoint_borrows_row_poly_and_lacks() {
+    use crate::type_set::{Cons, ExtendSet, HasPairMut, Lacks, UniqueSet};
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct MaxSpeed(u32);
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct Health(u32);
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct Armor(u32);
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct Burning;
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct Cargo(u32);
+
+    crate::declare_distinct!(MaxSpeed, Health, Armor, Burning, Cargo);
+
+    type Ship = crate::TypeSet![MaxSpeed, Health];
+    type Frigate = ExtendSet<Cargo, Ship>;
+
+    // Construct in arbitrary order {Health(500), MaxSpeed(100)} and reorder into Ship {MaxSpeed, Health}.
+    let raw = crate::tset! { Health(500), MaxSpeed(100) };
+    let mut s: Ship = raw.project();
+    assert_eq!(core::mem::size_of::<Ship>(), core::mem::size_of::<(MaxSpeed, Health)>());
+
+    // Access by type (`s.[Health].0 -= 10`).
+    s.get_mut::<Health, _>().0 -= 10;
+    assert_eq!(s.get::<Health, _>().0, 490);
+
+    // Safe disjoint borrow (`(&mut s.[Health], &s.[MaxSpeed])`), zero unsafe!
+    let (h, m) = s.borrow_mut_ref::<Health, MaxSpeed, _, _>();
+    h.0 -= m.0 / 10;
+    assert_eq!(s.get::<Health, _>().0, 480);
+
+    // Row-polymorphic "at least {Health, Armor}" function works on any superset.
+    fn damage<S, I1, I2>(e: &mut S, amount: u32)
+    where
+        S: HasPairMut<Health, Armor, I1, I2>,
+    {
+        let (health, armor) = e.borrow_pair_mut();
+        health.0 = health.0.saturating_sub(amount.saturating_sub(armor.0));
+    }
+
+    let mut cruiser = s.extend(Armor(25));
+    damage(&mut cruiser, 60);
+    assert_eq!(cruiser.get::<Health, _>().0, 445);
+
+    // Row-polymorphic extension requiring `Lacks<Burning>`.
+    fn ignite<R>(e: Cons<Health, R>) -> Cons<Burning, Cons<Health, R>>
+    where
+        R: Lacks<Burning>,
+        Cons<Health, R>: Lacks<Burning>,
+    {
+        e.extend_lacking(Burning)
+    }
+
+    let ship_h = crate::tset! { Health(500), MaxSpeed(100) };
+    let burning_ship = ignite(ship_h);
+    assert_eq!(*burning_ship.get::<Burning, _>(), Burning);
+    assert_eq!(burning_ship.get::<Health, _>().0, 500);
+
+    // Type-level extension Frigate = {Cargo, ..Ship}.
+    let frigate: Frigate = crate::tset! { Health(300), MaxSpeed(80), Cargo(40) }.project();
+    assert_eq!(frigate.get::<Cargo, _>().0, 40);
+    assert_eq!(frigate.get::<MaxSpeed, _>().0, 80);
+    assert!(<Frigate as UniqueSet>::ALL_DISTINCT);
+    assert!(!<crate::TypeSet![Health, Health] as UniqueSet>::ALL_DISTINCT);
+}

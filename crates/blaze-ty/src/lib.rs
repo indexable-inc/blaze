@@ -48,6 +48,7 @@ mod portable;
 mod print;
 mod relate;
 mod solve;
+pub mod type_set;
 mod tys;
 
 #[cfg(test)]

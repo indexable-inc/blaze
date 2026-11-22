@@ -94,6 +94,7 @@ pub use func::{Block, BlockKind, Func, Head, Value, View};
 pub use op::{End, Field, Info, Layout, Op, Operands, Res};
 pub use parse::{ParseError, parse};
 pub use print::print;
+pub use simplify::egraph;
 pub use ty::{Scalar, Ty};
 pub use verify::{Verified, VerifiedFunc, VerifyError, verify};
 

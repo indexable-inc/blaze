@@ -119,6 +119,7 @@
     coerce_unsized,
     const_cmp,
     const_trait_impl,
+    const_type_name,
     contracts,
     core_intrinsics,
     custom_inner_attributes,
@@ -257,6 +258,8 @@ pub mod layers;
 pub mod wasm64;
 /// Compile-time reflection & zero-proc-macro derive bridge (`cfg(blaze)` comptime-first).
 pub mod comptime;
+/// Order-independent, zero-overhead compile-time Type Sets with safe disjoint borrows & `Lacks<T>`.
+pub mod type_set;
 /// The native backend's reads of its host's facts.
 #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
 mod native;
