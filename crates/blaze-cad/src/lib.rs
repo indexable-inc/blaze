@@ -70,15 +70,17 @@ mod math_tests;
 mod tests;
 
 pub use asset::{
-    AssetFidelityPolicy, AssetPreset, AssetReport, BudgetInput, BudgetStatus, ExportedPart, GameAsset, GameAssetOpts, PartReport,
-    allocate_budgets, build_game_asset,
+    AssetFidelityPolicy, AssetPreset, AssetReport, BudgetInput, BudgetStatus, ExportedPart, GameAsset, GameAssetOpts,
+    PartFeature, PartFeatureReport, PartReport, allocate_budgets, build_game_asset,
 };
 pub use blaze_cad_mesh::{
-    CreaseProfile, CreaseProfileOpts, DecimateStats, Decimated, GridSizing, MaterialRole, MeshLimits, PieceCache, PieceCacheOpts,
-    Stop, Target, Topology, auto_grid, crease_profile, topology,
+    CreaseProfile, CreaseProfileOpts, DecimateStats, Decimated, FeatureProtect, FeatureRegion, FeatureZone, GridSizing,
+    MaterialRole, MeshLimits, PieceCache, PieceCacheOpts, Stop, Target, Topology, auto_grid, crease_profile, topology,
 };
 pub use blaze_cad_out::{Encoding, Material, StlUnit, Up};
-pub use blaze_cad_picture::{MeshNormalSource, MeshPictureOpts, MeshScenePart, RenderMode, Shading, StudioOpts, Wireframe};
+pub use blaze_cad_picture::{
+    HighlightStyle, MeshHighlight, MeshNormalSource, MeshPictureOpts, MeshScenePart, RenderMode, Shading, StudioOpts, Wireframe,
+};
 pub use check::{
     AssemblyInterference, CHECK_SCHEMA, CheckKey, CheckKind, Checked, DraftFace, DraftOpts, FitOpts, Interference, InterferenceOpts,
     MinWallOpts, Overhang, OverhangFace, OverhangOpts, ThinWall, Unsettled, Verdict, draft_angle_check, draft_angle_check_planted,
@@ -95,8 +97,9 @@ pub use export::{
     transform_of,
 };
 pub use fidelity::{
-    FidelityChecked, FidelityFinding, FidelityMetrics, FidelityOpts, FidelityPlant, check_mesh_fidelity,
-    check_mesh_fidelity_planted,
+    FeatureKind, FeatureReport, FeatureTarget, FeatureTargetOpts, FidelityChecked, FidelityFinding, FidelityMetrics,
+    FidelityOpts, FidelityPlant, FidelityReport, check_mesh_fidelity, check_mesh_fidelity_planted, check_mesh_fidelity_report,
+    check_mesh_fidelity_report_planted,
 };
 pub use part::{
     DecimatePartOpts, MassProperties, MeshPartOpts, Part, PartBudget, PartOpts, RoundEdgesOpts, TriangleBudget, assemble,
@@ -353,6 +356,7 @@ pub struct ModelOpts<'a> {
 pub struct Model<'a> {
     graph: Graph<'a, NoPlant>,
     parts: Vec<Part, Alloc<'a>>,
+    features: Vec<PartFeature, Alloc<'a>>,
     most_parts: u32,
 }
 
@@ -362,6 +366,7 @@ impl<'a> Model<'a> {
         Model {
             graph: Graph::new(blaze_cad_field::GraphOpts { alloc: o.alloc, limits: o.limits }),
             parts: Vec::new_in(o.alloc),
+            features: Vec::new_in(o.alloc),
             most_parts: o.most_parts,
         }
     }
@@ -427,6 +432,24 @@ impl<'a> Model<'a> {
         Ok(())
     }
 
+    /// Mark a critical feature (keyhole, bevel, mating surface, or detail region) on `id` in
+    /// that part's local coordinate frame. Marked features are preserved with extra geometry
+    /// during meshing & simplification, checked per feature, and highlighted in the export preview
+    /// if they miss tolerance.
+    pub fn mark_feature(&mut self, id: PartId, target: FeatureTarget) -> Result<(), ModelError> {
+        let at = usize::try_from(id.0).map_err(|_| ModelError::NoPart { id: id.0 })?;
+        let part_name = self.parts.get(at).ok_or(ModelError::NoPart { id: id.0 })?.name;
+        self.features
+            .try_push(PartFeature { part: part_name, target })
+            .map_err(|_| ModelError::Alloc { what: "the model's critical features" })
+    }
+
+    /// All marked per-feature fidelity targets across the model (pass straight to
+    /// `GameAssetOpts { features: model.features(), .. }`).
+    pub fn features(&self) -> &[PartFeature] {
+        &self.features
+    }
+
     /// Set one part's parent in the exported scene hierarchy (`parent` must have been added before
     /// `id` so the hierarchy is a forest by construction).
     pub fn set_parent(&mut self, id: PartId, parent: Option<PartId>) -> Result<(), ModelError> {
@@ -468,7 +491,8 @@ pub mod prelude {
         SuperellipsoidOpts, TaperOpts, TorusOpts, TwistOpts,
     };
     pub use blaze_cad_picture::{
-        MeshNormalSource, MeshPictureOpts, MeshScenePart, PictureOpts, Projection, RenderMode, Shading, StudioOpts, View, Wireframe,
+        HighlightStyle, MeshHighlight, MeshNormalSource, MeshPictureOpts, MeshScenePart, PictureOpts, Projection, RenderMode,
+        Shading, StudioOpts, View, Wireframe,
     };
     pub use blaze_units::{Angle, Area, Density, Length, Mass, Volume};
 
@@ -476,15 +500,16 @@ pub mod prelude {
     pub use crate::{
         AssemblyInterference, AssetFidelityPolicy, AssetPreset, AssetReport, BudgetInput, BudgetStatus, ColliderMode,
         CreaseProfile, CreaseProfileOpts, DecimatePartOpts, DecimateStats, Decimated, DraftFace, DraftOpts, Encoding,
-        ExportLodOpts, ExportOpts, ExportStlOpts, Exported, ExportedPart, ExportedStl, FidelityChecked, FidelityFinding,
-        FidelityMetrics, FidelityOpts, FitOpts, GameAsset, GameAssetOpts, GridSizing, InterferenceOpts, LodProjection, Material,
-        MaterialRole, MeshLimits, MeshPartOpts, MinWallOpts, Model, ModelError, ModelOpts, OverhangFace, OverhangOpts, Part,
-        PartBudget, PartId, PartOpts, PartReport, PieceCache, PieceCacheOpts, RoundEdgesOpts, SectionSvgOpts, StlUnit, Stop,
-        Target, Topology, TriangleBudget, Up, Verdict, allocate_budgets, assemble, auto_grid, build_game_asset,
-        check_mesh_fidelity, crease_profile, decimate_mesh, draft_angle_check, export_glb, export_section_svg, export_stl,
-        fits_within, gyroid, intersect_all, mass_properties, mesh_part, min_wall, mm3, no_interference, no_interference_assembly,
-        overhang_check, part_tape, picture, picture_exported_scene, picture_mesh, picture_studio, placed_tape, round_edges,
-        topology, union_all,
+        ExportLodOpts, ExportOpts, ExportStlOpts, Exported, ExportedPart, ExportedStl, FeatureKind, FeatureProtect,
+        FeatureRegion, FeatureReport, FeatureTarget, FeatureTargetOpts, FeatureZone, FidelityChecked, FidelityFinding,
+        FidelityMetrics, FidelityOpts, FidelityReport, FitOpts, GameAsset, GameAssetOpts, GridSizing, InterferenceOpts,
+        LodProjection, Material, MaterialRole, MeshLimits, MeshPartOpts, MinWallOpts, Model, ModelError, ModelOpts,
+        OverhangFace, OverhangOpts, Part, PartBudget, PartFeature, PartFeatureReport, PartId, PartOpts, PartReport, PieceCache,
+        PieceCacheOpts, RoundEdgesOpts, SectionSvgOpts, StlUnit, Stop, Target, Topology, TriangleBudget, Up, Verdict,
+        allocate_budgets, assemble, auto_grid, build_game_asset, check_mesh_fidelity, check_mesh_fidelity_report, crease_profile,
+        decimate_mesh, draft_angle_check, export_glb, export_section_svg, export_stl, fits_within, gyroid, intersect_all,
+        mass_properties, mesh_part, min_wall, mm3, no_interference, no_interference_assembly, overhang_check, part_tape, picture,
+        picture_exported_scene, picture_mesh, picture_studio, placed_tape, round_edges, topology, union_all,
     };
 }
 

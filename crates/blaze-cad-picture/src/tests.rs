@@ -608,12 +608,14 @@ blaze_sim::plants! {
         None,
         IgnoreTransform => PictureBroken::Wrong { .. },
         FlatOnly => PictureBroken::Wrong { .. },
+        IgnoreHighlights => PictureBroken::Wrong { .. },
     }
 }
 
 fn mesh_preview_case(tape: &Tape, plant: impl Planted<MeshPicturePlant> + Copy) -> Result<(), Broken<PictureBroken>> {
-    use blaze_cad_mesh::{COS_32_DEGREES, MeshOpts, ShadeOpts, mesh, shade};
+    use blaze_cad_mesh::{COS_32_DEGREES, FeatureRegion, MeshOpts, ShadeOpts, mesh, shade};
     use blaze_cad_out::{Material, Matrix, Transform};
+    use blaze_math::Vec3;
 
     let radius_mm = tape.int_in(22..=34i64, "radius mm") as f64;
     let shift_x_mm = tape.int_in(40..=70i64, "shift x mm") as f64;
@@ -699,6 +701,37 @@ fn mesh_preview_case(tape: &Tape, plant: impl Planted<MeshPicturePlant> + Copy) 
     if shaded.pixels[..] == flat.pixels[..] {
         return Err(Broken::Oracle(PictureBroken::Wrong {
             why: String::from("Shading normals matched Geometric normals on sphere"),
+        }));
+    }
+
+    // Highlight in part-local coordinates (front pole of the shifted sphere) must visibly alter
+    // pixels under the shifted transform.
+    let hl = [MeshHighlight {
+        part_index: 0,
+        region: FeatureRegion::Ball {
+            center: Vec3::new(0.0, -radius_mm / 1000.0, 0.0),
+            radius: Length::mm(radius_mm * 0.45),
+        },
+        style: HighlightStyle::Missed { colour: [250, 32, 64] },
+    }];
+    let highlighted = render_mesh_scene_planted(
+        &parts,
+        &MAT,
+        v,
+        MeshPictureOpts {
+            alloc: heap(),
+            scratch: heap(),
+            mode: RenderMode::Normals,
+            normal_source: MeshNormalSource::Shading,
+            highlights: &hl,
+            ..
+        },
+        plant,
+    )
+    .map_err(harness)?;
+    if highlighted.pixels[..] == shaded.pixels[..] {
+        return Err(Broken::Oracle(PictureBroken::Wrong {
+            why: String::from("missed-feature highlight left rendered pixels unchanged"),
         }));
     }
     Ok(())

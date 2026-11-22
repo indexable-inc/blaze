@@ -314,7 +314,7 @@ pub fn export_glb<'a, P: Planted<CadPlant>>(
             };
             let d = decimate(
                 Source::Verified(m.verified()),
-                DecimateOpts { target, cos_crease: o.cos_crease, limits: MeshLimits::SHIPPED, alloc: s, scratch: s },
+                DecimateOpts { target, cos_crease: o.cos_crease, limits: MeshLimits::SHIPPED, alloc: s, scratch: s, .. },
             )?;
             simple.try_push(d).map_err(|_| ModelError::Alloc { what: "the export's simplified meshes" })?;
         }
@@ -484,7 +484,7 @@ pub fn export_stl<'a, K: Ex, P: Planted<CadPlant>>(
     let (bytes, count) = if o.decimate {
         let d = decimate(
             Source::Verified(m.verified()),
-            DecimateOpts { target: Target::Error(o.tolerance), cos_crease: o.cos_crease, limits: MeshLimits::SHIPPED, alloc: s, scratch: s },
+            DecimateOpts { target: Target::Error(o.tolerance), cos_crease: o.cos_crease, limits: MeshLimits::SHIPPED, alloc: s, scratch: s, .. },
         )?;
         let verified = d.verified().unwrap_or_else(|| m.verified());
         let bytes = stl(&verified, StlOpts { title, unit: o.unit, limits: o.limits, alloc: o.alloc })?;
@@ -688,7 +688,7 @@ pub fn picture_mesh<'a>(
     mesh: MeshView<'_>,
     materials: &[Material<'_>],
     view: View,
-    o: MeshPictureOpts<'a, '_>,
+    o: MeshPictureOpts<'a, '_, '_>,
 ) -> Result<Picture<'a>, ModelError> {
     render_mesh(mesh, materials, view, o).map_err(ModelError::Picture)
 }
@@ -698,7 +698,7 @@ pub fn picture_mesh<'a>(
 pub fn picture_exported_scene<'a>(
     scene: &blaze_cad_out::Scene<'_>,
     view: View,
-    o: MeshPictureOpts<'a, '_>,
+    o: MeshPictureOpts<'a, '_, '_>,
 ) -> Result<Picture<'a>, ModelError> {
     let mut parts: Vec<MeshScenePart<'_>, Alloc<'_>> = Vec::new_in(o.scratch);
     parts.try_reserve(scene.parts.len()).map_err(|_| ModelError::Alloc { what: "scene preview parts" })?;

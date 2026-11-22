@@ -368,6 +368,7 @@ pub fn decimate_mesh<'a>(mesh: &Verified<'_>, o: DecimatePartOpts<'a, '_>) -> Re
             limits: o.limits,
             alloc: o.alloc,
             scratch: o.scratch,
+            ..
         },
     )
     .map_err(ModelError::Decimate)

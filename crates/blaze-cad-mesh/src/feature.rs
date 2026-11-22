@@ -1,0 +1,353 @@
+//! Spatial feature regions and fidelity zones shared by the mesher ([`crate::contour`]),
+//! simplifier ([`crate::simplify`]), fidelity checker, and export preview renderer.
+//!
+//! Marking a keyhole, bevel edge, or mating surface with a [`FeatureRegion`] lets every stage
+//! focus precision, geometry preservation, tolerance checking, and preview highlighting right on
+//! that feature without blowing up triangle counts or simplification time across the rest of the
+//! part.
+
+#![blaze::sans_io]
+
+use blaze_math::{Aabb3, Vec3};
+use blaze_units::Length;
+
+/// Exact 3D spatial region identifying a critical geometric feature (keyhole, bevel, mating
+/// surface, boss, or slot) in a part's local coordinate frame.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FeatureRegion {
+    /// Axis-aligned bounding box (for example a carved keyhole solid's bounds or a mating pad).
+    Box(Aabb3),
+    /// Sphere centered at `center` with `radius` (ideal for bolt holes, pins, or keyhole bores).
+    Ball { center: Vec3, radius: Length },
+    /// Swept capsule along segment `a..=b` with `radius` (ideal for bevel edges, keyhole slots,
+    /// rabbets, and French-cleat mating seams).
+    Capsule { a: Vec3, b: Vec3, radius: Length },
+}
+
+impl FeatureRegion {
+    /// Axis-aligned bounding box enclosing this region.
+    #[inline]
+    pub fn aabb(&self) -> Aabb3 {
+        match *self {
+            FeatureRegion::Box(b) => b,
+            FeatureRegion::Ball { center, radius } => {
+                let r = radius.as_m().max(0.0);
+                let ext = Vec3::new(r, r, r);
+                Aabb3::new(center - ext, center + ext)
+            }
+            FeatureRegion::Capsule { a, b, radius } => {
+                let r = radius.as_m().max(0.0);
+                let ext = Vec3::new(r, r, r);
+                Aabb3::new(a.min(b) - ext, a.max(b) + ext)
+            }
+        }
+    }
+
+    /// Expand this region outward by `margin` on every side.
+    #[inline]
+    pub fn pad(&self, margin: Length) -> FeatureRegion {
+        let m = margin.as_m().max(0.0);
+        match *self {
+            FeatureRegion::Box(b) => {
+                let ext = Vec3::new(m, m, m);
+                FeatureRegion::Box(Aabb3::new(b.lo - ext, b.hi + ext))
+            }
+            FeatureRegion::Ball { center, radius } => {
+                FeatureRegion::Ball { center, radius: Length::m((radius.as_m().max(0.0) + m).max(0.0)) }
+            }
+            FeatureRegion::Capsule { a, b, radius } => {
+                FeatureRegion::Capsule { a, b, radius: Length::m((radius.as_m().max(0.0) + m).max(0.0)) }
+            }
+        }
+    }
+
+    /// Exact Euclidean signed distance (metres) from `p` to the region boundary: `<= 0.0` inside,
+    /// `> 0.0` outside.
+    #[inline]
+    pub fn signed_distance(&self, p: Vec3) -> f64 {
+        match *self {
+            FeatureRegion::Box(b) => {
+                let half = (b.hi - b.lo) * 0.5;
+                let center = (b.lo + b.hi) * 0.5;
+                let q = Vec3::new((p.x - center.x).abs() - half.x, (p.y - center.y).abs() - half.y, (p.z - center.z).abs() - half.z);
+                let out = Vec3::new(q.x.max(0.0), q.y.max(0.0), q.z.max(0.0)).length();
+                let inside = q.x.max(q.y).max(q.z).min(0.0);
+                out + inside
+            }
+            FeatureRegion::Ball { center, radius } => (p - center).length() - radius.as_m().max(0.0),
+            FeatureRegion::Capsule { a, b, radius } => {
+                let ab = b - a;
+                let denom = ab.dot(ab);
+                let t = if denom > 1e-24 { ((p - a).dot(ab) / denom).clamp(0.0, 1.0) } else { 0.0 };
+                let closest = a + ab * t;
+                (p - closest).length() - radius.as_m().max(0.0)
+            }
+        }
+    }
+
+    /// True when `p` lies inside or on the boundary of this region.
+    #[inline]
+    pub fn contains(&self, p: Vec3) -> bool {
+        self.signed_distance(p) <= 0.0
+    }
+
+    /// Conservative-exact intersection test against an axis-aligned box `box3`.
+    #[inline]
+    pub fn intersects_aabb(&self, box3: &Aabb3) -> bool {
+        let mine = self.aabb();
+        if mine.hi.x < box3.lo.x
+            || mine.lo.x > box3.hi.x
+            || mine.hi.y < box3.lo.y
+            || mine.lo.y > box3.hi.y
+            || mine.hi.z < box3.lo.z
+            || mine.lo.z > box3.hi.z
+        {
+            return false;
+        }
+        match *self {
+            FeatureRegion::Box(_) => true,
+            FeatureRegion::Ball { center, radius } => {
+                let r = radius.as_m().max(0.0);
+                let clamped = clamp_point_to_aabb(center, box3);
+                let d = center - clamped;
+                d.dot(d) <= r * r
+            }
+            FeatureRegion::Capsule { a, b, radius } => {
+                let r = radius.as_m().max(0.0);
+                let r2 = r * r;
+                // Check endpoints and closest point along the segment to the box's clamped points.
+                let ca = clamp_point_to_aabb(a, box3);
+                if (a - ca).dot(a - ca) <= r2 {
+                    return true;
+                }
+                let cb = clamp_point_to_aabb(b, box3);
+                if (b - cb).dot(b - cb) <= r2 {
+                    return true;
+                }
+                // Alternating projection (4 steps converges to exact segment-box distance).
+                let ab = b - a;
+                let denom = ab.dot(ab);
+                if !(denom > 1e-24) {
+                    return false;
+                }
+                let mut q = clamp_point_to_aabb((a + b) * 0.5, box3);
+                for _ in 0..4 {
+                    let t = ((q - a).dot(ab) / denom).clamp(0.0, 1.0);
+                    let seg_p = a + ab * t;
+                    let box_p = clamp_point_to_aabb(seg_p, box3);
+                    let d = seg_p - box_p;
+                    if d.dot(d) <= r2 {
+                        return true;
+                    }
+                    q = box_p;
+                }
+                // Also test slab intersection of segment with the radius-expanded AABB so diagonal
+                // segments clipping a corner of the box are never missed.
+                let expanded = Aabb3::new(box3.lo - Vec3::new(r, r, r), box3.hi + Vec3::new(r, r, r));
+                segment_hits_aabb(a, b, &expanded)
+            }
+        }
+    }
+
+    /// True when triangle `(a, b, c)` overlaps or touches this region.
+    #[inline]
+    pub fn intersects_triangle(&self, a: Vec3, b: Vec3, c: Vec3) -> bool {
+        let tb = Aabb3::new(a.min(b).min(c), a.max(b).max(c));
+        if !self.intersects_aabb(&tb) {
+            return false;
+        }
+        let centroid = (a + b + c) * (1.0 / 3.0);
+        if self.contains(a) || self.contains(b) || self.contains(c) || self.contains(centroid) {
+            return true;
+        }
+        match *self {
+            FeatureRegion::Box(bx) => {
+                // Closest point on triangle to box center + edge midpoints.
+                let center = (bx.lo + bx.hi) * 0.5;
+                let cp = closest_point_on_triangle(center, a, b, c);
+                self.contains(cp)
+                    || self.contains((a + b) * 0.5)
+                    || self.contains((b + c) * 0.5)
+                    || self.contains((c + a) * 0.5)
+            }
+            FeatureRegion::Ball { center, radius } => {
+                let r = radius.as_m().max(0.0);
+                let cp = closest_point_on_triangle(center, a, b, c);
+                (cp - center).dot(cp - center) <= r * r
+            }
+            FeatureRegion::Capsule { a: sa, b: sb, radius } => {
+                let r = radius.as_m().max(0.0);
+                let r2 = r * r;
+                let ab = sb - sa;
+                let denom = ab.dot(ab);
+                if !(denom > 1e-24) {
+                    let cp = closest_point_on_triangle(sa, a, b, c);
+                    return (cp - sa).dot(cp - sa) <= r2;
+                }
+                let mut t = ((centroid - sa).dot(ab) / denom).clamp(0.0, 1.0);
+                for _ in 0..4 {
+                    let sp = sa + ab * t;
+                    let cp = closest_point_on_triangle(sp, a, b, c);
+                    if (cp - sp).dot(cp - sp) <= r2 {
+                        return true;
+                    }
+                    t = ((cp - sa).dot(ab) / denom).clamp(0.0, 1.0);
+                }
+                // Also test endpoints directly against the triangle.
+                let ca = closest_point_on_triangle(sa, a, b, c);
+                let cb = closest_point_on_triangle(sb, a, b, c);
+                (ca - sa).dot(ca - sa) <= r2 || (cb - sb).dot(cb - sb) <= r2
+            }
+        }
+    }
+
+    /// Characteristic smallest diameter of this region (metres), useful for automatic local
+    /// meshing refinement when `min_feature` is not stated explicitly.
+    #[inline]
+    pub fn minor_extent_m(&self) -> f64 {
+        match *self {
+            FeatureRegion::Box(b) => {
+                let d = b.hi - b.lo;
+                d.x.min(d.y).min(d.z).max(0.0)
+            }
+            FeatureRegion::Ball { radius, .. } | FeatureRegion::Capsule { radius, .. } => (radius.as_m() * 2.0).max(0.0),
+        }
+    }
+}
+
+/// How strongly the mesher and simplifier protect a spatial feature zone.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FeatureProtect {
+    /// Preserve tighter error and normal tolerances and bias QEM collapse priority so non-critical
+    /// areas absorb triangle-budget reduction first.
+    Critical,
+    /// Hard-protected: never relax this feature's error ceiling even during Phase-2 budget
+    /// reduction (stops with [`crate::Stop::ErrorCeiling`] rather than sacrificing the feature).
+    Pinned,
+}
+
+/// Spatial fidelity zone passed to the mesher ([`crate::MeshOpts::zones`]) and simplifier
+/// ([`crate::DecimateOpts::zones`]) to preserve extra geometry around critical features.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct FeatureZone {
+    pub region: FeatureRegion,
+    /// Tighter geometric error target inside this region (`None` inherits part tolerance).
+    pub max_error: Option<Length>,
+    /// Tighter local octree feature cell ceiling inside this region (`None` derives from
+    /// `max_error` when present).
+    pub min_feature: Option<Length>,
+    /// Tighter single-step normal-turn guard during simplification as `cos²(max_turn)` (e.g.
+    /// `cos²(12°) ≈ 0.956`). `None` uses the simplifier's default guard.
+    pub min_cos_sq: Option<f64>,
+    /// QEM heap cost multiplier (`>= 1.0`) so non-critical faces collapse before this feature when
+    /// competing for a triangle budget.
+    pub cost_weight: f64,
+    /// Protection policy during Phase-2 budget reduction.
+    pub protect: FeatureProtect,
+}
+
+impl FeatureZone {
+    /// Construct a critical protection zone with sensible priority weighting (`16×` for
+    /// [`FeatureProtect::Critical`], `64×` for [`FeatureProtect::Pinned`]).
+    #[inline]
+    pub const fn new(region: FeatureRegion, protect: FeatureProtect) -> FeatureZone {
+        FeatureZone {
+            region,
+            max_error: None,
+            min_feature: None,
+            min_cos_sq: None,
+            cost_weight: match protect {
+                FeatureProtect::Critical => 16.0,
+                FeatureProtect::Pinned => 64.0,
+            },
+            protect,
+        }
+    }
+}
+
+#[inline]
+fn clamp_point_to_aabb(p: Vec3, b: &Aabb3) -> Vec3 {
+    Vec3::new(p.x.clamp(b.lo.x, b.hi.x), p.y.clamp(b.lo.y, b.hi.y), p.z.clamp(b.lo.z, b.hi.z))
+}
+
+#[inline]
+fn segment_hits_aabb(a: Vec3, b: Vec3, bx: &Aabb3) -> bool {
+    let d = b - a;
+    let mut tmin = 0.0f64;
+    let mut tmax = 1.0f64;
+    for (o, dir, lo, hi) in [(a.x, d.x, bx.lo.x, bx.hi.x), (a.y, d.y, bx.lo.y, bx.hi.y), (a.z, d.z, bx.lo.z, bx.hi.z)] {
+        if dir.abs() <= 1e-18 {
+            if o < lo || o > hi {
+                return false;
+            }
+        } else {
+            let inv = 1.0 / dir;
+            let mut t0 = (lo - o) * inv;
+            let mut t1 = (hi - o) * inv;
+            if t0 > t1 {
+                core::mem::swap(&mut t0, &mut t1);
+            }
+            tmin = tmin.max(t0);
+            tmax = tmax.min(t1);
+            if tmin > tmax {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Exact closest point on triangle `(a, b, c)` to query point `p` (Ericson, *Real-Time Collision
+/// Detection*, §5.1.5).
+#[inline]
+fn closest_point_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+    let ab = b - a;
+    let ac = c - a;
+    let ap = p - a;
+    let d1 = ab.dot(ap);
+    let d2 = ac.dot(ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a;
+    }
+
+    let bp = p - b;
+    let d3 = ab.dot(bp);
+    let d4 = ac.dot(bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return b;
+    }
+
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        return a + ab * v;
+    }
+
+    let cp = p - c;
+    let d5 = ab.dot(cp);
+    let d6 = ac.dot(cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return c;
+    }
+
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        return a + ac * w;
+    }
+
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return b + (c - b) * w;
+    }
+
+    let denom = va + vb + vc;
+    if !(denom > 1e-24) {
+        return a;
+    }
+    let inv = 1.0 / denom;
+    let v = vb * inv;
+    let w = vc * inv;
+    a + ab * v + ac * w
+}

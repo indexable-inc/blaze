@@ -120,6 +120,7 @@ pub fn lod_chain<'a>(mesh: &Verified<'_>, opts: LodOpts<'a, '_>) -> Result<LodCh
                 limits: opts.limits,
                 alloc: opts.alloc,
                 scratch: opts.scratch,
+                ..
             },
         )
         .map_err(|error| LodError::Decimate { level, error })?;

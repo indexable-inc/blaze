@@ -146,6 +146,7 @@ blaze_sim::plants! {
         None,
         SkipVoidSubdivision => CadBroken::FidelityWrong { what: "off-center lost hole", .. },
         IgnoreNormalDeviation => CadBroken::FidelityWrong { what: "lost bevel", .. },
+        IgnoreFeatureTargets => CadBroken::FidelityWrong { what: "critical feature target", .. },
     }
 }
 
@@ -1077,6 +1078,7 @@ fn fidelity_case(tape: &Tape, plant: impl Planted<FidelityPlant> + Copy) -> Resu
             limits: MeshLimits::SHIPPED,
             alloc: heap(),
             scratch: heap(),
+            ..
         },
     )
     .map_err(harness)?;
@@ -1123,6 +1125,7 @@ fn fidelity_case(tape: &Tape, plant: impl Planted<FidelityPlant> + Copy) -> Resu
             limits: MeshLimits::SHIPPED,
             alloc: heap(),
             scratch: heap(),
+            ..
         },
     )
     .map_err(harness)?;
@@ -1148,6 +1151,45 @@ fn fidelity_case(tape: &Tape, plant: impl Planted<FidelityPlant> + Copy) -> Resu
         return Err(Broken::Oracle(CadBroken::FidelityWrong {
             what: "lost bevel",
             verdict: format!("{:?}", res_bevel.verdict),
+        }));
+    }
+
+    // 3) Per-feature critical target: mark the bridged off-center hole with a tight 1.5 mm
+    // keyhole target even when the part-wide tolerances are super loose (25 mm, 60 deg) so ONLY
+    // per-feature target enforcement catches it!
+    let feat = [FeatureTarget::new(FeatureTargetOpts {
+        name: "keyhole_a",
+        kind: FeatureKind::Keyhole,
+        region: FeatureRegion::Ball {
+            center: blaze_math::Vec3::new(hole_x / 1000.0, hole_y / 1000.0, 0.010),
+            radius: Length::mm(hole_r + 4.0),
+        },
+        max_error: Some(Length::mm(1.5)),
+        max_normal_error: Some(Angle::degrees(45.0)),
+        min_feature: Some(Length::mm(5.0)),
+        protect: FeatureProtect::Pinned,
+    })];
+    let res_feat = check_mesh_fidelity_planted(
+        &g,
+        &holed_part,
+        &box_12.mesh.view(),
+        None,
+        FidelityOpts {
+            hole_tolerance: Length::mm(25.0),
+            surface_tolerance: Length::mm(25.0),
+            max_normal_error: Angle::degrees(60.0),
+            min_hole_feature: Length::mm(20.0),
+            features: &feat,
+            scratch: heap(),
+            ..
+        },
+        plant,
+    )
+    .map_err(harness)?;
+    if !matches!(res_feat.verdict, Verdict::Found(FidelityFinding::FeatureMissed { .. })) {
+        return Err(Broken::Oracle(CadBroken::FidelityWrong {
+            what: "critical feature target",
+            verdict: format!("{:?}", res_feat.verdict),
         }));
     }
     Ok(())
@@ -1307,4 +1349,159 @@ fn game_asset_workflow_budgets_fidelity_report_and_mesh_preview() {
         .preview_part_colors(view, MeshPictureOpts { alloc: heap(), scratch: heap(), .. })
         .expect("preview part colors");
     assert_ne!(preview.pixels[..], part_col.pixels[..], "material+wireframe preview must differ from part-color preview");
+}
+
+#[test]
+fn per_feature_fidelity_targets_preserve_geometry_report_and_highlight_misses() {
+    use blaze_math::{Aabb3, Vec3};
+
+    let mut model = Model::new(ModelOpts { alloc: heap(), .. });
+
+    // Panel with a keyhole through-slot + 45-degree French cleat rail.
+    let plate = model.graph().cuboid(BoxOpts { size: mm3(300.0, 18.0, 360.0), .. }).expect("plate");
+    let bore = model.graph().cylinder(CylinderOpts { radius: Length::mm(7.0), height: Length::mm(30.0), .. }).expect("bore");
+    let bore = model
+        .graph()
+        .place(
+            bore,
+            Placement::shift(Length::mm(0.0), Length::ZERO, Length::mm(80.0))
+                .then_after(&Placement::rotation(Axis::X, Angle::degrees(90.0))),
+        )
+        .expect("place bore");
+    let slot = model.graph().cuboid(BoxOpts { size: mm3(7.0, 30.0, 18.0), .. }).expect("slot");
+    let slot = model
+        .graph()
+        .place(slot, Placement::shift(Length::ZERO, Length::ZERO, Length::mm(90.0)))
+        .expect("place slot");
+    let keyhole = model.graph().union(bore, slot).expect("keyhole");
+    let panel = model.graph().difference(plate, keyhole).expect("panel");
+    let (panel_id, _) = model.add(PartOpts { solid: panel, name: "panel" }).expect("add panel");
+
+    let cleat_raw = model.graph().cuboid(BoxOpts { size: mm3(240.0, 20.0, 56.0), .. }).expect("cleat raw");
+    let cutter = model.graph().cuboid(BoxOpts { size: mm3(260.0, 40.0, 80.0), .. }).expect("cutter");
+    let cutter = model
+        .graph()
+        .place(
+            cutter,
+            Placement::shift(Length::ZERO, Length::mm(14.0), Length::mm(32.0))
+                .then_after(&Placement::rotation(Axis::X, Angle::degrees(45.0))),
+        )
+        .expect("place cutter");
+    let cleat = model.graph().difference(cleat_raw, cutter).expect("cleat");
+    let cleat = model
+        .graph()
+        .place(cleat, Placement::shift(Length::ZERO, Length::mm(20.0), Length::mm(-60.0)))
+        .expect("place cleat");
+    let (cleat_id, _) = model.add(PartOpts { solid: cleat, name: "cleat" }).expect("add cleat");
+
+    let kh_region = FeatureRegion::Box(Aabb3::new(Vec3::new(-0.012, -0.012, 0.068), Vec3::new(0.012, 0.012, 0.105)));
+    let mating_region = FeatureRegion::Box(Aabb3::new(Vec3::new(-0.122, -0.012, 0.006), Vec3::new(0.122, 0.012, 0.030)));
+
+    model
+        .mark_feature(
+            panel_id,
+            FeatureTarget::new(FeatureTargetOpts {
+                name: "keyhole_top",
+                kind: FeatureKind::Keyhole,
+                region: kh_region,
+                max_error: Some(Length::mm(0.6)),
+                max_normal_error: Some(Angle::degrees(22.0)),
+                min_feature: Some(Length::mm(3.5)),
+                protect: FeatureProtect::Pinned,
+            }),
+        )
+        .expect("mark keyhole");
+    model
+        .mark_feature(
+            cleat_id,
+            FeatureTarget::new(FeatureTargetOpts {
+                name: "mating_45",
+                kind: FeatureKind::MatingSurface,
+                region: mating_region,
+                max_error: Some(Length::mm(0.5)),
+                max_normal_error: Some(Angle::degrees(12.0)),
+                protect: FeatureProtect::Pinned,
+                ..
+            }),
+        )
+        .expect("mark mating");
+
+    // 1) Normal build: keyhole preserved (genus 1), 45-degree cleat passes with zero false normal
+    // errors, both marked features pass, and missed_highlights is empty.
+    let asset = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts {
+            alloc: heap(),
+            scratch: heap(),
+            preset: AssetPreset::GameProp,
+            total_budget: Some(TriangleBudget(4_000)),
+            features: model.features(),
+            ..
+        },
+        None,
+    )
+    .expect("build protected asset");
+    let text = format!("{}", Shown(&asset.report));
+    assert!(asset.report.budget_passed, "budget must pass:\n{text}");
+    assert!(asset.report.fidelity_passed, "fidelity must pass:\n{text}");
+    assert_eq!(asset.report.parts[0].holes, Some(1), "keyhole genus must stay 1:\n{text}");
+    assert_eq!(asset.report.features.len(), 2, "expected 2 feature reports:\n{text}");
+    assert!(asset.missed_highlights.is_empty(), "passing asset must have 0 missed highlights");
+    assert_eq!(asset.all_highlights.len(), 2, "all_highlights should include both passing outlines");
+    assert!(text.contains("FEATURES") && text.contains("keyhole_top") && text.contains("mating_45"));
+
+    // 2) Intentionally over-tight/starved target misses tolerance and auto-highlights in preview!
+    let strict = [PartFeature::new(
+        "panel",
+        FeatureTarget::new(FeatureTargetOpts {
+            name: "keyhole_impossible",
+            kind: FeatureKind::Keyhole,
+            region: kh_region,
+            max_error: Some(Length::mm(0.01)),
+            max_normal_error: Some(Angle::degrees(1.0)),
+            protect: FeatureProtect::Critical,
+            ..
+        }),
+    )];
+    let missed = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts {
+            alloc: heap(),
+            scratch: heap(),
+            preset: AssetPreset::Environment,
+            total_budget: Some(TriangleBudget(140)),
+            features: &strict,
+            ..
+        },
+        None,
+    )
+    .expect("build missed asset");
+    assert!(!missed.report.fidelity_passed, "impossible target must fail fidelity");
+    assert_eq!(missed.missed_highlights.len(), 1, "missed feature must populate missed_highlights");
+
+    let view = View {
+        eye: mm3(0.0, -420.0, 80.0),
+        target: mm3(0.0, 0.0, 80.0),
+        projection: Projection::Orthographic { height: Length::mm(120.0) },
+        width: 48,
+        height: 48,
+        ..
+    };
+    let auto_pic = missed
+        .preview(STEEL_ONLY, view, MeshPictureOpts { alloc: heap(), scratch: heap(), .. })
+        .expect("auto highlighted preview");
+    let plain_pic = picture_mesh(
+        missed.parts[0].mesh.view(),
+        STEEL_ONLY,
+        view,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), .. },
+    )
+    .expect("plain mesh preview");
+    assert_ne!(
+        auto_pic.pixels[..],
+        plain_pic.pixels[..],
+        "auto-highlighted export preview must visibly highlight the missed feature"
+    );
 }
