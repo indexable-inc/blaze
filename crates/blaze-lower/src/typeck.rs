@@ -1192,6 +1192,7 @@ impl Conv<'_, '_, '_, '_, '_> {
                 }
                 tc::Expr::Struct { path, fields: List { start, len: fields.len }, base }
             }
+            Expr::Record { .. } => return self.refuse("a structural record literal", r),
             Expr::Index { base, index } => tc::Expr::Index { base, index },
             Expr::Closure { row } => {
                 let c = Closure::decode(self.v.row(row)?)?;
@@ -1327,6 +1328,7 @@ impl Conv<'_, '_, '_, '_, '_> {
                 }
                 tc::Pat::Struct { path, fields: List { start, len: fields.len }, rest }
             }
+            Pat::Record { .. } => return self.refuse("a structural record pattern", r),
             Pat::Or { alts } => tc::Pat::Or { alts: self.pats(alts)? },
             Pat::Slice { elems, rest } => tc::Pat::Slice { elems: self.pats(elems)?, rest },
             Pat::Box(_) => return self.refuse("a box pattern", r),

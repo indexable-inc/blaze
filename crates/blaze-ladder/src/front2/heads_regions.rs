@@ -1477,6 +1477,11 @@ fn named_in_bounds((v, scope, alloc): (&View<'_>, &Scope, Mem), bounds: lf::List
                 lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::Slice(inner) => todo.push(Work::Ty(inner, in_fn)),
                 lf::TypeRef::Array { elem, .. } => todo.push(Work::Ty(elem, in_fn)),
                 lf::TypeRef::Pat { base, .. } => todo.push(Work::Ty(base, in_fn)),
+                lf::TypeRef::Record(fields) => {
+                    for &n in read(v.rows(fields), "a record's fields")? {
+                        todo.push(Work::Ty(read(lf::Field::decode(n), "a record's field")?.ty, in_fn));
+                    }
+                }
                 lf::TypeRef::Tuple(l) => {
                     for &id in read(v.ids(l), "a tuple's elements")? {
                         todo.push(Work::Ty(lf::TypeId(id), in_fn));

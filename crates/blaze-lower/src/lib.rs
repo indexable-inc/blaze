@@ -713,6 +713,51 @@ fn input_columns<'a>(lexed: &parser::LexedStr<'_>, pe: parser::Edition, alloc: A
     (words, ranges)
 }
 
+/// Lowers one item's signature with the given Blaze syntax [`parser::Extensions`] enabled
+/// (e.g. `Extensions::UNIQ.with(Extensions::RECORDS)` for `#![blaze::uniq]` and `#![blaze::records]`).
+pub fn lower_signature_with_extensions<'a, 't>(
+    text: &'t str,
+    edition: Edition,
+    extensions: parser::Extensions,
+    cfg: &mut dyn Cfg,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
+    if extensions.is_none() {
+        return lower_signature(text, edition, cfg, alloc);
+    }
+    let pe = parser_edition(edition);
+    let lexed = parser::LexedStr::new(pe, text);
+    let mut input = lexed.to_input(pe);
+    input.mark_extensions(0, extensions);
+    let output = parser::Reparser::top_level_item().parse_outline(input.tokens());
+    let mut m = machine::Machine::new(text, Mode::Signature, edition, cfg, None, alloc);
+    feed::feed(&mut m, &lexed, &output, 0);
+    m.finish()
+}
+
+/// Lowers one item's body with the given Blaze syntax [`parser::Extensions`] enabled
+/// (e.g. `Extensions::UNIQ.with(Extensions::RECORDS)`).
+pub fn lower_body_with_extensions<'a, 't>(
+    text: &'t str,
+    edition: Edition,
+    extensions: parser::Extensions,
+    cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
+    if extensions.is_none() {
+        return lower_body(text, edition, cfg, values, alloc);
+    }
+    let pe = parser_edition(edition);
+    let lexed = parser::LexedStr::new(pe, text);
+    let mut input = lexed.to_input(pe);
+    input.mark_extensions(0, extensions);
+    let output = parser::Reparser::top_level_item().parse(input.tokens());
+    let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
+    feed::feed(&mut m, &lexed, &output, 0);
+    m.finish()
+}
+
 /// [`lower_signature`] as it was: the whole text lexed ([`parser::LexedStr::new`]), every body
 /// token in the input, and the feed walking the lexer's tokens. The reference the outline
 /// lexer's lowering is compared with, byte for byte.

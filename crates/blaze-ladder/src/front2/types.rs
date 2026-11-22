@@ -1879,6 +1879,11 @@ pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Gl
         // A signature's type macro is expanded from its own text ([`super::pattern_ty`]).
         lf::TypeRef::Macro(_) => {}
         lf::TypeRef::Pat { base, .. } => out.push(base),
+        lf::TypeRef::Record(fields) => {
+            for &n in v.rows(fields)? {
+                out.push(lf::Field::decode(n)?.ty);
+            }
+        }
         lf::TypeRef::For { binder, inner } => {
             super::preds::lifetimes_only(v, binder, r)?;
             out.push(inner);

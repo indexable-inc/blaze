@@ -646,6 +646,7 @@ fn new_rules_are_off_until_named() {
         Rule::LockWithoutReason,
         Rule::DoubleIndirectionArc,
         Rule::RawSandboxExec,
+        Rule::MutRef,
     ] {
         assert!(!Step::Strict.rules().runs(rule), "{} runs in strict", rule.name());
         assert!(Step::Strict.rules().with(rule).runs(rule));
@@ -1120,10 +1121,14 @@ fn rule_trie_equals_a_scan_per_sequence() {
 
 /// The fixes of `text`'s findings applied.
 fn fixed(text: &str) -> StdString {
+    fixed_rules(&RuleSet::ALL, text)
+}
+
+fn fixed_rules(rules: &RuleSet, text: &str) -> StdString {
     let alloc = blaze_own::testing::heap().alloc();
     let mut out = Findings::new_in(alloc);
     let unit = Unit { text, holes: &[], scope: FILE };
-    assert!(lint(&RuleSet::ALL, &unit, alloc, &mut out).is_ok());
+    assert!(lint(rules, &unit, alloc, &mut out).is_ok());
     match apply_all(text, &out, alloc) {
         Ok(new) => new.as_str().to_string(),
         Err(error) => panic!("fixes refused on {text:?}: {error:?}"),
@@ -1133,14 +1138,17 @@ fn fixed(text: &str) -> StdString {
 #[test]
 fn renamed() {
     let rule = Rule::Renamed;
+    let only = RuleSet::only(&[rule]);
     let typed = "fn f(al: A) {\n    let mut v: AVec<'_, u8> = AVec::new_in(al);\n    v.insert(0, 1);\n}";
     assert_eq!(kinds(rule, typed), ["fixed"]);
     assert_eq!(fixed(typed), "fn f(al: A) {\n    let mut v: AVec<'_, u8> = AVec::new_in(al);\n    v.insert_shift(0, 1);\n}");
     let param = "fn f(v: &mut AVec<'_, u8>) -> bool {\n    v.contains(&1)\n}";
-    assert_eq!(fixed(param), "fn f(v: &mut AVec<'_, u8>) -> bool {\n    v.scan_for(&1).is_some()\n}");
+    assert_eq!(fixed_rules(&only, param), "fn f(v: &mut AVec<'_, u8>) -> bool {\n    v.scan_for(&1).is_some()\n}");
+    assert_eq!(fixed(param), "fn f(v: &uniq AVec<'_, u8>) -> bool {\n    v.scan_for(&1).is_some()\n}");
     let init = "fn f(al: A) {\n    let mut d = ADeque::new_in(al);\n    d.remove(0);\n}";
     assert_eq!(fixed(init), "fn f(al: A) {\n    let mut d = ADeque::new_in(al);\n    d.remove_shift(0);\n}");
-    assert_eq!(fixed("fn f() { AVec::swap_remove(&mut v, 0); }"), "fn f() { AVec::remove_swap(&mut v, 0); }");
+    assert_eq!(fixed_rules(&only, "fn f() { AVec::swap_remove(&mut v, 0); }"), "fn f() { AVec::remove_swap(&mut v, 0); }");
+    assert_eq!(fixed("fn f() { AVec::swap_remove(&mut v, 0); }"), "fn f() { AVec::remove_swap(&uniq v, 0); }");
     assert_eq!(kinds(rule, "fn f(x: &mut X) {\n    x.insert_many(0, &[1]);\n}"), ["for-a-person"]);
     none(rule, &[
         "fn f(m: &mut HashMap<u8, u8>) {\n    m.insert(1, 2);\n}",
@@ -2082,5 +2090,78 @@ fn raw_sandbox_exec() {
         "fn f() {\n    // /usr/bin/sandbox-exec\n    /* sandbox-exec */\n}",
         "#[test]\nfn t() { Command::new(\"/usr/bin/sandbox-exec\"); }",
         "#[cfg(test)]\nmod t {\n    const S: &str = \"sandbox-exec\";\n}",
+    ]);
+}
+
+#[test]
+fn mut_ref_deprecated_with_autofix() {
+    let rule = Rule::MutRef;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("mut-ref"), Some(rule));
+    assert_eq!(Rule::from_lint("mut_ref"), Some(rule));
+    assert_eq!(Template::MutRef.rule(), rule);
+    assert_eq!(Template::RefMut.rule(), rule);
+    assert!(Step::Edition.rules().runs(rule), "Step::Edition runs mut-ref deprecation");
+    assert!(!Step::Rust.rules().runs(rule));
+
+    // RootMarks turns on mut-ref via `#![blaze::uniq]` or `#![deny(blaze::mut_ref)]`.
+    let uniq_marks = RootMarks::read("#![blaze::uniq]\nfn f() {}");
+    assert!(uniq_marks.uniq);
+    assert!(uniq_marks.rules(Step::Rust.rules()).runs(rule));
+    assert_ne!(uniq_marks.key(), RootMarks::NONE.key());
+
+    let deny_marks = RootMarks::read("#![deny(blaze::mut_ref)]\nfn f() {}");
+    assert!(deny_marks.denies(rule));
+    assert!(deny_marks.rules(Step::Rust.rules()).runs(rule));
+    assert_eq!(deny_marks.levels(Step::Rust.levels()).of(rule), Level::Error);
+
+    // Detection across `&mut`, `&'a mut`, `&&mut`, and `ref mut`.
+    let src = "fn obj_row<'a>(&'a mut self, ui: &mut UiWorld, x: &&mut i32) { let mut n = 0; let r = &mut n; let ref mut y = n; let &mut z = r; }";
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    assert!(lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    let matched: StdVec<(&str, &str)> =
+        out.list.iter().map(|f| (f.template.kind(), f.range.of(src))).collect();
+    assert_eq!(
+        matched,
+        [
+            ("mut-ref", "&'a mut"),
+            ("mut-ref", "&mut"),
+            ("mut-ref", "&mut"),
+            ("mut-ref", "&mut"),
+            ("ref-mut", "ref mut"),
+            ("mut-ref", "&mut"),
+        ]
+    );
+
+    // Mechanical auto-fix converts every `&mut` / `ref mut` to `&uniq` / `ref uniq`,
+    // leaving `let mut n = 0;` untouched.
+    let fixed = apply_all(src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(
+        fixed.as_str(),
+        "fn obj_row<'a>(&'a uniq self, ui: &uniq UiWorld, x: &&uniq i32) { let mut n = 0; let r = &uniq n; let ref uniq y = n; let &uniq z = r; }"
+    );
+
+    // Re-linting the fixed output produces zero findings!
+    out.clear();
+    assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert!(out.list.is_empty(), "fixed code must have zero mut-ref findings");
+
+    // Deprecation message mentions `&uniq`.
+    out.clear();
+    let msg_src = "fn f(x: &mut i32) {}";
+    assert!(lint(&only, &Unit { text: msg_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    let mut msg = OwnString::new_in(alloc);
+    show_message(&only, msg_src, &out, &out.list[0], &mut msg);
+    assert!(msg.as_str().contains("deprecated") && msg.as_str().contains("&uniq"), "{}", msg.as_str());
+
+    // Negative controls: `let mut`, `*mut`, `&raw mut`, `mut` bindings, raw idents, strings, comments.
+    none(rule, &[
+        "fn f(mut x: i32) { let mut y = x; y += 1; }",
+        "fn f(p: *mut u8) -> *mut u8 { p }",
+        "fn f(mut x: i32) { let _ = &raw mut x; }",
+        "fn f(ui: &uniq UiWorld) { let ref uniq y = *ui; }",
+        "fn f() { let s = \"&mut ref mut\"; /* &mut */ // ref mut\n }",
+        "fn f(r#mut: i32) { let _ = &r#mut; }",
     ]);
 }

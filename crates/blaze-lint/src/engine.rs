@@ -14,8 +14,9 @@ use crate::matcher::{DEAD, Live, NO_SEQ};
 use crate::sequences::{
     ArgOf, BANG, BAR, BRACE, CLOSE, Cut, DOT, DOTDOT, Guard, LT, MAX_WORD_LEN, MIN_WORD_LEN, NE, NO_WORD, OPEN, OTHER,
     SEP, SEQS, TRIE, W_ALLOC, W_ARC, W_AS, W_BLOCK_ON, W_CLONE, W_EXPECT, W_EXTERN, W_FILE, W_FN, W_FOR, W_GLOBAL,
-    W_IMPL, W_INSTANT, W_JOIN, W_LIBC, W_LOCK, W_MOD, W_ORDERING, W_RECV, W_RUSTIX, W_SELF, W_SEQCST, W_STD, W_STRING,
-    W_SYSTEM_TIME, W_THREAD_LOCAL, W_TRAIT, W_TYPE, W_UNSAFE, W_UNWRAP, W_USE, W_VEC, W_WAIT, WC_COLLECTION,
+    W_IMPL, W_INSTANT, W_JOIN, W_LIBC, W_LOCK, W_MOD, W_MUT, W_ORDERING, W_RECV, W_REF, W_RUSTIX, W_SELF, W_SEQCST,
+    W_STD, W_STRING, W_SYSTEM_TIME, W_THREAD_LOCAL, W_TRAIT, W_TYPE, W_UNSAFE, W_UNWRAP, W_USE, W_VEC, W_WAIT,
+    WC_COLLECTION,
     WC_DEFINING, WC_DISPATCHED, WC_IO_MODULE, WC_IO_TYPE, WC_LOCK_TYPE, WC_PRINT_MACRO, WC_RENAME, WC_SANS_IO,
     WC_STATIC, WORD, WORD_CLASS, WORD_FIRST_BY_LEN,
 };
@@ -103,6 +104,8 @@ enum Plan {
     Rename { row: u32, name: Span, after: u32 },
     /// These four tokens deleted, each a whole token (`dbg`, `!`, `(`, `)` around a value).
     Strip { tokens: [Span; 4] },
+    /// Replace one token span with fixed text (e.g. `mut` -> `uniq` in `&mut` / `ref mut`).
+    Replace { range: Span, text: &'static str },
 }
 
 /// A finding before test code is known.
@@ -155,9 +158,9 @@ pub(crate) const FORMAT_MACROS: [&str; 8] =
     ["format", "format_args", "write", "writeln", "print", "println", "eprint", "eprintln"];
 /// Every word [`Pass::on_word`] matches on by name: each must be in `sequences::WORDS`, which a
 /// compile-time check there holds, since a word not in the table is never dispatched.
-pub(crate) const DISPATCHED: [&str; 17] = [
+pub(crate) const DISPATCHED: [&str; 18] = [
     "use", "as", "clone", "Global", "fn", "type", "impl", "trait", "mod", "for", "self", "unwrap", "expect", "std",
-    "alloc", "unsafe", "Ordering",
+    "alloc", "unsafe", "Ordering", "ref",
 ];
 /// The words `process-static` starts at ([`Pass::process_static`]).
 pub(crate) const STATIC_WORDS: [&str; 2] = ["static", "thread_local"];
@@ -726,6 +729,12 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                     }
                 }
                 K::P(b'#') => self.attribute(i, t),
+                K::P(b'&') => {
+                    if self.rules.runs(Rule::MutRef) {
+                        self.cost.add(Rule::MutRef);
+                        self.mut_ref_amp(i, t);
+                    }
+                }
                 K::Ident => self.on_word(i, t),
                 K::Raw => self.defining = false,
                 K::Lit => {
@@ -893,6 +902,10 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                 W_ORDERING if rules.runs(Rule::SeqCstUnexplained) => {
                     self.cost.add(Rule::SeqCstUnexplained);
                     self.seqcst_word(i, t);
+                }
+                W_REF if rules.runs(Rule::MutRef) => {
+                    self.cost.add(Rule::MutRef);
+                    self.ref_mut_word(i, t);
                 }
                 _ => {}
             }
@@ -2921,6 +2934,45 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
         (last == k).then_some(owner)
     }
 
+    // ---- mut-ref (`&mut` / `ref mut` -> `&uniq` / `ref uniq`) ---------------------------
+
+    /// Flags `&mut` and `&'a mut` unique references (types, receivers, expressions, patterns)
+    /// and attaches a mechanical fix replacing `mut` with `uniq`. Ignores `&raw mut`, `*mut`,
+    /// `let mut`, and raw identifiers (`r#mut`).
+    fn mut_ref_amp(&mut self, i: usize, amp: Tok) {
+        let Some(next) = self.tok(i + 1) else { return };
+        let mut_tok = if next.k == K::Ident && next.word == W_MUT {
+            next
+        } else if next.k == K::Life
+            && let Some(after_life) = self.tok(i + 2)
+            && after_life.k == K::Ident
+            && after_life.word == W_MUT
+        {
+            after_life
+        } else {
+            return;
+        };
+        self.cands.push(Cand {
+            template: Template::MutRef,
+            range: Span::new(amp.start, mut_tok.end),
+            arg: None,
+            plan: Plan::Replace { range: Span::new(mut_tok.start, mut_tok.end), text: "uniq" },
+        });
+    }
+
+    /// Flags `ref mut` bindings and attaches a mechanical fix replacing `mut` with `uniq`.
+    fn ref_mut_word(&mut self, i: usize, ref_tok: Tok) {
+        let Some(next) = self.tok(i + 1) else { return };
+        if next.k == K::Ident && next.word == W_MUT {
+            self.cands.push(Cand {
+                template: Template::RefMut,
+                range: Span::new(ref_tok.start, next.end),
+                arg: None,
+                plan: Plan::Replace { range: Span::new(next.start, next.end), text: "uniq" },
+            });
+        }
+    }
+
     // ---- allocs' hatch ------------------------------------------------------------------
 
     /// allocs.rs's `keeps`: a line comment with `// alloc: <reason>`, the reason not empty.
@@ -2974,6 +3026,11 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                     for token in tokens {
                         out.push_edit(token, "")?;
                     }
+                    out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
+                }
+                Plan::Replace { range, text } => {
+                    let edits_from = count(out.edits.len())?;
+                    out.push_edit(range, text)?;
                     out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
                 }
             }

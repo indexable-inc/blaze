@@ -50,6 +50,8 @@ pub(crate) const WORDS: &[&str] = &[
     // Strengthened `ambient-hasher` and `ambient-heap`.
     "rustc_hash", "FxHashMap", "FxHashSet", "ahash", "AHashMap", "AHashSet", "foldhash", "pin", "into_boxed_slice",
     "into_boxed_str",
+    // `mut-ref` (`&mut` / `ref mut` -> `&uniq` / `ref uniq`).
+    "mut", "ref",
 ];
 
 blaze_phf::name_phf_table!(pub(crate) static WORD = WORDS;);
@@ -160,6 +162,8 @@ pub(crate) const W_INSTANT: u8 = word("Instant");
 pub(crate) const W_SYSTEM_TIME: u8 = word("SystemTime");
 pub(crate) const W_LIBC: u8 = word("libc");
 pub(crate) const W_RUSTIX: u8 = word("rustix");
+pub(crate) const W_MUT: u8 = word("mut");
+pub(crate) const W_REF: u8 = word("ref");
 
 const fn mark_all(table: &mut [u16; WORDS.len()], words: &[&str], bit: u16) {
     let mut at = 0;

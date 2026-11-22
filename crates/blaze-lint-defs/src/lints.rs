@@ -232,7 +232,7 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::unmarked_nonblocking", Allow, "detects a function the effects walk proves never blocks the thread that lacks `#[blaze::nonblocking]`, which callers could rely on")
         .externally_loaded(),
-    l("blaze::mut_ref", Allow, "detects a unique reference spelled `&mut` or `ref mut` in a crate that says `#![blaze::uniq]`, which spells it `&uniq` and `ref uniq`")
+    l("blaze::mut_ref", Allow, "deprecates unique references spelled `&mut` or `ref mut` in favor of `&uniq` and `ref uniq` (with mechanical auto-fix)")
         .externally_loaded(),
     l("blaze::undeclared_effect", Deny, "detects a function that may panic, allocate from the global heap, block the thread or not return (`diverge`), through any call, where its `#[blaze::expect(..)]`, its trait method's, the default of a module around it or `#![blaze::effects]` does not allow it; and an impl's method that lists an effect its trait's method does not; a list that is not one; and the deleted `#[blaze::may(..)]`, respelled `#[blaze::expect(..)]`")
         .externally_loaded(),

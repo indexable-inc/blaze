@@ -222,6 +222,12 @@ pub fn show_message<P: Put + ?Sized>(rules: &RuleSet, item: &str, findings: &Fin
         Template::RawSandboxExec => {
             out.str("raw ").str(range).str(" process spawn outside `bstd::procs::hermetic`: use `bstd::procs::hermetic::Hermetic` for cross-platform macOS Seatbelt and Linux Landlock/seccomp from one sans-IO `Plan`");
         }
+        Template::MutRef => {
+            out.str("`").str(range).str("` is deprecated in Blaze: spell unique references `&uniq`");
+        }
+        Template::RefMut => {
+            out.str("`").str(range).str("` is deprecated in Blaze: spell unique reference bindings `ref uniq`");
+        }
         Template::VariantCount | Template::VariantCountMany => {
             let names = || {
                 args.iter().filter_map(|arg| match arg {

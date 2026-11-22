@@ -267,6 +267,10 @@ pub mod type_set;
 pub mod union_ty;
 /// Zero-cost, `#![forbid(unsafe_code)]` View Types (`bstd::views!`, `ProjectView`, `DisjointSplit`).
 pub mod view;
+/// Structural Records (`{ a: T, b: U }`) and named-argument functions with defaults (`bstd::record_fn!`, `bstd::call!`).
+pub mod record_ty;
+/// Zero-copy shared Prefabs (`LocalShare` + `TypeSet!`) and reactive Templates with retractions.
+pub mod prefab;
 /// The native backend's reads of its host's facts.
 #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
 mod native;
