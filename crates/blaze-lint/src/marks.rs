@@ -28,7 +28,7 @@ pub struct RootMarks {
     /// `#![blaze::trust(unsafe, reason = "..")]`: the crate root explains why it uses `unsafe`.
     pub trust_unsafe: bool,
     /// The rules whose lint the file denies or forbids, as [`Rule::bit`]s.
-    denied: u32,
+    denied: u64,
 }
 
 impl RootMarks {
@@ -283,7 +283,7 @@ fn blaze_path<'t>(sig: &mut Peekable<Sig<'t>>) -> Option<&'t str> {
 
 /// `(blaze::a, blaze::b, other, reason = "..")` after a `deny` or `forbid`: the rules of the
 /// `blaze::` lints named, as bits; the list read up to and with its `)`.
-fn denied_list(sig: &mut Peekable<Sig<'_>>) -> u32 {
+fn denied_list(sig: &mut Peekable<Sig<'_>>) -> u64 {
     let mut bits = 0;
     let mut depth = 0usize;
     // Bounded: each turn takes one token of the text.

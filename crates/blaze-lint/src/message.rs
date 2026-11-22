@@ -189,6 +189,21 @@ pub fn show_message<P: Put + ?Sized>(rules: &RuleSet, item: &str, findings: &Fin
         Template::Transmute => {
             out.str("`").str(range).str("` reinterprets raw bits with only a size check: use ").str(instead());
         }
+        Template::BoolParam => {
+            out.str("`").str(span(0).unwrap_or(range)).str(": bool` in a public signature: use a two-variant enum or a `#[blaze::args]` options struct so call sites name the choice");
+        }
+        Template::SwappableParameters => {
+            out.str("`").str(range).str("` has adjacent `").str(span(0).unwrap_or("?"));
+            out.str("` parameters that can be silently transposed: wrap them in distinct newtypes or use a `#[blaze::args]` options struct");
+        }
+        Template::PrimitiveMeaning => {
+            out.str("`").str(range).str("` has bare `").str(span(0).unwrap_or("?"));
+            out.str("` carrying a unit or entity identity in its name: wrap it in a zero-cost newtype");
+        }
+        Template::AnonTupleReturn => {
+            out.str("`").str(range).str("` returns an anonymous tuple with unnamed state (`").str(span(0).unwrap_or("?"));
+            out.str("`): define a named struct so each field carries its meaning");
+        }
         Template::VariantCount | Template::VariantCountMany => {
             let names = || {
                 args.iter().filter_map(|arg| match arg {

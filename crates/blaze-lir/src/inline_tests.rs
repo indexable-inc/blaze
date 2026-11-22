@@ -473,3 +473,148 @@ fn fn_summary_and_guided_pgo_priority_and_external_refs() {
     let after2 = run_calls_in(out2.view(), id(1), &args, FUEL, &adapted, Global).expect("after2 runs");
     assert_eq!(after2, before2);
 }
+
+#[test]
+fn lto_bottom_up_scc_and_jit_tier_up() {
+    use blaze_own::Vec as OwnVec;
+    use crate::{
+        inline::InlinePolicy,
+        lto::{ModuleBody, advise_jit_tier_up, lto_optimize_module, tarjan_sccs},
+        pgo::{BodyWeight, PgoSiteTable, SiteEntry},
+    };
+
+    // 1. Tarjan SCC: 0 -> 1 -> {2 <-> 3}. Callee SCC {2, 3} comes first, then {1}, then {0}.
+    let adj_offsets = [0u32, 1, 2, 3, 4];
+    let adj = [1u32, 2, 3, 2];
+    let sccs = tarjan_sccs(4, &adj_offsets, &adj, Global);
+    assert_eq!(sccs.len(), 3);
+    assert_eq!(sccs.component(0), &[2, 3]);
+    assert_eq!(sccs.component(1), &[1]);
+    assert_eq!(sccs.component(2), &[0]);
+
+    // 2. End-to-end 3-function chain `main (id 1) -> mid (id 2) -> leaf (id 3)` with PGO weights:
+    // leaf(x, y) = (x + y) * 3; mid(x, y) = leaf(x, y) + 7; main(x, y) = mid(x, y) ^ y.
+    let leaf = build(false, |b, _sig, x, y| {
+        let sum = b.binary(Op::Add, Flags::NONE, x, y);
+        let three = b.iconst(Ty::I64, 3);
+        b.binary(Op::Mul, Flags::NONE, sum, three)
+    })
+    .expect("leaf");
+    let mid = build(false, |b, sig, x, y| {
+        let r = b.reference(RefKind::Func, 0);
+        let v = b.call(Flags::NONE, r, sig, &[x, y]);
+        let seven = b.iconst(Ty::I64, 7);
+        b.binary(Op::Add, Flags::NONE, v, seven)
+    })
+    .expect("mid");
+    let main_fn = build(false, |b, sig, x, y| {
+        let r = b.reference(RefKind::Func, 0);
+        let v = b.call(Flags::NONE, r, sig, &[x, y]);
+        b.binary(Op::Xor, Flags::NONE, v, y)
+    })
+    .expect("main");
+
+    // Also include a hot looping function `hot_loop (id 4)` to test JIT tier-up priority.
+    let hot_loop = build(false, |b, _sig, x, y| counted_loop(b, Op::Add, x, y, 8)).expect("loop");
+
+    // Baseline evaluation before LTO.
+    let ref_bank = Bank {
+        bodies: vec![
+            (id(1), build(false, |b, sig, x, y| {
+                let r = b.reference(RefKind::Func, 0);
+                let v = b.call(Flags::NONE, r, sig, &[x, y]);
+                b.binary(Op::Xor, Flags::NONE, v, y)
+            }).unwrap()),
+            (id(2), build(false, |b, sig, x, y| {
+                let r = b.reference(RefKind::Func, 0);
+                let v = b.call(Flags::NONE, r, sig, &[x, y]);
+                let seven = b.iconst(Ty::I64, 7);
+                b.binary(Op::Add, Flags::NONE, v, seven)
+            }).unwrap()),
+            (id(3), build(false, |b, _sig, x, y| {
+                let sum = b.binary(Op::Add, Flags::NONE, x, y);
+                let three = b.iconst(Ty::I64, 3);
+                b.binary(Op::Mul, Flags::NONE, sum, three)
+            }).unwrap()),
+            (id(4), build(false, |b, _sig, x, y| counted_loop(b, Op::Add, x, y, 8)).unwrap()),
+        ],
+        links: vec![(id(1), RefId(0), id(2)), (id(2), RefId(0), id(3))],
+    };
+
+    let main_call = (0..main_fn.view().len()).find(|&i| main_fn.view().op(i) == Op::Call).unwrap() as u32;
+    let mid_call = (0..mid.view().len()).find(|&i| mid.view().op(i) == Op::Call).unwrap() as u32;
+    let pgo = PgoSiteTable::new_in(
+        &[
+            SiteEntry { caller: id(1), site_inst: main_call, weight: 500 },
+            SiteEntry { caller: id(2), site_inst: mid_call, weight: 500 },
+        ],
+        &[
+            BodyWeight { body: id(1), weight: 500 },
+            BodyWeight { body: id(4), weight: 300 },
+            BodyWeight { body: id(3), weight: 5 },
+        ],
+        1,
+        Global,
+    );
+
+    let mut module = OwnVec::new_in(Global);
+    module.push(ModuleBody { id: id(1), func: main_fn });
+    module.push(ModuleBody { id: id(2), func: mid });
+    module.push(ModuleBody { id: id(3), func: leaf });
+    module.push(ModuleBody { id: id(4), func: hot_loop });
+
+    let lto = lto_optimize_module(module, &ref_bank, &pgo, InlinePolicy::default(), Global)
+        .expect("lto succeeds");
+    assert_eq!(lto.scc_count, 4);
+    assert!(lto.total_inlined_bodies >= 2, "expected leaf->mid and mid->main inlining");
+
+    // Verify optimized `main` has 0 remaining calls and evaluates bit-identically across inputs!
+    let opt_main = &lto.bodies[0];
+    assert!(verify(opt_main.func.view()).is_ok());
+    assert_eq!(calls_left(opt_main.func.view()), 0, "main should have collapsed all calls bottom-up");
+    assert!(opt_main.summary_changed);
+
+    for (a, b) in [(0u128, 0u128), (5, 3), (17, 42), (1000, 999), (u64::MAX as u128, 7)] {
+        let args = [Val::Int(a), Val::Int(b)];
+        let expected = run_calls_in(ref_bank.bodies[0].1.view(), id(1), &args, FUEL, &ref_bank, Global)
+            .expect("baseline runs");
+        let got = run_in(opt_main.func.view(), &args, FUEL, Global).expect("opt main runs");
+        assert_eq!(returned(got), returned(expected), "mismatch for ({a}, {b})");
+    }
+
+    // 3. JIT tier-up planner: `hot_loop` (weight 300 * 4x loop boost = 1200) ranks above `main` (500)
+    // and `mid` (500 via call-site sum), while `leaf` (weight 5 < threshold 100) is excluded.
+    let tier_up = advise_jit_tier_up(&lto.bodies, &pgo, 100, Global);
+    assert_eq!(tier_up.len(), 3);
+    assert_eq!(tier_up[0].body, id(4));
+    assert!(tier_up[0].has_loops);
+    assert_eq!(tier_up[0].priority, 1200);
+    assert_eq!(tier_up[1].priority, 500);
+    assert_eq!(tier_up[2].priority, 500);
+    assert!(!tier_up.iter().any(|c| c.body == id(3)), "cold leaf must be excluded");
+
+    // 4. Cross-run BPG1 encode/decode round-trip + corruption refusal + exponential decay + static cold-start estimate.
+    let mut encoded = pgo.encode(Global);
+    let decoded = PgoSiteTable::decode(&encoded, Global).expect("valid BPG1 decodes");
+    assert_eq!(decoded.site_entries(), pgo.site_entries());
+    assert_eq!(decoded.body_entries(), pgo.body_entries());
+    assert_eq!(decoded.tier_of(id(1)), crate::pgo::PgoTier::Hot);
+    assert_eq!(decoded.tier_of(id(3)), crate::pgo::PgoTier::Warm);
+    assert_eq!(decoded.tier_of(id(99)), crate::pgo::PgoTier::Cold);
+    // Single-bit corruption is refused by BLAKE3 digest check.
+    encoded[10] ^= 0x01;
+    assert_eq!(PgoSiteTable::decode(&encoded, Global).err(), Some(crate::pgo::PgoRecordError::BadDigest));
+
+    // Decayed cross-run merge: 50% of old (500 -> 250) + fresh (100) = 350.
+    let fresh = PgoSiteTable::new_in(&[], &[BodyWeight { body: id(1), weight: 100 }], 1, Global);
+    let merged = pgo.merge_decayed(&fresh, 1, 2, Global);
+    assert_eq!(merged.body_weight(id(1)), 350);
+
+    // Cold-start static estimate assigns higher weight to looping bodies than straight-line bodies.
+    let mut est_mod = OwnVec::new_in(Global);
+    est_mod.push(ModuleBody { id: id(10), func: build(false, |b, _sig, x, y| b.binary(Op::Add, Flags::NONE, x, y)).unwrap() });
+    est_mod.push(ModuleBody { id: id(11), func: build(false, |b, _sig, x, y| counted_loop(b, Op::Add, x, y, 4)).unwrap() });
+    let est = PgoSiteTable::estimate_static(&est_mod, Global);
+    assert!(est.body_weight(id(11)) > est.body_weight(id(10)));
+    assert_eq!(est.tier_of(id(11)), crate::pgo::PgoTier::Hot);
+}

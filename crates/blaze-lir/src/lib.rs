@@ -71,9 +71,13 @@ pub mod inline;
 /// compiler_builtins calls, in front of the Reference and Fast tiers only.
 pub mod legalize;
 pub mod loop_entry;
+/// Cross-function bottom-up Tarjan SCC ThinLTO and JIT tier-up planning.
+pub mod lto;
 pub mod op;
 pub mod parse;
 pub mod persist;
+/// PGO site and body weight tables for guided inlining, LTO, and JIT tier-up.
+pub mod pgo;
 pub mod print;
 /// The linear simplify stage in front of the Fast tier (backend-next.md D100 point 1): scalar
 /// replacement of slots that do not escape, then (S2) propagation and dead code.

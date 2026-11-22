@@ -1716,3 +1716,140 @@ fn sota_new_rules_and_wired_lints() {
     assert!(!kinds(Rule::AmbientHeap, "fn f() { let _ = BTreeMap::new(); }").is_empty());
     assert!(!kinds(Rule::AmbientHeap, "fn f() { let _ = VecDeque::new(); }").is_empty());
 }
+
+#[test]
+fn newtype_discipline_rules() {
+    for (rule, name) in [
+        (Rule::BoolParam, "bool_param"),
+        (Rule::SwappableParameters, "swappable_parameters"),
+        (Rule::PrimitiveMeaning, "primitive_meaning"),
+    ] {
+        assert_eq!(rule.lint(), Some(name));
+        let root = format!("#![deny(blaze::{name})]\n");
+        assert!(RootMarks::read(&root).denies(rule));
+    }
+
+    // BoolParam: catches `pub fn` bool flags, ignores private fns and trivial `set_*` setters.
+    assert_eq!(kinds(Rule::BoolParam, "pub fn open(path: &Path, create: bool) {}"), vec!["bool-param"]);
+    assert!(kinds(Rule::BoolParam, "fn helper(create: bool) {}").is_empty());
+    assert!(kinds(Rule::BoolParam, "pub fn set_enabled(&mut self, enabled: bool) {}").is_empty());
+
+    // SwappableParameters: catches adjacent same-primitive params, ignores symmetric `(x, y)` / `(min, max)`.
+    assert_eq!(
+        kinds(Rule::SwappableParameters, "pub fn connect(host: &str, user: &str) {}"),
+        vec!["swappable-parameters"]
+    );
+    assert_eq!(
+        kinds(Rule::SwappableParameters, "pub fn copy_range(src: u32, dst: u32) {}"),
+        vec!["swappable-parameters"]
+    );
+    assert!(kinds(Rule::SwappableParameters, "pub fn point(x: f32, y: f32, z: f32) {}").is_empty());
+    assert!(kinds(Rule::SwappableParameters, "pub fn clamp(min: u64, max: u64) {}").is_empty());
+    assert!(kinds(Rule::SwappableParameters, "pub fn typed(src: SrcId, dst: DstId) {}").is_empty());
+
+    // PrimitiveMeaning: catches bare numeric unit/ID params, ignores newtypes and generic counts.
+    assert_eq!(
+        kinds(Rule::PrimitiveMeaning, "pub fn wait_for(timeout_ms: u64, node_id: u32) {}"),
+        vec!["primitive-meaning", "primitive-meaning"]
+    );
+    assert_eq!(
+        kinds(Rule::PrimitiveMeaning, "pub fn bind(port: u16) {}"),
+        vec!["primitive-meaning"]
+    );
+    assert!(kinds(Rule::PrimitiveMeaning, "pub fn wait_for(timeout: Duration, node: NodeId) {}").is_empty());
+    assert!(kinds(Rule::PrimitiveMeaning, "pub fn reserve(count: usize) {}").is_empty());
+
+    // AnonTupleReturn: denies `(Option<T>, bool)`, `(T, bool)`, `Option<(A, B, C)>`, `Result<(T, bool), E>`,
+    // while allowing `()`, `(u32, u32)`, and named structs.
+    assert_eq!(Rule::AnonTupleReturn.lint(), Some("anon_tuple_return"));
+    assert!(RootMarks::read("#![deny(blaze::anon_tuple_return)]\n").denies(Rule::AnonTupleReturn));
+    assert_eq!(
+        kinds(Rule::AnonTupleReturn, "fn classify(s: &str) -> (Option<PrimKind>, bool) { todo!() }"),
+        vec!["anon-tuple-return"]
+    );
+    assert_eq!(
+        kinds(Rule::AnonTupleReturn, "fn parse(x: usize) -> Option<(Span, Span, Option<PrimKind>, bool)> { None }"),
+        vec!["anon-tuple-return"]
+    );
+    assert_eq!(
+        kinds(Rule::AnonTupleReturn, "pub fn step() -> Result<(u32, bool), Err> { todo!() }"),
+        vec!["anon-tuple-return"]
+    );
+    assert_eq!(
+        kinds(Rule::AnonTupleReturn, "fn triple() -> (u32, u32, u32) { (1, 2, 3) }"),
+        vec!["anon-tuple-return"]
+    );
+    assert!(kinds(Rule::AnonTupleReturn, "fn ok() -> () {}").is_empty());
+    assert!(kinds(Rule::AnonTupleReturn, "fn pair() -> (u32, u32) { (1, 2) }").is_empty());
+    assert!(kinds(Rule::AnonTupleReturn, "fn named() -> PrimClass { todo!() }").is_empty());
+}
+
+#[test]
+fn profile_guided_linting_and_advisor() {
+    use blaze_own::Alloc;
+    use crate::Levels;
+    use crate::pgo::{
+        AdviceKind, EffectiveLevel, FnSpan, Heat, HotSite, PgoHints, PgoPolicy, rank_findings,
+        suggest_from_pgo,
+    };
+
+    let src = concat!(
+        "fn cold_fn() { let _ = x.clone(); }\n",
+        "fn hot_fn() {\n",
+        "    let v = Vec::new();\n",
+        "    for _ in 0..10 { map.clear(); }\n",
+        "    let _ = slice.binary_search(&k);\n",
+        "    let _ = y.clone();\n",
+        "}\n",
+        "struct Bad { count: AtomicU64 }\n",
+        "struct Good { count: CachePadded<AtomicU64> }\n",
+    );
+
+    let cold_start = src.find("fn cold_fn").unwrap() as u32;
+    let hot_start = src.find("fn hot_fn").unwrap() as u32;
+    let struct_start = src.find("struct Bad").unwrap() as u32;
+    let fn_spans = [
+        FnSpan::for_symbol(Span::new(cold_start, hot_start), "cold_fn"),
+        FnSpan::for_symbol(Span::new(hot_start, struct_start), "hot_fn"),
+    ];
+    let hints = PgoHints::from_sites(
+        &[
+            HotSite::for_symbol("hot_fn", 90_000, 90_000),
+            HotSite::for_symbol("cold_fn", 10, 100),
+        ],
+        Alloc::global(),
+    );
+
+    let rules = RuleSet::only(&[Rule::Clones]);
+    let mut findings = Findings::new_in(Alloc::global());
+    lint(&rules, &Unit { text: src, holes: &[], scope: FILE }, Alloc::global(), &mut findings).unwrap();
+    assert_eq!(findings.list.len(), 2);
+
+    // Default policy: hot_fn's clone is promoted to Error and ranked first; cold_fn stays Advice.
+    let ranked = rank_findings(&findings, &Levels::ADVICE, &fn_spans, &hints, PgoPolicy::DEFAULT, Alloc::global());
+    assert_eq!(ranked.len(), 2);
+    assert_eq!(ranked[0].heat, Heat::Critical);
+    assert_eq!(ranked[0].level, EffectiveLevel::Error);
+    assert_eq!(ranked[1].heat, Heat::Cold);
+    assert_eq!(ranked[1].level, EffectiveLevel::Advice);
+
+    // HOT_ONLY policy suppresses cold perf noise while keeping hot errors.
+    let hot_only = rank_findings(&findings, &Levels::ADVICE, &fn_spans, &hints, PgoPolicy::HOT_ONLY, Alloc::global());
+    assert_eq!(hot_only.len(), 1);
+    assert_eq!(hot_only[0].heat, Heat::Critical);
+
+    // PGO-guided advisor fires on hot Vec::new, loop .clear(), .binary_search, and bare AtomicU64 —
+    // and does NOT fire on CachePadded<AtomicU64>.
+    let advice = suggest_from_pgo(src, &fn_spans, &hints, Heat::Hot, Alloc::global());
+    let mut kinds_found: StdVec<AdviceKind> = advice.iter().map(|a| a.kind).collect();
+    kinds_found.sort();
+    assert_eq!(
+        kinds_found,
+        vec![
+            AdviceKind::UseGenMapForHotClear,
+            AdviceKind::UseSmallVecForHotLocal,
+            AdviceKind::UseCachePadded,
+            AdviceKind::UseInterpSearch,
+        ]
+    );
+}

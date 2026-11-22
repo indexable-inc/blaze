@@ -153,6 +153,18 @@ if the answer is "it might have changed", find the key, stamp or proof that says
 skip on that. Count checks and recomputes per kind per request in the profile; a second of one thing
 in one snapshot is an invariant the simulation's oracle checks.
 
+## pgo-by-default (rule 86)
+
+Performance telemetry closes the loop automatically: seed cold runs with static loop/cold estimates
+(`PgoSiteTable::estimate_static`), persist exponentially decayed cross-run `BPG1` profiles across
+reboots and worktrees (`PgoSiteTable::merge_decayed`), key JIT code records by PGO tier for
+zero-warmup reuse, feed persisted PGO into bottom-up SCC LTO (`blaze-lir::lto`) and Profile-Guided
+Linting (`blaze-lint::pgo`), and consume persisted PGO by default in `blaze export`. Use
+`bstd::sync::CachePadded` (128B) for contended atomics and `bstd::mem::{SmallVec, GenMap, KindSet,
+interp_search_by_prefix}` on hot paths so one code path scales from Macs to 128-core servers.
+
+See [docs/v2/plan/design/auto-perf.md](../../../docs/v2/plan/design/auto-perf.md).
+
 <!-- End of the generated rules. Hand-written notes follow. -->
 
 ## The model

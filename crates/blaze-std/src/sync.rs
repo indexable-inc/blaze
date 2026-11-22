@@ -362,6 +362,54 @@ pub(crate) fn wait_ready<T, R>(
 
 pub use blaze_spin::SpinWait;
 
+/// Isolates `T` onto its own 128-byte cache-line pair across Apple Silicon (128B L1 lines),
+/// EPYC Zen 4/5, and Graviton 5 (adjacent-line spatial prefetchers), eliminating cross-core
+/// false sharing at 128 cores with a single portable type.
+#[repr(align(128))]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct CachePadded<T>(T);
+
+impl<T> CachePadded<T> {
+    #[inline]
+    pub const fn new(value: T) -> Self {
+        Self(value)
+    }
+
+    #[inline]
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T> core::ops::Deref for CachePadded<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> core::ops::DerefMut for CachePadded<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+impl<T> AsRef<T> for CachePadded<T> {
+    #[inline]
+    fn as_ref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> AsMut<T> for CachePadded<T> {
+    #[inline]
+    fn as_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 /// Reclamation at task ends: a value unlinked from a shared table is dropped once every thread
 /// that was in a task when it was unlinked has left that task (`blaze_reclaim`). Its epoch and
 /// slots are blaze-reclaim's own process-wide state, not bstd's; bstd holds none.

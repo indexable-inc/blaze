@@ -570,4 +570,7 @@ pub(super) const BLAZE: &[Lint] = &[
     // Raw std/third-party synchronization primitives, checked by blaze-lint's `raw-sync` rule.
     l("blaze::raw_sync", Allow, "detects raw synchronization primitives (`std::sync::{Mutex, RwLock, Condvar, Barrier}`, `parking_lot::{Mutex, RwLock, Condvar}`, `dashmap::DashMap`, `mpsc::{channel, sync_channel}`) where blaze's named locks or bounded channels belong")
         .externally_loaded(),
+    // Anonymous tuple return types with unnamed state (`(Option<T>, bool)`, `(A, B, C)`), checked by blaze-lint's `anon-tuple-return` rule.
+    l("blaze::anon_tuple_return", Allow, "detects a function returning an anonymous tuple carrying unnamed state (e.g. `(Option<T>, bool)`, `(T, bool)`, or 3+ elements) where a named struct should name each field")
+        .externally_loaded(),
 ];

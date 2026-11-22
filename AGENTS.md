@@ -28,10 +28,9 @@ time; cleanup that never blocks; disk use. Best on 128 cores, good on a typical 
 - A program runs from code records in its own process: compiled on first call, no link step.
 - A dependency is only its records and an item only its key; text for the crate compiled alone.
 - A check happens once and leaves a proof later code takes; a coarse proof covers all under it.
-- Records are shared by content: across a machine's checkouts, and std's arrive precomputed from R2.
-- Decide at run time: a hook, check or optimization is a version swapped into a slot.
-- A lint finding is a record too: errors before the answer, advice after, analyses in the
-  background.
+- Records share by content across checkouts; std's arrive precomputed from R2.
+- Decide at run time: hooks and opts swap into slots, guided by persisted PGO (`export` default).
+- Lint findings are records: errors before the answer, advice after, PGO-ranked in background.
 
 ## Scope
 
@@ -39,9 +38,8 @@ In scope:
 - Cargo workspaces. The acceptance projects are reth, tempo and blaze itself.
 - Hosts: macOS on arm64, and Linux (arm64 first; x86-64 is covered by CI).
 - A build runs when asked, and may leave a helper with an expiry that never builds on its own.
-- `run`, `test`, `check`; later `export` (a native file). No `build`. A run compiles what is called.
-- Dependencies and cached records are fully optimized; workspace code is built fast, then tiered up
-  in the background, the top tier optimizing across functions at function grain.
+- `run`, `test`, `check`; `export` (native, PGO by default). No `build`. Runs compile what's called.
+- Deps and cached records are fully optimized; workspace code tiers up via cross-fn LTO & PGO.
 - std's records (names, heads, code) are fetched per platform from R2, CI-written; yours stay local.
 - An old home after an upgrade is detected, reported and rebuilt; nothing is migrated.
 - blaze's own code is on bstd and our collections: no `std`, `alloc` or third-party crate.
@@ -115,6 +113,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 - **16. slow-is-p0-traced**: Anything slow or large is a P0 until the profile names it; the fix quotes before and after.
 - **60. incremental-first**: Judge by the edit loop first; trade: incremental and lints, remote, memory, cold, cleanup, disk.
 - **84. per-core-units**: Report throughput and latency in per-core units (`MB/s/core`, `ns/op/core`) and name core count.
+- **86. pgo-by-default**: Persist decayed cross-run PGO (`BPG1`) for JIT, LTO, PGL, and default `blaze export`; pad 128B.
 
 ### Evidence and debugging (skill `debugging`)
 - **17. ask-the-profile-first**: Say why a build was slow, reran or grew from its profile, before guessing or measuring.
@@ -139,6 +138,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 - **78. strategy-is-a-type-parameter**: A choice between strategies is a type parameter at one seam, each instantiation tested equal.
 - **79. interfaces-first**: A rewrite starts as one small crate of types and state machines that compiles and is simulated.
 - **83. options-struct**: One constructor a type, `new(Opts { .. })`: choices required, tunables defaulted; no `with_*` names.
+- **85. newtypes-and-named-returns**: Use newtypes, enums and named return structs instead of bare primitives or `(Option<T>, bool)`.
 
 ### Building, lanes and machines (skill `build-and-test`)
 - **2. blaze-builds-blaze**: Cargo is the dev-loop builder for now; blaze still builds itself and makes every verdict.

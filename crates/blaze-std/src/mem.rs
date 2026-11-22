@@ -54,6 +54,8 @@ pub use blaze_mem::{
     format_in, page_size,
 };
 pub use blaze_mem::Arena as RequestArena;
+pub mod fast;
+pub use fast::{GenMap, KindSet, SmallVec, interp_search_by_prefix};
 
 use alloc::vec::Vec;
 use crate::{Plant, Stopped, io::Io};

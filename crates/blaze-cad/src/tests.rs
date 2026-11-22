@@ -1003,3 +1003,33 @@ fn gyroid_booleans_and_picture_studio() {
         "Studio shading + 2x2 supersampling should differ from classic Lambertian"
     );
 }
+
+#[test]
+fn decimate_mesh_reduces_triangles_within_hausdorff_bound() {
+    let mut model = Model::new(ModelOpts { alloc: heap(), .. });
+    let s = model.graph().sphere(SphereOpts { radius: Length::mm(25.0), .. }).expect("sphere");
+    let (_, part) = model.add(PartOpts { solid: s, name: "ball", .. }).expect("add");
+    let meshed = mesh_part(
+        model.graph_ref(),
+        &part,
+        MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(0.3) },
+        None,
+    )
+    .expect("mesh");
+    let orig_tris = meshed.mesh.view().triangle_count();
+    let max_err = Length::mm(1.0);
+    let dec = decimate_mesh(
+        &meshed.verified(),
+        DecimatePartOpts {
+            target: Target::Error(max_err),
+            alloc: heap(),
+            scratch: heap(),
+            ..
+        },
+    )
+    .expect("decimate");
+    let dec_tris = dec.mesh.view().triangle_count();
+    assert!(dec.verified().is_some(), "decimated mesh keeps Verified proof");
+    assert!(dec_tris < orig_tris, "expected fewer triangles: {dec_tris} vs {orig_tris}");
+    assert!(dec.error_bound <= max_err, "error_bound {:?} exceeded {:?}", dec.error_bound, max_err);
+}

@@ -1036,8 +1036,8 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                 let handle = match receiver {
                     // A field's declaration is the file's, which an item does not see: its own
                     // text is read (clones.rs reads the whole file).
-                    Some((name, true)) => self.declared_handle(0, self.toks.len(), name, false),
-                    Some((name, false)) => self.declared_handle(self.last_fn.unwrap_or(0), i, name, true),
+                    Some(Receiver { name, is_field: true }) => self.declared_handle(0, self.toks.len(), name, false),
+                    Some(Receiver { name, is_field: false }) => self.declared_handle(self.last_fn.unwrap_or(0), i, name, true),
                     None => false,
                 };
                 if handle { Template::CloneHandle } else { Template::CloneUnknown }
@@ -1049,7 +1049,7 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
 
     /// clones.rs's `receiver_of`: the last name of the run of names and dots before the `.`
     /// at `dot`, and whether it is a field (a dot in the run, or a `)` or `]` before it).
-    fn receiver(&self, dot: usize) -> Option<(&'u str, bool)> {
+    fn receiver(&self, dot: usize) -> Option<Receiver<'u>> {
         let mut j = dot.checked_sub(1)?;
         let last = self.tok(j)?;
         let name = match last.k {
@@ -1069,8 +1069,8 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                 run_start = j;
             }
         }
-        let field = run_start < dot - 1 || matches!(self.back(run_start, 1), Some(b) if matches!(b.k, K::P(b')' | b']')));
-        Some((name, field))
+        let is_field = run_start < dot - 1 || matches!(self.back(run_start, 1), Some(b) if matches!(b.k, K::P(b')' | b']')));
+        Some(Receiver { name, is_field })
     }
 
     /// clones.rs's `declared_handle` over tokens `from..to`: `name: [&][mut] path::Arc<` or
@@ -1170,6 +1170,19 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                     }
                 }
             }
+            if (rules.runs(Rule::BoolParam)
+                || rules.runs(Rule::SwappableParameters)
+                || rules.runs(Rule::PrimitiveMeaning))
+                && let Some(close) = close
+                && self.is_pub_fn(i)
+            {
+                self.check_newtype_params(i + 1, close, name);
+            }
+            if rules.runs(Rule::AnonTupleReturn)
+                && let Some(close) = close
+            {
+                self.check_anon_tuple_return(t.start, name_tok.end, i + 1, close);
+            }
         }
         if self.sig.is_none()
             && let Some(n) = name
@@ -1223,9 +1236,364 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
         matches!((self.back(j, 1), self.tok(j)), (Some(m), Some(g)) if m.k == K::P(b'-') && m.end == g.start)
     }
 
+    /// Whether the `fn` at token `fn_at` has a `pub` visibility modifier immediately preceding it.
+    fn is_pub_fn(&self, fn_at: usize) -> bool {
+        let mut j = fn_at;
+        let mut steps = 0usize;
+        while j > 0 && steps < 10 {
+            j -= 1;
+            steps += 1;
+            let Some(t) = self.tok(j) else { break };
+            match t.k {
+                K::Ident => match self.str_of(t) {
+                    "pub" => return true,
+                    "const" | "async" | "unsafe" | "extern" => continue,
+                    _ => return false,
+                },
+                K::Lit => continue,
+                K::P(b')') => {
+                    let mut depth = 1usize;
+                    while j > 0 && depth > 0 {
+                        j -= 1;
+                        if let Some(p) = self.tok(j) {
+                            match p.k {
+                                K::P(b')') => depth += 1,
+                                K::P(b'(') => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Checks a `pub fn`'s parameter list (`from..close`) for `Rule::BoolParam`,
+    /// `Rule::SwappableParameters`, and `Rule::PrimitiveMeaning` in one zero-allocation pass.
+    fn check_newtype_params(&mut self, from: usize, close: usize, fn_name: &str) {
+        let mut depth = 0usize;
+        let mut open_paren = None;
+        let mut j = from;
+        while j < close {
+            if let Some(t) = self.tok(j) {
+                match t.k {
+                    K::P(b'(') if depth == 0 => {
+                        open_paren = Some(j);
+                        break;
+                    }
+                    K::P(b'<' | b'[' | b'{') => depth += 1,
+                    K::P(b'>' | b']' | b'}') => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            j += 1;
+        }
+        let Some(lparen) = open_paren else { return };
+
+        let mut rparen = None;
+        let mut pdepth = 1usize;
+        let mut k = lparen + 1;
+        while k < close {
+            if let Some(t) = self.tok(k) {
+                match t.k {
+                    K::P(b'(') => pdepth += 1,
+                    K::P(b')') => {
+                        pdepth -= 1;
+                        if pdepth == 0 {
+                            rparen = Some(k);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            k += 1;
+        }
+        let Some(rparen) = rparen else { return };
+
+        let mut params: [ParsedParam; 16] = [ParsedParam {
+            name_span: Span::new(0, 0),
+            ty_span: Span::new(0, 0),
+            prim: None,
+            is_numeric: false,
+        }; 16];
+        let mut nparams = 0usize;
+
+        let mut seg_start = lparen + 1;
+        let mut bdepth = 0usize;
+        let mut idx = lparen + 1;
+        while idx <= rparen {
+            let at_end = idx == rparen;
+            let is_comma = !at_end && self.tok(idx).is_some_and(|t| t.k == K::P(b',') && bdepth == 0);
+            if !at_end {
+                if let Some(t) = self.tok(idx) {
+                    match t.k {
+                        K::P(b'(' | b'[' | b'<' | b'{') => bdepth += 1,
+                        K::P(b')' | b']' | b'>' | b'}') => bdepth = bdepth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+            }
+            if (is_comma || at_end) && seg_start < idx && nparams < params.len() {
+                if let Some(parsed) = self.parse_param_slice(seg_start, idx) {
+                    params[nparams] = parsed;
+                    nparams += 1;
+                }
+                seg_start = idx + 1;
+            }
+            idx += 1;
+        }
+
+        let rules = self.rules;
+        let trivial_bool_setter = nparams == 1 && (fn_name.starts_with("set_") || fn_name == "from_bool");
+
+        for p_idx in 0..nparams {
+            let p = params[p_idx];
+            if rules.runs(Rule::BoolParam) && p.prim == Some(PrimKind::Bool) && !trivial_bool_setter {
+                self.push(
+                    Template::BoolParam,
+                    p.name_span.start,
+                    p.ty_span.end,
+                    Some(Arg::Span(p.name_span)),
+                );
+            }
+            if rules.runs(Rule::PrimitiveMeaning) && p.is_numeric {
+                let pname = p.name_span.of(self.text);
+                if carries_primitive_meaning(pname) {
+                    self.push(
+                        Template::PrimitiveMeaning,
+                        p.name_span.start,
+                        p.ty_span.end,
+                        Some(Arg::Span(p.ty_span)),
+                    );
+                }
+            }
+            if rules.runs(Rule::SwappableParameters) && p_idx + 1 < nparams {
+                let next = params[p_idx + 1];
+                if let (Some(k1), Some(k2)) = (p.prim, next.prim)
+                    && k1 == k2
+                {
+                    let n1 = p.name_span.of(self.text);
+                    let n2 = next.name_span.of(self.text);
+                    if !is_symmetric_param_pair(n1, n2) {
+                        self.push(
+                            Template::SwappableParameters,
+                            p.name_span.start,
+                            next.ty_span.end,
+                            Some(Arg::Span(p.ty_span)),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn parse_param_slice(&self, from: usize, to: usize) -> Option<ParsedParam> {
+        let mut j = from;
+        while j < to {
+            let t = self.tok(j)?;
+            if t.k == K::P(b'#') {
+                j += 1;
+                if self.tok(j).is_some_and(|b| b.k == K::P(b'[')) {
+                    let mut d = 1usize;
+                    j += 1;
+                    while j < to && d > 0 {
+                        if let Some(tok) = self.tok(j) {
+                            match tok.k {
+                                K::P(b'[') => d += 1,
+                                K::P(b']') => d -= 1,
+                                _ => {}
+                            }
+                        }
+                        j += 1;
+                    }
+                }
+                continue;
+            }
+            if t.k == K::Ident && self.str_of(t) == "mut" {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        let name_tok = self.tok(j)?;
+        if name_tok.k != K::Ident {
+            return None;
+        }
+        let name_str = self.str_of(name_tok);
+        if name_str == "self" || name_str.starts_with('_') {
+            return None;
+        }
+        let colon = self.tok(j + 1)?;
+        if colon.k != K::P(b':') {
+            return None;
+        }
+        let ty_from = j + 2;
+        if ty_from >= to {
+            return None;
+        }
+        let first_ty = self.tok(ty_from)?;
+        let last_ty = self.back(to, 1)?;
+        let ty_span = Span::new(first_ty.start, last_ty.end);
+
+        let class = if ty_from + 1 == to && first_ty.k == K::Ident {
+            classify_primitive(self.str_of(first_ty))
+        } else if first_ty.k == K::P(b'&') && last_ty.k == K::Ident && self.str_of(last_ty) == "str" {
+            let len = to - ty_from;
+            if len == 2 || (len == 3 && self.tok(ty_from + 1).is_some_and(|t| t.k == K::Life)) {
+                PrimClass { kind: Some(PrimKind::Str), is_numeric: false }
+            } else {
+                PrimClass::NONE
+            }
+        } else {
+            PrimClass::NONE
+        };
+        Some(ParsedParam {
+            name_span: Span::new(name_tok.start, name_tok.end),
+            ty_span,
+            prim: class.kind,
+            is_numeric: class.is_numeric,
+        })
+    }
+
+    /// Checks a function's return type (`-> ...` inside `from..close`) for anonymous tuples
+    /// carrying unnamed state such as `(Option<T>, bool)`, `(T, bool)`, `Option<(A, B, C)>`, or
+    /// `Result<(A, bool), E>`.
+    fn check_anon_tuple_return(&mut self, fn_start: u32, name_end: u32, from: usize, close: usize) {
+        // Find top-level `->` after the parameter list.
+        let mut depth = 0usize;
+        let mut ret_start = None;
+        let mut j = from;
+        while j < close {
+            if let Some(t) = self.tok(j) {
+                match t.k {
+                    K::P(b'(' | b'[' | b'<' | b'{') => depth += 1,
+                    K::P(b'>') if self.arrow(j) && depth == 0 => {
+                        ret_start = Some(j + 1);
+                        break;
+                    }
+                    K::P(b')' | b']' | b'>' | b'}') => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            j += 1;
+        }
+        let Some(ret_from) = ret_start else { return };
+
+        // Stop at top-level `where`.
+        let mut ret_end = close;
+        let mut d = 0usize;
+        let mut k = ret_from;
+        while k < close {
+            if let Some(t) = self.tok(k) {
+                match t.k {
+                    K::P(b'(' | b'[' | b'<' | b'{') => d += 1,
+                    K::P(b')' | b']' | b'>' | b'}') => d = d.saturating_sub(1),
+                    K::Ident if d == 0 && self.str_of(t) == "where" => {
+                        ret_end = k;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            k += 1;
+        }
+        if ret_from >= ret_end {
+            return;
+        }
+
+        // Unwrap leading `Option<...>` or `Result<..., E>` wrapper (or qualified `core::option::Option<...>`).
+        let mut tuple_open = None;
+        let Some(first) = self.tok(ret_from) else { return };
+        if first.k == K::P(b'(') {
+            tuple_open = Some(ret_from);
+        } else {
+            // Scan optional path prefix ending in `Option` or `Result` followed by `<(`.
+            let mut p = ret_from;
+            while p + 2 < ret_end {
+                let Some(tok) = self.tok(p) else { break };
+                if tok.k == K::Ident
+                    && matches!(self.str_of(tok), "Option" | "Result")
+                    && self.tok(p + 1).is_some_and(|x| x.k == K::P(b'<'))
+                    && self.tok(p + 2).is_some_and(|x| x.k == K::P(b'('))
+                {
+                    tuple_open = Some(p + 2);
+                    break;
+                }
+                if tok.k == K::Ident || tok.k == K::P(b':') {
+                    p += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        let Some(open) = tuple_open else { return };
+
+        // Scan the tuple `( elem_0, elem_1, ... )` at paren depth 1.
+        let mut tdepth = 1usize;
+        let mut elem_count = 0usize;
+        let mut has_token_in_elem = false;
+        let mut has_state_type = false;
+        let mut tuple_close = None;
+        let mut m = open + 1;
+        while m < ret_end {
+            let Some(tok) = self.tok(m) else { break };
+            match tok.k {
+                K::P(b'(' | b'[' | b'<' | b'{') => {
+                    tdepth += 1;
+                    has_token_in_elem = true;
+                }
+                K::P(b')') if tdepth == 1 => {
+                    if has_token_in_elem {
+                        elem_count += 1;
+                    }
+                    tuple_close = Some(m);
+                    break;
+                }
+                K::P(b')' | b']' | b'>' | b'}') => {
+                    tdepth = tdepth.saturating_sub(1);
+                    has_token_in_elem = true;
+                }
+                K::P(b',') if tdepth == 1 => {
+                    if has_token_in_elem {
+                        elem_count += 1;
+                        has_token_in_elem = false;
+                    }
+                }
+                K::Ident => {
+                    has_token_in_elem = true;
+                    if tdepth == 1 && matches!(self.str_of(tok), "bool" | "Option" | "Result") {
+                        has_state_type = true;
+                    }
+                }
+                _ => {
+                    has_token_in_elem = true;
+                }
+            }
+            m += 1;
+        }
+        let Some(close_tok_idx) = tuple_close else { return };
+
+        // Flag any tuple with 2+ elements carrying unnamed state (`bool` / `Option` / `Result`)
+        // OR any tuple with 3+ elements.
+        if elem_count >= 2 && (has_state_type || elem_count >= 3) {
+            let Some(open_tok) = self.tok(open) else { return };
+            let Some(close_tok) = self.tok(close_tok_idx) else { return };
+            let tuple_span = Span::new(open_tok.start, close_tok.end);
+            self.push(
+                Template::AnonTupleReturn,
+                fn_start,
+                name_end,
+                Some(Arg::Span(tuple_span)),
+            );
+        }
+    }
+
     /// The `<..>` opening at `open` (to `limit`): its count of top-level arguments (a trailing
     /// comma adds none), its first and its last argument as token ranges.
-    fn type_args(&self, open: usize, limit: usize) -> Option<(usize, (usize, usize), (usize, usize))> {
+    fn type_args(&self, open: usize, limit: usize) -> Option<TypeArgs> {
         let mut depth = 0usize;
         let mut count = 0usize;
         let mut from = open + 1;
@@ -1246,7 +1614,7 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                             last = (from, j);
                             first.get_or_insert(last);
                         }
-                        return Some((count, first.unwrap_or(last), last));
+                        return Some(TypeArgs { count, first: first.unwrap_or(last), last });
                     }
                 }
                 K::P(b',') if depth == 1 => {
@@ -1276,7 +1644,7 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                 }
                 if let Some(&(_, arity)) = ALLOCATING.iter().find(|(name, _)| *name == word)
                     && next_open
-                    && let Some((count, _, last)) = self.type_args(k + 1, to)
+                    && let Some(TypeArgs { count, last, .. }) = self.type_args(k + 1, to)
                     && (count + 1 == arity || (count == arity && self.names_global(last)))
                 {
                     let end = self.closing_angle(k + 1, to).map_or(t.end, |c| self.toks[c].end);
@@ -1328,7 +1696,7 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                         Some("Error") => true,
                         Some("Result") => match then {
                             Some(n) if n.k == K::P(b'<') => {
-                                self.type_args(k + 4, to).is_some_and(|(count, _, _)| count == 1)
+                                self.type_args(k + 4, to).is_some_and(|args| args.count == 1)
                             }
                             _ => true,
                         },
@@ -1340,7 +1708,7 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                     }
                 }
                 Some("Result") if matches!(self.tok(k + 1), Some(n) if n.k == K::P(b'<')) => {
-                    if let Some((count, _, last)) = self.type_args(k + 1, to)
+                    if let Some(TypeArgs { count, last, .. }) = self.type_args(k + 1, to)
                         && count >= 2
                         && let Some(kind) = self.error_kind(last)
                         && found[kind].is_none()
@@ -1382,7 +1750,7 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
             "String" => Some(0),
             "Error" if (from..last).any(|k| self.is_word(self.tok(k), "anyhow")) => Some(3),
             "Box" if path_to < to => {
-                let (_, (a, b), _) = self.type_args(path_to, to)?;
+                let TypeArgs { first: (a, b), .. } = self.type_args(path_to, to)?;
                 if !self.is_word(self.tok(a), "dyn") {
                     return None;
                 }
@@ -2645,4 +3013,132 @@ fn expects_implicit_allocator(rest: &str) -> Option<usize> {
         from = at + 1;
     }
     None
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrimKind {
+    Bool,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    Usize,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    Isize,
+    F32,
+    F64,
+    Str,
+    String,
+}
+
+#[derive(Clone, Copy)]
+struct Receiver<'u> {
+    name: &'u str,
+    is_field: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TypeArgs {
+    count: usize,
+    first: (usize, usize),
+    last: (usize, usize),
+}
+
+#[derive(Clone, Copy)]
+struct ParsedParam {
+    name_span: Span,
+    ty_span: Span,
+    prim: Option<PrimKind>,
+    is_numeric: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PrimClass {
+    kind: Option<PrimKind>,
+    is_numeric: bool,
+}
+
+impl PrimClass {
+    const NONE: PrimClass = PrimClass { kind: None, is_numeric: false };
+}
+
+#[inline]
+fn classify_primitive(name: &str) -> PrimClass {
+    match name {
+        "bool" => PrimClass { kind: Some(PrimKind::Bool), is_numeric: false },
+        "u8" => PrimClass { kind: Some(PrimKind::U8), is_numeric: true },
+        "u16" => PrimClass { kind: Some(PrimKind::U16), is_numeric: true },
+        "u32" => PrimClass { kind: Some(PrimKind::U32), is_numeric: true },
+        "u64" => PrimClass { kind: Some(PrimKind::U64), is_numeric: true },
+        "u128" => PrimClass { kind: Some(PrimKind::U128), is_numeric: true },
+        "usize" => PrimClass { kind: Some(PrimKind::Usize), is_numeric: true },
+        "i8" => PrimClass { kind: Some(PrimKind::I8), is_numeric: true },
+        "i16" => PrimClass { kind: Some(PrimKind::I16), is_numeric: true },
+        "i32" => PrimClass { kind: Some(PrimKind::I32), is_numeric: true },
+        "i64" => PrimClass { kind: Some(PrimKind::I64), is_numeric: true },
+        "i128" => PrimClass { kind: Some(PrimKind::I128), is_numeric: true },
+        "isize" => PrimClass { kind: Some(PrimKind::Isize), is_numeric: true },
+        "f32" => PrimClass { kind: Some(PrimKind::F32), is_numeric: true },
+        "f64" => PrimClass { kind: Some(PrimKind::F64), is_numeric: true },
+        "String" => PrimClass { kind: Some(PrimKind::String), is_numeric: false },
+        _ => PrimClass::NONE,
+    }
+}
+
+/// Well-known symmetric/coordinate/range parameter pairs where adjacent identical primitives are
+/// idiomatic rather than a swappable-parameter defect.
+#[inline]
+fn is_symmetric_param_pair(a: &str, b: &str) -> bool {
+    matches!(
+        (a, b),
+        ("x", "y")
+            | ("y", "z")
+            | ("z", "w")
+            | ("a", "b")
+            | ("b", "c")
+            | ("lhs", "rhs")
+            | ("left", "right")
+            | ("lo", "hi")
+            | ("low", "high")
+            | ("min", "max")
+            | ("start", "end")
+            | ("from", "to")
+            | ("first", "last")
+            | ("row", "col")
+            | ("width", "height")
+            | ("w", "h")
+            | ("r", "g")
+            | ("g", "b")
+            | ("b", "a")
+            | ("u", "v")
+            | ("dx", "dy")
+            | ("p", "q")
+    )
+}
+
+/// Whether a numeric parameter's name encodes a physical unit, time unit, or entity identity that
+/// should be a zero-cost newtype (`struct TimeoutNs(u64)`, `struct BlockId(u32)`, ...).
+#[inline]
+fn carries_primitive_meaning(name: &str) -> bool {
+    if matches!(name, "timeout" | "deadline" | "duration" | "port" | "pid" | "fd") {
+        return true;
+    }
+    const SUFFIXES: &[&str] = &[
+        "_ns", "_us", "_ms", "_sec", "_secs", "_bytes", "_kib", "_mib", "_gib", "_hz", "_deg",
+        "_rad", "_id", "_pid", "_fd", "_port",
+    ];
+    let mut idx = 0;
+    while idx < SUFFIXES.len() {
+        let suf = SUFFIXES[idx];
+        if name.len() > suf.len() && name.ends_with(suf) {
+            return true;
+        }
+        idx += 1;
+    }
+    false
 }

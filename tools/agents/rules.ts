@@ -150,9 +150,9 @@ Fast incremental compiles, lints and tests of real Rust in monorepos of millions
 - A program runs from code records in its own process: compiled on first call, no link step.
 - A dependency is only its records and an item only its key; text for the crate compiled alone.
 - A check happens once and leaves a proof later code takes; a coarse proof covers all under it.
-- Records are shared by content: across a machine's checkouts, and std's arrive precomputed from R2.
-- Decide at run time: a hook, check or optimization is a version swapped into a slot.
-- A lint finding is a record too: errors before the answer, advice after, analyses in the background.
+- Records share by content across checkouts; std's arrive precomputed from R2.
+- Decide at run time: hooks and opts swap into slots, guided by persisted PGO (\`export\` default).
+- Lint findings are records: errors before the answer, advice after, PGO-ranked in background.
 
 ## Scope
 
@@ -160,8 +160,8 @@ In scope:
 - Cargo workspaces. The acceptance projects are reth, tempo and blaze itself.
 - Hosts: macOS on arm64, and Linux (arm64 first; x86-64 is covered by CI).
 - A build runs when asked, and may leave a helper with an expiry that never builds on its own.
-- \`run\`, \`test\`, \`check\`; later \`export\` (a native file). No \`build\`. A run compiles what is called.
-- Dependencies and cached records are fully optimized; workspace code is built fast, then tiered up in the background, the top tier optimizing across functions at function grain.
+- \`run\`, \`test\`, \`check\`; \`export\` (native, PGO by default). No \`build\`. Runs compile what's called.
+- Deps and cached records are fully optimized; workspace code tiers up via cross-fn LTO & PGO.
 - std's records (names, heads, code) are fetched per platform from R2, CI-written; yours stay local.
 - An old home after an upgrade is detected, reported and rebuilt; nothing is migrated.
 - blaze's own code is on bstd and our collections: no \`std\`, \`alloc\` or third-party crate.
@@ -807,6 +807,24 @@ export const rules = [
 		line: "Report throughput and latency in per-core units (`MB/s/core`, `ns/op/core`) and name core count.",
 		info: "Every throughput or latency number reported in a benchmark, commit, PR or reply names its concurrency explicitly and states per-core units (`MB/s/core`, `GB/s/core`, `ops/s/core`, `ns/op/core`, `tris/s/core`, `rays/s/core`, `evals/s/core`). When reporting multi-core aggregate throughput, always show both the core count and the per-core rate (e.g. `38.7 GB/s across 18 cores = 2.15 GB/s/core`), never a bare `MB/s` or `GB/s` that hides whether the run was 1 core or 18 cores.",
 		reason: "Andrew, 2026-11-22: \"please give per core units (mentoin in AGENTS.md sa well?) like i htink blaze lint is it 143.1 MB /s core ? (or specify that in AGNETS.md) etc\".",
+	},
+	{
+		id: "newtypes-and-named-returns",
+		skill: "changing-code",
+		line: "Use newtypes, enums and named return structs instead of bare primitives or `(Option<T>, bool)`.",
+		info: "At function and capability boundaries, name the meaning in the type: wrap unit- or ID-bearing numbers in zero-cost newtypes, replace bare `bool` flags with two-variant enums or `#[blaze::args]` options structs, avoid adjacent identical primitive parameters (`blaze::bool_param`, `blaze::swappable_parameters`, `blaze::primitive_meaning`), and return a named struct instead of an anonymous stateful tuple like `(Option<T>, bool)` or `Option<(A, B, C)>` (`blaze::anon_tuple_return`). Narrow capabilities monotonically at boundaries (`Dir<ReadOnly, Flat>`, `Leaf`, `Budget`).",
+		reason: "Andrew, 2026-11-22: \"also should we have lint or anything for using new types anywhere mroe ? and maybe apply that s ewll\" and \"also make lint denying anon enums liek (Option<PrimKind>, bool) shoudl be requiet struct (in parallel) and then fix all of them\".",
+		link: "docs/v2/plan/design/auto-perf.md",
+		alsoIn: ["runtime-code"],
+	},
+	{
+		id: "pgo-by-default",
+		skill: "perf-and-tracing",
+		line: "Persist decayed cross-run PGO (`BPG1`) for JIT, LTO, PGL, and default `blaze export`; pad 128B.",
+		info: "Performance telemetry closes the loop automatically: seed cold runs with static loop/cold estimates (`PgoSiteTable::estimate_static`), persist exponentially decayed cross-run `BPG1` profiles across reboots and worktrees (`PgoSiteTable::merge_decayed`), key JIT code records by PGO tier for zero-warmup reuse, feed persisted PGO into bottom-up SCC LTO (`blaze-lir::lto`) and Profile-Guided Linting (`blaze-lint::pgo`), and consume persisted PGO by default in `blaze export`. Use `bstd::sync::CachePadded` (128B) for contended atomics and `bstd::mem::{SmallVec, GenMap, KindSet, interp_search_by_prefix}` on hot paths so one code path scales from Macs to 128-core servers.",
+		reason: "Andrew, 2026-11-22: \"ideally JIT shuodl ahve some estimate cross run or something to go off of for PGO or reuse thigns etc ideally and if you blaze export it hsould use that PGO data by default etc\" and \"please make guide or AGNETS.md change based on what i have said too\".",
+		link: "docs/v2/plan/design/auto-perf.md",
+		alsoIn: ["memory-and-data"],
 	},
 ] as const satisfies readonly Rule[];
 

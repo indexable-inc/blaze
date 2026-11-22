@@ -109,6 +109,7 @@ mod flat;
 mod flight;
 mod forms;
 mod freeze;
+mod fast_tests;
 mod gpu_tests;
 mod hosted;
 mod inflight;

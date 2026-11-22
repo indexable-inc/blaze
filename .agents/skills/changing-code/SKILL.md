@@ -313,4 +313,16 @@ follows this wherever a thing is made, and blaze's own crates use it (`blaze-use
 blaze builds it: a struct expression with `..` and no base takes each unset field's default, a
 constant of the field's type.
 
+## newtypes-and-named-returns (rule 85)
+
+At function and capability boundaries, name the meaning in the type: wrap unit- or ID-bearing
+numbers in zero-cost newtypes, replace bare `bool` flags with two-variant enums or `#[blaze::args]`
+options structs, avoid adjacent identical primitive parameters (`blaze::bool_param`,
+`blaze::swappable_parameters`, `blaze::primitive_meaning`), and return a named struct instead of an
+anonymous stateful tuple like `(Option<T>, bool)` or `Option<(A, B, C)>`
+(`blaze::anon_tuple_return`). Narrow capabilities monotonically at boundaries (`Dir<ReadOnly,
+Flat>`, `Leaf`, `Budget`).
+
+See [docs/v2/plan/design/auto-perf.md](../../../docs/v2/plan/design/auto-perf.md).
+
 <!-- End of the generated rules. Hand-written notes follow. -->

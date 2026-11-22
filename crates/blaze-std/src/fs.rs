@@ -159,11 +159,91 @@ mod sealed {
     pub trait Sealed {}
     impl Sealed for super::ReadOnly {}
     impl Sealed for super::ReadWrite {}
+    impl Sealed for super::Subtree {}
+    impl Sealed for super::Flat {}
 }
 
 /// What a holder may do: [`ReadOnly`] or [`ReadWrite`].
 pub trait Rights: sealed::Sealed {
     const WRITE: bool;
+}
+
+/// How far beneath a directory a [`Dir`] may reach: [`Subtree`] (this folder and every descendant
+/// beneath it) or [`Flat`] (this folder's direct children only; no `subdir`, no `walk`, no `/`
+/// in a [`Leaf`]). Narrowing (`Dir::flat`) is monotone and never widens.
+pub trait Scope: sealed::Sealed {
+    const RECURSIVE: bool;
+}
+
+/// This folder and every descendant beneath it (the default scope of [`Dir`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Subtree;
+
+/// Direct children of this folder only: cannot traverse into subdirectories (`subdir` and `walk`
+/// do not exist on `Dir<P, Flat>`), and operations accept only single-segment [`Leaf`] names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Flat;
+
+impl Scope for Subtree {
+    const RECURSIVE: bool = true;
+}
+
+impl Scope for Flat {
+    const RECURSIVE: bool = false;
+}
+
+/// A single-segment entry name inside one folder: a valid [`Path`] containing no `/` separator.
+/// Used by [`Dir<P, Flat>`] so directory traversal is ruled out by the type system.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)] // clone: refcount over FileName
+pub struct Leaf(Path);
+
+/// Why [`Leaf::new`] refused a name.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
+pub enum LeafError {
+    /// Not a valid relative [`Path`] (empty, rooted, `.`, `..`, `\`, or NUL).
+    Path(crate::path::PathError),
+    /// Contains a `/` separator and therefore names a nested path rather than a direct child.
+    Nested { raw: String },
+}
+
+impl fmt::Display for LeafError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LeafError::Path(e) => fmt::Display::fmt(e, f),
+            LeafError::Nested { raw } => write!(f, "leaf name {raw:?} contains `/`: a flat Dir accesses only direct children"),
+        }
+    }
+}
+
+impl core::error::Error for LeafError {}
+
+impl Leaf {
+    /// Parses `raw` as a single-segment leaf name with no `/` separator.
+    pub fn new(raw: &str) -> Result<Leaf, LeafError> {
+        let path = Path::new(raw).map_err(LeafError::Path)?;
+        if path.as_str().as_bytes().contains(&b'/') {
+            return Err(LeafError::Nested { raw: alloc::borrow::ToOwned::to_owned(raw) });
+        }
+        Ok(Leaf(path))
+    }
+
+    /// This leaf as a single-segment [`Path`].
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// This leaf's UTF-8 text.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
 }
 
 /// Reads only.
@@ -1059,7 +1139,7 @@ impl Fs {
                 Err(FsError::new(FsOp::OpenDir, path.name(), FsKind::NotADirectory))
             }
             // clone: the directory's name, a refcount.
-            Some(_) | None => Ok(Dir { io: self.io.clone(), base: DirName::Named(path.name().clone()), quota: None, rights: PhantomData }),
+            Some(_) | None => Ok(Dir { io: self.io.clone(), base: DirName::Named(path.name().clone()), quota: None, rights: PhantomData, scope: PhantomData }),
         }
     }
 
@@ -1104,31 +1184,35 @@ impl Fs {
     #[blaze::nonblocking]
     pub fn root(&self) -> Dir<ReadWrite> {
         // clone: authority held, a refcount.
-        Dir { io: self.io.clone(), base: DirName::Root, quota: None, rights: PhantomData }
+        Dir { io: self.io.clone(), base: DirName::Root, quota: None, rights: PhantomData, scope: PhantomData }
     }
 }
 
-/// A directory: the files beneath it, by relative path only.
-pub struct Dir<#[blaze::linear] P: Rights> {
+/// A directory capability: `P` is its [`Rights`] (`ReadOnly` or `ReadWrite`) and `S` is its
+/// [`Scope`] ([`Subtree`] by default, or [`Flat`] for direct children only). Narrowing
+/// (`read_only`, `flat`, `subdir`, `quota`) is monotone and never widens.
+pub struct Dir<#[blaze::linear] P: Rights, S: Scope = Subtree> {
     io: Io,
     /// Where it is under the driver's root, or the root itself.
     base: DirName,
     /// The bytes that may still be written through it, if it has a quota ([`Dir::quota`]).
     quota: Option<Arc<Budget>>,
     rights: PhantomData<P>,
+    scope: PhantomData<S>,
 }
 
-impl<#[blaze::linear] P: Rights> Clone for Dir<P> {
-    fn clone(&self) -> Dir<P> {
+impl<#[blaze::linear] P: Rights, S: Scope> Clone for Dir<P, S> {
+    fn clone(&self) -> Dir<P, S> {
         // clone: authority held, copied: a refcount each.
-        Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData }
+        Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData, scope: PhantomData }
     }
 }
 
-impl<#[blaze::linear] P: Rights> fmt::Debug for Dir<P> {
+impl<#[blaze::linear] P: Rights, S: Scope> fmt::Debug for Dir<P, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let rights = if P::WRITE { "ReadWrite" } else { "ReadOnly" };
-        write!(f, "Dir<{rights}>({})", self.base)
+        let scope = if S::RECURSIVE { "Subtree" } else { "Flat" };
+        write!(f, "Dir<{rights}, {scope}>({})", self.base)
     }
 }
 
@@ -1136,9 +1220,11 @@ impl Dir<ReadWrite> {
     /// The directory named `base` under the driver's root, read and write: for a capability
     /// that holds a directory's name as authority ([`crate::user::User::home`]).
     pub(crate) fn at(io: &Io, base: FileName) -> Dir<ReadWrite> {
-        Dir { io: io.clone(), base: DirName::Named(base), quota: None, rights: PhantomData }
+        Dir { io: io.clone(), base: DirName::Named(base), quota: None, rights: PhantomData, scope: PhantomData }
     }
+}
 
+impl<S: Scope> Dir<ReadWrite, S> {
     /// The same directory with a quota: at most `bytes` bytes are written through the `Dir`
     /// this returns, through its subdirectories and through the files opened from them,
     /// counted by bstd. A write with no room left ends in [`FsKind::OverQuota`], and nothing
@@ -1156,14 +1242,14 @@ impl Dir<ReadWrite> {
     /// driver's to bound, with an effect blaze-core does not have yet.
     ///
     /// The contract: the directory it gives has at most `bytes` left, whatever it is inside.
-    #[core::contracts::ensures(move |r: &Dir<ReadWrite>| match r.quota_left() {
+    #[core::contracts::ensures(move |r: &Dir<ReadWrite, S>| match r.quota_left() {
         Some(left) => left <= bytes,
         None => false,
     })]
-    pub fn quota(&self, bytes: u64) -> Dir<ReadWrite> {
+    pub fn quota(&self, bytes: u64) -> Dir<ReadWrite, S> {
         // clone: authority held, narrowed: a refcount each, the budget this one is inside too.
         let quota = Some(Budget::new(bytes, self.quota.clone()));
-        Dir { io: self.io.clone(), base: self.base.clone(), quota, rights: PhantomData }
+        Dir { io: self.io.clone(), base: self.base.clone(), quota, rights: PhantomData, scope: PhantomData }
     }
 
     /// The bytes that may still be written through it; `None` with no quota.
@@ -1174,7 +1260,7 @@ impl Dir<ReadWrite> {
     }
 }
 
-impl<#[blaze::linear] P: Rights> Dir<P> {
+impl<#[blaze::linear] P: Rights, S: Scope> Dir<P, S> {
     /// Where it is, under the driver's root, or the root itself.
     #[blaze::nopanic]
     #[blaze::noalloc]
@@ -1183,6 +1269,85 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         &self.base
     }
 
+    /// The same directory, read only (preserves [`Scope`]).
+    pub fn read_only(&self) -> Dir<ReadOnly, S> {
+        // clone: authority held, narrowed: a refcount each.
+        Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData, scope: PhantomData }
+    }
+
+    /// Narrows this directory to [`Flat`] scope: only direct children ([`Leaf`] names) may be
+    /// accessed; `subdir` and `walk` are absent at compile time. Monotone and never widens.
+    pub fn flat(&self) -> Dir<P, Flat> {
+        // clone: authority held, narrowed: a refcount each.
+        Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData, scope: PhantomData }
+    }
+}
+
+impl<#[blaze::linear] P: Rights> Dir<P, Flat> {
+    #[inline]
+    fn as_subtree_for_leaf(&self) -> Dir<P, Subtree> {
+        // clone: internal delegation ONLY for validated single-segment `Leaf` names.
+        Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData, scope: PhantomData }
+    }
+
+    /// What is directly in this folder itself, one level (no descent into child directories).
+    pub fn own_entries(&self, cx: &Cx) -> Result<Entries, FsError> {
+        self.as_subtree_for_leaf().own_entries(cx)
+    }
+
+    /// Metadata for direct child `leaf`, or `None` if absent.
+    pub fn stat_leaf(&self, cx: &Cx, leaf: &Leaf) -> Result<Option<Meta>, FsError> {
+        self.as_subtree_for_leaf().stat(cx, leaf.as_path())
+    }
+
+    /// Opens direct child `leaf` read-only, whatever this directory's rights.
+    pub fn open_read_leaf(&self, cx: &Cx, leaf: &Leaf) -> Result<File<ReadOnly>, FsError> {
+        self.as_subtree_for_leaf().open_read(cx, leaf.as_path())
+    }
+}
+
+impl Dir<ReadOnly, Flat> {
+    /// Opens direct child `leaf` read-only.
+    pub fn open_leaf(&self, cx: &Cx, leaf: &Leaf) -> Result<File<ReadOnly>, FsError> {
+        self.open_read_leaf(cx, leaf)
+    }
+}
+
+impl Dir<ReadWrite, Flat> {
+    /// Opens direct child `leaf` read-write (linear: must be explicitly closed).
+    #[track_caller]
+    pub fn open_leaf(&self, cx: &Cx, leaf: &Leaf) -> Result<File<ReadWrite>, FsError> {
+        self.as_subtree_for_leaf().open(cx, leaf.as_path())
+    }
+
+    /// Creates direct child `leaf` empty, read-write.
+    #[track_caller]
+    pub fn create_leaf(&self, cx: &Cx, leaf: &Leaf) -> Result<File<ReadWrite>, FsError> {
+        self.as_subtree_for_leaf().create(cx, leaf.as_path())
+    }
+
+    /// Atomically publishes `content` at direct child `leaf`, synced.
+    pub fn publish_leaf_synced(&self, cx: &Cx, leaf: &Leaf, content: Content<'_>) -> Result<Published<Flushed>, FsError> {
+        self.as_subtree_for_leaf().publish_synced(cx, leaf.as_path(), content)
+    }
+
+    /// Atomically publishes `content` at direct child `leaf`, unsynced.
+    pub fn publish_leaf_unsynced(&self, cx: &Cx, leaf: &Leaf, content: Content<'_>, unsynced: Unsynced) -> Result<Published<Written>, FsError> {
+        self.as_subtree_for_leaf().publish_unsynced(cx, leaf.as_path(), content, unsynced)
+    }
+
+    /// Removes direct child `leaf`, synced.
+    pub fn remove_leaf_synced(&self, cx: &Cx, leaf: &Leaf) -> Result<(), FsError> {
+        self.as_subtree_for_leaf().remove_synced(cx, leaf.as_path())
+    }
+
+    /// Removes direct child `leaf`, unsynced.
+    pub fn remove_leaf_unsynced(&self, cx: &Cx, leaf: &Leaf, unsynced: Unsynced) -> Result<(), FsError> {
+        self.as_subtree_for_leaf().remove_unsynced(cx, leaf.as_path(), unsynced)
+    }
+}
+
+impl<#[blaze::linear] P: Rights> Dir<P> {
     /// The directory `path` beneath this one, with the same rights or fewer.
     pub fn subdir(&self, path: &Path) -> Dir<P> {
         let base = match self.io.plant() {
@@ -1191,13 +1356,7 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
             Plant::None | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded => DirName::Named(self.beneath(path)),
         };
         // clone: the quota shared, a refcount.
-        Dir { io: self.io.clone(), base, quota: self.quota.clone(), rights: PhantomData }
-    }
-
-    /// The same directory, read only.
-    pub fn read_only(&self) -> Dir<ReadOnly> {
-        // clone: authority held, narrowed: a refcount each.
-        Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData }
+        Dir { io: self.io.clone(), base, quota: self.quota.clone(), rights: PhantomData, scope: PhantomData }
     }
 
     /// The world it is in: for a capability made from a directory ([`crate::local::Local`]).

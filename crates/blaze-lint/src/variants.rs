@@ -167,9 +167,16 @@ fn mix(parent: u64, name: &[u8]) -> u64 {
     (h ^ 0xff).wrapping_mul(PRIME)
 }
 
+/// A parsed integer literal and whether its suffix leaves its type as `usize`.
+#[derive(Clone, Copy)]
+struct IntLiteral {
+    value: u32,
+    suffix_usize: bool,
+}
+
 /// An integer literal's value and whether its type is `usize` by its suffix (none or `usize`).
 /// `None` for a value past `u32` or a malformed literal.
-fn int_value(lit: &str) -> Option<(u32, bool)> {
+fn int_value(lit: &str) -> Option<IntLiteral> {
     let b = lit.as_bytes();
     let (radix, mut at) = match b {
         [b'0', b'x', ..] => (16u32, 2usize),
@@ -202,7 +209,7 @@ fn int_value(lit: &str) -> Option<(u32, bool)> {
         return None;
     }
     let suffix = &lit[at..];
-    Some((value, suffix.is_empty() || suffix == "usize"))
+    Some(IntLiteral { value, suffix_usize: suffix.is_empty() || suffix == "usize" })
 }
 
 impl<'a> Variants<'a> {
@@ -594,7 +601,7 @@ fn site_at(text: &str, toks: &[T], i: usize, top: Frame) -> Option<Site> {
         return None;
     }
     let t = toks[i];
-    let (value, suffix_usize) = int_value(&text[t.start as usize..t.end as usize])?;
+    let IntLiteral { value, suffix_usize } = int_value(&text[t.start as usize..t.end as usize])?;
     if value < MIN_COUNT {
         return None;
     }

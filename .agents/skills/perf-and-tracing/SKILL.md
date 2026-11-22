@@ -58,4 +58,16 @@ concurrency explicitly and states per-core units (`MB/s/core`, `GB/s/core`, `ops
 throughput, always show both the core count and the per-core rate (e.g. `38.7 GB/s across 18 cores =
 2.15 GB/s/core`), never a bare `MB/s` or `GB/s` that hides whether the run was 1 core or 18 cores.
 
+## pgo-by-default (rule 86)
+
+Performance telemetry closes the loop automatically: seed cold runs with static loop/cold estimates
+(`PgoSiteTable::estimate_static`), persist exponentially decayed cross-run `BPG1` profiles across
+reboots and worktrees (`PgoSiteTable::merge_decayed`), key JIT code records by PGO tier for
+zero-warmup reuse, feed persisted PGO into bottom-up SCC LTO (`blaze-lir::lto`) and Profile-Guided
+Linting (`blaze-lint::pgo`), and consume persisted PGO by default in `blaze export`. Use
+`bstd::sync::CachePadded` (128B) for contended atomics and `bstd::mem::{SmallVec, GenMap, KindSet,
+interp_search_by_prefix}` on hot paths so one code path scales from Macs to 128-core servers.
+
+See [docs/v2/plan/design/auto-perf.md](../../../docs/v2/plan/design/auto-perf.md).
+
 <!-- End of the generated rules. Hand-written notes follow. -->

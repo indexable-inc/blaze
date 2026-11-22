@@ -302,6 +302,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::same_behaviour",
             "blaze::workspace_unsafe",
             "blaze::raw_sync",
+            "blaze::anon_tuple_return",
         ],
     ),
     // The cross-configuration reachability lints (docs/v2/plan/design/multiconfig-check.md), also in

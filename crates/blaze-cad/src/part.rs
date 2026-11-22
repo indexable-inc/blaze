@@ -6,7 +6,10 @@ use blaze_cad_field::{
     AtLeastInside, Bound, CadPlant, CompileOpts, Detail, Ex, Graph, GyroidOpts, Join, Name, OffsetOpts, Outside, Placement, Solid,
     Tape, Weakens, compile,
 };
-use blaze_cad_mesh::{MaterialRole, MeshOpts, Meshed, PieceCache, RedistanceOpts, Verified, mesh, mesh_cached, solve_redistance};
+use blaze_cad_mesh::{
+    DecimateOpts, Decimated, MaterialRole, MeshLimits, MeshOpts, Meshed, PieceCache, RedistanceOpts, Source,
+    Target, Verified, decimate, mesh, mesh_cached, solve_redistance,
+};
 use blaze_own::Alloc;
 use blaze_own::planted::{NoPlant, Planted};
 use blaze_units::{Density, Length, Mass, Volume};
@@ -238,6 +241,42 @@ pub fn mesh_part<'a, K: Ex, P: Planted<CadPlant>>(
         None => mesh(&t, opts),
     }
     .map_err(ModelError::Mesh)
+}
+
+/// Options for [`decimate_mesh`]: error-bounded or triangle-budget Garland-Heckbert QEM
+/// simplification preserving sharp creases, boundaries, and material borders.
+#[blaze::args]
+#[derive(Clone, Copy, Debug)]
+pub struct DecimatePartOpts<'a, 's> {
+    /// Simplification goal: `Target::Error(Length)` (two-sided Hausdorff bound) or `Target::Triangles(usize)`.
+    pub target: Target,
+    /// Crease angle cosine where sharp edges are preserved (default: `cos(30°)` ≈ `0.8660254`).
+    pub cos_crease: f32 = 0.866_025_4,
+    /// Mesh safety limits.
+    pub limits: MeshLimits = MeshLimits::SHIPPED,
+    /// Allocator for the output simplified mesh.
+    pub alloc: Alloc<'a>,
+    /// Scratch allocator for quadrics, successive-map pieces, and collapse heap.
+    pub scratch: Alloc<'s>,
+}
+
+/// Simplifies a verified part mesh by Garland-Heckbert QEM edge collapse with Cohen-Olano-Manocha
+/// successive-mapping two-sided Hausdorff error bounds, preserving sharp creases and manifoldness.
+///
+/// The returned [`Decimated`] carries the exact two-sided `error_bound`, work counts (`stats`),
+/// and a re-verified [`Verified`] proof (`decimated.verified()`).
+pub fn decimate_mesh<'a>(mesh: &Verified<'_>, o: DecimatePartOpts<'a, '_>) -> Result<Decimated<'a>, ModelError> {
+    decimate(
+        Source::Verified(*mesh),
+        DecimateOpts {
+            target: o.target,
+            cos_crease: o.cos_crease,
+            limits: o.limits,
+            alloc: o.alloc,
+            scratch: o.scratch,
+        },
+    )
+    .map_err(ModelError::Decimate)
 }
 
 /// A part's mass, centre and inertia.

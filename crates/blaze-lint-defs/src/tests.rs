@@ -66,9 +66,9 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     // `blaze::same_behaviour`, and the 5 trust lints (`blaze::dependency_capability` ..
     // `blaze::workspace_unsafe`), `blaze::implied_bound_written` and `blaze::loop_match_candidate`,
     // and `blaze::default_refuses`, `blaze::one_at_a_time` and `blaze::unwritten_allocator`,
-    // and `blaze::lock_without_reason` (D179), and `blaze::raw_sync`. (The refinement gate,
-    // `blaze::refinement`, is the one more.)
-    assert_eq!(blaze_lints().len(), 257);
+    // and `blaze::lock_without_reason` (D179), `blaze::raw_sync`, and `blaze::anon_tuple_return`.
+    // (The refinement gate, `blaze::refinement`, is the one more.)
+    assert_eq!(blaze_lints().len(), 258);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =

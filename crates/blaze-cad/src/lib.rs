@@ -67,7 +67,7 @@ mod math_tests;
 #[cfg(test)]
 mod tests;
 
-pub use blaze_cad_mesh::{MaterialRole, PieceCache, PieceCacheOpts};
+pub use blaze_cad_mesh::{DecimateStats, Decimated, MaterialRole, MeshLimits, PieceCache, PieceCacheOpts, Stop, Target};
 pub use blaze_cad_out::{Encoding, Material, StlUnit, Up};
 pub use blaze_cad_picture::{RenderMode, Shading, StudioOpts};
 pub use check::{
@@ -85,8 +85,9 @@ pub use export::{
     SectionSvgOpts, export_glb, export_section_svg, export_stl, picture, picture_studio, transform_of,
 };
 pub use part::{
-    MassProperties, MeshPartOpts, Part, PartOpts, RoundEdgesOpts, assemble, gyroid, intersect_all, mass_properties,
-    mass_properties_planted, mesh_part, part_tape, placed, placed_tape, round_edges, round_edges_planted, union_all,
+    DecimatePartOpts, MassProperties, MeshPartOpts, Part, PartOpts, RoundEdgesOpts, assemble, decimate_mesh, gyroid, intersect_all,
+    mass_properties, mass_properties_planted, mesh_part, part_tape, placed, placed_tape, round_edges, round_edges_planted,
+    union_all,
 };
 
 use blaze_cad_field::{Bound, CadError, CompileError, EvalError, Ex, Graph, InspectError, Name, Placement, Solid, Weakens};
@@ -449,12 +450,13 @@ pub mod prelude {
 
     pub use crate::Shown;
     pub use crate::{
-        AssemblyInterference, ColliderMode, DraftFace, DraftOpts, Encoding, ExportLodOpts, ExportOpts, ExportStlOpts, Exported,
-        ExportedStl, FitOpts, InterferenceOpts, LodProjection, Material, MaterialRole, MeshPartOpts, MinWallOpts, Model, ModelError,
-        ModelOpts, OverhangFace, OverhangOpts, Part, PartId, PartOpts, PieceCache, PieceCacheOpts, RoundEdgesOpts, SectionSvgOpts,
-        StlUnit, Up, Verdict, assemble, draft_angle_check, export_glb, export_section_svg, export_stl, fits_within, gyroid,
-        intersect_all, mass_properties, mesh_part, min_wall, mm3, no_interference, no_interference_assembly, overhang_check,
-        part_tape, picture, picture_studio, placed_tape, round_edges, union_all,
+        AssemblyInterference, ColliderMode, DecimatePartOpts, DecimateStats, Decimated, DraftFace, DraftOpts, Encoding,
+        ExportLodOpts, ExportOpts, ExportStlOpts, Exported, ExportedStl, FitOpts, InterferenceOpts, LodProjection, Material,
+        MaterialRole, MeshLimits, MeshPartOpts, MinWallOpts, Model, ModelError, ModelOpts, OverhangFace, OverhangOpts, Part,
+        PartId, PartOpts, PieceCache, PieceCacheOpts, RoundEdgesOpts, SectionSvgOpts, StlUnit, Stop, Target, Up, Verdict,
+        assemble, decimate_mesh, draft_angle_check, export_glb, export_section_svg, export_stl, fits_within, gyroid, intersect_all,
+        mass_properties, mesh_part, min_wall, mm3, no_interference, no_interference_assembly, overhang_check, part_tape, picture,
+        picture_studio, placed_tape, round_edges, union_all,
     };
 }
 

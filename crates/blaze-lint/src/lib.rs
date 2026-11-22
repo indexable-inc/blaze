@@ -53,6 +53,7 @@ mod fix;
 mod marks;
 mod matcher;
 mod message;
+pub mod pgo;
 mod sequences;
 mod units;
 mod variants;
@@ -223,6 +224,20 @@ pub enum Rule {
     /// `mem::transmute` or `mem::transmute_copy` (direct call or turbofish). The lint
     /// `blaze::transmute`.
     Transmute = 27,
+    /// A bare `bool` parameter on a public function where a two-variant enum or `#[blaze::args]`
+    /// options struct should name the choice. The lint `blaze::bool_param`.
+    BoolParam = 28,
+    /// Two adjacent parameters of the same primitive or string type on a public function that can
+    /// be silently transposed at call sites. The lint `blaze::swappable_parameters`.
+    SwappableParameters = 29,
+    /// A bare numeric parameter on a public function whose name encodes a unit or entity identity
+    /// (`_ns`, `_ms`, `_bytes`, `_id`, `timeout`, `port`, ...) and should be a zero-cost newtype.
+    /// The lint `blaze::primitive_meaning`.
+    PrimitiveMeaning = 30,
+    /// A function returning an anonymous tuple carrying unnamed state (e.g. `(Option<T>, bool)`,
+    /// `(T, bool)`, `Option<(A, B, C)>`) where a named struct should name each field.
+    /// The lint `blaze::anon_tuple_return`.
+    AnonTupleReturn = 31,
 }
 
 impl Rule {
@@ -258,6 +273,10 @@ impl Rule {
         Rule::RawSync,
         Rule::BlockingOnPool,
         Rule::Transmute,
+        Rule::BoolParam,
+        Rule::SwappableParameters,
+        Rule::PrimitiveMeaning,
+        Rule::AnonTupleReturn,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -309,6 +328,10 @@ impl Rule {
             Rule::RawSync => "raw-sync",
             Rule::BlockingOnPool => "blocking-on-pool",
             Rule::Transmute => "transmute",
+            Rule::BoolParam => "bool-param",
+            Rule::SwappableParameters => "swappable-parameters",
+            Rule::PrimitiveMeaning => "primitive-meaning",
+            Rule::AnonTupleReturn => "anon-tuple-return",
         }
     }
 
@@ -332,6 +355,10 @@ impl Rule {
             Rule::RawSync => Some("raw_sync"),
             Rule::BlockingOnPool => Some("blocking_on_pool"),
             Rule::Transmute => Some("transmute"),
+            Rule::BoolParam => Some("bool_param"),
+            Rule::SwappableParameters => Some("swappable_parameters"),
+            Rule::PrimitiveMeaning => Some("primitive_meaning"),
+            Rule::AnonTupleReturn => Some("anon_tuple_return"),
             _ => None,
         }
     }
@@ -364,8 +391,8 @@ impl Rule {
     }
 
     #[inline]
-    const fn bit(self) -> u32 {
-        1 << (self as u16)
+    const fn bit(self) -> u64 {
+        1u64 << (self as u16)
     }
 
     /// The test code a site in exempts it from this rule: allocs.rs reads only `#[cfg(test)]`
@@ -526,6 +553,14 @@ pub enum Template {
     BlockingOnPool = 220,
     /// `mem::transmute` or `mem::transmute_copy`; argument: the row of the sequence table.
     Transmute = 230,
+    /// A bare `bool` parameter on a public function; argument: the parameter's name span.
+    BoolParam = 240,
+    /// Two adjacent parameters of the same primitive/string type; argument: the shared type span.
+    SwappableParameters = 250,
+    /// A bare numeric parameter whose name carries a unit or entity identity; argument: the type span.
+    PrimitiveMeaning = 260,
+    /// A function returning an anonymous tuple carrying unnamed state; argument: the tuple span.
+    AnonTupleReturn = 270,
 }
 
 impl Template {
@@ -556,6 +591,10 @@ impl Template {
             210 => Rule::RawSync,
             220 => Rule::BlockingOnPool,
             230 => Rule::Transmute,
+            240 => Rule::BoolParam,
+            250 => Rule::SwappableParameters,
+            260 => Rule::PrimitiveMeaning,
+            270 => Rule::AnonTupleReturn,
             _ => Rule::VariantCount,
         }
     }
@@ -627,6 +666,10 @@ impl Template {
             Template::RawSync => "raw-sync",
             Template::BlockingOnPool => "blocking-on-pool",
             Template::Transmute => "transmute",
+            Template::BoolParam => "bool-param",
+            Template::SwappableParameters => "swappable-parameters",
+            Template::PrimitiveMeaning => "primitive-meaning",
+            Template::AnonTupleReturn => "anon-tuple-return",
         }
     }
 }
@@ -1063,13 +1106,13 @@ const ONLY_OWN: [&str; 2] = ["insert_many", "try_insert_many"];
 /// Which rules run, with their tables: what [`RuleSet::id`] digests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuleSet {
-    enabled: u32,
+    enabled: u64,
     renames: &'static [Rename],
 }
 
 impl RuleSet {
     /// Every rule, with [`RENAMES`].
-    pub const ALL: RuleSet = RuleSet { enabled: u32::MAX, renames: &RENAMES };
+    pub const ALL: RuleSet = RuleSet { enabled: u64::MAX, renames: &RENAMES };
 
     /// No rule runs: a driver makes no lint task for it.
     pub const fn is_empty(&self) -> bool {
