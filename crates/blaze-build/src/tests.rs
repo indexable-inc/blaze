@@ -2798,7 +2798,7 @@ fn run_native_vt(host: &[(ItemKey, u64)], fns: &[(ItemKey, Option<List>, &Built<
     let (_, _, entry) = placed.last().expect("one fn to run");
     // SAFETY: the entry is an emitted function of no parameters returning one integer in x0;
     // every callee it names is mapped and held in `placed` until it returns.
-    let f = unsafe { std::mem::transmute::<usize, extern "C" fn() -> u64>(entry.code_address() as usize) };
+    let f: extern "C" fn() -> u64 = unsafe { entry.as_fn() };
     f()
 }
 

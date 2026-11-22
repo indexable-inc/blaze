@@ -242,10 +242,15 @@ pub fn create_key(desc: u64, ender: u64) -> Result<(), PlaceError> {
     if ender == 0 || desc == 0 || desc % 8 != 0 {
         return Err(PlaceError::NoEnder);
     }
+    type PthreadDtor = unsafe extern "C" fn(*mut core::ffi::c_void);
+    const {
+        assert!(size_of::<PthreadDtor>() == size_of::<usize>(), "pthread destructor is one address");
+        assert!(align_of::<PthreadDtor>() == align_of::<usize>(), "pthread destructor has pointer alignment");
+    }
     // SAFETY: `ender` is the entry thunk of the ender's slot, declared by `place` before this
     // call: the C function `fn(t: *mut Table)` blaze-build's `tls::index::ender` built. One
     // pointer argument, no result: the ABI of pthread's destructor type.
-    let destructor = unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(*mut core::ffi::c_void)>(ender) };
+    let destructor: PthreadDtor = unsafe { core::ptr::read((&raw const ender).cast::<PthreadDtor>()) };
     #[cfg(target_os = "macos")]
     let key_at = (desc + index::DESC_KEY as u64) as *mut blaze_sys::posix::thread::pthread_key_t;
     #[cfg(not(target_os = "macos"))]

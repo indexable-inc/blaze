@@ -5,10 +5,10 @@
 //! `process::spawn`) and `fs::mapped` keep their own unsafe; everything else in the crate is
 //! safe Rust (`#![deny(unsafe_code)]` at the root).
 //!
-//! What the safe versions would cost: [`Aligned::bytes`] would copy the bytes on every read (std
-//! has no safe byte view of a slice of aligned blocks); each call has no safe std equivalent
-//! that makes one system call (`File::set_times` opens the file first, `std::process::Child`
-//! reaps without the `rusage`, std has no `poll`, `waitid` or `clonefile`).
+//! [`Aligned::bytes`] is 100% safe and zero-copy via [`crate::pod::bytes_of_slice`]. Each raw
+//! syscall helper has no safe std equivalent that makes one system call (`File::set_times` opens
+//! the file first, `std::process::Child` reaps without the `rusage`, std has no `poll`, `waitid`
+//! or `clonefile`).
 
 /// Sixteen bytes on a sixteen-byte boundary: an image's records need their buffer that aligned
 /// (`blaze_format::ALIGN`), as a mapped file's page is.
@@ -17,6 +17,7 @@
 struct Block([u8; 16]);
 
 const _: () = assert!(size_of::<Block>() == 16 && align_of::<Block>() == 16);
+blaze_own::impl_pod!(Block(bytes: [u8; 16]));
 
 /// Bytes copied into blocks of sixteen-byte alignment: a [`crate::Mapping`] made from bytes.
 /// Its fields are private, so `len` is at most the blocks' bytes whatever safe code does.
@@ -38,11 +39,7 @@ impl Aligned {
 
     pub(crate) fn bytes(&self) -> &[u8] {
         debug_assert!(self.len <= self.blocks.len() * 16);
-        // SAFETY: `Block` is sixteen `u8`s with no padding (`repr(C)`, asserted above), so
-        // `blocks` is `16 * blocks.len()` initialized bytes, and `copy`, the one maker, set `len`
-        // to at most that; the slice borrows `self`, so the box outlives it. A longer `len` would
-        // read past the allocation.
-        unsafe { std::slice::from_raw_parts(self.blocks.as_ptr().cast::<u8>(), self.len) }
+        &crate::pod::bytes_of_slice(&self.blocks)[..self.len]
     }
 }
 
@@ -207,12 +204,27 @@ mod unix {
             .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))
     }
 
+    /// Reinterprets one C ABI mirror struct `A` as its identical-layout counterpart `B` without
+    /// `core::mem::transmute`, proving identical size and alignment at compile time.
+    ///
+    /// # Safety
+    /// `A` and `B` must be ABI-identical C layout mirrors whose bit representation of `src` is a
+    /// valid initialized `B`.
+    #[inline]
+    unsafe fn abi_mirror<A: Copy, B: Copy>(src: A) -> B {
+        const {
+            assert!(size_of::<A>() == size_of::<B>(), "C ABI mirror size mismatch");
+            assert!(align_of::<A>() == align_of::<B>(), "C ABI mirror align mismatch");
+        }
+        // SAFETY: `A` and `B` have identical compile-time-verified size & alignment and caller
+        // guarantees `src` is a valid initialized bit representation of `B`.
+        unsafe { core::ptr::read((&raw const src).cast::<B>()) }
+    }
+
     /// The `timespec` of `seconds` and `nanos` (below 10^9).
     pub(crate) fn timespec(seconds: blaze_sys::posix::types::time_t, nanos: u32) -> libc::timespec {
         debug_assert!(nanos < 1_000_000_000);
-        let time = blaze_sys::Timespec { sec: seconds, nsec: i64::from(nanos) };
-        // SAFETY: both are the C timespec of two signed 64-bit integers, seconds then nanoseconds.
-        unsafe { std::mem::transmute(time) }
+        libc::timespec { tv_sec: seconds, tv_nsec: i64::from(nanos) }
     }
 
     /// The access and modification times of `path` (relative to the working directory, a link
@@ -261,7 +273,7 @@ mod unix {
         )
         .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))?;
         // SAFETY: both stat types have the target's C stat layout and integer fields.
-        Ok(unsafe { std::mem::transmute(stat) })
+        Ok(unsafe { abi_mirror(stat) })
     }
 
     /// `target`, a new empty file, made to share `source`'s blocks: `FICLONE`.
@@ -287,7 +299,7 @@ mod unix {
             stat
         };
         // SAFETY: both statfs types represent the target's C statfs, with the same fields and layout.
-        Ok(unsafe { std::mem::transmute(stat) })
+        Ok(unsafe { abi_mirror(stat) })
     }
 
     /// `to` made a clone of the open file `from` (`fclonefileat`, no flags).
@@ -456,7 +468,7 @@ mod unix {
             .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))?;
         // SAFETY: both Linux utsname structures are the kernel's six consecutive 65-byte
         // character arrays. All bytes are initialized and valid in either signedness.
-        Ok(unsafe { core::mem::transmute(name) })
+        Ok(unsafe { abi_mirror(name) })
     }
 
     /// `pid`'s physical footprint now and the most it has been: `proc_pid_rusage`'s

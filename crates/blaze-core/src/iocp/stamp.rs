@@ -326,8 +326,7 @@ fn list(dir: &Path, name: &crate::DirName, buffer: &mut [u64]) -> io::Result<cra
             };
         }
         class = FileIdBothDirectoryInfo;
-        // SAFETY: the call filled the buffer, which is read as bytes while it is not written.
-        let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), LISTING) };
+        let bytes = &crate::pod::bytes_of_slice(buffer)[..LISTING];
         let mut at = 0;
         let malformed = || {
             named(io::Error::new(

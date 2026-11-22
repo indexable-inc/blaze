@@ -256,7 +256,7 @@ pub fn read_back<A: Allocator + Clone>(
     got.resize(leaves as usize, 0);
     // SAFETY: the code is an emitted C function `fn(ptr, ptr)` that reads only the placed
     // allocations (alive in `words`) and writes `leaves` words to `got`.
-    let f = unsafe { core::mem::transmute::<usize, extern "C" fn(*const u8, *mut u64)>(exec.code_address() as usize) };
+    let f: extern "C" fn(*const u8, *mut u64) = unsafe { exec.as_fn() };
     f((base + at[0]) as *const u8, got.as_mut_ptr());
     drop(words);
     Ok(got)

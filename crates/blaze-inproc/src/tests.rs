@@ -1042,7 +1042,12 @@ mod linux {
         // SAFETY: `address` is the start of code this test wrote whole and published, mapped
         // executable for the rest of the test: a function taking nothing and returning a
         // `u32` in the C ABI (`returning`), or a stub jumping to one (`stub`).
-        let function: extern "C" fn() -> u32 = unsafe { std::mem::transmute(address as usize) };
+        let ptr = address as usize as *const ();
+        const {
+            assert!(size_of::<*const ()>() == size_of::<extern "C" fn() -> u32>());
+            assert!(align_of::<*const ()>() == align_of::<extern "C" fn() -> u32>());
+        }
+        let function: extern "C" fn() -> u32 = unsafe { core::ptr::read((&raw const ptr).cast()) };
         function()
     }
 

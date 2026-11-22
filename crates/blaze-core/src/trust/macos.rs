@@ -165,15 +165,18 @@ fn open(path: &'static CStr, name: &'static str) -> Result<*mut c_void, Looked> 
 ///
 /// `F` is a pointer type that is the symbol's type as its header declares it.
 unsafe fn symbol<F: Copy>(handle: *mut c_void, framework: &'static str, name: &'static CStr) -> Result<F, Looked> {
-    const { assert!(size_of::<F>() == size_of::<*mut c_void>(), "a symbol is one address") };
+    const {
+        assert!(size_of::<F>() == size_of::<*mut c_void>(), "a symbol is one address");
+        assert!(align_of::<F>() == align_of::<*mut c_void>(), "a symbol has pointer alignment");
+    }
     // SAFETY: a handle `open` returned, never closed, and a NUL-terminated name.
     let found = unsafe { thread::dlsym(handle, name.as_ptr()) };
     if found.is_null() {
         let symbol = name.to_str().ok();
         return Err(Looked { place: Place::System(framework), why: Why::Missing { symbol } });
     }
-    // SAFETY: an address the size of `F` (asserted above), of the symbol whose type `F` is.
-    Ok(unsafe { std::mem::transmute_copy::<*mut c_void, F>(&found) })
+    // SAFETY: `F` has pointer size & alignment (asserted above) and names the loaded symbol's ABI.
+    Ok(unsafe { core::ptr::read((&raw const found).cast::<F>()) })
 }
 
 /// A domain's decision on one certificate for SSL.

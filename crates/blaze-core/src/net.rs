@@ -394,10 +394,7 @@ fn accepting(
     if got <= 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: `info` is plain bytes, 2048 of them, all initialized.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(info.as_ptr().cast::<u8>(), std::mem::size_of_val(&info))
-    };
+    let bytes = crate::pod::bytes_of(&info);
     let int =
         |at: usize| c_int::from_ne_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
     if (got as usize) < OPTIONS + 2

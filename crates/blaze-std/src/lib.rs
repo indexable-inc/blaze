@@ -228,6 +228,9 @@ pub mod opener;
 pub mod out;
 /// Data parallelism over disjoint chunks: `for_each`, `map_into`, `reduce`.
 pub mod par;
+/// Safe plain-old-data (`Pod`), `Zeroable`, `CheckedBitPattern`, and `TransparentWrapper`
+/// conversions (`blaze_own::pod`): Blaze's safe replacement for `core::mem::transmute`.
+pub use blaze_own::pod;
 /// Ownership properties derived by reflection (`Acyclic`, `NoCapability`), the walk they are
 /// instances of, and the handles built on them: `Shared`, `LocalShared`, `Shares`.
 #[expect(

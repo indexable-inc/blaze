@@ -48,6 +48,9 @@ use core::{
 };
 
 pub use blaze_own::{Alloc, Erased, SharedAlloc};
+pub use blaze_own::pod::{
+    self, AnyBitPattern, CastError, CheckedBitPattern, NoUninit, Pod, TransparentWrapper, Zeroable,
+};
 pub use blaze_mem::{
     AppendVec, ArenaLocal, Block, Built, Cache, Column, Frame, FromUtf8Error, HUGE_PAGE, Handle,
     Kept, Marker, MemError, Pool, Pooled, Region, RegionVec, Revisions, Slab, String, Tag,

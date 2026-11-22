@@ -277,7 +277,7 @@ fn a_vtable_address_in_code_is_a_relocation_to_the_placed_table() {
     })
     .expect("the code maps");
     // SAFETY: the code is `fn() -> ptr` of the C convention, mapped and held by `exec`.
-    let run = unsafe { std::mem::transmute::<usize, extern "C" fn() -> u64>(exec.code_address() as usize) };
+    let run: extern "C" fn() -> u64 = unsafe { exec.as_fn() };
     let got = run();
     assert_eq!(got, table);
     // SAFETY: `got` is the leaked 8-word table `place_table` made (header 3 + 5 words).
