@@ -265,6 +265,8 @@ pub mod comptime;
 pub mod type_set;
 /// Anonymous Union Types (`A | B | C`) with small local tags, by-value widening & narrowing.
 pub mod union_ty;
+/// Zero-cost, `#![forbid(unsafe_code)]` View Types (`bstd::views!`, `ProjectView`, `DisjointSplit`).
+pub mod view;
 /// The native backend's reads of its host's facts.
 #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
 mod native;
