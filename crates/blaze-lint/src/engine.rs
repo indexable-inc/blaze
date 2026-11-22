@@ -285,7 +285,6 @@ pub(crate) fn run_with<'a>(
         in_use: false,
         defining: false,
         last_fn: None,
-        cur_fn_len: 0,
         cost: Cost::NONE,
     };
     pass.lex(unit.holes)?;
@@ -334,8 +333,6 @@ struct Pass<'u, 's, 'a> {
     defining: bool,
     /// The last `fn` read: where a local's declaration is looked for from.
     last_fn: Option<usize>,
-    /// Byte length of the innermost open non-recursive function's name when `sig.is_none()`, or 0.
-    cur_fn_len: u32,
     /// The sites each rule tried ([`Cost`]): one count at each dispatch into a rule.
     cost: Cost,
 }
@@ -796,8 +793,20 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
         let word_id = t.word;
         if word_id == NO_WORD {
             // No rule reads this word (every word below is in the table, a compile-time check
-            // in sequences.rs): only a recursive call can be its use.
+            // in sequences.rs): only a recursive call, `match` discriminant table, or
+            // `#[proc_macro*]` attribute can be its use.
             self.defining = false;
+            let len = t.end - t.start;
+            if len == 5 && self.rules.runs(Rule::HandWrittenDerivable) && self.str_of(t) == "match" {
+                self.check_hand_written_discriminant(i, t);
+            } else if matches!(len, 10 | 17 | 20)
+                && self.rules.runs(Rule::ProcMacroDef)
+                && matches!(self.str_of(t), "proc_macro" | "proc_macro_derive" | "proc_macro_attribute")
+                && self.back(i, 1).is_some_and(|b| b.k == K::P(b'['))
+                && self.back(i, 2).is_some_and(|b| b.k == K::P(b'#'))
+            {
+                self.push(Template::ProcMacroDef, self.toks[i - 2].start, t.end, None);
+            }
             if self.rules.runs(Rule::Recursion) {
                 self.cost.add(Rule::Recursion);
                 if self.sig.is_none() && !self.bodies.is_empty() {
@@ -1587,6 +1596,71 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                 fn_start,
                 name_end,
                 Some(Arg::Span(tuple_span)),
+            );
+        }
+    }
+
+    /// Detects `match expr { Variant => <int>, ... }` with `>= 8` arms mapping directly to
+    /// integer literals (a hand-written discriminant table where `#[repr(u8)]`,
+    /// `core::mem::discriminant`, or `bstd::comptime` derive belongs).
+    fn check_hand_written_discriminant(&mut self, match_at: usize, match_tok: Tok) {
+        // Find opening `{` of the `match` body at paren/bracket depth 0.
+        let mut depth = 0usize;
+        let mut open = None;
+        let mut j = match_at + 1;
+        let scan_limit = (match_at + 48).min(self.toks.len());
+        while j < scan_limit {
+            if let Some(t) = self.tok(j) {
+                match t.k {
+                    K::P(b'(' | b'[') => depth += 1,
+                    K::P(b')' | b']') => depth = depth.saturating_sub(1),
+                    K::P(b'{') if depth == 0 => {
+                        open = Some(j);
+                        break;
+                    }
+                    K::P(b';') if depth == 0 => return,
+                    _ => {}
+                }
+            }
+            j += 1;
+        }
+        let Some(open) = open else { return };
+
+        // Count top-level `=> <int_literal>` arms inside `{ ... }`.
+        let mut bdepth = 1usize;
+        let mut int_arms = 0u32;
+        let mut total_arms = 0u32;
+        let mut k = open + 1;
+        while k < self.toks.len() && bdepth > 0 {
+            let Some(t) = self.tok(k) else { break };
+            match t.k {
+                K::P(b'{') => bdepth += 1,
+                K::P(b'}') => bdepth -= 1,
+                K::P(b'=')
+                    if bdepth == 1
+                        && self.tok(k + 1).is_some_and(|g| g.k == K::P(b'>') && t.end == g.start) =>
+                {
+                    total_arms += 1;
+                    // Check if arm body is a bare integer literal followed by `,` or `}`.
+                    if self.tok(k + 2).is_some_and(|lit| lit.k == K::Int)
+                        && self
+                            .tok(k + 3)
+                            .is_some_and(|after| matches!(after.k, K::P(b',' | b'}')))
+                    {
+                        int_arms += 1;
+                    }
+                    k += 1;
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        if bdepth == 0 && total_arms >= 8 && int_arms >= 8 && int_arms * 4 >= total_arms * 3 {
+            self.push(
+                Template::HandWrittenDiscriminant,
+                match_tok.start,
+                match_tok.end,
+                Some(Arg::Int(int_arms)),
             );
         }
     }

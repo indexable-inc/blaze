@@ -94,7 +94,7 @@ fn said_once_and_kept(seed: u64, files: &[(&str, &[u8])], verbatim: &str) {
     let said = stderr(&io);
     println!("{said}");
     assert!(said.contains(verbatim), "the note is not the one stated:\n{said}");
-    assert_eq!(said.matches("blaze: note:").count(), 1, "more than one note: {said}");
+    assert_eq!(said.matches("other-version store").count(), 1, "more than one note group: {said}");
     assert!(there(&io, &format!("h/.blaze/{STORE_DIR}/head")), "this blaze's folder was not made");
     assert!(there(&io, TAG), "the store root's cache tag is not there");
     assert_eq!(command(&io, 2), 0, "the second command looked again");
@@ -108,19 +108,17 @@ fn said_once_and_kept(seed: u64, files: &[(&str, &[u8])], verbatim: &str) {
 fn a_legacy_store_is_said_once_by_size_and_kept_byte_for_byte() {
     let mut files = LEGACY.to_vec();
     files.push((TAG, blaze_cas::plain::CACHEDIR_SIGNATURE));
-    let size: usize = LEGACY.iter().map(|(_, it)| it.len()).sum();
-    let verbatim = format!(
-        "blaze: note: the home's .blaze/v2/store holds a store of format 4 or before (4 files directly in it, {size} bytes); this blaze reads only its own, .blaze/{STORE_DIR}, and migrates nothing (its records are made again); `blaze clean` removes it, and so does the cleanup after a command once it is unused for {EXPIRY_DAYS} days\n"
-    );
+    let size: u64 = LEGACY.iter().map(|(_, it)| it.len() as u64).sum();
+    let human = blaze_report::ui::fmt_bytes(size);
+    let verbatim = format!("~/.blaze/v2/store  format <=4 · 4 files · {human}");
     said_once_and_kept(21, &files, &verbatim);
 }
 
 #[test]
 fn a_newer_blazes_folder_is_said_once_and_kept() {
-    let size: usize = NEWER.iter().map(|(_, it)| it.len()).sum();
-    let verbatim = format!(
-        "blaze: note: the home's .blaze/v2/store/f6s2 holds a store of another blaze's forms (2 files, {size} bytes); this blaze reads only its own, .blaze/{STORE_DIR}, and migrates nothing (its records are made again); `blaze clean` removes it, and so does the cleanup after a command once it is unused for {EXPIRY_DAYS} days\n"
-    );
+    let size: u64 = NEWER.iter().map(|(_, it)| it.len() as u64).sum();
+    let human = blaze_report::ui::fmt_bytes(size);
+    let verbatim = format!("~/.blaze/v2/store/f6s2  other version · 2 files · {human}");
     said_once_and_kept(22, &NEWER, &verbatim);
 }
 

@@ -145,6 +145,7 @@ pub fn start<'a>(entry: Entry, platform: Platform, alloc: Alloc<'a>) -> Result<S
             records.push((symbol, bytes));
             symbol
         }
+        Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     };
     Ok(Start { records, entry })
 }

@@ -294,6 +294,7 @@ fn laid_tables(platform: Platform, check_index: impl Fn(&Laid<'_, '_>, &EhSectio
     let plan = match platform {
         Platform::MacosArm64 => macho::plan(),
         Platform::LinuxArm64 => elf::plan(),
+        Platform::Wasm64 => unreachable!("eh_out tests cover native arm64 platforms"),
     };
     let personality = Some(sym("personality"));
     let room = eh_room(&members, personality, platform, Alloc::global()).unwrap();
@@ -383,6 +384,7 @@ fn eh_out_the_room_is_the_measure_and_a_byte_short_is_refused_by_type() {
         let plan = match platform {
             Platform::MacosArm64 => macho::plan(),
             Platform::LinuxArm64 => elf::plan(),
+            Platform::Wasm64 => unreachable!("eh_out tests cover native arm64 platforms"),
         };
         let room = eh_room(&members, personality, platform, Alloc::global()).unwrap();
         let mut laid = lay_out(&members, &[], sym("main"), None, plan, room, Alloc::global()).unwrap();
@@ -433,6 +435,7 @@ fn eh_out_export_reports_and_checks() {
         let checked = match platform {
             Platform::MacosArm64 => check::macho(&out).map(|_| ()),
             Platform::LinuxArm64 => check::elf(&out).map(|_| ()),
+            Platform::Wasm64 => unreachable!("eh_out tests cover native arm64 platforms"),
         };
         assert_eq!(checked, Ok(()), "the file passes the crate's own format checker");
     }

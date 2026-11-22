@@ -184,13 +184,14 @@ impl core::fmt::Display for Note<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let OtherForm { kind, files, bytes, .. } = self.0;
         let noun = if *files == 1 { "file" } else { "files" };
+        let size = blaze_report::ui::fmt_bytes(*bytes);
         match kind {
-            FormKind::Legacy => write!(f, "blaze: note: the home's .blaze/{STORE_ROOT} holds a store of format 4 or before ({files} {noun} directly in it, {bytes} bytes)")?,
-            FormKind::Folder(name) => write!(f, "blaze: note: the home's .blaze/{STORE_ROOT}/{} holds a store of another blaze's forms ({files} {noun}, {bytes} bytes)", name.as_str())?,
+            FormKind::Legacy => write!(f, "blaze: note: ~/.blaze/{STORE_ROOT} (format <=4 · {files} {noun} · {size})")?,
+            FormKind::Folder(name) => write!(f, "blaze: note: ~/.blaze/{STORE_ROOT}/{} (other version · {files} {noun} · {size})", name.as_str())?,
         }
         write!(
             f,
-            "; this blaze reads only its own, .blaze/{STORE_DIR}, and migrates nothing (its records are made again); `blaze clean` removes it, and so does the cleanup after a command once it is unused for {EXPIRY_DAYS} days"
+            " — active: ~/.blaze/{STORE_DIR}; run `blaze clean` to remove (auto-expires after {EXPIRY_DAYS} days)"
         )
     }
 }
@@ -209,8 +210,46 @@ pub(crate) fn note_once<D: Driver>(cx: &Cx, blaze: &Dir<ReadWrite>, lent: &Lent<
         blaze.publish(cx, &tag, Content::bytes(CACHEDIR_SIGNATURE), Durable::No).map_err(look)?;
     }
     let found = list(cx, blaze, &root()?)?;
-    for form in found.iter() {
-        err.line(cx, format_args!("{}", Note(form)))?;
+    if found.len() > 0 {
+        let total_bytes: u64 = found.iter().map(|it| it.bytes).sum();
+        let noun = if found.len() == 1 { "store" } else { "stores" };
+        let headline = std::format!(
+            "{} other-version {noun} ({}) — active: ~/.blaze/{STORE_DIR}",
+            found.len(),
+            blaze_report::ui::fmt_bytes(total_bytes),
+        );
+        let owned_rows: std::vec::Vec<(std::string::String, std::string::String)> = found
+            .iter()
+            .map(|form| {
+                let path = match &form.kind {
+                    FormKind::Legacy => std::format!("~/.blaze/{STORE_ROOT}"),
+                    FormKind::Folder(name) => std::format!("~/.blaze/{STORE_ROOT}/{}", name.as_str()),
+                };
+                let label = match &form.kind {
+                    FormKind::Legacy => "format <=4",
+                    FormKind::Folder(_) => "other version",
+                };
+                let fnoun = if form.files == 1 { "file" } else { "files" };
+                let detail = std::format!(
+                    "{label} · {} {fnoun} · {}",
+                    blaze_report::ui::fmt_count(form.files),
+                    blaze_report::ui::fmt_bytes(form.bytes)
+                );
+                (path, detail)
+            })
+            .collect();
+        let rows: std::vec::Vec<(&str, &str)> = owned_rows.iter().map(|(l, r)| (l.as_str(), r.as_str())).collect();
+        let action = std::format!("run `blaze clean` to remove (auto-expires after {EXPIRY_DAYS} days)");
+        let rendered = blaze_report::ui::Theme::PLAIN.notice_group(
+            "note",
+            blaze_report::palette::Token::Warning,
+            &headline,
+            &rows,
+            Some(&action),
+        );
+        for line in rendered.lines() {
+            err.line(cx, format_args!("{line}"))?;
+        }
     }
     lent.root(OTHER_FORMS_LOOKED, &[]).map_err(|error| CliError::Store(StoreFailure::Place(super::PlaceError::Lent(error))))?;
     Ok(found.len() as u32)

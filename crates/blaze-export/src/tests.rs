@@ -247,3 +247,55 @@ fn statics_and_vtables_are_placed_and_fixed() {
     assert_eq!((facts.rebases, facts.binds), (1, 0));
     println!("data: the static's load is adrp+add to its home; {} rebase for the vtable's word", facts.rebases);
 }
+
+#[test]
+fn wasm64_export_is_deterministic_and_valid_memory64() {
+    use crate::wasm64::{
+        ValType, Wasm64Data, Wasm64Error, Wasm64Func, Wasm64Opts, Wasm64Program, check_wasm64,
+        export_wasm64,
+    };
+
+    // `_start() -> i32 { 0 }` (i32.const 0 = 0x41 0x00)
+    let funcs = [Wasm64Func {
+        export_name: Some("_start"),
+        params: &[],
+        results: &[ValType::I32],
+        locals: &[],
+        body: &[0x41, 0x00],
+    }];
+    let data = [Wasm64Data { offset: 0x1000, bytes: b"hello wasm64" }];
+    let prog = Wasm64Program {
+        name: "hello-wasm64",
+        funcs: &funcs,
+        data: &data,
+        profile_digest: Some([0xAB; 32]),
+        opts: Wasm64Opts::DEFAULT,
+    };
+    let mut out1 = Vec::new_in(Alloc::global());
+    let mut out2 = Vec::new_in(Alloc::global());
+    let meta1 = export_wasm64(&prog, &mut out1, Alloc::global()).expect("wasm64 exports");
+    let meta2 = export_wasm64(&prog, &mut out2, Alloc::global()).expect("wasm64 exports");
+    assert_eq!(out1.as_slice(), out2.as_slice(), "wasm64 export must be byte-deterministic");
+    assert_eq!(meta1.identity, meta2.identity);
+
+    let checked = check_wasm64(&out1).expect("wasm64 spec validator accepts module");
+    assert!(checked.memory64);
+    assert_eq!(checked.min_pages, Wasm64Opts::DEFAULT.min_pages);
+    assert_eq!(checked.max_pages, Wasm64Opts::DEFAULT.max_pages);
+    assert_eq!(checked.host_imports, 3);
+    assert_eq!(checked.func_count, 1);
+    assert_eq!(checked.data_segments, 1);
+    assert!(checked.has_memory_export);
+    assert!(checked.has_start_export);
+    assert!(checked.has_profile_section);
+
+    // Corrupted memory32 module (flag 0x01 instead of 0x05) is refused by check_wasm64.
+    let mut bad = out1.clone();
+    let mem_sec_pos = bad.windows(3).position(|w| w == [5, 8, 1]).or_else(|| {
+        bad.windows(2).position(|w| w[0] == 0x05 && (w[1] == 0x10))
+    });
+    if let Some(p) = mem_sec_pos {
+        bad[p] = 0x01; // clear memory64 bit 0x04
+        assert!(matches!(check_wasm64(&bad), Err(Wasm64Error::NotMemory64 { .. })));
+    }
+}

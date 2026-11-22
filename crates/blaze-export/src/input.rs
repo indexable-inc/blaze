@@ -109,15 +109,17 @@ pub enum Platform {
     MacosArm64,
     /// ELF `ET_DYN` (PIE), AArch64, glibc's dynamic loader.
     LinuxArm64,
+    /// WebAssembly 64-bit linear memory (`memory64`, Wasmtime 64) over Blaze's sans-IO ring ABI.
+    Wasm64,
 }
 
 impl Platform {
-    /// The page a layout aligns its regions to: 16 KiB on macOS on arm64; on Linux the largest
-    /// page an arm64 kernel may use, 64 KiB, so one file runs on every kernel.
+    /// The page a layout aligns its regions to: 16 KiB on macOS on arm64; on Linux and Wasm64
+    /// 64 KiB (arm64 max kernel page / WebAssembly page size).
     pub fn page(self) -> u64 {
         match self {
             Platform::MacosArm64 => 0x4000,
-            Platform::LinuxArm64 => 0x1_0000,
+            Platform::LinuxArm64 | Platform::Wasm64 => 0x1_0000,
         }
     }
 }

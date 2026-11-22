@@ -55,7 +55,10 @@ pub use blaze_mem::{
 };
 pub use blaze_mem::Arena as RequestArena;
 pub mod fast;
-pub use fast::{GenMap, KindSet, SmallVec, interp_search_by_prefix};
+pub use fast::{
+    GenMap, KindSet, SmallVec, interp_search_by_prefix, simd_count_byte, simd_find_byte_any4,
+    simd_mismatch, simd_prefix_sum_u32,
+};
 
 use alloc::vec::Vec;
 use crate::{Plant, Stopped, io::Io};

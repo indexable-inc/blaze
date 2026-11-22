@@ -127,6 +127,7 @@
     generic_atomic,
     macro_attr,
     marker_trait_attr,
+    portable_simd,
     register_tool,
     rustc_attrs,
     thread_local,
@@ -252,6 +253,10 @@ pub mod guest;
 pub mod hosting;
 // The `dry` and `ask` layers and the `fake` providers, at the host's seam (run.md).
 pub mod layers;
+/// High-performance Wasmtime 64 (`memory64`) batched sans-IO host/guest ring ABI (`blaze_host_v1`).
+pub mod wasm64;
+/// Compile-time reflection & zero-proc-macro derive bridge (`cfg(blaze)` comptime-first).
+pub mod comptime;
 /// The native backend's reads of its host's facts.
 #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
 mod native;

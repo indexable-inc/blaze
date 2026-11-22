@@ -204,6 +204,12 @@ pub fn show_message<P: Put + ?Sized>(rules: &RuleSet, item: &str, findings: &Fin
             out.str("`").str(range).str("` returns an anonymous tuple with unnamed state (`").str(span(0).unwrap_or("?"));
             out.str("`): define a named struct so each field carries its meaning");
         }
+        Template::HandWrittenDiscriminant => {
+            out.str("`").str(range).str("` hand-maps enum variants to integer tags: use `#[repr(u8)]`, `core::mem::discriminant`, or `bstd::comptime` derive instead");
+        }
+        Template::ProcMacroDef => {
+            out.str("`").str(range).str("` defines a proc macro: under Blaze, prefer `bstd::comptime` reflection (`#[cfg(blaze)] comptime fn`) to avoid proc-macro build overhead");
+        }
         Template::VariantCount | Template::VariantCountMany => {
             let names = || {
                 args.iter().filter_map(|arg| match arg {

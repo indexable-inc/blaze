@@ -609,14 +609,12 @@ pub fn old_home<D: Driver>(cx: &Cx, home: &Home, root: &Dir<ReadWrite>, checkout
         checkout_root.push(char::from(HEX[usize::from(byte & 15)]));
     }
     let looked = |name: &str| roots.iter().any(|(it, _)| it == name);
-    let mut found = 0;
-    let say = |cx: &Cx, place: &str, folder: &str| {
-        err.line(cx, format_args!("blaze: an old store under {place}{folder} is not read by this blaze: its records are made again; delete it when no older blaze needs it"))
-    };
+    let mut found = 0u32;
+    let mut items: std::vec::Vec<std::string::String, Global> = std::vec::Vec::new_in(Global);
     if !looked(OLD_HOME_LOOKED) {
         for folder in OLD_HOME {
             if home.dir.stat(cx, &Path::new(folder)?).map_err(|error| CliError::Store(StoreFailure::Look { folder, error }))?.is_some() {
-                say(cx, "the home's .blaze/", folder)?;
+                items.push(std::format!("~/.blaze/{folder}"));
                 found += 1;
             }
         }
@@ -625,11 +623,26 @@ pub fn old_home<D: Driver>(cx: &Cx, home: &Home, root: &Dir<ReadWrite>, checkout
     if !looked(&checkout_root) {
         for old in OLD_CHECKOUT {
             if root.stat(cx, &Path::new(old)?).map_err(|error| CliError::Store(StoreFailure::Look { folder: old, error }))?.is_some() {
-                say(cx, "the checkout's ", old)?;
+                items.push(std::string::String::from(old));
                 found += 1;
             }
         }
         lent.root(&checkout_root, &[]).map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
+    }
+    if !items.is_empty() {
+        let noun = if items.len() == 1 { "folder" } else { "folders" };
+        let headline = std::format!("{} old store {noun} unused by this blaze", items.len());
+        let rows: std::vec::Vec<(&str, &str), Global> = items.iter().map(|p| (p.as_str(), "unused")).collect();
+        let rendered = blaze_report::ui::Theme::PLAIN.notice_group(
+            "note",
+            blaze_report::palette::Token::Warning,
+            &headline,
+            &rows,
+            Some("delete when no older blaze needs them; records are rebuilt in the active store"),
+        );
+        for line in rendered.lines() {
+            err.line(cx, format_args!("{line}"))?;
+        }
     }
     Ok(found)
 }

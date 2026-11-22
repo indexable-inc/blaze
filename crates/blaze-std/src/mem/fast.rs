@@ -551,3 +551,130 @@ pub fn interp_search_by_prefix<T>(
     }
     Err(lo)
 }
+
+// ---- Portable zero-unsafe SIMD primitives (NEON on Apple Silicon / Graviton, AVX2/AVX-512 on EPYC)
+
+use core::simd::{Select as _, Simd, cmp::SimdPartialEq as _};
+
+/// Finds the first index in `haystack` equal to any of the four delimiter bytes `(b0, b1, b2, b3)`
+/// using 32-byte portable SIMD vectors (`core::simd::Simd<u8, 32>`). Zero `unsafe`.
+#[inline]
+pub fn simd_find_byte_any4(haystack: &[u8], b0: u8, b1: u8, b2: u8, b3: u8) -> Option<usize> {
+    const LANES: usize = 32;
+    let v0 = Simd::<u8, LANES>::splat(b0);
+    let v1 = Simd::<u8, LANES>::splat(b1);
+    let v2 = Simd::<u8, LANES>::splat(b2);
+    let v3 = Simd::<u8, LANES>::splat(b3);
+
+    let chunks = haystack.chunks_exact(LANES);
+    let rem_start = haystack.len() - chunks.remainder().len();
+    for (idx, chunk) in chunks.enumerate() {
+        let v = Simd::<u8, LANES>::from_slice(chunk);
+        let mask = v.simd_eq(v0) | v.simd_eq(v1) | v.simd_eq(v2) | v.simd_eq(v3);
+        let bits = mask.to_bitmask();
+        if bits != 0 {
+            return Some(idx * LANES + bits.trailing_zeros() as usize);
+        }
+    }
+    for (off, &byte) in haystack[rem_start..].iter().enumerate() {
+        if byte == b0 || byte == b1 || byte == b2 || byte == b3 {
+            return Some(rem_start + off);
+        }
+    }
+    None
+}
+
+/// Counts occurrences of `needle` in `haystack` using 32-byte SIMD with 255-block vector
+/// accumulation (amortizing horizontal reductions to once per 8,160 bytes). Zero `unsafe`.
+#[inline]
+pub fn simd_count_byte(haystack: &[u8], needle: u8) -> usize {
+    const LANES: usize = 32;
+    let target = Simd::<u8, LANES>::splat(needle);
+    let ones = Simd::<u8, LANES>::splat(1);
+    let zeros = Simd::<u8, LANES>::splat(0);
+
+    let mut total = 0usize;
+    let mut chunks = haystack.chunks_exact(LANES);
+    loop {
+        let mut acc = zeros;
+        let mut block = 0usize;
+        while block < 255 {
+            let Some(chunk) = chunks.next() else {
+                break;
+            };
+            let v = Simd::<u8, LANES>::from_slice(chunk);
+            acc += v.simd_eq(target).select(ones, zeros);
+            block += 1;
+        }
+        if block == 0 {
+            break;
+        }
+        // Horizontal sum of 32 lanes (each lane <= 255, total <= 8160).
+        let arr = acc.to_array();
+        let mut s = 0usize;
+        for &x in &arr {
+            s += usize::from(x);
+        }
+        total += s;
+        if block < 255 {
+            break;
+        }
+    }
+    for &b in chunks.remainder() {
+        total += usize::from(b == needle);
+    }
+    total
+}
+
+/// Returns the index of the first differing byte between `a` and `b` (or `a.len().min(b.len())`
+/// if one is a prefix of the other) using 32-byte SIMD vectors. Zero `unsafe`.
+#[inline]
+pub fn simd_mismatch(a: &[u8], b: &[u8]) -> usize {
+    const LANES: usize = 32;
+    let len = a.len().min(b.len());
+    let mut i = 0usize;
+    while i + LANES <= len {
+        let va = Simd::<u8, LANES>::from_slice(&a[i..i + LANES]);
+        let vb = Simd::<u8, LANES>::from_slice(&b[i..i + LANES]);
+        let diff = va.simd_ne(vb).to_bitmask();
+        if diff != 0 {
+            return i + diff.trailing_zeros() as usize;
+        }
+        i += LANES;
+    }
+    while i < len {
+        if a[i] != b[i] {
+            return i;
+        }
+        i += 1;
+    }
+    len
+}
+
+/// In-place inclusive wrapping prefix sum over `values` using 8-wide SIMD Hillis-Steele
+/// in-register scans (for building CSR offset tables at 8 `u32`s per vector step). Zero `unsafe`.
+#[inline]
+pub fn simd_prefix_sum_u32(values: &mut [u32]) {
+    const LANES: usize = 8;
+    let mut carry = 0u32;
+    let mut chunks = values.chunks_exact_mut(LANES);
+    for chunk in &mut chunks {
+        let mut v = Simd::<u32, LANES>::from_slice(chunk);
+        // Step 1: shift by 1
+        let s1 = Simd::<u32, LANES>::from_array([0, v[0], v[1], v[2], v[3], v[4], v[5], v[6]]);
+        v += s1;
+        // Step 2: shift by 2
+        let s2 = Simd::<u32, LANES>::from_array([0, 0, v[0], v[1], v[2], v[3], v[4], v[5]]);
+        v += s2;
+        // Step 3: shift by 4
+        let s4 = Simd::<u32, LANES>::from_array([0, 0, 0, 0, v[0], v[1], v[2], v[3]]);
+        v += s4;
+        v += Simd::<u32, LANES>::splat(carry);
+        carry = v[LANES - 1];
+        chunk.copy_from_slice(&v.to_array());
+    }
+    for slot in chunks.into_remainder() {
+        carry = carry.wrapping_add(*slot);
+        *slot = carry;
+    }
+}

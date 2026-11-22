@@ -43,11 +43,17 @@ pub mod optimized;
 mod plant;
 pub mod sign;
 pub mod start;
+/// Wasmtime 64 (`memory64`) `.wasm` module writer & validator for Blaze's sans-IO host ring ABI.
+pub mod wasm64;
 
 pub use error::ExportError;
 pub use export::{Exported, Panics, export};
 pub use input::{CExport, Data, DataPlace, DataWord, Entry, Function, Panic, Platform, Profile, ProgramIn, Tier};
 pub use optimized::{Function02, ProgramIn02, export_optimized, v1_to_v2};
+pub use wasm64::{
+    Wasm64Check, Wasm64Data, Wasm64Error, Wasm64Exported, Wasm64Func, Wasm64Opts, Wasm64Program,
+    check_wasm64, export_wasm64,
+};
 
 #[cfg(test)]
 mod tests;

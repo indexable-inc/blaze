@@ -1020,7 +1020,14 @@ pub(crate) struct Tally {
 
 impl fmt::Display for Tally {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "code records: reached {}, found {}, made {}, unkeyed {}", self.reached, self.found, self.made, self.unkeyed)
+        write!(
+            f,
+            "{} compiled · {} cached ({} reached{})",
+            blaze_report::ui::fmt_count(self.made as u64),
+            blaze_report::ui::fmt_count(self.found as u64),
+            blaze_report::ui::fmt_count(self.reached as u64),
+            if self.unkeyed > 0 { std::format!(", {} unkeyed", self.unkeyed) } else { std::string::String::new() },
+        )
     }
 }
 

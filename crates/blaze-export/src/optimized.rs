@@ -231,6 +231,7 @@ pub fn export_optimized<'a>(program: &ProgramIn02<'_>, platform: Platform, out: 
     let plan = match platform {
         Platform::MacosArm64 => macho::plan(),
         Platform::LinuxArm64 => elf::plan(),
+        Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     };
     let rows = rows_of(&members, alloc);
     let unwinds = unwinds(&members, &rows, alloc)?;
@@ -245,6 +246,7 @@ pub fn export_optimized<'a>(program: &ProgramIn02<'_>, platform: Platform, out: 
     let identity = match platform {
         Platform::MacosArm64 => macho::write(&laid, &eh, program.name, &seed, out, alloc)?,
         Platform::LinuxArm64 => elf::write(&laid, &eh, &seed, out, alloc)?,
+        Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     };
     let (mut functions, mut folded, mut fast, mut optimized, mut made_count) = (0u32, 0u32, 0u32, 0u32, 0u32);
     for p in laid.placed.iter() {

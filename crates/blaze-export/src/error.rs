@@ -88,6 +88,8 @@ pub enum ExportError {
     /// The file's one `__unwind_info` (Rust rows and the native image's) was refused by its
     /// writer (blaze-native unwind.rs).
     NativeUnwind { error: UnwindInfoError },
+    /// `Platform::Wasm64` takes Wasm64 IR via [`crate::wasm64::export_wasm64`], not AArch64 machine code records.
+    Wasm64RequiresWasmProgram,
 }
 
 impl From<ImageError> for ExportError {
@@ -191,6 +193,9 @@ impl fmt::Display for ExportError {
             ExportError::Native(error) => write!(f, "export: {error} (NATIVE.md 3.9)"),
             ExportError::NativeUnwind { error } => {
                 write!(f, "export: the unwind index over the program's and the native image's rows is refused: {error:?} (NATIVE.md 3.9)")
+            }
+            ExportError::Wasm64RequiresWasmProgram => {
+                write!(f, "export: Platform::Wasm64 takes a Wasm64Program via blaze_export::export_wasm64, not AArch64 code records")
             }
         }
     }

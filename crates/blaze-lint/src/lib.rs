@@ -48,6 +48,7 @@
 extern crate std;
 
 mod allowed;
+pub mod dup;
 mod engine;
 mod fix;
 mod marks;
@@ -238,6 +239,14 @@ pub enum Rule {
     /// `(T, bool)`, `Option<(A, B, C)>`) where a named struct should name each field.
     /// The lint `blaze::anon_tuple_return`.
     AnonTupleReturn = 31,
+    /// A large `match` (`>= 8` arms) hand-mapping enum variants to sequential integer tags where
+    /// `#[repr(..)]`, `core::mem::discriminant`, or `bstd::comptime` derive belongs.
+    /// The lint `blaze::hand_written_derivable`.
+    HandWrittenDerivable = 32,
+    /// A procedural macro definition (`#[proc_macro]`, `#[proc_macro_derive]`,
+    /// `#[proc_macro_attribute]`) where Blaze's `comptime` reflection should be used instead.
+    /// The lint `blaze::proc_macro_derive`.
+    ProcMacroDef = 33,
 }
 
 impl Rule {
@@ -277,6 +286,8 @@ impl Rule {
         Rule::SwappableParameters,
         Rule::PrimitiveMeaning,
         Rule::AnonTupleReturn,
+        Rule::HandWrittenDerivable,
+        Rule::ProcMacroDef,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -332,6 +343,8 @@ impl Rule {
             Rule::SwappableParameters => "swappable-parameters",
             Rule::PrimitiveMeaning => "primitive-meaning",
             Rule::AnonTupleReturn => "anon-tuple-return",
+            Rule::HandWrittenDerivable => "hand-written-derivable",
+            Rule::ProcMacroDef => "proc-macro-def",
         }
     }
 
@@ -359,6 +372,8 @@ impl Rule {
             Rule::SwappableParameters => Some("swappable_parameters"),
             Rule::PrimitiveMeaning => Some("primitive_meaning"),
             Rule::AnonTupleReturn => Some("anon_tuple_return"),
+            Rule::HandWrittenDerivable => Some("hand_written_derivable"),
+            Rule::ProcMacroDef => Some("proc_macro_derive"),
             _ => None,
         }
     }
@@ -561,6 +576,10 @@ pub enum Template {
     PrimitiveMeaning = 260,
     /// A function returning an anonymous tuple carrying unnamed state; argument: the tuple span.
     AnonTupleReturn = 270,
+    /// A large `match` hand-mapping enum variants to integer tags; argument: arm count.
+    HandWrittenDiscriminant = 280,
+    /// A `#[proc_macro*]` attribute where Blaze `comptime` reflection belongs.
+    ProcMacroDef = 290,
 }
 
 impl Template {
@@ -595,6 +614,8 @@ impl Template {
             250 => Rule::SwappableParameters,
             260 => Rule::PrimitiveMeaning,
             270 => Rule::AnonTupleReturn,
+            280 => Rule::HandWrittenDerivable,
+            290 => Rule::ProcMacroDef,
             _ => Rule::VariantCount,
         }
     }
@@ -670,6 +691,8 @@ impl Template {
             Template::SwappableParameters => "swappable-parameters",
             Template::PrimitiveMeaning => "primitive-meaning",
             Template::AnonTupleReturn => "anon-tuple-return",
+            Template::HandWrittenDiscriminant => "hand-written-discriminant",
+            Template::ProcMacroDef => "proc-macro-def",
         }
     }
 }

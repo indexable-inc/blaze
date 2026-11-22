@@ -1853,3 +1853,59 @@ fn profile_guided_linting_and_advisor() {
         ]
     );
 }
+
+#[test]
+fn dup_and_health_scanner() {
+    use blaze_own::Alloc;
+    use crate::dup::{
+        CloneKind, HealthKind, HealthLimits, analyze_health, find_duplicates, fingerprint_file,
+    };
+
+    // Two alpha-equivalent functions with renamed variables -> ExactClone!
+    let src = concat!(
+        "fn compute_alpha(a: u64, b: u64) -> u64 {\n",
+        "    let mut acc = a.wrapping_add(b);\n",
+        "    for i in 0..16 {\n",
+        "        acc = acc.wrapping_mul(31).wrapping_add(i);\n",
+        "        if acc > 1000 { acc ^= b; }\n",
+        "    }\n",
+        "    acc\n",
+        "}\n",
+        "fn compute_beta(x: u64, y: u64) -> u64 {\n",
+        "    let mut sum = x.wrapping_add(y);\n",
+        "    for k in 0..16 {\n",
+        "        sum = sum.wrapping_mul(31).wrapping_add(k);\n",
+        "        if sum > 1000 { sum ^= y; }\n",
+        "    }\n",
+        "    sum\n",
+        "}\n",
+        "fn nested_mess(flag: bool) -> bool {\n",
+        "    if flag { if flag { if flag { if flag { if flag { return true; } } } } }\n",
+        "    if flag { true } else { false }\n",
+        "}\n",
+    );
+
+    let fps = fingerprint_file(0, src, 12, Alloc::global());
+    assert!(fps.len() >= 2);
+    let dups = find_duplicates(&fps, Alloc::global());
+    assert_eq!(dups.len(), 1);
+    assert_eq!(dups[0].kind, CloneKind::ExactClone);
+    assert_eq!(dups[0].similarity_pct, 100);
+
+    let health = analyze_health(src, HealthLimits::DEFAULT, Alloc::global());
+    assert!(health.iter().any(|h| h.kind == HealthKind::DeepNesting));
+    assert!(health.iter().any(|h| h.kind == HealthKind::RedundantBoolIf));
+
+    // HandWrittenDerivable catches >= 8-arm integer discriminant tables; ProcMacroDef catches #[proc_macro*].
+    let hand_table = concat!(
+        "fn tag(k: K) -> u8 { match k {\n",
+        "    K::A => 1, K::B => 2, K::C => 3, K::D => 4,\n",
+        "    K::E => 5, K::F => 6, K::G => 7, K::H => 8, _ => 9,\n",
+        "} }\n",
+    );
+    assert_eq!(kinds(Rule::HandWrittenDerivable, hand_table), vec!["hand-written-discriminant"]);
+    assert_eq!(
+        kinds(Rule::ProcMacroDef, "#[proc_macro_derive(Foo)] pub fn foo(ts: TokenStream) -> TokenStream { ts }"),
+        vec!["proc-macro-def"]
+    );
+}

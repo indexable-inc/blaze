@@ -381,6 +381,7 @@ fn tables<'a>(
     match platform {
         Platform::MacosArm64 => write_unwind_info(covered, &given, outside, native_at, alloc, &mut unwind_info)?,
         Platform::LinuxArm64 => write_eh_frame_hdr(covered, &given, eh_frame_at, index_at, functions, &mut eh_frame_hdr)?,
+        Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     }
     Ok(EhSections {
         platform,

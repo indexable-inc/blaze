@@ -60,6 +60,7 @@ pub mod rules;
 pub mod say;
 pub mod script;
 pub mod terminal;
+pub mod ui;
 #[cfg(test)]
 mod tests;
 

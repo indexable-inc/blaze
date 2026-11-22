@@ -82,6 +82,7 @@ impl Exported {
         let form = match self.platform {
             Platform::MacosArm64 => "Mach-O for arm64 macOS, signed ad hoc",
             Platform::LinuxArm64 => "ELF for arm64 Linux",
+            Platform::Wasm64 => "WebAssembly memory64 for Wasmtime 64 (blaze_host_v1)",
         };
         write!(f, "wrote {} bytes ({form}), {} C names bound at start, identity ", self.len, self.imports)?;
         hex(f, &self.identity)?;
@@ -99,6 +100,9 @@ fn panics(program: &ProgramIn<'_>, functions: u32) -> Panics {
 
 /// Exports `program` for `platform`: the file's bytes replace `out`'s contents.
 pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a, u8>, alloc: Alloc<'a>) -> Result<Exported, ExportError> {
+    if platform == Platform::Wasm64 {
+        return Err(ExportError::Wasm64RequiresWasmProgram);
+    }
     let has =|symbol: Symbol| program.functions.iter().any(|f| f.symbol == symbol);
     let main = main_of(program.entry);
     if !matches!(program.entry, Entry::Hosted { .. }) && !has(main) {
@@ -121,11 +125,13 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
     let natives = match (program.natives, platform) {
         (None, _) => None,
         (Some(_), Platform::LinuxArm64) => return Err(ExportError::Native(MergeError::ElfNotBuilt)),
+        (Some(_), Platform::Wasm64) => return Err(ExportError::Wasm64RequiresWasmProgram),
         (Some(image), Platform::MacosArm64) => Some((image, native_merge::libraries(image, alloc).map_err(ExportError::Native)?)),
     };
     let plan = match platform {
         Platform::MacosArm64 => macho::plan_for(natives.as_ref().map(|(_, libraries)| &libraries[..])),
         Platform::LinuxArm64 => elf::plan(),
+        Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     };
     let room = eh_room_with(&members, program.personality, platform, program.natives, alloc)?;
     let laid = lay_out(&members, program.data, start.entry, program.profile, plan, room, alloc)?;
@@ -143,6 +149,7 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
     let identity = match platform {
         Platform::MacosArm64 => macho::write_native(&laid, &eh, merged.as_ref(), program.name, &seed, out, alloc)?,
         Platform::LinuxArm64 => elf::write(&laid, &eh, &seed, out, alloc)?,
+        Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     };
     let bound = merged.as_ref().map_or(laid.imports.len(), |m| m.bound(laid.imports.len()));
     let (mut functions, mut folded, mut fast, mut optimized, mut made) = (0u32, 0u32, 0u32, 0u32, 0u32);
