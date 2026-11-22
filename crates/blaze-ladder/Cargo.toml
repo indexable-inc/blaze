@@ -67,6 +67,8 @@ blaze-consteval.workspace = true
 # The slot table and code area the program's bodies are placed in, and its wire types.
 blaze-launch.workspace = true
 blaze-launch-rt.workspace = true
+# `Executable`: dual-mapped W^X in-process code execution for Tier 0 direct LIR comptime (zero libc).
+blaze-inproc.workspace = true
 # `ContentId`: a placed body's record id, by its bytes.
 blaze-ids.workspace = true
 # The program's native library record (src/natives.rs, NATIVE.md W7): blaze-native's readers, resolve

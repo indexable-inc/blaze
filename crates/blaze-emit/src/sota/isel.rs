@@ -380,7 +380,7 @@ pub(crate) fn emit_sota_a64<'a>(
                     }
                     None
                 };
-                if let Some((sop, a, sb, shift, sk)) = try_shift(rhs, lhs).or_else(|| try_shift(lhs, rhs)) {
+                if let Some((sop, a, sb, shift, _sk)) = try_shift(rhs, lhs).or_else(|| try_shift(lhs, rhs)) {
                     let sh_inst = if try_shift(rhs, lhs).is_some() { rhs } else { lhs };
                     fusion[inst] = if sop == Op::Shl {
                         Fusion::AddLsl { a, b: sb, shift }
@@ -388,7 +388,7 @@ pub(crate) fn emit_sota_a64<'a>(
                         Fusion::AddLsr { a, b: sb, shift }
                     };
                     skip_emit[sh_inst as usize] = true;
-                    imm_uses[sk as usize] += 1;
+                    // Note: `sk`'s immediate use was already counted once when visiting `sh_inst`.
                     continue;
                 }
                 // Immediate add_imm check (`0..=4095`).
@@ -418,7 +418,7 @@ pub(crate) fn emit_sota_a64<'a>(
                     if let Some(k) = const_u64[sk as usize] {
                         fusion[inst] = Fusion::SubLsl { a: lhs, b: sb, shift: (k & 63) as u32 };
                         skip_emit[ri] = true;
-                        imm_uses[sk as usize] += 1;
+                        // Note: `sk`'s immediate use was already counted once when visiting `ri`.
                         continue;
                     }
                 }
@@ -461,9 +461,7 @@ pub(crate) fn emit_sota_a64<'a>(
                         let op_ty = Ty(view.tys[a as usize]);
                         fusion[inst] = Fusion::CmpBr { cond, a, b: bv, op_ty };
                         skip_emit[cond_v] = true;
-                        if op_ty.bits(64) == 64 && const_u64[bv as usize].is_some_and(|v| v <= 4095) {
-                            imm_uses[bv as usize] += 1;
-                        }
+                        // Note: `bv`'s immediate use was already counted once when visiting `cond_v`.
                     }
                 }
             }
@@ -478,9 +476,7 @@ pub(crate) fn emit_sota_a64<'a>(
                         let op_ty = Ty(view.tys[a as usize]);
                         fusion[inst] = Fusion::CmpSelect { cond, a, b: bv, op_ty };
                         skip_emit[cond_v] = true;
-                        if op_ty.bits(64) == 64 && const_u64[bv as usize].is_some_and(|v| v <= 4095) {
-                            imm_uses[bv as usize] += 1;
-                        }
+                        // Note: `bv`'s immediate use was already counted once when visiting `cond_v`.
                     }
                 }
             }
@@ -511,7 +507,7 @@ pub(crate) fn emit_sota_a64<'a>(
     })?;
     let reg_of = |v: u32| -> Reg {
         let r = reg_alloc.reg_of[v as usize];
-        debug_assert!(r != NO_REG, "use of unallocated value {v}");
+        assert!(r != NO_REG, "Sota internal error: use of unallocated value {v}");
         u32::from(r)
     };
 

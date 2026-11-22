@@ -76,7 +76,7 @@ MANIFEST = "lean/analysis/lake-manifest.json"
 type Package = Literal["core", "analysis"]
 # A package's directory, and the directories its modules are found under, in order.
 PACKAGES: dict[str, tuple[str, tuple[str, ...]]] = {
-    "core": ("lean", ("lean", "crates/blaze-graph/lean", "crates/blaze-core/lean")),
+    "core": ("lean", ("lean", "crates/blaze-graph/lean", "crates/blaze-core/lean", "crates/blaze-std/lean")),
     "analysis": ("lean/analysis", ("lean/analysis",)),
 }
 # What no proof may say, outside comments: each defeats the kernel's check or adds to what is trusted.

@@ -2,7 +2,7 @@
 # written against, the checked-in models the golden tests hold to the translator's output, and
 # the proofs that live beside each crate's `src/`. No dependency: core Lean only.
 name = "blaze"
-defaultTargets = ["Blaze", "BlazeModel", "BlazeMir", "BlazeValidated", "BlazeGraph", "BlazeCore"]
+defaultTargets = ["Blaze", "BlazeModel", "BlazeMir", "BlazeValidated", "BlazeGraph", "BlazeCore", "BlazeStd"]
 
 # The library (`Blaze.Result`, `Blaze.Scalar`, `Blaze.Slice`, `Blaze.Std`), the semantics of MIR
 # (`Blaze.Mir.*`: syntax, values, `step`, `run`, the proved passes) and their tests.
@@ -43,6 +43,12 @@ globs = ["BlazeGraph.+"]
 name = "BlazeCore"
 srcDir = "../crates/blaze-core/lean"
 globs = ["BlazeCore.+"]
+
+# blaze-std's proofs, beside its `src/`.
+[[lean_lib]]
+name = "BlazeStd"
+srcDir = "../crates/blaze-std/lean"
+globs = ["BlazeStd.+"]
 
 # The compiled model of `blaze_graph::ledger::fnv1a_from`, for harness/v2/lean_differential.py.
 [[lean_exe]]

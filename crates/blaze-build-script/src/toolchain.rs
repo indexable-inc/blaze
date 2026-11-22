@@ -364,6 +364,39 @@ pub enum Mode {
 /// fact shim answers `sw_vers`.
 pub const NATIVE_EVERY_MODE: [&str; 1] = ["sha3-asm"];
 
+/// Execution policy for build-script placement:
+/// - `Hybrid`: D69 default (pure scripts on Wasm for `check`, native for `build`/`run` and
+///   `NO_WASM_CLASS`/`NATIVE_EVERY_MODE`).
+/// - `NativeOnly`: D175 zero-Wasm long-term path — every build script runs natively under
+///   `bstd::procs::hermetic` (macOS Seatbelt / Linux Landlock + seccomp), eliminating
+///   `wasm32-wasip1` and `-Zbuild-std` completely.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ComptimePolicy {
+    Hybrid,
+    NativeOnly,
+}
+
+/// Where a script runs in `mode` under `policy`.
+///
+/// Under [`ComptimePolicy::NativeOnly`], every script is placed natively (`Runner::Native`),
+/// completely bypassing `wasm32-wasip1` so workspaces like `tempo` never stall on Wasm module
+/// bootstraps.
+pub fn placement_with_policy(
+    closure: crate::native::Closure,
+    mode: Mode,
+    package: &str,
+    script: blaze_unit_graph::UnitId,
+    policy: ComptimePolicy,
+) -> Runner {
+    match policy {
+        ComptimePolicy::NativeOnly => match closure.runner {
+            Runner::Native { .. } => closure.runner,
+            Runner::Wasm => Runner::Native { because: script },
+        },
+        ComptimePolicy::Hybrid => placement(closure, mode, package),
+    }
+}
+
 /// Where a script runs in `mode` (D69 (3)), and so its key: a script whose closure
 /// [`crate::native::closure`] calls native runs native for `build` and `run`; for `check` it
 /// runs as wasm with its C requests deferred, unless its closure holds a crate that does not

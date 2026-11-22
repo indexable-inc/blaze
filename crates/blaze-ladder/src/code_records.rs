@@ -52,7 +52,7 @@ use std::boxed::Box;
 
 use blaze_build::tls;
 use blaze_code::record::{CodeView, DecodeError, MAGIC, RecordError, Symbol, TrapSource};
-use blaze_emit::{AddressWord, Isa, Named, Names, Os, Outside, RecordEmitError, emit_record_measured, no_address_word};
+use blaze_emit::{AddressWord, Isa, Named, Names, Os, Outside, RecordEmitError, emit_sota_record_measured, no_address_word};
 use blaze_ids::producer::{CodeBuilder, ProducerId};
 use blaze_ids::{ContentId, Hasher};
 use blaze_lir::Verified;
@@ -545,7 +545,7 @@ pub fn make_entry_with_vtables<'a, 'd>(
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, CodeRecordError> {
     let (record, insts, called) =
-        emit_record_measured(func, names, routines.places(), isa, traps, alloc).map_err(|why| routines.refusal(why))?;
+        emit_sota_record_measured(func, names, routines.places(), isa, traps, alloc).map_err(|why| routines.refusal(why))?;
     // Which soft-float routines the record calls is the emitter's answer (only legalize maps an
     // `f128` operation to its routine): exactly those are declared, as any instance it reaches.
     for r in called.iter() {

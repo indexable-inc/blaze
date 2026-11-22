@@ -18,6 +18,7 @@ pub mod body_ids;
 mod class_chain;
 pub mod code_records;
 pub mod declared_names;
+pub mod direct_comptime;
 mod emit_class;
 mod callee_shown;
 mod clone_shim;

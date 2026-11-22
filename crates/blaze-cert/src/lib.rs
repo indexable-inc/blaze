@@ -23,6 +23,7 @@ extern crate std;
 pub mod check;
 pub mod derivation;
 pub mod emit;
+pub mod lean_kernel;
 pub mod questions;
 
 #[cfg(test)]

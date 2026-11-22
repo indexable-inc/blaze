@@ -208,7 +208,7 @@ mod scratch_tests;
 mod sota;
 pub mod table_gen;
 mod tier;
-pub use sota::Sota;
+pub use sota::{Sota, emit_sota_record_measured};
 pub use tier::Reference;
 pub use asm::AsmToken;
 

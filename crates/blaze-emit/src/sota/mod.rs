@@ -22,16 +22,17 @@ mod regalloc;
 #[cfg(test)]
 mod tests;
 
+use blaze_code::record::{CodeRecord, Site, SiteKind, TrapSource};
 use blaze_lir::{
-    Verified,
+    Op, Verified,
     egraph::{RegBudget, sota_optimize_fixpoint},
     simplify::scalar_replace,
     verify,
 };
 use blaze_own::Alloc;
-use blaze_tier::{Arch, Emitted, Machine, Names, Tier, TierError, TierName};
+use blaze_tier::{Arch, Emitted, Machine, Names, RelocKind, Tier, TierError, TierName};
 
-use crate::Reference;
+use crate::{BULK_INLINE_MOST, Called, Isa, RecordEmitError, Reference, RoutinePlaces, record::emit_record_sourced};
 
 /// The Experimental Non-LLVM SOTA Optimizing Tier (`TierName::Sota`).
 pub struct Sota<F = Reference> {
@@ -106,4 +107,100 @@ impl<F: Tier> Tier for Sota<F> {
             }
         }
     }
+}
+
+/// Converts a `Sota`-emitted AArch64 [`Emitted`] record into `blaze-code`'s [`CodeRecord`] (`bzcode01`)
+/// for direct use by `blaze-ladder` (`blaze run` / `blaze test`) on AArch64.
+fn emitted_to_code_record<'a>(emitted: Emitted<'a>, alloc: Alloc<'a>) -> Option<(CodeRecord<'a>, u32)> {
+    let mut rec = CodeRecord::new_in(alloc);
+    let insts = u32::try_from(emitted.code.len()).ok()?;
+    rec.code = emitted.code;
+    rec.relro = emitted.relro;
+    rec.frame = emitted.frame;
+    rec.code_align = emitted.code_align;
+    rec.relro_align = emitted.relro_align;
+
+    // Remap targets and C-name entries onto `CodeRecord`.
+    let mut target_remap: blaze_own::Vec<u32, Alloc<'a>> =
+        blaze_own::Vec::with_capacity_in(emitted.targets.len(), alloc);
+    for t in emitted.targets.iter() {
+        if let Some(&(_, start, len)) = emitted.names.iter().find(|(sym, _, _)| *sym == t.symbol) {
+            let s = core::str::from_utf8(&emitted.text[start as usize..(start + len) as usize]).ok()?;
+            target_remap.push(rec.outside(s));
+        } else {
+            let idx = rec.targets.len() as u32;
+            rec.targets.push(*t);
+            target_remap.push(idx);
+        }
+    }
+
+    // Pair `GotPage21` + `GotPageOff12` relocations into `CodeRecord`'s `SiteKind::Call`.
+    let mut i = 0;
+    while i < emitted.relocs.len() {
+        let r = emitted.relocs[i];
+        if r.kind == RelocKind::GotPage21
+            && i + 1 < emitted.relocs.len()
+            && emitted.relocs[i + 1].kind == RelocKind::GotPageOff12
+            && emitted.relocs[i + 1].at == r.at + 4
+        {
+            let target = *target_remap.get(r.target as usize)?;
+            rec.sites.push(Site { at: r.at, kind: SiteKind::Call, target, addend: 0 });
+            i += 2;
+        } else {
+            return None;
+        }
+    }
+    Some((rec, insts))
+}
+
+/// Default AArch64 optimizing record emitter for `blaze-ladder` (`blaze run` / `blaze test`):
+/// runs SROA + fixed-point Aegraph/Strength-Reduction/LICM/DCE, emits native frameless fused
+/// AArch64 `Sota` code directly whenever the function fits `Sota`'s subset, and delegates exotic
+/// ops (already SOTA-optimized!) cleanly to `emit_record_sourced` while preserving trap-row
+/// ordinal correspondence.
+pub fn emit_sota_record_measured<'a>(
+    func: Verified<'_>,
+    names: &dyn Names,
+    routines: &RoutinePlaces,
+    isa: Isa,
+    traps: &[TrapSource],
+    alloc: Alloc<'a>,
+) -> Result<(CodeRecord<'a>, u32, Called), RecordEmitError> {
+    // Preserve exact `Op::Unreachable` count when `traps` are attached so trap-source ordinals stay
+    // 1:1 with `traps`.
+    let orig_unreach = if traps.is_empty() {
+        0
+    } else {
+        func.view().ops.iter().filter(|&&op| op == Op::Unreachable as u8).count()
+    };
+
+    let sroa_func = scalar_replace(func.view(), alloc).ok();
+    let mid_in = match &sroa_func {
+        Some(f) => f.view(),
+        None => func.view(),
+    };
+    let sota_opt = sota_optimize_fixpoint(mid_in, RegBudget::AARCH64, 3, |_| 1, alloc).ok();
+    let chosen_opt = sota_opt.as_ref().and_then(|res| {
+        let v = verify(res.func.view()).ok()?;
+        if !traps.is_empty() {
+            let after_unreach = v.view().ops.iter().filter(|&&op| op == Op::Unreachable as u8).count();
+            if after_unreach != orig_unreach {
+                return None;
+            }
+        }
+        Some(v)
+    });
+
+    if let Some(opt_v) = chosen_opt {
+        if traps.is_empty() {
+            if let Ok(emitted) = isel::emit_sota_a64(opt_v.view(), names, alloc) {
+                if let Some((rec, insts)) = emitted_to_code_record(emitted, alloc) {
+                    return Ok((rec, insts, Called::NONE));
+                }
+            }
+        }
+        return emit_record_sourced(opt_v, names, routines, isa, BULK_INLINE_MOST, traps, alloc);
+    }
+
+    emit_record_sourced(func, names, routines, isa, BULK_INLINE_MOST, traps, alloc)
 }
