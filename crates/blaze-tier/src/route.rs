@@ -19,10 +19,13 @@
 
 use blaze_lir::{Op, View};
 
-use crate::{Machine, TierName, features::base};
+use crate::{Arch, Machine, TierName, features::base};
 
 /// The tier that compiles `func` first on `machine`; `dependency` when the instance is of a
 /// dependency (or shared) rather than of the workspace.
+///
+/// Recommended hot-path pipeline on AArch64: `Fast` (stencils, microseconds cold start + PGO
+/// profiling) -> [`optimizing_tier`] (`TierName::Sota` by default on AArch64, no LLVM `-O3`).
 pub fn first_tier(func: View<'_>, machine: Machine, dependency: bool) -> TierName {
     let target_intrinsic = Op::TargetIntrinsic as u8;
     let asm = Op::Asm as u8;
@@ -34,6 +37,28 @@ pub fn first_tier(func: View<'_>, machine: Machine, dependency: bool) -> TierNam
         return TierName::Optimized;
     }
     if dependency { TierName::Reference } else { TierName::Fast }
+}
+
+/// The default optimizing tier for tier-up (from `Fast` stencils) and release/export builds on
+/// `machine`.
+///
+/// On AArch64 (`Arch::Arm64`), routes through Blaze's native non-LLVM [`TierName::Sota`] tier by
+/// default instead of LLVM `-O3`, falling back to [`TierName::Optimized`] only when the function
+/// requires raw `asm!`, target intrinsics, or non-base target features (e.g. `+sve`).
+pub fn optimizing_tier(func: View<'_>, machine: Machine) -> TierName {
+    let target_intrinsic = Op::TargetIntrinsic as u8;
+    let asm = Op::Asm as u8;
+    let asm_br = Op::AsmBr as u8;
+    if func.ops.iter().any(|&op| op == target_intrinsic || op == asm || op == asm_br) {
+        return TierName::Optimized;
+    }
+    if !within_base(func.features, machine) {
+        return TierName::Optimized;
+    }
+    match machine.arch {
+        Arch::Arm64 => TierName::Sota,
+        Arch::X86_64 => TierName::Optimized,
+    }
 }
 
 /// Whether the LLVM feature string `features` turns on only what `machine`'s base set has.

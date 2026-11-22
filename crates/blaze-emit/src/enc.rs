@@ -105,8 +105,23 @@ pub(crate) const fn add(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x8b00_0000 | (rm << 16) | (rn << 5) | rd
 }
 
+/// `add xd, xn, xm, lsl #shift` (`shift` in `0..=63`).
+pub(crate) const fn add_lsl(rd: Reg, rn: Reg, rm: Reg, shift: u32) -> u32 {
+    0x8b00_0000 | (rm << 16) | ((shift & 63) << 10) | (rn << 5) | rd
+}
+
+/// `add xd, xn, xm, lsr #shift` (`shift` in `0..=63`).
+pub(crate) const fn add_lsr(rd: Reg, rn: Reg, rm: Reg, shift: u32) -> u32 {
+    0x8b40_0000 | (rm << 16) | ((shift & 63) << 10) | (rn << 5) | rd
+}
+
 pub(crate) const fn sub(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0xcb00_0000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `sub xd, xn, xm, lsl #shift` (`shift` in `0..=63`).
+pub(crate) const fn sub_lsl(rd: Reg, rn: Reg, rm: Reg, shift: u32) -> u32 {
+    0xcb00_0000 | (rm << 16) | ((shift & 63) << 10) | (rn << 5) | rd
 }
 
 /// `subs xzr, xn, xm`.

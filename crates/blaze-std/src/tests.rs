@@ -147,6 +147,7 @@ mod sip_key;
 mod swap;
 mod syncs;
 mod unfinished;
+mod union_tests;
 mod upgrades;
 mod walk;
 mod world;

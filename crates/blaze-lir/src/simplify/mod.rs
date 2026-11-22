@@ -23,7 +23,8 @@ mod stage;
 pub use dce::{coalesce_cfg, dead};
 pub use egraph::{
     AegraphOutput, AegraphStats, LoopSummary, OpportunisticInlineSite, RegBudget, SotaFeedbackOutput, SsaRegPlan,
-    aegraph_optimize, plan_opportunistic_inlining, plan_ssa_regalloc, sota_optimize_fixpoint,
+    aegraph_optimize, hoist_loop_invariants, materialize_strength_reduction, plan_opportunistic_inlining,
+    plan_ssa_regalloc, sota_optimize_fixpoint,
 };
 pub use prop::{Plant, propagate, propagate_planted};
 pub use sroa::scalar_replace;

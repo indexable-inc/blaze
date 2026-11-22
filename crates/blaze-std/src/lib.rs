@@ -260,6 +260,8 @@ pub mod wasm64;
 pub mod comptime;
 /// Order-independent, zero-overhead compile-time Type Sets with safe disjoint borrows & `Lacks<T>`.
 pub mod type_set;
+/// Anonymous Union Types (`A | B | C`) with small local tags, by-value widening & narrowing.
+pub mod union_ty;
 /// The native backend's reads of its host's facts.
 #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
 mod native;

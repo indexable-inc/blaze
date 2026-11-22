@@ -21,7 +21,9 @@ use super::{
 };
 use crate::{
     Block, Flags, Func, IntCond, Op, Ty, View,
-    arith::{binary, compare, iconst_value, unary, wide_value},
+    arith::{binary, compare, iconst_value, sext, unary, wide_value},
+    op::{Field, Layout},
+    verify,
 };
 
 /// Loop-level analysis & optimization summary discovered from the dominator tree.
@@ -1073,9 +1075,502 @@ pub struct SotaFeedbackOutput<A: Allocator> {
     pub rounds_run: u32,
 }
 
-/// Runs the iterative SOTA optimization feedback loop (`aegraph` -> `propagate` -> `dead`) up to
-/// `max_rounds` until fixed point, then computes chordal-SSA register pressure and feeds that back
-/// into PGO + loop-guided opportunistic JIT inlining decisions.
+/// Copies one instruction from `view` into `func`, remapping all value operands through `val_map`.
+fn copy_inst_remapped<A: Allocator + Clone>(
+    view: &View<'_>,
+    inst: usize,
+    val_map: &[u32],
+    func: &mut Func<A>,
+) -> Result<u32, SimplifyError> {
+    let op = view.op(inst);
+    let flags = view.flags[inst];
+    let ty = view.tys[inst];
+    let attrs = view.attrs[inst];
+    let loc = view.locs[inst];
+    let map_val = |v: u32| -> Result<u32, SimplifyError> {
+        let mapped = val_map[v as usize];
+        if mapped == NONE {
+            Err(SimplifyError::Refused { inst, what: "unmapped operand during SOTA rewrite" })
+        } else {
+            Ok(mapped)
+        }
+    };
+
+    let data = match op.info().layout {
+        Layout::None => 0,
+        Layout::Data(Field::Value) => map_val(view.data[inst])?,
+        Layout::Data(_) => view.data[inst],
+        Layout::Extra(fields) => {
+            let start = func.extra.len() as u32;
+            let words = view.extra;
+            let mut at = view.data[inst] as usize;
+            let mut scrutinee = None;
+            for &field in fields {
+                match field {
+                    Field::Value => {
+                        scrutinee = Some(words[at]);
+                        func.extra.push(map_val(words[at])?);
+                        at += 1;
+                    }
+                    Field::Block
+                    | Field::Imm
+                    | Field::Offset
+                    | Field::IntCond
+                    | Field::FloatCond
+                    | Field::Rmw
+                    | Field::Ref
+                    | Field::Sig
+                    | Field::Slot
+                    | Field::Intrinsic
+                    | Field::Asm => {
+                        func.extra.push(words[at]);
+                        at += 1;
+                    }
+                    Field::Target => {
+                        let block = words[at];
+                        let n = words[at + 1] as usize;
+                        func.extra.push(block);
+                        func.extra.push(n as u32);
+                        for k in 0..n {
+                            func.extra.push(map_val(words[at + 2 + k])?);
+                        }
+                        at += 2 + n;
+                    }
+                    Field::Values => {
+                        let n = words[at] as usize;
+                        func.extra.push(n as u32);
+                        for k in 0..n {
+                            func.extra.push(map_val(words[at + 1 + k])?);
+                        }
+                        at += 1 + n;
+                    }
+                    Field::Blocks => {
+                        let n = words[at] as usize;
+                        func.extra.extend_from_slice(&words[at..at + 1 + n]);
+                        at += 1 + n;
+                    }
+                    Field::Mask => {
+                        let n = words[at] as usize;
+                        func.extra.extend_from_slice(&words[at..at + 1 + n]);
+                        at += 1 + n;
+                    }
+                    Field::Const => {
+                        let n = Ty(ty).const_words() as usize;
+                        func.extra.extend_from_slice(&words[at..at + n]);
+                        at += n;
+                    }
+                    Field::Cases => {
+                        let width = scrutinee.map_or(0, |it: u32| Ty(view.tys[it as usize]).const_words()) as usize;
+                        let n = words[at] as usize;
+                        func.extra.push(n as u32);
+                        at += 1;
+                        for _ in 0..n {
+                            func.extra.extend_from_slice(&words[at..at + width]);
+                            at += width;
+                            let block = words[at];
+                            let argc = words[at + 1] as usize;
+                            func.extra.push(block);
+                            func.extra.push(argc as u32);
+                            for k in 0..argc {
+                                func.extra.push(map_val(words[at + 2 + k])?);
+                            }
+                            at += 2 + argc;
+                        }
+                    }
+                }
+            }
+            start
+        }
+    };
+
+    let out_idx = func.ops.len() as u32;
+    func.ops.push(op as u8);
+    func.flags.push(flags);
+    func.tys.push(ty);
+    func.data.push(data);
+    func.attrs.push(attrs);
+    func.locs.push(loc);
+    Ok(out_idx)
+}
+
+/// Emits an integer constant (`Iconst` or `IconstWide`) of scalar type `ty` into `func`.
+fn push_const_inst<A: Allocator + Clone>(
+    func: &mut Func<A>,
+    ty: Ty,
+    ptr_bits: u32,
+    value: u128,
+    loc: u32,
+) -> u32 {
+    let bits = ty.bits(ptr_bits);
+    let idx = func.ops.len() as u32;
+    if bits <= 32 {
+        func.ops.push(Op::Iconst as u8);
+        func.flags.push(0);
+        func.tys.push(ty.0);
+        func.data.push(value as u32);
+        func.attrs.push(0);
+        func.locs.push(loc);
+        return idx;
+    }
+    match i32::try_from(sext(value, bits)) {
+        Ok(small) => {
+            func.ops.push(Op::Iconst as u8);
+            func.flags.push(0);
+            func.tys.push(ty.0);
+            func.data.push(small as u32);
+            func.attrs.push(0);
+            func.locs.push(loc);
+        }
+        Err(_) => {
+            let start = func.extra.len() as u32;
+            for w in 0..ty.const_words() {
+                func.extra.push((value >> (32 * w)) as u32);
+            }
+            func.ops.push(Op::IconstWide as u8);
+            func.flags.push(0);
+            func.tys.push(ty.0);
+            func.data.push(start);
+            func.attrs.push(0);
+            func.locs.push(loc);
+        }
+    }
+    idx
+}
+
+/// Emits a binary scalar instruction `op(lhs, rhs)` into `func`.
+fn push_binary_inst<A: Allocator + Clone>(
+    func: &mut Func<A>,
+    op: Op,
+    ty: Ty,
+    lhs: u32,
+    rhs: u32,
+    loc: u32,
+) -> u32 {
+    let start = func.extra.len() as u32;
+    func.extra.push(lhs);
+    func.extra.push(rhs);
+    let idx = func.ops.len() as u32;
+    func.ops.push(op as u8);
+    func.flags.push(0);
+    func.tys.push(ty.0);
+    func.data.push(start);
+    func.attrs.push(0);
+    func.locs.push(loc);
+    idx
+}
+
+/// Materializes strength reductions directly into verified LIR:
+/// - `mul x, 2^k` (or `2^k * x`) -> `shl x, k`
+/// - `udiv x, 2^k` -> `lshr x, k`
+/// - `urem x, 2^k` -> `and x, (2^k - 1)`
+/// - `add x, x` -> `shl x, 1`
+///
+/// Returns `(rewritten_func, count_rewritten)`.
+pub fn materialize_strength_reduction<A: Allocator + Clone>(
+    view: View<'_>,
+    alloc: A,
+) -> Result<(Func<A>, u32), SimplifyError> {
+    let len = view.len();
+    let ptr_bits = view.head.ptr_bits;
+
+    // Collect known constants in one forward scan.
+    let mut known: Vec<Option<u128>, A> = filled(len, None, &alloc);
+    for inst in 0..len {
+        let op = view.op(inst);
+        let ty = Ty(view.tys[inst]);
+        if op == Op::Iconst {
+            if let Some((bits, _)) = scalar_int_mask(ty, ptr_bits) {
+                known[inst] = Some(iconst_value(view.data[inst], bits));
+            }
+        } else if op == Op::IconstWide {
+            if let Some((bits, _)) = scalar_int_mask(ty, ptr_bits) {
+                let at = view.data[inst] as usize;
+                let w = ty.const_words() as usize;
+                known[inst] = Some(wide_value(&view.extra[at..at + w], bits));
+            }
+        }
+    }
+
+    let mut func = view.to_func_in(alloc.clone());
+    func.ops.clear();
+    func.flags.clear();
+    func.tys.clear();
+    func.data.clear();
+    func.extra.clear();
+    func.attrs.clear();
+    func.locs.clear();
+    func.block_starts.clear();
+    func.block_kinds.clear();
+
+    let mut val_map = filled(len, NONE, &alloc);
+    let mut rewrites = 0u32;
+
+    for b in 0..view.blocks() {
+        func.block_starts.push(func.ops.len() as u32);
+        func.block_kinds.push(view.block_kinds[b]);
+        for inst in view.block(Block(b as u32)) {
+            let op = view.op(inst);
+            let ty = Ty(view.tys[inst]);
+            let loc = view.locs[inst];
+            let mut replaced = None;
+
+            if Flags(view.flags[inst]).0 == 0 {
+                if let Some((bits, _)) = scalar_int_mask(ty, ptr_bits) {
+                    if matches!(op, Op::Mul | Op::Udiv | Op::Urem | Op::Add) {
+                        let at = view.data[inst] as usize;
+                        let raw_a = view.extra[at];
+                        let raw_b = view.extra[at + 1];
+                        let a = val_map[raw_a as usize];
+                        let b_val = val_map[raw_b as usize];
+                        let ca = known[raw_a as usize];
+                        let cb = known[raw_b as usize];
+
+                        match op {
+                            Op::Mul => {
+                                if let Some(v) = cb.filter(|&v| is_power_of_two_gt1(v)) {
+                                    let k = v.trailing_zeros();
+                                    if k < bits {
+                                        let kc = push_const_inst(&mut func, ty, ptr_bits, u128::from(k), loc);
+                                        replaced = Some(push_binary_inst(&mut func, Op::Shl, ty, a, kc, loc));
+                                    }
+                                } else if let Some(v) = ca.filter(|&v| is_power_of_two_gt1(v)) {
+                                    let k = v.trailing_zeros();
+                                    if k < bits {
+                                        let kc = push_const_inst(&mut func, ty, ptr_bits, u128::from(k), loc);
+                                        replaced = Some(push_binary_inst(&mut func, Op::Shl, ty, b_val, kc, loc));
+                                    }
+                                }
+                            }
+                            Op::Udiv => {
+                                if let Some(v) = cb.filter(|&v| is_power_of_two_gt1(v)) {
+                                    let k = v.trailing_zeros();
+                                    if k < bits {
+                                        let kc = push_const_inst(&mut func, ty, ptr_bits, u128::from(k), loc);
+                                        replaced = Some(push_binary_inst(&mut func, Op::Lshr, ty, a, kc, loc));
+                                    }
+                                }
+                            }
+                            Op::Urem => {
+                                if let Some(v) = cb.filter(|&v| is_power_of_two_gt1(v)) {
+                                    let mask_v = v - 1;
+                                    let mc = push_const_inst(&mut func, ty, ptr_bits, mask_v, loc);
+                                    replaced = Some(push_binary_inst(&mut func, Op::And, ty, a, mc, loc));
+                                }
+                            }
+                            Op::Add if raw_a == raw_b => {
+                                let one = push_const_inst(&mut func, ty, ptr_bits, 1, loc);
+                                replaced = Some(push_binary_inst(&mut func, Op::Shl, ty, a, one, loc));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            if let Some(new_idx) = replaced {
+                val_map[inst] = new_idx;
+                rewrites += 1;
+            } else {
+                val_map[inst] = copy_inst_remapped(&view, inst, &val_map, &mut func)?;
+            }
+        }
+    }
+
+    if rewrites == 0 {
+        return Ok((view.to_func_in(alloc), 0));
+    }
+    verify(func.view()).map_err(SimplifyError::Verify)?;
+    Ok((func, rewrites))
+}
+
+/// Materializes Loop-Invariant Code Motion (LICM): physically hoists pure, flag-free loop-invariant
+/// instructions out of natural loop bodies into the loop's single dominating `Jump` preheader.
+///
+/// Returns `(rewritten_func, hoisted_count)`.
+pub fn hoist_loop_invariants<A: Allocator + Clone>(
+    view: View<'_>,
+    alloc: A,
+) -> Result<(Func<A>, u32), SimplifyError> {
+    let blocks = view.blocks();
+    let len = view.len();
+    if blocks < 2 {
+        return Ok((view.to_func_in(alloc), 0));
+    }
+
+    let no_jumps = filled(len, NONE, &alloc);
+    let reached = reachable(&view, &no_jumps, &alloc);
+    let (idom, _) = compute_dom_tree(&view, &reached, &alloc);
+
+    let mut preds: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(blocks, alloc.clone());
+    for _ in 0..blocks {
+        preds.push(Vec::new_in(alloc.clone()));
+    }
+    let mut inst_block = filled(len, 0u32, &alloc);
+    let mut back_edges: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
+
+    for b in 0..blocks {
+        for inst in view.block(Block(b as u32)) {
+            inst_block[inst] = b as u32;
+        }
+        if !reached[b] {
+            continue;
+        }
+        let term = view.terminator(Block(b as u32));
+        each(&view, term, |item| {
+            if let Item::Edge(edge) = item {
+                let to = edge.block as usize;
+                if to < blocks && reached[to] {
+                    preds[to].push(b as u32);
+                    if dominates(&idom, edge.block, b as u32) {
+                        back_edges.push((b as u32, edge.block));
+                    }
+                }
+            }
+        });
+    }
+
+    if back_edges.is_empty() {
+        return Ok((view.to_func_in(alloc), 0));
+    }
+
+    // `hoist_to[inst]` = target preheader block index, or `NONE`.
+    let mut hoist_to = filled(len, NONE, &alloc);
+    let mut hoisted_by_preheader: Vec<Vec<usize, A>, A> = Vec::with_capacity_in(blocks, alloc.clone());
+    for _ in 0..blocks {
+        hoisted_by_preheader.push(Vec::new_in(alloc.clone()));
+    }
+    let mut total_hoisted = 0u32;
+
+    let mut in_loop = filled(blocks, false, &alloc);
+    let mut work: Vec<u32, A> = Vec::new_in(alloc.clone());
+    let mut body_blocks: Vec<u32, A> = Vec::new_in(alloc.clone());
+
+    for &(latch, header) in &back_edges {
+        body_blocks.clear();
+        work.clear();
+        in_loop[header as usize] = true;
+        body_blocks.push(header);
+        if !in_loop[latch as usize] {
+            in_loop[latch as usize] = true;
+            body_blocks.push(latch);
+            work.push(latch);
+        }
+        while let Some(cur) = work.pop() {
+            for &p in &preds[cur as usize] {
+                if !in_loop[p as usize] {
+                    in_loop[p as usize] = true;
+                    body_blocks.push(p);
+                    work.push(p);
+                }
+            }
+        }
+
+        // Find unique outside preheader dominating `header` and ending in `Op::Jump` (and appearing
+        // before `header` in layout order so single-pass emission stays ordered).
+        let mut outside_preds = 0u32;
+        let mut preheader = NONE;
+        for &p in &preds[header as usize] {
+            if !in_loop[p as usize] {
+                outside_preds += 1;
+                preheader = p;
+            }
+        }
+
+        let valid_preheader = outside_preds == 1
+            && preheader != NONE
+            && preheader < header
+            && dominates(&idom, preheader, header)
+            && view.op(view.terminator(Block(preheader))) == Op::Jump;
+
+        if valid_preheader {
+            // Sort loop blocks in layout order so hoisting preserves def-before-use order.
+            body_blocks.sort_unstable();
+            // Fixed-point mark pure invariant instructions (including transitively invariant ones).
+            let mut progressed = true;
+            while progressed {
+                progressed = false;
+                for &bb in &body_blocks {
+                    for inst in view.block(Block(bb)) {
+                        if hoist_to[inst] != NONE {
+                            continue;
+                        }
+                        let op = view.op(inst);
+                        if op == Op::Param || Flags(view.flags[inst]).0 != 0 || !is_licm_pure(op) {
+                            continue;
+                        }
+                        let mut all_ok = true;
+                        each(&view, inst, |item| {
+                            if let Item::Value(v) = item {
+                                let vi = v as usize;
+                                let def_b = inst_block[vi];
+                                let defined_outside = !in_loop[def_b as usize] && dominates(&idom, def_b, preheader);
+                                let already_hoisted_here = hoist_to[vi] == preheader;
+                                if !defined_outside && !already_hoisted_here {
+                                    all_ok = false;
+                                }
+                            }
+                        });
+                        if all_ok {
+                            hoist_to[inst] = preheader;
+                            hoisted_by_preheader[preheader as usize].push(inst);
+                            total_hoisted += 1;
+                            progressed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        for &bb in &body_blocks {
+            in_loop[bb as usize] = false;
+        }
+    }
+
+    if total_hoisted == 0 {
+        return Ok((view.to_func_in(alloc), 0));
+    }
+
+    let mut func = view.to_func_in(alloc.clone());
+    func.ops.clear();
+    func.flags.clear();
+    func.tys.clear();
+    func.data.clear();
+    func.extra.clear();
+    func.attrs.clear();
+    func.locs.clear();
+    func.block_starts.clear();
+    func.block_kinds.clear();
+
+    let mut val_map = filled(len, NONE, &alloc);
+
+    for b in 0..blocks {
+        func.block_starts.push(func.ops.len() as u32);
+        func.block_kinds.push(view.block_kinds[b]);
+        let range = view.block(Block(b as u32));
+        let term = range.end - 1;
+
+        for inst in range.start..term {
+            if hoist_to[inst] != NONE {
+                continue;
+            }
+            val_map[inst] = copy_inst_remapped(&view, inst, &val_map, &mut func)?;
+        }
+        // Insert any instructions hoisted into this preheader right before its `Jump` terminator.
+        for &h_inst in &hoisted_by_preheader[b] {
+            val_map[h_inst] = copy_inst_remapped(&view, h_inst, &val_map, &mut func)?;
+        }
+        // Emit block terminator.
+        val_map[term] = copy_inst_remapped(&view, term, &val_map, &mut func)?;
+    }
+
+    verify(func.view()).map_err(SimplifyError::Verify)?;
+    Ok((func, total_hoisted))
+}
+
+/// Runs the iterative SOTA optimization feedback loop:
+/// `[aegraph (GVN + identities + const-fold)] -> [strength reduction] -> [LICM hoist] ->
+/// [propagate] -> [dead]` up to `max_rounds` until fixed point, then computes chordal-SSA register
+/// pressure and feeds that back into PGO + loop-guided opportunistic JIT inlining decisions.
 pub fn sota_optimize_fixpoint<A: Allocator + Clone>(
     view: View<'_>,
     budget: RegBudget,
@@ -1091,19 +1586,25 @@ pub fn sota_optimize_fixpoint<A: Allocator + Clone>(
     for _ in 0..rounds {
         rounds_run += 1;
         let step = aegraph_optimize(cur.view(), alloc.clone())?;
-        let prop = super::propagate(step.func.view(), alloc.clone())?;
+        let (sr_func, sr_count) = materialize_strength_reduction(step.func.view(), alloc.clone())?;
+        let (licm_func, hoisted_count) = hoist_loop_invariants(sr_func.view(), alloc.clone())?;
+        let prop = super::propagate(licm_func.view(), alloc.clone())?;
         let cleaned = dead(prop.view(), alloc.clone())?;
 
         total_stats.gvn_hits += step.stats.gvn_hits;
         total_stats.identities_folded += step.stats.identities_folded;
         total_stats.constants_folded += step.stats.constants_folded;
-        total_stats.strength_reductions = step.stats.strength_reductions;
+        total_stats.strength_reductions += sr_count;
+        let prev_hoisted = total_stats.loops.licm_candidates;
         total_stats.loops = step.stats.loops;
+        total_stats.loops.licm_candidates = prev_hoisted + hoisted_count;
 
         let changed = cleaned.ops.len() != cur.ops.len()
             || step.stats.gvn_hits > 0
             || step.stats.identities_folded > 0
-            || step.stats.constants_folded > 0;
+            || step.stats.constants_folded > 0
+            || sr_count > 0
+            || hoisted_count > 0;
         cur = cleaned;
         if !changed {
             break;
@@ -1258,5 +1759,77 @@ mod tests {
         assert!(res.inline_sites[0].hotness_score > res.inline_sites[2].hotness_score);
         assert!(res.inline_sites[0].allowed_callee_insts > res.inline_sites[2].allowed_callee_insts);
         assert!(res.inline_sites.iter().any(|s| s.speculative_devirt));
+
+        // Verify that `inv_prod = factor * n` was physically hoisted out of the loop body into block 0!
+        let body_ops: std::vec::Vec<Op> = res
+            .func
+            .view()
+            .block(Block(2))
+            .map(|i| res.func.view().op(i))
+            .collect();
+        assert!(
+            !body_ops.contains(&Op::Mul),
+            "expected loop-invariant Mul to be hoisted out of block 2 into preheader block 0; body ops: {body_ops:?}"
+        );
+    }
+
+    #[test]
+    fn strength_reduction_and_licm_preserve_eval_semantics() {
+        let alloc = Global;
+        let mut b = Builder::<Global, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let [entry, header, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let n = b.param(Ty::I64);
+        let a = b.param(Ty::I64);
+        let zero = b.iconst(Ty::I64, 0);
+        b.jump((header, &[zero, zero]));
+
+        b.begin(header);
+        let i = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let cont = b.icmp(IntCond::Ult, i, n);
+        b.br(Flags::NONE, cont, (body, &[]), (exit, &[]));
+
+        b.begin(body);
+        // Loop-invariant math + power-of-2 udiv/urem/mul!
+        let eight = b.iconst(Ty::I64, 8);
+        let sixteen = b.iconst(Ty::I64, 16);
+        let inv = b.binary(Op::Mul, Flags::NONE, a, eight); // strength-reduced to shl 3 AND hoisted!
+        let q = b.binary(Op::Udiv, Flags::NONE, i, eight); // strength-reduced to lshr 3!
+        let r = b.binary(Op::Urem, Flags::NONE, i, sixteen); // strength-reduced to and 15!
+        let t = b.binary(Op::Add, Flags::NONE, inv, q);
+        let t2 = b.binary(Op::Add, Flags::NONE, t, r);
+        let next_acc = b.binary(Op::Add, Flags::NONE, acc, t2);
+        let one = b.iconst(Ty::I64, 1);
+        let next_i = b.binary(Op::Add, Flags::NONE, i, one);
+        b.jump((header, &[next_i, next_acc]));
+
+        b.begin(exit);
+        b.ret(&[acc]);
+
+        let func = b.finish_checked().unwrap();
+        let res = sota_optimize_fixpoint(func.view(), RegBudget::AARCH64, 3, |_| 1, alloc).unwrap();
+
+        // No Udiv, Urem, or Mul left in the entire function!
+        let all_ops: std::vec::Vec<Op> = (0..res.func.ops.len()).map(|i| res.func.view().op(i)).collect();
+        assert!(!all_ops.contains(&Op::Udiv), "expected Udiv strength-reduced to Lshr: {all_ops:?}");
+        assert!(!all_ops.contains(&Op::Urem), "expected Urem strength-reduced to And: {all_ops:?}");
+        assert!(!all_ops.contains(&Op::Mul), "expected Mul-by-8 strength-reduced to Shl: {all_ops:?}");
+
+        // Exact bit-for-bit evaluator equivalence across test inputs!
+        for &(nv, av) in &[(0u64, 5u64), (1, 9), (25, 17), (64, 1234)] {
+            let args = [Val::Int(u128::from(nv)), Val::Int(u128::from(av))];
+            let before = eval::run_in(func.view(), &args, 100_000, alloc).unwrap();
+            let after = eval::run_in(res.func.view(), &args, 100_000, alloc).unwrap();
+            assert_eq!(before, after, "SOTA fixpoint changed semantics on ({nv}, {av})");
+        }
     }
 }

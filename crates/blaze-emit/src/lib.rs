@@ -203,8 +203,12 @@ mod routines;
 pub(crate) mod scratch;
 #[cfg(test)]
 mod scratch_tests;
+/// Experimental non-LLVM SOTA optimizing tier (Aegraph + LICM + Strength Reduction + Chordal-SSA
+/// regalloc + ISLE-style fused AArch64 emitter; default optimizing tier on AArch64).
+mod sota;
 pub mod table_gen;
 mod tier;
+pub use sota::Sota;
 pub use tier::Reference;
 pub use asm::AsmToken;
 

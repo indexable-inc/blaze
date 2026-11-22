@@ -20,6 +20,9 @@ pub enum TierName {
     Reference = 0,
     Fast = 1,
     Optimized = 2,
+    /// Experimental non-LLVM SOTA optimizing tier (Aegraph + LICM + ISLE-style DAG ISEL +
+    /// Chordal-SSA regalloc + PGO/loop feedback). Default optimizing tier on AArch64.
+    Sota = 3,
 }
 
 impl TierName {
@@ -28,6 +31,7 @@ impl TierName {
             TierName::Reference => "reference",
             TierName::Fast => "fast",
             TierName::Optimized => "optimized",
+            TierName::Sota => "sota",
         }
     }
 }

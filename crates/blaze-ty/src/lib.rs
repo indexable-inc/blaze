@@ -49,6 +49,7 @@ mod print;
 mod relate;
 mod solve;
 pub mod type_set;
+pub mod union_ty;
 mod tys;
 
 #[cfg(test)]
