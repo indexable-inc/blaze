@@ -74,7 +74,7 @@ use crate::code_store::HomeCodeStore;
 use crate::run_names::{Found, TestRows, TestUnit};
 use crate::run_ids::RunIds;
 use crate::run_loop::LoopError as RunLoopError;
-use crate::run_parent::{self, Codes, Front, Gate, Lazy, Needs, ParentError, RECORDS, RecordsDir, Resolve, Resolved, RunMaker, Start as _, WRITE_BOUND};
+use crate::run_parent::{self, CodeRefusal, Codes, Front, Gate, Lazy, Needs, ParentError, RECORDS, RecordsDir, Resolve, Resolved, RunMaker, Start as _, WRITE_BOUND};
 use blaze_engine::SVec;
 use blaze_engine::code_pool::relay::{self as code_relay, Relay as PoolRelay, RelayError, Reply};
 use blaze_engine::code_pool::{Child, Time, Worker};
@@ -134,10 +134,13 @@ pub(crate) enum DriveError {
     Print,
     /// A pinned child's storage must come from the caller's process heap.
     ChildHeap,
-    /// [`CODES`] is `Pooled` and this build has no [`CodeWorkers`] for the command (D194 piece 2).
-    NoCodeWorkers,
+    /// [`CODES`] is `Pooled` and the command's pool gave no code worker (D194): one worker, or
+    /// none idle at the start. Refused by name, never made serially in its place (rule 3).
+    NoCodeWorkers { have: u32 },
     /// The code relay could not be made (its own words, D194).
     Relay(RelayError),
+    /// A code worker failed, or did not end by [`END_WAIT`] after the run (D194).
+    CodeWorkers(bstd::task::TaskError),
 }
 
 impl fmt::Display for DriveError {
@@ -156,8 +159,9 @@ impl fmt::Display for DriveError {
             DriveError::Steps { most } => write!(f, "blaze test: the loop took more than {most} steps (rule 18)"),
             DriveError::Print => f.write_str("blaze test: the output stream refused a write"),
             DriveError::ChildHeap => f.write_str("blaze test: the child pool needs the process heap to pin its lazy parents"),
-            DriveError::NoCodeWorkers => f.write_str("blaze test: code made by the command's workers (test_drive.rs `CODES` = `Pooled`, D194) needs workers with their own names records and makers, which are not built yet (D194 piece 2)"),
+            DriveError::NoCodeWorkers { have } => write!(f, "blaze test: code made by the command's workers (test_drive.rs `CODES` = `Pooled`, D194) needs at least one worker beside the command thread, and the command's pool of {have} gave none (bstd task.rs `must_overlap`)"),
             DriveError::Relay(error) => write!(f, "blaze test: {error}"),
+            DriveError::CodeWorkers(error) => write!(f, "blaze test: the command's code workers (D194): {error}"),
         }
     }
 }
@@ -207,6 +211,9 @@ pub(crate) enum OneError {
     /// The test's code for `instance` was asked of the command's workers and did not come
     /// within `waited` nanoseconds ([`CODE_WAIT`], D194): the test is stopped, never waited out.
     CodeLate { instance: crate::run_fault::Named, symbol: [u8; 32], waited: u64 },
+    /// A make, or a worker's ask for the proc-macro runner, could not be handed over the code
+    /// workers' channel `chan` (D194): the worker `worker` is gone, or the hand-over stopped so.
+    CodeHandOff { chan: &'static str, worker: usize, why: &'static str },
 }
 
 impl fmt::Display for OneError {
@@ -238,6 +245,7 @@ impl fmt::Display for OneError {
             OneError::Loop(error) => write!(f, "a test's run: {error}"),
             OneError::Signals(error) => write!(f, "a test's run: the parent's signals: {error}"),
             OneError::Relay(error) => write!(f, "a test's code: {error}"),
+            OneError::CodeHandOff { chan, worker, why } => write!(f, "a test's code: code worker {worker}'s channel `{chan}` {why} (test_drive.rs `CodePool`, D194)"),
             OneError::CodeLate { instance, symbol, waited } => write!(
                 f,
                 "a test's code: {} was asked of the command's workers and did not come in {}.{} s (test_drive.rs `CODE_WAIT`, D194; rule 18)",
@@ -317,6 +325,14 @@ impl fmt::Display for InstanceRefusal {
                 why: blaze_ladder::body_ids::WalkError::Make { why: blaze_ladder::run::RunError::Build { error, .. }, .. }, ..
             } => write!(f, ": {error}"),
             ParentError::Walk { why: blaze_ladder::body_ids::WalkError::Make { why, .. }, .. } => write!(f, ": {why}"),
+            // The two arms above, as the refusal's worker printed them (test_drive.rs `crossing`).
+            ParentError::CodeRefused { why: CodeRefusal { cause: Some(cause), whole, .. }, .. } => {
+                write!(f, ": {cause}")?;
+                if !whole {
+                    f.write_str(" (its words were cut: the command's heap refused the rest, run_parent.rs `CodeRefusal`)")?;
+                }
+                Ok(())
+            }
             ParentError::Special { why, .. } => write!(f, ": {why}"),
             cause => write!(f, ": {cause}"),
         }
@@ -369,6 +385,8 @@ fn refused_instance(cause: &ParentError) -> Option<([u8; 32], Option<(ItemKey, u
             | WalkError::ArenaFull { tabled, .. }
             | WalkError::RecursionLimit { tabled, .. } => (*symbol, Some((*tabled, 0))),
         },
+        // Sorted on its worker by the arm above (test_drive.rs `crossing`).
+        ParentError::CodeRefused { symbol, why } => (*symbol, Some(why.at?)),
         ParentError::Special { symbol, why } if !record_stops_suite(why) => (*symbol, None),
         ParentError::NotChecked { function, symbol, .. } => (*symbol, Some((*function, 0))),
         ParentError::NoPersonality { function, symbol, .. } => (*symbol, function.map(|item| (item, 0))),
@@ -1169,7 +1187,8 @@ impl Refuse for EntryCheck<'_, '_> {
 /// other test's answer). `Pooled`: each make is handed to a worker through [`CodeRelay`], the
 /// command thread only relays, and the asking test is parked, its allowance stopped, until its
 /// code comes or [`CODE_WAIT`] passes. `Pooled` for the real command needs [`CodeWorkers`] made
-/// on the command's pool (piece 2 of D194): until then [`run_suites`] refuses it by name.
+/// on the command's pool (piece 2 of D194, [`pooled`]); with no worker beside the command
+/// thread, [`run_suites`] refuses it by name (`DriveError::NoCodeWorkers`), never runs serially.
 pub(crate) const CODES: Codes = Codes::Serial;
 
 /// How long one test's ask for its code may wait for a worker's make (rule 18): past it the test
@@ -1184,7 +1203,6 @@ const MOST_ASKS: usize = 1 << 20;
 const MOST_KEPT: usize = 1 << 30;
 
 /// One make handed to a worker (D194): all it needs, owned, so it crosses to the worker's thread.
-#[allow(dead_code, reason = "read by the command's workers, which D194 piece 2 builds")]
 pub(crate) struct Job<'a> {
     /// The suite whose names records the make reads.
     pub suite: SuiteId,
@@ -1209,17 +1227,23 @@ pub(crate) trait CodeWorkers<'a> {
     fn count(&self) -> usize;
     /// Hands `job` to `worker`, which the relay gave no other make in flight.
     fn give(&self, worker: Worker, job: Job<'a>) -> Result<(), OneError>;
-    /// One make finished since the last call, if any: the entry's bytes, or the make's refusal.
-    fn finished(&self) -> Option<(Worker, Result<SVec<'a, u8>, Unmade>)>;
+    /// One make finished since the last call, if any: the entry's bytes, or the make's refusal;
+    /// `Err`: what the workers asked of the command thread meanwhile could not be answered.
+    fn finished(&self) -> Result<Option<(Worker, Result<SVec<'a, u8>, CodeRefusal>)>, OneError>;
 }
 
 /// The relay of D194 over the command's [`CodeWorkers`], shared by every test's run on the
 /// command thread. Its state is borrowed only inside one call, never across a turn (rule 27).
+///
+/// What it holds (its asks, the made entries kept for later askers, at most [`MOST_KEPT`] bytes:
+/// past it a make is the relay's `Full`) is in the command's own heap, handed in (`heap.shared()`),
+/// and freed with the relay at the command's end. Its data is `'static` for that reason, and its
+/// one lifetime is its borrows', so a run may borrow it for less than it lives (`Launched::codes`).
 pub(crate) struct CodeRelay<'a> {
-    relay: RefCell<PoolRelay<'a, Job<'a>, Unmade>>,
-    workers: &'a dyn CodeWorkers<'a>,
+    relay: RefCell<PoolRelay<'static, Job<'static>, CodeRefusal>>,
+    workers: &'a dyn CodeWorkers<'static>,
     now: &'a dyn Fn() -> Nanos,
-    alloc: SharedAlloc<'a>,
+    alloc: SharedAlloc<'static>,
     /// A step refused where no error could be returned (a run's end, [`Asking`]'s drop): said by
     /// the next [`CodeRelay::pump`], so nothing is quietly dropped (rule 3).
     fault: Cell<Option<RelayError>>,
@@ -1228,8 +1252,7 @@ pub(crate) struct CodeRelay<'a> {
 impl<'a> CodeRelay<'a> {
     /// A relay for `children` tests (ids dense from zero, [`Launched::child_base`]) over `workers`,
     /// on the clock `now`; `hash_seed` is the command's (rule 75).
-    #[allow(dead_code, reason = "made by `run_suites` under `Codes::Pooled`, once D194 piece 2 gives it workers")]
-    pub(crate) fn new(children: usize, workers: &'a dyn CodeWorkers<'a>, now: &'a dyn Fn() -> Nanos, alloc: SharedAlloc<'a>, hash_seed: u64) -> Result<CodeRelay<'a>, RelayError> {
+    pub(crate) fn new(children: usize, workers: &'a dyn CodeWorkers<'static>, now: &'a dyn Fn() -> Nanos, alloc: SharedAlloc<'static>, hash_seed: u64) -> Result<CodeRelay<'a>, RelayError> {
         let opts = code_relay::Options {
             alloc,
             hash_seed,
@@ -1252,13 +1275,13 @@ impl<'a> CodeRelay<'a> {
 
     /// One turn of relaying, never waiting: every finished make given back, the asks' deadlines
     /// ticked, every make the pool wants handed to its worker.
-    fn pump(&self) -> Result<(), OneError> {
+    pub(crate) fn pump(&self) -> Result<(), OneError> {
         if let Some(fault) = self.fault.take() {
             return Err(OneError::Relay(fault));
         }
         let now = self.time();
         let mut relay = self.relay.borrow_mut();
-        while let Some((worker, result)) = self.workers.finished() {
+        while let Some((worker, result)) = self.workers.finished()? {
             match result {
                 Ok(bytes) => relay.made(now, worker, bytes),
                 Err(why) => relay.refused(now, worker, why),
@@ -1273,14 +1296,14 @@ impl<'a> CodeRelay<'a> {
     }
 
     /// Child `child` asks for the code of `key` (`None`: unkeyed, its own), to be made by `job`.
-    fn ask(&self, child: Child, key: Option<blaze_ladder::code_records::CodeKey>, job: Job<'a>) -> Result<(), OneError> {
+    pub(crate) fn ask(&self, child: Child, key: Option<blaze_ladder::code_records::CodeKey>, job: Job<'static>) -> Result<(), OneError> {
         let key = key.map(|key| blaze_engine::code_pool::CodeKey(key.0));
         self.relay.borrow_mut().ask(self.time(), child, key, job).map_err(OneError::Relay)?;
         self.pump()
     }
 
     /// Child `child`'s answer through `with`, once it came; `None` while it has not.
-    fn answer<R>(&self, child: Child, with: impl FnOnce(Reply<'_, Unmade>) -> R) -> Result<Option<R>, OneError> {
+    pub(crate) fn answer<R>(&self, child: Child, with: impl FnOnce(Reply<'_, CodeRefusal>) -> R) -> Result<Option<R>, OneError> {
         self.relay.borrow_mut().answer(child, with).map_err(OneError::Relay)
     }
 }
@@ -1300,6 +1323,533 @@ impl Drop for Asking<'_, '_> {
         {
             self.code.fault.set(Some(fault));
         }
+    }
+}
+
+/// How long a hand-over on a code workers' channel may wait (rule 18): a make to its worker's
+/// inbox, a made entry to the done channel, an answer of the proc-macro runner. Each has room by
+/// construction (the doc of [`Lanes`]), so the wait is for the channel's lock alone, held for a
+/// move.
+const HAND_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the command waits, after its run, for its code workers to end (rule 18): a make in
+/// flight is not cancelled inside the maker, so this is a make's bound ([`CODE_WAIT`]). Past it
+/// the command fails naming the workers ([`DriveError::CodeWorkers`]), never waits on.
+const END_WAIT: Duration = CODE_WAIT;
+
+/// The most makers one code worker keeps (rule 18: a table has a cap): one a (suite, entry,
+/// start) its makes asked, the oldest dropped first. A test's roots start at its fn, so this is
+/// about the tests whose code one worker made lately; a maker dropped is made again, cheaply
+/// (make_one.rs `Maker::of_start` reads nothing), its program state lowered again by need.
+const MOST_MAKERS: usize = 64;
+
+/// The scratch of a code worker's task (bstd `Scope::must_overlap`): its waits and spans; its
+/// names records and makers are in a frame of its own ([`work`]).
+const WORKER_SCRATCH: usize = 1 << 20;
+
+/// The words of a make that panicked on its worker (rule 20): that make alone fails, typed, and
+/// the worker forgets what it kept for the suite ([`KeptMakers::forget`]).
+const PANICKED: &str = "the make of this instance panicked on its code worker; the worker forgot this suite's names records and makers (test_drive.rs `make_one`, D194)";
+
+/// The words of a make handed a maker of another start (the seam test's control, rule 78).
+const ANOTHER_START: &str = "the make was handed a maker made for another entry or start than its test's roots say (test_drive.rs `Makers::of`, D194)";
+
+/// What a code worker sends back: its id, and the entry it made or the make's refusal.
+/// The refusal crosses as a [`CodeRefusal`]: `Unmade` is not `Send`.
+pub(crate) type Done = (Worker, Result<SVec<'static, u8>, CodeRefusal>);
+
+/// The command's proc-macro runner as a worker may reach it (D194 piece 2): the runner itself,
+/// made already (`Sync`: check's stretches share it, engine_bodies.rs `Shared::procs`); asked of
+/// the command thread at a worker's first call, as the command's by-need maker is the command
+/// thread's (engine_start.rs `RunProcs`, over its context and frame); or none.
+#[derive(Clone, Copy)]
+pub(crate) enum ProcsSide<'p> {
+    None,
+    Made(&'p crate::proc_runner::ProcRunner<'static>),
+    ByNeed,
+}
+
+impl<'p> ProcsSide<'p> {
+    pub(crate) fn of(procs: crate::job_texts::Procs<'p>) -> ProcsSide<'p> {
+        match procs {
+            crate::job_texts::Procs::None => ProcsSide::None,
+            crate::job_texts::Procs::Made(made) => ProcsSide::Made(made),
+            crate::job_texts::Procs::ByNeed(_) => ProcsSide::ByNeed,
+        }
+    }
+}
+
+/// The channels between the command thread and its code workers (D194 piece 2), in the
+/// command's heap (handed in), every one bounded and every one with room by construction, so
+/// a hand-over waits only for a channel's lock ([`HAND_WAIT`]):
+/// - each worker's inbox holds one make: the relay hands a worker its next make only once its
+///   last came back (code_pool_relay.rs `Relay::job`);
+/// - the done channel holds one entry a worker: a worker sends one, then waits for its next;
+/// - a worker asks for the proc-macro runner at most once (its memo, [`WorkerProcs`]), and its
+///   answer has one place.
+///
+/// No lock is held across a wait: a channel's lock is held for a move (bstd sync/chan.rs). Each
+/// wait is named by a span and bounded by a deadline (rules 15, 18). [`Lanes::close`] ends them
+/// all: a worker waiting for its next make sees the close and ends.
+pub(crate) struct Lanes<'p> {
+    inboxes: SVec<'static, bstd::sync::chan::OwnedChan<Job<'static>, SharedAlloc<'static>>>,
+    done: bstd::sync::chan::OwnedChan<Done, SharedAlloc<'static>>,
+    procs_asked: bstd::sync::chan::OwnedChan<Worker, SharedAlloc<'static>>,
+    procs_answers: SVec<'static, bstd::sync::chan::OwnedChan<crate::job_texts::MadeProcs<'p>, SharedAlloc<'static>>>,
+}
+
+impl<'p> Lanes<'p> {
+    /// The channels of `count` workers, in `heap`.
+    pub(crate) fn new(count: core::num::NonZeroUsize, heap: &'static blaze_own::Heap) -> Lanes<'p> {
+        use bstd::sync::chan::owned;
+        let alloc = heap.shared();
+        let one = core::num::NonZeroUsize::MIN;
+        let mut inboxes = SVec::with_capacity_in(count.get(), alloc);
+        let mut procs_answers = SVec::with_capacity_in(count.get(), alloc);
+        for _ in 0..count.get() {
+            inboxes.push(owned("blaze test: a code worker's inbox", one, alloc));
+            procs_answers.push(owned("blaze test: a code worker's proc-macro runner", one, alloc));
+        }
+        Lanes {
+            inboxes,
+            done: owned("blaze test: the code workers' made entries", count, alloc),
+            procs_asked: owned("blaze test: the code workers' asks for the proc-macro runner", count, alloc),
+            procs_answers,
+        }
+    }
+
+    /// Worker `worker`'s ends.
+    pub(crate) fn lane(&self, worker: usize) -> WorkerLane<'_, 'p> {
+        WorkerLane { me: Worker(worker), lanes: self }
+    }
+
+    /// Every channel closed: each worker's next wait ends, and a worker's late send is refused
+    /// as `Closed` (the command ended: its entry is dropped, [`WorkerLane::answer`]).
+    pub(crate) fn close(&self) {
+        for inbox in self.inboxes.iter() {
+            inbox.close();
+        }
+        for answer in self.procs_answers.iter() {
+            answer.close();
+        }
+        self.done.close();
+        self.procs_asked.close();
+    }
+
+    /// What was sent and not taken, dropped once the workers ended: entries made for tests that
+    /// ended (rule 3: by design, said here; the relay drops a result for a child that exited the
+    /// same way, code_pool_relay.rs `Relay::made`). How many.
+    pub(crate) fn drain(&self) -> usize {
+        let mut dropped = 0;
+        while self.done.try_recv().is_ok() {
+            dropped += 1;
+        }
+        dropped
+    }
+}
+
+/// Why a code worker ended other than by the command's close (each names its wait, rule 19).
+#[derive(Debug)]
+pub(crate) enum WorkerEnd {
+    /// Its frame for its names records could not be made.
+    Frame(blaze_mem::MemError),
+    /// The wait `what` stopped so (its deadline, or the scope's cancel).
+    Stopped { what: &'static str, stopped: bstd::Stopped },
+    /// No inbox for this worker: the pool made fewer lanes than workers.
+    NoLane { worker: usize },
+    /// The channel `chan` answered what its use rules out ([`Lanes`]): no room for a send, or
+    /// empty after a wait that ends only with a value, the close, or a stop.
+    Full { chan: &'static str },
+}
+
+impl fmt::Display for WorkerEnd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WorkerEnd::Frame(error) => write!(f, "a code worker's frame could not be made: {error:?}"),
+            WorkerEnd::Stopped { what, stopped } => write!(f, "a code worker's wait ({what}) stopped: {stopped}"),
+            WorkerEnd::NoLane { worker } => write!(f, "code worker {worker} has no channels (test_drive.rs `Lanes`)"),
+            WorkerEnd::Full { chan } => write!(f, "the code workers' channel `{chan}` had no room, which its construction rules out (test_drive.rs `Lanes`)"),
+        }
+    }
+}
+
+/// One worker's makers (rule 78: the command's suites' [`SuiteMakers`], or a test's): each make
+/// handed to the maker of its own suite and start.
+pub(crate) trait KeptMakers {
+    /// The entry of `job` appended to `entry`.
+    fn make(&mut self, job: &Job<'static>, entry: &mut AVec<'_, u8>) -> Result<(), Unmade>;
+    /// Everything kept for `suite` forgotten (after one of its makes panicked).
+    fn forget(&mut self, suite: SuiteId);
+}
+
+/// The one make of a worker (sans-IO, rule 14): `job` made into `scratch` by `makers`, copied
+/// into the command's heap (`alloc`, handed in); a panic in it fails this make alone, typed,
+/// naming the instance's fn (rule 20; the asking test's NOT RUN names the instance, run_parent.rs
+/// `Lazy::refused`), and the suite's state is forgotten, as it may be half made. The refusal
+/// crosses as a [`CodeRefusal`] ([`crossing`]).
+pub(crate) fn make_one(makers: &mut dyn KeptMakers, job: &Job<'static>, scratch: &mut AVec<'_, u8>, alloc: SharedAlloc<'static>) -> Result<SVec<'static, u8>, CodeRefusal> {
+    scratch.clear();
+    match crate::work::unwinding(|| makers.make(job, scratch)) {
+        Ok(Ok(())) => {
+            let mut made = SVec::with_capacity_in(scratch.len(), alloc);
+            made.extend_from_slice(scratch.as_slice());
+            Ok(made)
+        }
+        Ok(Err(why)) => Err(crossing(why, alloc)),
+        Err(_panicked) => {
+            makers.forget(job.suite);
+            Err(crossing(refused(job, PANICKED), alloc))
+        }
+    }
+}
+
+/// `why` as it crosses to the command thread (run_parent.rs [`CodeRefusal`]): whose and where by
+/// [`refused_instance`], the serial path's own sorting, and its words as [`InstanceRefusal`] and
+/// `ParentError::Walk` print them, in `alloc` (the command's heap).
+pub(crate) fn crossing(why: Unmade, alloc: SharedAlloc<'static>) -> CodeRefusal {
+    use blaze_ladder::body_ids::WalkError;
+
+    let mut walk = String::new_in(alloc);
+    let mut whole = write!(walk, "{why}").is_ok();
+    let cause = match &why {
+        WalkError::Make { why: blaze_ladder::run::RunError::Build { error, .. }, .. } => Some(words(error, alloc, &mut whole)),
+        WalkError::Make { why, .. } => Some(words(why, alloc, &mut whole)),
+        _ => None,
+    };
+    // The symbol is the command thread's (its asking row's), and the sorting does not read it.
+    let at = refused_instance(&ParentError::Walk { symbol: [0; 32], why }).and_then(|(_, at)| at);
+    CodeRefusal { at, cause, walk, whole }
+}
+
+/// `shown`'s words in `alloc`; `whole` cleared when the heap refused part of them.
+fn words(shown: &dyn fmt::Display, alloc: SharedAlloc<'static>, whole: &mut bool) -> String<SharedAlloc<'static>> {
+    let mut words = String::new_in(alloc);
+    if write!(words, "{shown}").is_err() {
+        *whole = false;
+    }
+    words
+}
+
+/// `job`'s refusal for `why`, as a make's (`Order::make`'s `WalkError::Make`).
+fn refused(job: &Job<'_>, why: &'static str) -> Unmade {
+    let tabled = job.order.tabled;
+    blaze_ladder::body_ids::WalkError::Make { tabled, why: blaze_ladder::run::RunError::OneBody { key: tabled, why } }
+}
+
+/// Worker `me`'s ends of [`Lanes`].
+#[derive(Clone, Copy)]
+pub(crate) struct WorkerLane<'l, 'p> {
+    me: Worker,
+    lanes: &'l Lanes<'p>,
+}
+
+/// A worker's wait for its next make.
+const WAIT_JOB: &str = "blaze test: a code worker waits for its next make";
+/// A worker's hand-over of what it made.
+const WAIT_DONE: &str = "blaze test: a code worker hands back what it made";
+/// A worker's wait for the command's proc-macro runner.
+const WAIT_PROCS: &str = "blaze test: a code worker waits for the command's proc-macro runner";
+
+impl<'l, 'p> WorkerLane<'l, 'p> {
+    fn inbox(&self) -> Result<&'l bstd::sync::chan::OwnedChan<Job<'static>, SharedAlloc<'static>>, WorkerEnd> {
+        self.lanes.inboxes.get(self.me.0).ok_or(WorkerEnd::NoLane { worker: self.me.0 })
+    }
+
+    /// The worker's loop: each make waited for (named, until `cx`'s deadline, which is the
+    /// command's, and ended by the close), made and handed back; `Ok` once the command closed it.
+    pub(crate) fn run(self, cx: &Cx, clock: &bstd::clock::Clock, makers: &mut dyn KeptMakers, heap: &'static blaze_own::Heap) -> Result<(), WorkerEnd> {
+        use bstd::sync::RecvError;
+        let inbox = self.inbox()?;
+        let mut scratch: AVec<'static, u8> = Vec::new_in(heap.alloc());
+        loop {
+            let waiting = cx.span(WAIT_JOB);
+            let job = match inbox.recv(&waiting) {
+                Ok(job) => job,
+                Err(RecvError::Closed { .. }) => return Ok(()),
+                Err(RecvError::Empty { chan }) => return Err(WorkerEnd::Full { chan }),
+                Err(RecvError::Stopped(stopped)) => return Err(WorkerEnd::Stopped { what: WAIT_JOB, stopped }),
+            };
+            drop(waiting);
+            self.answer(cx, clock, makers, &job, &mut scratch, heap)?;
+        }
+    }
+
+    /// The seam test's turn of this worker (rule 78: the same make and hand-back as [`run`]'s,
+    /// driven inline): the make in its inbox now, if one is, made and handed back. Whether one
+    /// was.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the seam test's inline worker (run_parent_tests.rs `pooled_codes_equal_serial`)"))]
+    pub(crate) fn step(self, cx: &Cx, clock: &bstd::clock::Clock, makers: &mut dyn KeptMakers, scratch: &mut AVec<'_, u8>, heap: &'static blaze_own::Heap) -> Result<bool, WorkerEnd> {
+        match self.inbox()?.try_recv() {
+            Ok(job) => {
+                self.answer(cx, clock, makers, &job, scratch, heap)?;
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// `job` made and handed back. A done channel closed is the command's end: what was made
+    /// is dropped (its asker is gone), by design and said here, never an error of the worker.
+    fn answer(self, cx: &Cx, clock: &bstd::clock::Clock, makers: &mut dyn KeptMakers, job: &Job<'static>, scratch: &mut AVec<'_, u8>, heap: &'static blaze_own::Heap) -> Result<(), WorkerEnd> {
+        use bstd::sync::SendError;
+        let made = {
+            let _making = cx.span("blaze test: a code worker makes one entry");
+            make_one(makers, job, scratch, heap.shared())
+        };
+        let by = cx.until(Deadline::after(clock.now().since_start(), HAND_WAIT));
+        let handing = by.span(WAIT_DONE);
+        match self.lanes.done.send(&handing, (self.me, made)) {
+            Ok(()) | Err(SendError::Closed(_)) => Ok(()),
+            Err(SendError::Full { chan, .. }) => Err(WorkerEnd::Full { chan }),
+            Err(SendError::Stopped { stopped, .. }) => Err(WorkerEnd::Stopped { what: WAIT_DONE, stopped }),
+        }
+    }
+
+    /// The command's proc-macro runner, asked of the command thread ([`CodePool::finished`]
+    /// answers it): named, and bounded by [`CODE_WAIT`] (making the runner is the command's
+    /// longest one-off, engine_start.rs `RunProcs::make`).
+    fn ask_procs(self, cx: &Cx, clock: &bstd::clock::Clock) -> crate::job_texts::MadeProcs<'p> {
+        let Some(answer) = self.lanes.procs_answers.get(self.me.0) else {
+            return Err("no proc-macro runner: this code worker has no channel to ask for it (test_drive.rs `Lanes`)");
+        };
+        let by = cx.until(Deadline::after(clock.now().since_start(), CODE_WAIT));
+        let waiting = by.span(WAIT_PROCS);
+        if self.lanes.procs_asked.send(&waiting, self.me).is_err() {
+            return Err("no proc-macro runner: the command ended, or its hand-over stopped, before this code worker's ask for it was taken (test_drive.rs `WorkerLane::ask_procs`)");
+        }
+        match answer.recv(&waiting) {
+            Ok(made) => made,
+            Err(_) => Err("no proc-macro runner: the command ended, or `CODE_WAIT` passed, before it answered this code worker's ask (test_drive.rs `WorkerLane::ask_procs`)"),
+        }
+    }
+}
+
+/// A worker's proc-macro runner by need (job_texts.rs `ProcsByNeed`): asked of the command
+/// thread at its first call, once (the same answer on every later call, as `MadeOnce`).
+pub(crate) struct WorkerProcs<'w, 'p> {
+    cx: &'w Cx,
+    clock: &'w bstd::clock::Clock,
+    lane: WorkerLane<'w, 'p>,
+    got: core::cell::OnceCell<crate::job_texts::MadeProcs<'p>>,
+}
+
+impl<'w, 'p: 'w> crate::job_texts::ProcsByNeed<'w> for WorkerProcs<'w, 'p> {
+    fn procs(&self) -> Result<&'static crate::proc_runner::ProcRunner<'static>, &'w str> {
+        *self.got.get_or_init(|| self.lane.ask_procs(self.cx, self.clock))
+    }
+}
+
+/// What a maker was made for (make_one.rs `Maker::made_for`): its entry and start.
+pub(crate) trait MadeFor {
+    fn made_for(&self) -> (Option<ItemKey>, MakerStart);
+}
+
+impl MadeFor for RunMaker<'_> {
+    fn made_for(&self) -> (Option<ItemKey>, MakerStart) {
+        Maker::made_for(self)
+    }
+}
+
+/// A PLANTED BUG for the seam test's control (skill `testing`): `BySuiteAlone` finds a kept
+/// maker by its suite alone, so a make may be handed a maker of another test's start, which
+/// [`Makers::of`] must catch. Always `None` outside the test.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MakersPlant {
+    None,
+    BySuiteAlone,
+}
+
+/// One worker's makers, one a (suite, entry, start) its makes asked, made at the first and kept
+/// (at most [`MOST_MAKERS`], the oldest dropped first), in the command's heap.
+pub(crate) struct Makers<M> {
+    kept: AVec<'static, (SuiteId, Option<ItemKey>, MakerStart, M)>,
+    plant: MakersPlant,
+}
+
+impl<M: MadeFor> Makers<M> {
+    pub(crate) fn new(alloc: Alloc<'static>, plant: MakersPlant) -> Makers<M> {
+        Makers { kept: Vec::new_in(alloc), plant }
+    }
+
+    /// The maker of `job`'s suite, entry and start: kept, or made by `make` and kept. A kept
+    /// maker made for another entry or start than `job`'s is refused by name (its control:
+    /// [`MakersPlant::BySuiteAlone`]), never used.
+    pub(crate) fn of(&mut self, job: &Job<'_>, make: impl FnOnce() -> Result<M, Unmade>) -> Result<&mut M, Unmade> {
+        let plant = self.plant;
+        let found = self.kept.iter().position(|(suite, entry, start, _)| *suite == job.suite && (plant == MakersPlant::BySuiteAlone || (*entry == job.entry && *start == job.start)));
+        let at = match found {
+            Some(at) => at,
+            None => {
+                let maker = make()?;
+                if self.kept.len() >= MOST_MAKERS {
+                    // The oldest first: at most `MOST_MAKERS` moved, once a maker is made.
+                    drop(self.kept.remove_shift(0));
+                }
+                self.kept.push((job.suite, job.entry, job.start, maker));
+                self.kept.len() - 1
+            }
+        };
+        let Some((_, _, _, maker)) = self.kept.get_mut(at) else { return Err(refused(job, ANOTHER_START)) };
+        if maker.made_for() != (job.entry, job.start) {
+            return Err(refused(job, ANOTHER_START));
+        }
+        Ok(maker)
+    }
+
+    pub(crate) fn forget(&mut self, suite: SuiteId) {
+        self.kept.retain(|(kept, ..)| *kept != suite);
+    }
+}
+
+/// What one suite's makes read, shared read only by every worker (run_names.rs `RunCrates`):
+/// its crates and its builder.
+#[derive(Clone, Copy)]
+pub(crate) struct SuiteSide<'s> {
+    pub crates: crate::run_names::RunCrates<'s>,
+    pub builder: Builder,
+}
+
+/// The words of a make whose suite's names records could not be made on its worker.
+const NO_NAMES: &str = "its suite's names records could not be made on the code worker (run_names.rs `names_in`, D194)";
+/// The words of a make naming a suite the command does not have.
+const NO_SUITE: &str = "the make names a suite this command does not have (test_drive.rs `SuiteMakers`, D194)";
+
+/// THE [`KeptMakers`] of the command (D194 piece 2): on one worker, each suite's names records
+/// made at its first make, of the suite's shared [`RunCrates`](crate::run_names::RunCrates),
+/// in the worker's own frame (its trees, environments and records' memo its own), and each
+/// (suite, entry, start)'s maker over them, made as the asking test's serial step would make it
+/// (`TestFront::maker`: the same entry, start, typing and builder).
+pub(crate) struct SuiteMakers<'w> {
+    cx: &'w Cx,
+    root: &'w Dir<ReadWrite>,
+    sides: &'w [SuiteSide<'w>],
+    procs: crate::job_texts::Procs<'w>,
+    frame: &'w Frame,
+    tables: Alloc<'static>,
+    names: AVec<'static, Option<NamesRecords<'w>>>,
+    makers: Makers<RunMaker<'w>>,
+}
+
+impl<'w> SuiteMakers<'w> {
+    pub(crate) fn new(cx: &'w Cx, root: &'w Dir<ReadWrite>, sides: &'w [SuiteSide<'w>], procs: crate::job_texts::Procs<'w>, frame: &'w Frame, heap: &'static blaze_own::Heap) -> SuiteMakers<'w> {
+        let mut names = Vec::with_capacity_in(sides.len(), heap.alloc());
+        names.resize(sides.len(), None);
+        SuiteMakers { cx, root, sides, procs, frame, tables: heap.alloc(), names, makers: Makers::new(heap.alloc(), MakersPlant::None) }
+    }
+}
+
+impl KeptMakers for SuiteMakers<'_> {
+    fn make(&mut self, job: &Job<'static>, entry: &mut AVec<'_, u8>) -> Result<(), Unmade> {
+        let at = job.suite.0 as usize;
+        let side = *self.sides.get(at).ok_or_else(|| refused(job, NO_SUITE))?;
+        let names = match self.names.get(at).copied().flatten() {
+            Some(names) => names,
+            None => {
+                let frame = self.frame;
+                // Its own count of the trees it opened: the command's closing line counts the
+                // command thread's (run_names.rs `NamesRead`), a worker's are its own.
+                let seen: &crate::body_types::TreesSeen = frame.alloc(crate::body_types::TreesSeen::default());
+                let names = crate::run_names::names_in(self.cx, self.root, side.crates, self.procs, seen, frame).map_err(|_| refused(job, NO_NAMES))?;
+                if let Some(slot) = self.names.get_mut(at) {
+                    *slot = Some(names);
+                }
+                names
+            }
+        };
+        let tables = self.tables;
+        let maker = self.makers.of(job, || Ok(Maker::of_start(names, job.entry, job.start, SecondCheck, &side.builder, tables)))?;
+        job.order.make(maker, &job.proof, job.name.as_slice(), entry)
+    }
+
+    fn forget(&mut self, suite: SuiteId) {
+        self.makers.forget(suite);
+        if let Some(slot) = self.names.get_mut(suite.0 as usize) {
+            *slot = None;
+        }
+    }
+}
+
+/// One code worker's task (D194 piece 2): its frame, its proc-macro runner by need, its
+/// makers over every suite, then its loop until the command closes its lane.
+pub(crate) fn work(cx: &Cx, lane: WorkerLane<'_, '_>, clock: &bstd::clock::Clock, sides: &[SuiteSide<'_>], root: &Dir<ReadWrite>, procs: ProcsSide<'_>, heap: &'static blaze_own::Heap) -> Result<(), WorkerEnd> {
+    let frame = Frame::new(bstd::mem::Tag::Other).map_err(WorkerEnd::Frame)?;
+    let by_need = WorkerProcs { cx, clock, lane, got: core::cell::OnceCell::new() };
+    let procs = match procs {
+        ProcsSide::None => crate::job_texts::Procs::None,
+        ProcsSide::Made(made) => crate::job_texts::Procs::Made(made),
+        ProcsSide::ByNeed => crate::job_texts::Procs::ByNeed(&by_need),
+    };
+    let mut makers = SuiteMakers::new(cx, root, sides, procs, &frame, heap);
+    lane.run(cx, clock, &mut makers, heap)
+}
+
+/// THE [`CodeWorkers`] of the command (D194 piece 2), on the command thread: a make handed to
+/// its worker's inbox, a finished one taken from the done channel, and, at each turn, every
+/// worker's ask for the proc-macro runner answered from the command's own (`procs`, made by need
+/// on this thread at the first ask, engine_start.rs `RunProcs`). Never waits but for a
+/// channel's lock ([`HAND_WAIT`]).
+pub(crate) struct CodePool<'l, 'p> {
+    pub lanes: &'l Lanes<'p>,
+    /// How many workers run: the lanes beyond are unused.
+    pub count: usize,
+    pub cx: &'l Cx,
+    pub clock: &'l bstd::clock::Clock,
+    pub procs: crate::job_texts::Procs<'p>,
+}
+
+impl CodePool<'_, '_> {
+    fn hand_off(&self, chan: &'static str, worker: usize, why: &'static str) -> OneError {
+        OneError::CodeHandOff { chan, worker, why }
+    }
+
+    /// Every worker's ask for the proc-macro runner answered.
+    fn serve_procs(&self) -> Result<(), OneError> {
+        use bstd::sync::SendError;
+        while let Ok(worker) = self.lanes.procs_asked.try_recv() {
+            let made = match self.procs {
+                crate::job_texts::Procs::None => Err("no proc-macro runner: this command has none (job_texts.rs `Procs::None`)"),
+                // Handed made to every worker (`ProcsSide::Made`), which then never asks.
+                crate::job_texts::Procs::Made(_) => Err("no proc-macro runner by ask: this command handed its runner made to every code worker, and a worker asked anyway (test_drive.rs `ProcsSide`, a bug)"),
+                crate::job_texts::Procs::ByNeed(maker) => maker.procs(),
+            };
+            let chan = "blaze test: a code worker's proc-macro runner";
+            let answer = self.lanes.procs_answers.get(worker.0).ok_or_else(|| self.hand_off(chan, worker.0, "does not exist"))?;
+            let by = self.cx.until(Deadline::after(self.clock.now().since_start(), HAND_WAIT));
+            let handing = by.span("blaze test: answer a code worker's ask for the proc-macro runner");
+            match answer.send(&handing, made) {
+                Ok(()) => {}
+                Err(SendError::Closed(_)) => return Err(self.hand_off(chan, worker.0, "was closed")),
+                Err(SendError::Full { .. }) => return Err(self.hand_off(chan, worker.0, "had no room")),
+                Err(SendError::Stopped { .. }) => return Err(self.hand_off(chan, worker.0, "stopped its hand-over (`HAND_WAIT`)")),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CodeWorkers<'static> for CodePool<'_, '_> {
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    fn give(&self, worker: Worker, job: Job<'static>) -> Result<(), OneError> {
+        use bstd::sync::SendError;
+        let chan = "blaze test: a code worker's inbox";
+        let inbox = self.lanes.inboxes.get(worker.0).filter(|_| worker.0 < self.count).ok_or_else(|| self.hand_off(chan, worker.0, "does not exist"))?;
+        let by = self.cx.until(Deadline::after(self.clock.now().since_start(), HAND_WAIT));
+        let handing = by.span("blaze test: hand a make to its code worker");
+        match inbox.send(&handing, job) {
+            Ok(()) => Ok(()),
+            Err(SendError::Closed(_)) => Err(self.hand_off(chan, worker.0, "was closed")),
+            Err(SendError::Full { .. }) => Err(self.hand_off(chan, worker.0, "had no room")),
+            Err(SendError::Stopped { .. }) => Err(self.hand_off(chan, worker.0, "stopped its hand-over (`HAND_WAIT`)")),
+        }
+    }
+
+    fn finished(&self) -> Result<Option<Done>, OneError> {
+        self.serve_procs()?;
+        // Empty now (or the channel's lock taken this instant): the next turn takes it.
+        Ok(self.lanes.done.try_recv().ok())
     }
 }
 
@@ -1597,7 +2147,7 @@ impl<'c> Launched<'c, '_> {
                         Ok(()) => Came::Made,
                         Err(cause) => Came::Failed(cause),
                     },
-                    Reply::Refused(why) => Came::Failed(lazy.unmade(why)),
+                    Reply::Refused(why) => Came::Failed(lazy.refused(why)),
                     Reply::RefusedElsewhere { first, .. } => Came::Elsewhere { first },
                     Reply::Late { waited, .. } => Came::Late { waited },
                 })?;
@@ -2051,6 +2601,9 @@ pub(crate) fn list(cx: &Cx, suites: &[(Found<'_>, TestUnit<'_>)], config: LoopCo
 pub(crate) struct Suite<'s, 'h> {
     pub unit: TestUnit<'s>,
     pub names: NamesRecords<'h>,
+    /// What its names records were made of (run_names.rs `RunCrates`): each code worker makes
+    /// its own of them under `Codes::Pooled` ([`SuiteMakers`]).
+    pub crates: crate::run_names::RunCrates<'h>,
     pub builder: Builder,
     /// Where its tests run and what of their package they are told ([`package_run`]).
     pub place: PackageRun<'s>,
@@ -2165,10 +2718,97 @@ impl RunOne for Selected<'_, Launched<'_, '_>> {
     }
 }
 
+/// The selected suites run, their code made where [`CODES`] says (D194, THE seam): `Serial`, in
+/// each test's own turn; `Pooled`, by the command's code workers ([`pooled`]), the relay handed
+/// to every test's run. `root` is the checkout's (each worker's names records read its trees
+/// through it); `procs` is the command's proc-macro runner (by need: a worker asks for it,
+/// [`CodePool`]); `heap` is the command's, the relay's and the workers' tables in it.
 #[expect(clippy::too_many_arguments, reason = "the command supplies the selected records and runtime capabilities")]
 pub(crate) fn run_suites<'h>(
     cx: &Cx, io: &Io, suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, config: LoopConfig<'_>,
+    args: &[&str], lent: &CommandLent, root: &Dir<ReadWrite>, procs: crate::job_texts::Procs<'_>, heap: &'static blaze_own::Heap, watch: &dyn Watch, frame: &Frame,
+) -> Result<Status, DriveError> {
+    let tables = heap.alloc();
+    match CODES {
+        Codes::Serial => run_selected(cx, io, suites, ids, config, args, lent, tables, watch, frame, None),
+        Codes::Pooled => pooled(cx, io, suites, root, procs, heap, |relay| run_selected(cx, io, suites, ids, config, args, lent, tables, watch, frame, Some(relay))),
+    }
+}
+
+/// [`run_suites`] under `Codes::Pooled` (D194 piece 2): the command's code workers started (one
+/// a worker of the pool beside the command thread, as many as are idle now: the pool's size is
+/// the machine's, never waited for; none is a refusal by name, never a serial run in its place,
+/// rule 3), the relay made over them, `run` handed it; then every lane closed and each worker
+/// joined within [`END_WAIT`] (a make in flight ends, its entry dropped: its asker is gone).
+///
+/// What is shared and what is not (the doc of run_names.rs `RunCrates`): each worker reads the
+/// suites' crates in place and makes its own names records, trees, environments and makers; the
+/// proc-macro runner, made by need on this thread, is relayed ([`CodePool::finished`]).
+fn pooled<'h>(
+    cx: &Cx, io: &Io, suites: &[Suite<'_, 'h>], root: &Dir<ReadWrite>, procs: crate::job_texts::Procs<'_>, heap: &'static blaze_own::Heap,
+    run: impl FnOnce(&CodeRelay<'_>) -> Result<Status, DriveError>,
+) -> Result<Status, DriveError> {
+    let cx = cx.span("blaze test: the command's code workers");
+    let clock = io.need_clock().map_err(DriveError::Missing)?;
+    let hash_seed = io.need_rng().map_err(DriveError::Missing)?.next_u64();
+    let have = cx.workers();
+    let Some(most) = core::num::NonZeroUsize::new(usize::try_from(have.saturating_sub(1)).unwrap_or(0)) else {
+        return Err(DriveError::NoCodeWorkers { have });
+    };
+    let lanes = Lanes::new(most, heap);
+    let mut sides: AVec<'static, SuiteSide<'_>> = Vec::with_capacity_in(suites.len(), heap.alloc());
+    sides.extend(suites.iter().map(|suite| SuiteSide { crates: suite.crates, builder: suite.builder }));
+    let sides = sides.as_slice();
+    let side = ProcsSide::of(procs);
+    let children = suites.iter().map(|suite| suite.unit.tests.len()).sum::<usize>();
+    let now = || Nanos(u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX));
+    // The scope is linear: nothing returns between it and its join.
+    let scope = cx.scope();
+    let mut tasks = Vec::with_capacity_in(most.get(), heap.alloc());
+    for at in 0..most.get() {
+        let lane = lanes.lane(at);
+        let clock = clock.clone();
+        match scope.must_overlap("blaze test: a code worker", WORKER_SCRATCH, move |cx: &Cx| work(cx, lane, &clock, sides, root, side, heap)) {
+            Ok(task) => tasks.push(task),
+            // No worker idle now: the workers are the ones the pool gave at the start.
+            Err(_) => break,
+        }
+    }
+    let ran = match core::num::NonZeroUsize::new(tasks.len()) {
+        None => Err(DriveError::NoCodeWorkers { have }),
+        Some(count) => {
+            let pool = CodePool { lanes: &lanes, count: count.get(), cx: &cx, clock: &clock, procs };
+            match CodeRelay::new(children, &pool, &now, heap.shared(), hash_seed) {
+                Ok(relay) => run(&relay),
+                Err(error) => Err(DriveError::Relay(error)),
+            }
+        }
+    };
+    // The end: every lane closed, so a worker waiting for its next make ends; one making ends
+    // after its make, its entry refused by the closed channel and dropped (its asker is gone).
+    lanes.close();
+    let ending = cx.until(Deadline::after(clock.now().since_start(), END_WAIT));
+    let mut ended = Ok(());
+    for task in tasks {
+        if let Err(error) = task.join(&ending)
+            && ended.is_ok()
+        {
+            ended = Err(error);
+        }
+    }
+    let joined = scope.join(&ending);
+    let _dropped = lanes.drain();
+    let status = ran?;
+    ended.map_err(DriveError::CodeWorkers)?;
+    joined.map_err(DriveError::CodeWorkers)?;
+    Ok(status)
+}
+
+#[expect(clippy::too_many_arguments, reason = "the command supplies the selected records and runtime capabilities")]
+fn run_selected<'h>(
+    cx: &Cx, io: &Io, suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, config: LoopConfig<'_>,
     args: &[&str], lent: &CommandLent, tables: Alloc<'static>, watch: &dyn Watch, frame: &Frame,
+    relay: Option<&CodeRelay<'_>>,
 ) -> Result<Status, DriveError> {
     let cx = cx.span("blaze test: selected suites");
     let env = io.need_env().map_err(DriveError::Missing)?;
@@ -2219,15 +2859,9 @@ pub(crate) fn run_suites<'h>(
         let temp = bstd::mem::format_in!(frame, "{home}/{TEMPS}/{}/{index}", command.as_str());
         dirs.push((dir, temp));
     }
-    // THE seam of D194 ([`CODES`]): `Serial` makes each test's code in its own turn; `Pooled`
-    // relays it to the command's workers, which this build does not make yet (piece 2): refused
-    // by name, never run serially in its place (rule 3).
-    // A borrow, never an owned relay here: `Launched::codes` is `&'c CodeRelay<'c>` (invariant),
-    // so an owned relay in this frame would be borrowed past its own drop (E0597, a1850).
-    let relay: Option<&CodeRelay<'_>> = match CODES {
-        Codes::Serial => None,
-        Codes::Pooled => return Err(DriveError::NoCodeWorkers),
-    };
+    // THE seam of D194 ([`CODES`]): `None` makes each test's code in its own turn; `Some`, the
+    // command's relay over its code workers ([`pooled`]), which lives in the caller's frame and
+    // outlives every run borrowing it (`Launched::codes`; E0597 when it was owned here, a1850).
     let mut child_base = 0usize;
     let mut launches = Vec::with_capacity_in(suites.len(), alloc);
     let mut checks = Vec::with_capacity_in(suites.len(), alloc);
@@ -2332,6 +2966,7 @@ mod package_run_tests {
             build_script: false,
             script: None,
             test_or_bench: false,
+            bin_exes: blaze_scope::crate_env::BinNames::NONE,
             meta: None,
         }
     }

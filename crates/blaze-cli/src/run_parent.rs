@@ -230,6 +230,41 @@ pub enum ParentError {
     /// The row of `symbol` was to be served under [`Codes::Pooled`] before its code (and its
     /// statics') came: the ready pass steps them first (a bug of [`Lazy::publication`]).
     NotReady { symbol: [u8; 32] },
+    /// Under [`Codes::Pooled`], a code worker refused the make of the row of `symbol`: the walk's
+    /// refusal as it crossed to the command thread (D194, [`CodeRefusal`]).
+    CodeRefused { symbol: [u8; 32], why: CodeRefusal },
+}
+
+/// A make's refusal as it crosses from a code worker to the command thread (D194 piece 2).
+/// `WalkError<RunError>` is not `Send` (rustc, the whole-tree check c94 at test_drive.rs's
+/// `must_overlap`), so the worker keeps of it, typed, what the command thread reads of a
+/// refusal: whose it is and where (decided on the worker by the serial path's own function,
+/// test_drive.rs `refused_instance`, so the two cannot differ), and its words as a test's NOT RUN
+/// and a suite's stop print them ([`ParentError::Walk`]'s, byte for byte). The words are in the
+/// command's heap, handed in.
+#[derive(Debug)]
+pub struct CodeRefusal {
+    /// The refused instance's tabled fn and the byte of its body where its make refused (`0`: the
+    /// body, no place); `None`: a fault that is the suite's, not one test's.
+    pub at: Option<(ItemKey, u32)>,
+    /// What a test's NOT RUN prints after the instance for a maker's refusal (the build's error,
+    /// or the maker's words: test_drive.rs `InstanceRefusal`); `None` for the walk's own.
+    pub cause: Option<blaze_own::String<blaze_own::SharedAlloc<'static>>>,
+    /// The walk's refusal as [`ParentError::Walk`] prints it after the symbol.
+    pub walk: blaze_own::String<blaze_own::SharedAlloc<'static>>,
+    /// Whether the words are whole: the command's heap refused part of them (rule 3: said, never
+    /// cut quietly).
+    pub whole: bool,
+}
+
+impl fmt::Display for CodeRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.walk.as_str())?;
+        if !self.whole {
+            f.write_str(" (its words were cut: the command's heap refused the rest, run_parent.rs `CodeRefusal`)")?;
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for ParentError {
@@ -238,6 +273,7 @@ impl fmt::Display for ParentError {
         match self {
             ParentError::Build(why) => write!(f, "{rule}: {why}"),
             ParentError::Walk { symbol, why } => write!(f, "{rule}: the first call of symbol {}: {why}", Hex(symbol)),
+            ParentError::CodeRefused { symbol, why } => write!(f, "{rule}: the first call of symbol {}: {why}", Hex(symbol)),
             ParentError::Special { symbol, why } => write!(f, "{rule}: the run's special record {}: {why:?}", Hex(symbol)),
             ParentError::Roots(why) => write!(f, "{rule}: {why}"),
             ParentError::BodyIds { shown } => write!(f, "{rule}: the body ids: {shown}"),
@@ -1130,11 +1166,12 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
 
     /// The code the waiting row asked for was refused (`why`, the worker's): the row is given
     /// back, waiting again, and the refusal is the parent's error naming its symbol, as the
-    /// serial step's would be.
-    pub(crate) fn unmade(&mut self, why: WalkError<RunError>) -> ParentError {
+    /// serial step's would be. The refusal crossed from its code worker as a [`CodeRefusal`]
+    /// (D194 piece 2), printed and sorted as the serial step's `ParentError::Walk`.
+    pub(crate) fn refused(&mut self, why: CodeRefusal) -> ParentError {
         let Some(symbol) = self.asked.as_ref().map(|asked| asked.symbol) else { return ParentError::NothingAsked };
         match self.withdraw() {
-            Ok(()) => ParentError::Walk { symbol, why },
+            Ok(()) => ParentError::CodeRefused { symbol, why },
             Err(lost) => lost,
         }
     }

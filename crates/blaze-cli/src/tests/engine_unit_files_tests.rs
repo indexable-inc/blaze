@@ -143,11 +143,14 @@ pub(super) fn units_fixture(io: &Io, wrong: bool, cut: bool) {
     write(io, "src/orphan.rs", "pub fn lost() -> u8 {\n    true\n}\n");
 }
 
+/// The words of the plan's note of a file no unit holds (engine_body_plan.rs `FileWords`).
+const FILE_NOTE: &str = "no unit checks this file";
+
 /// The words the two refusal classes and an unnamed body were said with.
 const REFUSED: [&str; 4] = ["lists no file at its path", "no body of its crate's records is at this entry", "the body of `` ", "body ``"];
 
 fn file_notes(notes: &[std::string::String]) -> std::vec::Vec<&std::string::String> {
-    notes.iter().filter(|note| note.contains("no unit of its crate holds this file")).collect()
+    notes.iter().filter(|note| note.contains(FILE_NOTE)).collect()
 }
 
 /// NO UNIT'S BODY IS REFUSED, EACH ROW ONCE: on the fixture, no body is refused (neither class,
@@ -171,8 +174,8 @@ fn engine_unit_files_refuse_nothing_and_check_each_body_once() {
     let gated = file_notes(notes);
     assert_eq!(gated.len(), 1, "one note for the one file no unit holds: {notes:#?}");
     assert!(gated[0].contains("src/gated.rs"), "it names the file: {}", gated[0]);
-    assert!(gated[0].contains("the `mod` in `src/lib.rs` that names it"), "it names the file whose `mod` is cut: {}", gated[0]);
-    assert_eq!(first.iter().filter(|line| line.contains("no unit of its crate holds this file")).count(), 1, "printed once:\n{}", first.join("\n"));
+    assert!(gated[0].contains("by the `mod` in `src/lib.rs`"), "it names the file whose `mod` is cut: {}", gated[0]);
+    assert_eq!(first.iter().filter(|line| line.contains(FILE_NOTE)).count(), 1, "printed once:\n{}", first.join("\n"));
     assert!(error_lines(&first.join("\n")).is_empty(), "no error: orphan.rs is no module's:\n{}", first.join("\n"));
     // No row with findings lacks its block: the head task of `gated.rs`'s `g` was one (a refused,
     // failed row no printer writes) before it became no unit's (engine_heads.rs `run_items`).
@@ -182,7 +185,7 @@ fn engine_unit_files_refuse_nothing_and_check_each_body_once() {
     }
     let bodies: u32 = checked.phases.iter().filter(|(phase, _, _)| phase.stage == Stage::Bodies).map(|(_, planned, _)| *planned).sum();
     assert_eq!(checked.stages[Stage::Bodies.index()].entered, bodies, "cold: each row entered once");
-    let line = profile(&io).lines().find(|line| line.contains("file(s) no unit holds under its cfg")).map(str::to_owned);
+    let line = profile(&io).lines().find(|line| line.contains("file(s) no unit holds (cfg or macro)")).map(str::to_owned);
     let line = line.expect("the plan's line is in the profile");
     assert!(line.contains("; 1 file(s) no unit holds"), "the profile counts the file: {line}");
     // `top` (lib.rs) is held by the lib and the test unit: checked by each, the test unit's row
@@ -193,14 +196,14 @@ fn engine_unit_files_refuse_nothing_and_check_each_body_once() {
     let (_, again, certificate) = said(&io, false);
     assert!(certificate.certified && certificate.entered == 0, "nothing changed: certified, nothing entered; {}", entries(&certificate));
     assert_eq!(again, first, "the note is said again from the stored lines");
-    assert_eq!(again.iter().filter(|line| line.contains("no unit of its crate holds this file")).count(), 1, "once");
+    assert_eq!(again.iter().filter(|line| line.contains(FILE_NOTE)).count(), 1, "once");
 
     // An edit elsewhere (a comment in other/place.rs): the gated file's rows stand, its note is
     // kept from the last lines record, as a fresh run says it.
     write(&io, "src/other/place.rs", "// moved\npub fn here() -> u8 {\n    1\n}\n");
     let (_, kept, _) = said(&io, false);
     let (_, fresh, _) = said(&io, true);
-    let notes_of = |lines: &[std::string::String]| lines.iter().filter(|line| line.contains("no unit of its crate holds this file")).cloned().collect::<std::vec::Vec<_>>();
+    let notes_of = |lines: &[std::string::String]| lines.iter().filter(|line| line.contains(FILE_NOTE)).cloned().collect::<std::vec::Vec<_>>();
     assert_eq!(notes_of(&kept), notes_of(&fresh), "an incremental request says the note a fresh one says");
     assert_eq!(notes_of(&kept).len(), 1, "once");
 }
@@ -551,4 +554,117 @@ fn engine_unit_files_a_unit_has_no_row_of_a_body_its_test_cuts() {
     let (entered, held_rows, nothing, undecided, held) = plan_counts(&control);
     assert_eq!((entered, held_rows, held), (6, 4, 3), "the feature-gated fn's two rows are entered and check nothing (its units' records do not hold it)");
     assert_eq!((nothing, undecided), (2, 2), "an atom plan time cannot know keeps every reacher's row, counted as undecided");
+}
+
+// ---- One file two crates name by two names (D191; turso c1814) ----
+
+/// `a`'s `mod config;`: planned as the slot `a/src/config.rs`, read at `a/src/config/mod.rs`.
+const A_SLOT: &str = "pub mod config;\n";
+/// `a`'s `#[path]` to the same file: planned as `a/src/config/mod.rs` itself.
+const A_PATH: &str = "#[path = \"config/mod.rs\"]\npub mod config;\n";
+/// `p`'s (turso's postgres/cli/main.rs `#[path = "../../cli/config/mod.rs"] mod config;`).
+const P_PATH: &str = "#[path = \"../../a/src/config/mod.rs\"]\npub mod config;\n";
+/// A `mod` line under a feature that is off.
+const GATED: &str = "#[cfg(feature = \"x\")]\n";
+
+/// Members `a` and `p` (each with a feature `x`, off), `a/src/lib.rs` and `p/src/lib.rs` the
+/// given texts, and the one file `a/src/config/mod.rs` whose one body is a type error.
+fn named_twice(io: &Io, a_lib: &str, p_lib: &str) {
+    write(io, "Cargo.toml", "[workspace]\nmembers = [\"a\", \"p\"]\nresolver = \"2\"\n");
+    write(io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[features]\nx = []\n");
+    write(io, "p/Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[features]\nx = []\n");
+    write(io, "a/src/lib.rs", a_lib);
+    write(io, "p/src/lib.rs", p_lib);
+    write(io, "a/src/config/mod.rs", "pub fn shared() -> u8 {\n    let _wrong: u8 = true;\n    1\n}\n");
+}
+
+/// A FILE TWO CRATES NAME BY TWO NAMES IS CHECKED BY EVERY UNIT THAT HOLDS IT (D191): `a`'s
+/// `mod config;` and `p`'s `#[path]` give the one file two outlines; each of the four units
+/// (each crate's lib and test build) checks the body of the outline its tree reaches: 4 rows,
+/// 4 checked, none checking nothing, 2 distinct bodies (one an outline), no file note, the
+/// error printed in `a/src/config/mod.rs`. Before the fix (engine_bodies.rs matched an items
+/// record's file row to the FIRST outline at its path) the crate whose outline was not first
+/// held "nothing" there: 2 rows checked nothing and the file was noted "not part of this build"
+/// (turso: `cli/config/mod.rs`, twice). TWIN: both crates name it by `#[path]`, one outline:
+/// 4 rows, 4 checked, 1 distinct body, no note (this shape checked before the fix too, so the
+/// two names are the trigger). CONTROL: both `mod`s cut by a feature that is off: one note (one
+/// file, not one an outline) naming both `mod`s, nothing checked, no error; and with `p`'s alone
+/// cut, `a` checks the file and nothing is noted (the file is not outside the build).
+#[test]
+fn engine_unit_files_a_file_named_twice_is_checked_by_each_holder() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    named_twice(&io, A_SLOT, P_PATH);
+    let (_, lines, checked) = said(&io, true);
+    let text = lines.join("\n");
+    println!("named twice:\n{text}\n{}", entries(&checked));
+    assert!(file_notes(&checked.bodies.0).is_empty() && !text.contains(FILE_NOTE), "the file is held by both crates: no note:\n{text}");
+    let errors = error_lines(&text);
+    assert!(!errors.is_empty() && errors.iter().all(|line| line.contains("a/src/config/mod.rs")), "the shared body's error, in its file:\n{text}");
+    let (entered, held_rows, nothing, undecided, held) = plan_counts(&io);
+    assert_eq!((entered, held_rows, nothing, undecided, held), (4, 4, 0, 0, 2), "each unit checks the outline its tree reaches");
+    assert!(profile(&io).contains("; 0 file(s) no unit holds"), "the profile counts no file");
+
+    let twin = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    named_twice(&twin, A_PATH, P_PATH);
+    let (_, twin_lines, _) = said(&twin, true);
+    assert!(!twin_lines.join("\n").contains(FILE_NOTE), "TWIN: no note:\n{}", twin_lines.join("\n"));
+    assert!(!error_lines(&twin_lines.join("\n")).is_empty(), "TWIN: the error is printed");
+    assert_eq!(plan_counts(&twin), (4, 4, 0, 0, 1), "TWIN: one outline, its body's 4 rows each checked");
+
+    let cut = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    named_twice(&cut, &format!("{GATED}{A_SLOT}"), &format!("{GATED}{P_PATH}"));
+    let (_, cut_lines, cut_checked) = said(&cut, true);
+    let cut_text = cut_lines.join("\n");
+    println!("both cut:\n{cut_text}");
+    let notes = file_notes(&cut_checked.bodies.0);
+    assert_eq!(notes.len(), 1, "CONTROL: one note for the one file: {notes:#?}");
+    assert!(notes[0].contains("`a/src/config/mod.rs`") && notes[0].contains("the `mod` in `a/src/lib.rs`") && notes[0].contains("the `mod` in `p/src/lib.rs`"), "CONTROL: it names the file and both `mod`s: {}", notes[0]);
+    assert_eq!(cut_lines.iter().filter(|line| line.contains(FILE_NOTE)).count(), 1, "CONTROL: printed once:\n{cut_text}");
+    assert!(error_lines(&cut_text).is_empty(), "CONTROL: nothing checked, no error:\n{cut_text}");
+    assert!(profile(&cut).contains("; 1 file(s) no unit holds"), "CONTROL: the profile counts the one file");
+
+    let half = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    named_twice(&half, A_SLOT, &format!("{GATED}{P_PATH}"));
+    let (_, half_lines, _) = said(&half, true);
+    let half_text = half_lines.join("\n");
+    assert!(!half_text.contains(FILE_NOTE), "CONTROL: `a` holds the file: no note:\n{half_text}");
+    assert!(!error_lines(&half_text).is_empty(), "CONTROL: `a` checks it:\n{half_text}");
+    assert!(profile(&half).contains("; 0 file(s) no unit holds"), "CONTROL: the profile counts no file");
+}
+
+/// THE CAUSE, ALONE (engine_body_plan.rs `outline_at_path`): of one file's two outlines (the
+/// slot `a/src/config.rs` and the `#[path]` name `a/src/config/mod.rs`, both read at
+/// `a/src/config/mod.rs`), each unit holds the one its tree reaches; a unit that reaches
+/// neither holds the first; no outline at a path is `None`. CONTROL: the rule it replaced, the
+/// first outline at the path, gives both units ONE outline, so the unit that reaches the other
+/// held nothing it reached.
+#[test]
+fn engine_unit_files_a_unit_holds_the_outline_it_reaches() {
+    use crate::engine_body_plan::outline_at_path;
+    let alloc = blaze_own::testing::heap().shared();
+    let outline = |name: &[u8]| {
+        let file = Name::file(name);
+        let mut path = blaze_engine::SVec::new_in(alloc);
+        path.extend_from_slice(b"a/src/config/mod.rs");
+        crate::engine_tasks::Outlined {
+            name: file,
+            path,
+            source: ContentId::of("named twice file", name),
+            outline_source: ContentId::of("named twice outline", name),
+            edition: 3,
+            made: Ok(crate::work::Record::new_in(file, alloc)),
+        }
+    };
+    let mut outlined = std::vec![outline(&b"a/src/config.rs"[..]), outline(&b"a/src/config/mod.rs"[..])];
+    outlined.sort_unstable_by_key(|one| one.name);
+    let (first, second) = (outlined[0].name, outlined[1].name);
+    let path: &[u8] = b"a/src/config/mod.rs";
+    assert_eq!(outline_at_path(&outlined, path, &[first]), Some(0), "the unit reaching the first holds it");
+    assert_eq!(outline_at_path(&outlined, path, &[second]), Some(1), "the unit reaching the second holds the second");
+    assert_eq!(outline_at_path(&outlined, path, &[]), Some(0), "a unit reaching neither holds the first");
+    assert_eq!(outline_at_path(&outlined, b"a/src/other.rs", &[first]), None, "no outline at the path");
+    // The old rule read no reach: one answer for every unit.
+    let old = outlined.iter().position(|one| one.path.as_slice() == path);
+    assert_eq!(old, Some(0), "CONTROL: the old rule gives both units the first outline");
+    assert_ne!(outline_at_path(&outlined, path, &[second]), old, "CONTROL: the unit reaching the second held it under the old rule nowhere it reached");
 }

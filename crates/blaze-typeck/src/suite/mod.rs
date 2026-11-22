@@ -101,6 +101,8 @@ mod self_impl_args;
 mod self_paths;
 mod self_ty_paths;
 mod type_alias_paths;
+mod trait_relative_value;
+mod inherent_impl_clauses;
 mod panic_hook_closure;
 mod why_maybe;
 mod suggest;

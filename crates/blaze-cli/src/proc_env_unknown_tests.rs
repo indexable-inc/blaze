@@ -62,6 +62,7 @@ fn integration_test() -> CrateEnv<'static> {
         build_script: true,
         script: None,
         test_or_bench: true,
+        bin_exes: blaze_scope::crate_env::BinNames::new("app").expect("one name"),
         meta: None,
     };
     CrateEnv::of(facts, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the environment of app_it: {e}"))
@@ -90,7 +91,8 @@ fn a_macro_s_getenv_answers_each_name_as_env_does_and_refuses_an_unknown_one_by_
     assert_eq!(package.env.get("CARGO_PRIMARY_PACKAGE"), EnvAnswer::Set("1"), "a member's crate is a selected package");
     assert_eq!(package.env.get("CARGO_TARGET_TMPDIR"), EnvAnswer::Unknown);
     assert_eq!(package.env.get("OUT_DIR"), EnvAnswer::Unknown, "a script whose record is not joined");
-    assert_eq!(package.env.get("CARGO_BIN_EXE_app"), EnvAnswer::Unknown, "an integration test's binary path");
+    assert_eq!(package.env.get("CARGO_BIN_EXE_app"), EnvAnswer::Set("/target/debug/bin/app/app"), "an integration test's binary: the guest path of its launcher stub");
+    assert_eq!(package.env.get("CARGO_BIN_EXE_other"), EnvAnswer::Unset, "no binary of that name in the package");
     assert_eq!(package.env.get("CARGO_BIN_NAME"), EnvAnswer::Unset, "not a binary");
     assert_eq!(package.env.get("CARGO"), EnvAnswer::Unset, "no cargo binary: proc-macro-crate reads the package's manifest");
     assert_eq!(package.env.get("PATH"), EnvAnswer::Unset, "no ambient environment (rule 75)");
@@ -136,6 +138,7 @@ fn a_git_package_s_macro_finds_cargo_unset_and_reads_its_own_manifest() {
         build_script: false,
         script: None,
         test_or_bench: false,
+        bin_exes: blaze_scope::crate_env::BinNames::NONE,
         meta: None,
     };
     let env = CrateEnv::of(facts, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the environment of reth_rpc_api: {e}"));
@@ -172,7 +175,7 @@ fn a_git_package_s_macro_finds_cargo_unset_and_reads_its_own_manifest() {
     old_unknown.push(String::from("CARGO"));
     let mut set = std::vec::Vec::new();
     set.extend(unit_env(&env));
-    let old_env = PackageEnv::new(set, old_unknown, env.unknown_prefixes().map(String::from).collect()).unwrap_or_else(|e| panic!("{e}"));
+    let old_env = PackageEnv::new(set, old_unknown, std::vec::Vec::new()).unwrap_or_else(|e| panic!("{e}"));
     let mut old = Sandbox::new(Arc::new(Package::new(files(), old_env).unwrap_or_else(|e| panic!("{e}"))));
     assert!(old.var("CARGO").is_err(), "the planted old env answered CARGO");
     println!("git package's macro: CARGO unset, read {} manifest bytes at {path}; the old env refused CARGO", read.len());

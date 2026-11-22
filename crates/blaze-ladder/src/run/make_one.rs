@@ -315,7 +315,7 @@ impl MakerState {
         // A ctor has no body to check: its row is made, and its instance built as a fn
         // ([`build_one`]'s ctor arm).
         // The trait's `Clone::clone` has no body either: the one instance tabled at it is a
-        // builtin clone ([`build_one`]'s arm; clone_shim.rs `language_copy_clone`).
+        // builtin clone ([`build_one`]'s arm; clone_shim.rs `language_clone`).
         if program.ctor_of(key).is_some() || program.lang_trait_fn(LangItem::Clone, "clone") == Some(key) {
             let at = program.head_row(key)?;
             self.asked.insert_shift(slot, (key, at));
@@ -425,8 +425,28 @@ pub fn make_instance<P: FrontEnd, T: Typing<P>>(
         program.head_row(item)?;
     }
     // The constants this instance reads at its ground arguments, pulled before the build
-    // (front2/const_at.rs): a plain instance's own body only, as in build_from.
-    pull_constants(program, state, i, instance)?;
+    // (front2/const_at.rs): a plain instance's own body only, as in build_from. Grounding a
+    // constant path's arguments normalizes them, and that asks the world as the build does:
+    // arbitrary 1.4.2's `T::Unsigned::ZERO` (`<<T as Int>::Unsigned as Int>::ZERO`) at `T =
+    // usize` asks `ImplsOf(Int, usize)` for `<usize as Int>::Unsigned` HERE, before the build's
+    // loop below, so an unmade answer (`Missing`) ended the instance with the fills its world
+    // noted never made (tempo t1855d, 15 tests; d106_callables.rs rows 4-11: only the cut of the
+    // projection paths passed). The same ask-again as the build's: the program makes what the
+    // worlds asked (`FrontEnd::make_asked`) and the constants are pulled again; bounded by the
+    // same count (rule 18), and nothing made is the `Missing` itself.
+    let mut pulled = 0u32;
+    loop {
+        match pull_constants(program, state, i, instance) {
+            Ok(()) => break,
+            Err(e) if asks_again(&e) && pulled < crate::front2::check::MOST_ROUNDS => {
+                pulled += 1;
+                if !program.make_asked(i)? {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
     // The build, its coroutine states laid out from types first (lay_states.rs); a lay that
     // meets an owner fn not checked yet has it checked and the instance made again (no LIR
     // was built: types only were read); bounded (rule 18).
@@ -543,10 +563,11 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     let MakerState { checked, tables, work, .. } = &mut *state;
     work.needs.clear();
     let function = program.function(i);
-    // A ctor's fn reads no constant: its fields in, its value out. Nor a builtin clone (a copy).
+    // A ctor's fn reads no constant: its fields in, its value out. Nor a builtin clone (a copy,
+    // or its fields' own clones).
     if instance.item != function.key
         || (function.kind == FnKind::Ctor && function.body.is_none())
-        || (function.body.is_none() && crate::clone_shim::language_copy_clone(&*program, instance, &work.ground).is_some())
+        || (function.body.is_none() && crate::clone_shim::language_clone(&*program, instance, &work.ground).is_some())
     {
         return Ok(());
     }
@@ -587,10 +608,10 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         (FnKind::Ctor, None) => program.ctor_of(function.key).map(|(_, variant)| variant),
         _ => None,
     };
-    // The trait's bodiless `Clone::clone` at a fn item or fn pointer: the language's copy
-    // (clone_shim.rs `language_copy_clone`), built with no body.
+    // The trait's bodiless `Clone::clone` at a fn item, fn pointer, tuple or closure: the
+    // language's clone (clone_shim.rs `language_clone`), built with no body.
     let builtin_clone = match function.body {
-        None if instance.item == function.key => crate::clone_shim::language_copy_clone(program, instance, &work.ground),
+        None if instance.item == function.key => crate::clone_shim::language_clone(program, instance, &work.ground),
         _ => None,
     };
     let checked = match (function.body, bodies.checked.get(i).and_then(Option::as_ref)) {
@@ -670,10 +691,11 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, &adts, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, &adts, Global),
             }
-        } else if let Some(clone) = builtin_clone {
-            // `Self: Copy` holds for a fn item and a fn pointer by the language (no solver
-            // asked): the clone is a copy of its bytes.
-            blaze_build::build_builtin_clone(clone, true, &mut subst, &adts, Global)
+        } else if let Some(made) = builtin_clone {
+            // A fn item's and a fn pointer's clone is a copy of its bytes (`Copy` by the
+            // language, no solver asked); a tuple's or a closure's clones each field by its own
+            // `clone` (clone_shim.rs `language_clone`: what it does is a function of the type).
+            blaze_build::build_builtin_clone(made.clone, made.bytes, &mut subst, &adts, Global)
         } else if let Some(variant) = ctor_row {
             // The ctor's own instance (a shim of it was taken above): its fields in, its value out.
             blaze_build::build_ctor_fn(function.key, variant, &program.sig(i), &mut subst, &adts, Global)
@@ -728,7 +750,15 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     // The soft-float routines after the instance's own references: the emitter's one table
     // (front2/builtins_shim.rs); `make_entry` declares those it says the record calls.
     let routines = work.routines.bind(&mut funcs).map_err(|error| RunError::CodeRecord { function: name(), error })?;
-    let names = InstanceNames { funcs: &funcs, statics: &built.statics, vtables: &vtables, tls: &built.thread_locals };
+    // A static an `extern` block declares is named by its C symbol (the seam's
+    // `foreign_static`), never by a record of its own.
+    let mut c_statics: AVec<'_, (ItemKey, &str)> = blaze_own::Vec::new_in(work.alloc);
+    for &s in built.statics.iter() {
+        if let Some(c) = program.foreign_static(s) {
+            c_statics.push((s, c));
+        }
+    }
+    let names = InstanceNames { funcs: &funcs, statics: &built.statics, c_statics: &c_statics, vtables: &vtables, tls: &built.thread_locals };
     let mut declared: AVec<'_, Declared<'_>> = blaze_own::Vec::with_capacity_in(reach.rows.len(), work.alloc);
     for n in 0..reach.rows.len() {
         let (tabled, name_bytes) = reach.row(n);
@@ -867,10 +897,12 @@ fn name_ref<'p, P: FrontEnd>(
         let refusal = callee_refusal(program, name(), at, owner, crate::callee_shown::CalleeGap::NotTabled, ground.view());
         return Ok(Named1::Untabled(owner.item, refusal));
     }
-    // `Clone::clone` at a fn item or fn pointer: the language's copy, no impl item to select
-    // (clone_shim.rs `language_copy_clone`; t1800: proptest's derived `Clone for Config`
-    // cloning its `fn(..)` field, 30 tests NOT RUN). Tabled at the trait's `clone` row.
-    if let Some(clone) = crate::clone_shim::language_copy_clone(program, called, ground) {
+    // `Clone::clone` at a fn item, fn pointer, tuple or closure: the language's clone, no impl
+    // item to select (clone_shim.rs `language_clone`; t1800: proptest's derived `Clone for
+    // Config` cloning its `fn(..)` field, 30 tests NOT RUN; t1855d: the same `Config` cloning a
+    // tuple field, 30 NOT RUN). Tabled at the trait's `clone` row; a tuple's field clones are
+    // resolved in that row's world (world_items.rs `ctor_world`: its trait's).
+    if let Some(crate::clone_shim::LanguageClone { clone, .. }) = crate::clone_shim::language_clone(program, called, ground) {
         let Some(c) = program.fn_index(clone) else {
             let refusal = callee_refusal(program, name(), at, called, crate::callee_shown::CalleeGap::NotTabled, ground.view());
             return Ok(Named1::Untabled(clone, refusal));
@@ -1162,6 +1194,22 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// until the check keeps its typed record; then [`FromRecord`]).
     pub fn of_roots(names: NamesRecords<'n>, entry: Option<ItemKey>, roots: &crate::run::special::Roots<'_>, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, G, T> {
         Self::starting(names, entry, roots.maker_start, typing, builder, alloc)
+    }
+
+    /// [`Maker::of_roots`] for the `entry` and `start` read off those roots beforehand
+    /// (`Roots::maker_start`): what a maker made away from the roots needs (blaze-cli
+    /// test_drive.rs `CodePool`, D194: a code worker's maker over its own names records, for the
+    /// start the asking test's roots said), so its roots are not made again. Equal to `of_roots`
+    /// over roots whose `maker_start` is `start`: that one reads nothing else of them.
+    pub fn of_start(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, G, T> {
+        Self::starting(names, entry, start, typing, builder, alloc)
+    }
+
+    /// Where this maker's program starts and from which entry: what it was made for, so a
+    /// keeper of makers can check that a make is handed to the maker of its own start (blaze-cli
+    /// test_drive.rs `SuiteMakers`).
+    pub fn made_for(&self) -> (Option<ItemKey>, crate::run::special::MakerStart) {
+        (self.entry, self.start)
     }
 
     fn starting(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, G, T> {

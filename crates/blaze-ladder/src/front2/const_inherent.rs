@@ -124,6 +124,15 @@ pub fn refusal<R>(table: &core::cell::RefCell<Table>, need: LibKey, f: impl FnOn
     f(found)
 }
 
+/// The leaf being evaluated now ([`State::Running`]) of the type `adt` whose name `declares`
+/// says the impl being made declares: a constant of that impl whose type names it waits for
+/// its value, and the impl's header is made without that constant's row (heads.rs
+/// `Store::impl_`, `ConstWait`). `None`: no such leaf.
+pub fn running_sibling(table: &core::cell::RefCell<Table>, adt: ItemKey, declares: &dyn Fn(Name) -> bool) -> Option<LibKey> {
+    let t = table.borrow();
+    t.entries.iter().find(|e| e.state == State::Running && e.adt == adt && declares(e.name)).map(|e| e.need)
+}
+
 impl Table {
     fn find(&self, need: LibKey) -> Option<&Entry> {
         self.entries.iter().find(|e| e.need == need)
@@ -431,7 +440,12 @@ pub enum InherentFail {
     Key { adt: LibKey, clash: super::keys::KeyClash },
     /// An inherent impl of the type is refused (its own refusal is the impl index's gap of
     /// the type, `Buckets::inherent_gap`): the constant may be declared in it.
-    RefusedImpl { adt: ItemKey, impl_: LibKey },
+    /// `why` is the gap's own words (`Buckets::inherent_gap`), printed with it (rule 19).
+    RefusedImpl { adt: ItemKey, impl_: LibKey, why: std::boxed::Box<str> },
+    /// The constant's own row was refused (its type), by why: a constant whose type needs
+    /// its own value (the Reference, "Constant evaluation": "Recursively defining constants is
+    /// not allowed") or any other refusal of that row alone (heads.rs `Store::impl_const`).
+    OwnRow { constant: ItemKey, why: std::boxed::Box<str> },
     /// The inherent impls were made and the index holds no answer for the type.
     NoAnswer { adt: ItemKey },
     /// Two inherent impls of the type declare a constant of the name (E0592).
@@ -452,7 +466,8 @@ impl core::fmt::Display for InherentFail {
         match self {
             InherentFail::Fill { adt, error } => write!(f, "the inherent impls of the type {adt:?}: {error}"),
             InherentFail::Key { adt, clash } => write!(f, "the type {adt:?}: {clash}"),
-            InherentFail::RefusedImpl { adt, impl_ } => write!(f, "the inherent impl {impl_:?} of the type {adt:?} is refused (the impl index's gap of the type names why), and the constant may be declared there"),
+            InherentFail::RefusedImpl { adt, impl_, why } => write!(f, "the inherent impl {impl_:?} of the type {adt:?} is refused, and the constant may be declared there: {why}"),
+            InherentFail::OwnRow { constant, why } => write!(f, "the inherent constant {constant:?}: its own head was refused: {why}"),
             InherentFail::NoAnswer { adt } => write!(f, "the inherent impls of the type {adt:?} were made and the impl index holds no answer for it"),
             InherentFail::Two { adt, a, b } => write!(f, "two inherent impls of the type {adt:?} declare a constant of this name ({a:?}, {b:?}): E0592"),
             InherentFail::Type { constant } => write!(f, "the inherent constant {constant:?} has no signature row, or its type no node in the records' table"),
@@ -479,8 +494,8 @@ fn find<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, e: Entry) -> Result<
     let shape = Shape::Adt(e.adt);
     make_for(r, Fill::Inherent(shape, e.name), checker_of(e.need)).map_err(|error| InherentFail::Fill { adt: e.adt, error })?;
     let Some(b) = r.buckets.as_ref() else { return Err(InherentFail::NoAnswer { adt: e.adt }) };
-    if let Some((impl_, _)) = b.inherent_gap(shape, e.name) {
-        return Err(InherentFail::RefusedImpl { adt: e.adt, impl_ });
+    if let Some((impl_, why)) = b.inherent_gap(shape, e.name) {
+        return Err(InherentFail::RefusedImpl { adt: e.adt, impl_, why });
     }
     let items = b.inherent(shape, e.name).ok_or(InherentFail::NoAnswer { adt: e.adt })?;
     // A constant is counted by its key: two entries of one key are one constant.
@@ -490,6 +505,13 @@ fn find<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, e: Entry) -> Result<
         return Err(InherentFail::Two { adt: e.adt, a: one.item, b: other.item });
     }
     let constant = one.item;
+    // A row refused alone (its impl's head made without it: heads.rs `Store::impl_`) is that
+    // refusal, by its words, never "no signature row".
+    if !r.store.fns.contains_key(&constant)
+        && let Some(why) = r.store.fn_gaps.get(&constant)
+    {
+        return Err(InherentFail::OwnRow { constant, why: std::format!("{why:?}").into_boxed_str() });
+    }
     let head = r.store.fns.get(&constant).ok_or(InherentFail::Type { constant })?;
     let ty = r.store.tys.view().node(head.output).map_err(|_| InherentFail::Type { constant })?;
     // A constant of any other type (time's `Date::MIN: Date` in `ri32<{
@@ -520,6 +542,10 @@ fn file<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, need: LibKey, out: R
         }
     };
     r.store.maps.inherents.borrow_mut().set(need, state);
+    // The impl constants whose rows waited on this leaf (heads.rs `ConstWait`: a sibling
+    // constant's type named it while it was evaluated) are made now, with its value or its
+    // refusal in the text.
+    r.store.remake_waiting(r.names, need);
 }
 
 /// Answers the leaf under need key `c` and every other asked leaf with no answer yet (one round

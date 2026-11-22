@@ -67,6 +67,17 @@ impl Statics {
 /// statics made and each static refused with its words (the evaluator's refusal, no head, an
 /// attribute row that does not read): a run stops at the first, a survey files them.
 pub fn static_values<'c, 'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, bodies: impl Iterator<Item = &'c Checked<'static>>) -> (Statics, Vec<(ItemKey, Box<str>), Global>) {
+    static_values_but(r, bodies, &|_| false)
+}
+
+/// [`static_values`] with each static `foreign` says yes to left out: a static an `extern`
+/// block declares has no initializer to evaluate (the Reference, "External blocks", "Statics":
+/// it is "declared without an initializer"; its storage is the foreign object's), so it has no
+/// record here: a path to it is a place at its C symbol (lazy/fill.rs `foreign_static`), and
+/// nothing evaluates it.
+pub fn static_values_but<'c, 'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>, bodies: impl Iterator<Item = &'c Checked<'static>>, foreign: &dyn Fn(ItemKey) -> bool,
+) -> (Statics, Vec<(ItemKey, Box<str>), Global>) {
     let mut todo: Vec<ItemKey, Global> = Vec::new_in(Global);
     for c in bodies {
         todo.extend(c.expr_defs.column::<1>().iter().filter_map(|d| match d {
@@ -84,6 +95,9 @@ pub fn static_values<'c, 'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, bod
     while let Some(k) = todo.pop() {
         let Err(at) = done.binary_search(&k) else { continue };
         done.insert(at, k);
+        if foreign(k) {
+            continue;
+        }
         if done.len() > MOST_STATICS {
             refused.push((k, format!("more than {MOST_STATICS} statics reached (the work list's bound)").into_boxed_str()));
             break;
@@ -140,6 +154,19 @@ pub(crate) fn one_static<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, k: 
     };
     let thread_local = thread_local_of(r, k)?;
     Ok((record, StaticItem { thread_local, mutable: matches!(m, tc::Mutbl::Mut) }))
+}
+
+/// Static `k`'s kind when an `extern` block declares it: its head's mutability, nothing
+/// evaluated (it has no initializer: the Reference, "External blocks", "Statics"). A foreign
+/// `#[thread_local]` is refused by name: no foreign thread-local is built.
+pub(crate) fn foreign_kind<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Result<StaticItem, Box<str>> {
+    let Some(&m) = r.store.statics.get(&k) else {
+        return Err(Box::from("no static head in the store (heads.rs `Store::statics`)"));
+    };
+    if thread_local_of(r, k)? {
+        return Err(Box::from("a `#[thread_local]` static an `extern` block declares: no foreign thread-local is built (statics.rs `foreign_kind`)"));
+    }
+    Ok(StaticItem { thread_local: false, mutable: matches!(m, tc::Mutbl::Mut) })
 }
 
 /// Whether static `k`'s signature carries `#[thread_local]` (its attribute rows, read as

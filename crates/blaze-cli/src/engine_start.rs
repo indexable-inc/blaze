@@ -497,15 +497,17 @@ pub(crate) fn run_tests(
         for (at, (found, unit)) in inventory.suites.iter().enumerate() {
             let place = crate::test_drive::package_run(checkout, list.env_facts(unit.at), alloc)
                 .map_err(|why| CliError::Start(StartError::TestPlace { shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) }))?;
-            let names = run_names::names_of(
-                cx, root, found, run_names::Owner::At(unit.at), &mut *standing.store, &mut facts.bodies,
-                &mut read, &facts.fetch_env, procs, &seen, frame, heap,
-            )
-            .map_err(CliError::RunNames)?;
+            // What the suite's names records are made of, kept for the command's code workers
+            // (test_drive.rs `pooled`, D194), then the command thread's own names records of it.
+            let named = cx.span("run names: open the names records");
+            let crates = run_names::crates_of(&named, found, run_names::Owner::At(unit.at), &mut *standing.store, &mut facts.bodies, &mut read, &facts.fetch_env, frame, heap)
+                .map_err(CliError::RunNames)?;
+            drop(named);
+            let names = run_names::names_in(cx, root, crates, procs, &seen, frame).map_err(CliError::RunNames)?;
             let builder = crate::run_parent::builder_for(unit.edition.name(), overflow, panic, producer, isa).map_err(parent)?;
-            runnable.push(crate::test_drive::Suite { names, builder, unit: *unit, place, native: images[at] });
+            runnable.push(crate::test_drive::Suite { names, crates, builder, unit: *unit, place, native: images[at] });
         }
-        let ran = crate::test_drive::run_suites(cx, io, &runnable, &ids, config, launch.args, standing.lent, heap.alloc(), watch, frame);
+        let ran = crate::test_drive::run_suites(cx, io, &runnable, &ids, config, launch.args, standing.lent, root, procs, heap, watch, frame);
         end_procs(cx, &maker, err, "test")?;
         ids_line = Some(ids.line(&asked, ids_ns));
         ran.map_err(|error| CliError::Test(blaze_own::Box::new_in(error, heap.alloc())))?

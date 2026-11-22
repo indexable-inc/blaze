@@ -973,6 +973,368 @@ pub extern \"C-unwind\" fn main() -> i32 {{
     );
 }
 
+/// Row 4: the REAL site's text (arbitrary 1.4.2 unstructured.rs:300-370 and :820-923), cut only
+/// where `no_core` has no item for it (`ops::*` supertraits, `mem::size_of`, the `Iterator` the
+/// bytes come through, inherent `<$ty>::wrapping_*`, `Result`). Rows 1-3 pass (19:08), so the
+/// cause is in what the real text has and they lack; each kept below as written there: the
+/// trait's supertrait (`Int: Copy`), its BOUNDED, self-recursive associated type (`type
+/// Unsigned: Int;`), its associated CONSTS read through a two-level projection path
+/// (`T::Unsigned::ZERO`, an item of `<<T as Int>::Unsigned as Int>`, found by the associated
+/// type's bound, not by `T`'s), an associated fn by that path (`T::Unsigned::from_u8`), a
+/// method on a value of the projection type (`arbitrary_int.wrapping_add(..)`), the `where T:
+/// Int` form, the callee an associated fn of `impl<'a> Unstructured<'a>` reached as
+/// `Self::int_in_range_impl` with an `impl Trait` argument, and the `usize: usize` row (the
+/// site fails at `Uint(Usize)` as at `Uint(U64)`). `30 + 2` at `u64` and `8 + 2` at `usize`: 42.
+#[test]
+fn a_macro_made_primitive_impl_as_arbitrary_writes_it() {
+    row(
+        "macro-made primitive impl as arbitrary writes it",
+        "
+impl Copy for u64 {}
+impl Copy for usize {}
+
+trait Int: Copy {
+    type Unsigned: Int;
+
+    const ZERO: Self;
+
+    const ONE: Self;
+
+    fn from_u8(b: u8) -> Self;
+
+    fn wrapping_add(self, rhs: Self) -> Self;
+
+    fn wrapping_sub(self, rhs: Self) -> Self;
+
+    fn to_unsigned(self) -> Self::Unsigned;
+
+    fn from_unsigned(unsigned: Self::Unsigned) -> Self;
+}
+
+macro_rules! impl_int {
+    ( $( $ty:ty : $unsigned_ty: ty ; )* ) => {
+        $(
+            impl Int for $ty {
+                type Unsigned = $unsigned_ty;
+
+                const ZERO: Self = 0;
+
+                const ONE: Self = 1;
+
+                fn from_u8(b: u8) -> Self {
+                    b as Self
+                }
+
+                fn wrapping_add(self, rhs: Self) -> Self {
+                    self + rhs
+                }
+
+                fn wrapping_sub(self, rhs: Self) -> Self {
+                    self - rhs
+                }
+
+                fn to_unsigned(self) -> Self::Unsigned {
+                    self as $unsigned_ty
+                }
+
+                fn from_unsigned(unsigned: $unsigned_ty) -> Self {
+                    unsigned as Self
+                }
+            }
+        )*
+    }
+}
+
+impl_int! {
+    u8: u8;
+    u64: u64;
+    usize: usize;
+}
+
+trait Bytes {
+    fn next_byte(&mut self) -> u8;
+}
+
+struct One {
+    byte: u8,
+}
+
+impl Bytes for One {
+    fn next_byte(&mut self) -> u8 {
+        self.byte
+    }
+}
+
+struct Unstructured<'a> {
+    data: &'a u8,
+}
+
+impl<'a> Unstructured<'a> {
+    fn int_in_range<T>(&mut self, start: T, end: T) -> T
+    where
+        T: Int,
+    {
+        Self::int_in_range_impl(start, end, One { byte: *self.data })
+    }
+
+    fn int_in_range_impl<T>(start: T, end: T, mut bytes: impl Bytes) -> T
+    where
+        T: Int,
+    {
+        let start = start.to_unsigned();
+        let end = end.to_unsigned();
+        let delta = end.wrapping_sub(start);
+        let mut arbitrary_int = T::Unsigned::ZERO;
+        arbitrary_int = arbitrary_int.wrapping_add(T::Unsigned::from_u8(bytes.next_byte()));
+        let offset = arbitrary_int.wrapping_add(delta.wrapping_sub(delta)).wrapping_add(T::Unsigned::ONE).wrapping_sub(T::Unsigned::ONE);
+        let result = start.wrapping_add(offset);
+        T::from_unsigned(result)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let byte = 2u8;
+    let mut u = Unstructured { data: &byte };
+    u.int_in_range(30u64, 50u64) as i32 + u.int_in_range(8usize, 20usize) as i32
+}
+",
+        42,
+    );
+}
+
+/// The part of row 4 a bisecting row leaves out (rows 5..11): ONE each, the rest as row 4.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cut {
+    /// `trait Int` with no supertrait (`Copy` gone).
+    Supertrait,
+    /// No item named through the projection path (`T::Unsigned::ZERO`, `::ONE`, `::from_u8`):
+    /// the zero is `start.wrapping_sub(start)`, the byte `T::from_u8(..).to_unsigned()`.
+    ProjectionPaths,
+    /// No method call on a value of the projection type: each `a.wrapping_add(b)` there is
+    /// `Int::wrapping_add(a, b)` (the trait's fn by path, its `Self` inferred).
+    ProjectionMethods,
+    /// The callee a FREE generic fn `int_in_range_impl<T: Int, B: Bytes>` called by name, no
+    /// `Self::`, no `impl Trait` argument, no inherent impl with a lifetime.
+    SelfAndImplTrait,
+    /// The `usize` call gone (`30 + 2` at `u64`, plus 10 written as a literal).
+    SecondPrimitive,
+    /// Nothing asked at the projection: the body only `T::from_unsigned(start.to_unsigned()
+    /// .wrapping_add(..))`-free: `T::from_unsigned(T::to_unsigned(start))` plus the byte through
+    /// `T` (`T::from_u8`, `T::wrapping_add`). The bound `type Unsigned: Int;` kept.
+    AllProjectionUse,
+    /// As [`Cut::AllProjectionUse`], and the bound gone too (`type Unsigned;`).
+    AllProjectionUseAndBound,
+}
+
+/// Row 4's text with the part `cut` left out (see [`Cut`]): the status stays 42.
+fn arbitrary_cut(cut: Cut) -> String {
+    let supertrait = if cut == Cut::Supertrait { "" } else { ": Copy" };
+    let bound = if cut == Cut::AllProjectionUseAndBound { "" } else { ": Int" };
+    let projection_free = matches!(cut, Cut::AllProjectionUse | Cut::AllProjectionUseAndBound);
+    let body = if projection_free {
+        "        let byte = T::from_u8(bytes.next_byte());
+        let delta = T::wrapping_sub(end, start);
+        let offset = T::wrapping_add(byte, T::wrapping_sub(delta, delta));
+        T::from_unsigned(T::to_unsigned(T::wrapping_add(start, offset)))"
+    } else if cut == Cut::ProjectionPaths {
+        "        let start = start.to_unsigned();
+        let end = end.to_unsigned();
+        let delta = end.wrapping_sub(start);
+        let mut arbitrary_int = start.wrapping_sub(start);
+        arbitrary_int = arbitrary_int.wrapping_add(T::from_u8(bytes.next_byte()).to_unsigned());
+        let offset = arbitrary_int.wrapping_add(delta.wrapping_sub(delta));
+        let result = start.wrapping_add(offset);
+        T::from_unsigned(result)"
+    } else if cut == Cut::ProjectionMethods {
+        "        let start = start.to_unsigned();
+        let end = end.to_unsigned();
+        let delta = Int::wrapping_sub(end, start);
+        let mut arbitrary_int = T::Unsigned::ZERO;
+        arbitrary_int = Int::wrapping_add(arbitrary_int, T::Unsigned::from_u8(bytes.next_byte()));
+        let offset = Int::wrapping_sub(Int::wrapping_add(Int::wrapping_add(arbitrary_int, Int::wrapping_sub(delta, delta)), T::Unsigned::ONE), T::Unsigned::ONE);
+        let result = Int::wrapping_add(start, offset);
+        T::from_unsigned(result)"
+    } else {
+        "        let start = start.to_unsigned();
+        let end = end.to_unsigned();
+        let delta = end.wrapping_sub(start);
+        let mut arbitrary_int = T::Unsigned::ZERO;
+        arbitrary_int = arbitrary_int.wrapping_add(T::Unsigned::from_u8(bytes.next_byte()));
+        let offset = arbitrary_int.wrapping_add(delta.wrapping_sub(delta)).wrapping_add(T::Unsigned::ONE).wrapping_sub(T::Unsigned::ONE);
+        let result = start.wrapping_add(offset);
+        T::from_unsigned(result)"
+    };
+    let callee = if cut == Cut::SelfAndImplTrait {
+        format!(
+            "impl<'a> Unstructured<'a> {{
+    fn int_in_range<T>(&mut self, start: T, end: T) -> T
+    where
+        T: Int,
+    {{
+        int_in_range_impl(start, end, One {{ byte: *self.data }})
+    }}
+}}
+
+fn int_in_range_impl<T: Int, B: Bytes>(start: T, end: T, mut bytes: B) -> T {{
+{body}
+}}"
+        )
+    } else {
+        format!(
+            "impl<'a> Unstructured<'a> {{
+    fn int_in_range<T>(&mut self, start: T, end: T) -> T
+    where
+        T: Int,
+    {{
+        Self::int_in_range_impl(start, end, One {{ byte: *self.data }})
+    }}
+
+    fn int_in_range_impl<T>(start: T, end: T, mut bytes: impl Bytes) -> T
+    where
+        T: Int,
+    {{
+{body}
+    }}
+}}"
+        )
+    };
+    let second = if cut == Cut::SecondPrimitive { "10" } else { "u.int_in_range(8usize, 20usize) as i32" };
+    format!(
+        "
+impl Copy for u64 {{}}
+impl Copy for usize {{}}
+
+trait Int{supertrait} {{
+    type Unsigned{bound};
+
+    const ZERO: Self;
+
+    const ONE: Self;
+
+    fn from_u8(b: u8) -> Self;
+
+    fn wrapping_add(self, rhs: Self) -> Self;
+
+    fn wrapping_sub(self, rhs: Self) -> Self;
+
+    fn to_unsigned(self) -> Self::Unsigned;
+
+    fn from_unsigned(unsigned: Self::Unsigned) -> Self;
+}}
+
+macro_rules! impl_int {{
+    ( $( $ty:ty : $unsigned_ty: ty ; )* ) => {{
+        $(
+            impl Int for $ty {{
+                type Unsigned = $unsigned_ty;
+
+                const ZERO: Self = 0;
+
+                const ONE: Self = 1;
+
+                fn from_u8(b: u8) -> Self {{
+                    b as Self
+                }}
+
+                fn wrapping_add(self, rhs: Self) -> Self {{
+                    self + rhs
+                }}
+
+                fn wrapping_sub(self, rhs: Self) -> Self {{
+                    self - rhs
+                }}
+
+                fn to_unsigned(self) -> Self::Unsigned {{
+                    self as $unsigned_ty
+                }}
+
+                fn from_unsigned(unsigned: $unsigned_ty) -> Self {{
+                    unsigned as Self
+                }}
+            }}
+        )*
+    }}
+}}
+
+impl_int! {{
+    u8: u8;
+    u64: u64;
+    usize: usize;
+}}
+
+trait Bytes {{
+    fn next_byte(&mut self) -> u8;
+}}
+
+struct One {{
+    byte: u8,
+}}
+
+impl Bytes for One {{
+    fn next_byte(&mut self) -> u8 {{
+        self.byte
+    }}
+}}
+
+struct Unstructured<'a> {{
+    data: &'a u8,
+}}
+
+{callee}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    let byte = 2u8;
+    let mut u = Unstructured {{ data: &byte }};
+    u.int_in_range(30u64, 50u64) as i32 + {second}
+}}
+"
+    )
+}
+
+/// Row 5: row 4 without the supertrait `Copy`.
+#[test]
+fn arbitrary_cut_supertrait() {
+    row("arbitrary cut: supertrait", &arbitrary_cut(Cut::Supertrait), 42);
+}
+
+/// Row 6: row 4 with no item named through `T::Unsigned::..`.
+#[test]
+fn arbitrary_cut_projection_paths() {
+    row("arbitrary cut: projection paths", &arbitrary_cut(Cut::ProjectionPaths), 42);
+}
+
+/// Row 7: row 4 with no method call on a value of the projection type.
+#[test]
+fn arbitrary_cut_projection_methods() {
+    row("arbitrary cut: projection methods", &arbitrary_cut(Cut::ProjectionMethods), 42);
+}
+
+/// Row 8: row 4 with a free generic callee (no `Self::`, no `impl Trait` argument).
+#[test]
+fn arbitrary_cut_self_and_impl_trait() {
+    row("arbitrary cut: Self and impl Trait", &arbitrary_cut(Cut::SelfAndImplTrait), 42);
+}
+
+/// Row 9: row 4 at `u64` only.
+#[test]
+fn arbitrary_cut_second_primitive() {
+    row("arbitrary cut: second primitive", &arbitrary_cut(Cut::SecondPrimitive), 42);
+}
+
+/// Row 10: nothing asked at the projection (the bound kept).
+#[test]
+fn arbitrary_cut_all_projection_use() {
+    row("arbitrary cut: all projection use", &arbitrary_cut(Cut::AllProjectionUse), 42);
+}
+
+/// Row 11: nothing asked at the projection and no bound on it.
+#[test]
+fn arbitrary_cut_all_projection_use_and_bound() {
+    row("arbitrary cut: projection use and bound", &arbitrary_cut(Cut::AllProjectionUseAndBound), 42);
+}
+
 // (g) `Clone::clone` at a FN POINTER or a FN ITEM: the language's impl, no impl item (tempo
 // t1800, 30 tests: proptest 1.x's `#[derive(Clone)] struct Config { .., failure_persistence:
 // .., source_file: .., ..}` with a `fn(..)` field, "calls trait fn `core::clone::Clone::clone`
@@ -981,7 +1343,7 @@ pub extern \"C-unwind\" fn main() -> i32 {{
 // types; core's clone.rs `mod impls`: those "cannot be described in Rust" (no impl item). The
 // record walk's maker had no rule for it (only run.rs `build_from` had, clone_shim.rs
 // `Clones`): it now tables the instance at the trait's `clone` row and builds the copy
-// (clone_shim.rs `language_copy_clone`).
+// (clone_shim.rs `language_clone`).
 
 /// The lang `Clone` as core declares it (no default body), and a struct holding a fn pointer
 /// whose `clone` clones the field as `#[derive(Clone)]` writes it.
@@ -1060,5 +1422,106 @@ pub extern \"C-unwind\" fn main() -> i32 {{
 "
         ),
         44,
+    );
+}
+
+// (h) `Clone::clone` at a TUPLE and at a CLOSURE: the language's impl, FIELD-WISE (tempo
+// t1855d, 30 tests: proptest 1.11's derived `Clone for Config` cloning a tuple field, "calls
+// trait fn `core::clone::Clone::clone` .. with Self a tuple: .. no impl of trait .. holds").
+// The Reference, "Special types and traits", `Clone`: tuples "of types that implement `Clone`"
+// and closures "that capture .. only values that implement `Clone`" implement it, by no impl
+// item. clone_shim.rs `language_clone`: each field through its own `clone`, in order. `Count`'s
+// `clone` adds one, so a clone that copied the bytes instead gives a smaller status.
+
+/// A non-`Copy` field type whose `clone` is observable.
+const COUNT: &str = "
+struct Count(u8);
+
+impl Clone for Count {
+    fn clone(&self) -> Count {
+        Count(self.0 + 1)
+    }
+}
+";
+
+/// The site's shape: a tuple of two `Count`s cloned by `Clone::clone`: `21 + 21` = 42.
+#[test]
+fn a_tuple_cloned_field_wise() {
+    row(
+        "tuple cloned field-wise",
+        &format!(
+            "{CLONE}{COUNT}
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    let t = (Count(20), Count(20));
+    let c = Clone::clone(&t);
+    (c.0.0 + c.1.0) as i32
+}}
+"
+        ),
+        42,
+    );
+}
+
+/// The twin: a tuple inside a tuple (the inner one is a builtin clone called by the outer's)
+/// and a closure capturing a `Count` by move: `(14 + 14) + 14` here, `41 + 1` below.
+#[test]
+fn a_nested_tuple_cloned_field_wise() {
+    row(
+        "nested tuple cloned field-wise",
+        &format!(
+            "{CLONE}{COUNT}
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    let t = ((Count(13), Count(13)), Count(13));
+    let c = Clone::clone(&t);
+    (c.0.0.0 + c.0.1.0 + c.1.0) as i32
+}}
+"
+        ),
+        42,
+    );
+}
+
+/// The closure twin: a `move` closure holding a `Count`, cloned, then called: `41 + 1` = 42.
+#[test]
+fn a_closure_cloned_field_wise() {
+    row(
+        "closure cloned field-wise",
+        &format!(
+            "{CLONE}{COUNT}
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    let a = Count(40);
+    let f = move || a.0;
+    let g = Clone::clone(&f);
+    (call_none(g) + 1) as i32
+}}
+
+fn call_none<F: Fn() -> u8>(f: F) -> u8 {{
+    f()
+}}
+"
+        ),
+        42,
+    );
+}
+
+/// The control: the same tuple read with no clone: `21 + 21` = 42, so a wrong status above is
+/// the clone's.
+#[test]
+fn a_tuple_read_uncloned() {
+    row(
+        "tuple read uncloned",
+        &format!(
+            "{CLONE}{COUNT}
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    let t = (Count(21), Count(21));
+    (t.0.0 + t.1.0) as i32
+}}
+"
+        ),
+        42,
     );
 }

@@ -206,3 +206,69 @@ fn main() {}
     assert_eq!(outcome("five"), "clean", "{}", lines.join("\n"));
     assert!(outcome("six").contains("E0308"), "{}", lines.join("\n"));
 }
+
+/// A constant whose type names a sibling constant of its own impl: turso's divan,
+/// `impl KnownCounterKind { pub const COUNT: usize = 4; pub const ALL: [Self; Self::COUNT] =
+/// [..]; }` with `struct CounterSet { counts: [Option<u64>; KnownCounterKind::COUNT] }` (the
+/// Reference, "Associated Items": the path to an associated item is the type's path and the
+/// item's name, so finding `COUNT` needs the impls' names, never `ALL`'s type; "Constant
+/// evaluation" refuses only a constant that needs itself). Finding `COUNT` makes the impl's
+/// header, and `ALL`'s row waits for `COUNT`'s value (heads.rs `ConstWait`), then is made with
+/// it, so `ALL` is `[Kind; 4]` too. The negative twins: `[_; 5]` is E0308 for both.
+/// Expected lines: "sibling constant: four: clean", "sibling constant: five: .." holding E0308,
+/// "sibling constant: all4: clean", "sibling constant: all5: .." holding E0308.
+///
+/// CONTROL: with the wait in heads.rs `Store::impl_` taken out (its `Err(why) => match
+/// self.waits_on_running(..)` arm made `Err(why) => return Err(why)`), `four` prints "not
+/// checked: .. the inherent impl .. is refused, and the constant may be declared there: ..
+/// Self::COUNT: the inherent constant is needed while it is being evaluated .." (turso c1851p,
+/// 137 notes and 268 heads), and the test fails.
+#[test]
+fn a_constant_typed_by_a_sibling_constant() {
+    const TEXT: &str = "enum Kind { A, B, C, D }
+impl Kind {
+    const COUNT: usize = 4;
+    const ALL: [Self; Self::COUNT] = [Self::A, Self::B, Self::C, Self::D];
+}
+struct Set { counts: [Option<u64>; Kind::COUNT] }
+fn four(s: Set) -> [Option<u64>; 4] { s.counts }
+fn five(s: Set) -> [Option<u64>; 5] { s.counts }
+fn all4() -> [Kind; 4] { Kind::ALL }
+fn all5() -> [Kind; 5] { Kind::ALL }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["four", "five", "all4", "all5"]);
+    let lines: Vec<String> = got.iter().map(|(n, o)| format!("sibling constant: {n}: {o}")).collect();
+    for l in &lines {
+        println!("{l}");
+    }
+    let outcome = |n: &str| got.iter().find(|(m, _)| m == n).map(|(_, o)| o.as_str()).unwrap_or("");
+    assert_eq!(outcome("four"), "clean", "{}", lines.join("\n"));
+    assert!(outcome("five").contains("E0308"), "{}", lines.join("\n"));
+    assert_eq!(outcome("all4"), "clean", "{}", lines.join("\n"));
+    assert!(outcome("all5").contains("E0308"), "{}", lines.join("\n"));
+}
+
+/// The twin rustc refuses (E0391, a cycle): `B`'s value reads `A`, whose type needs `B`. The
+/// wait above must not make this a value: `t` is not clean, and its refusal names the cycle's
+/// constant, never a panic or a silent pass. Expected line: "constant cycle: t: not checked:
+/// .." (anything but "clean").
+#[test]
+fn a_constant_whose_type_needs_itself_is_refused() {
+    const TEXT: &str = "struct S;
+impl S {
+    const A: [u8; Self::B] = [0; 2];
+    const B: usize = Self::A.len();
+}
+struct T { x: [u8; S::B] }
+fn t(v: T) -> T { v }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["t"]);
+    let lines: Vec<String> = got.iter().map(|(n, o)| format!("constant cycle: {n}: {o}")).collect();
+    for l in &lines {
+        println!("{l}");
+    }
+    let outcome = |n: &str| got.iter().find(|(m, _)| m == n).map(|(_, o)| o.as_str()).unwrap_or("");
+    assert_ne!(outcome("t"), "clean", "{}", lines.join("\n"));
+}

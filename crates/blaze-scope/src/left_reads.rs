@@ -130,6 +130,7 @@ mod tests {
             build_script: false,
             script: None,
             test_or_bench: false,
+            bin_exes: crate::crate_env::BinNames::NONE,
             meta: None,
         };
         let env = CrateEnv::of(facts, alloc).unwrap_or_else(|e| panic!("the member's environment: {e:?}"));

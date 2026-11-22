@@ -10,10 +10,29 @@ use crate::telemetry::{Event, EventKind, CPU_UNKNOWN};
 
 pub const MAX_SAMPLES: usize = 16_384;
 pub const MAX_SPAN_HISTORY: usize = 4_096;
+pub const MAX_ALLOC_HISTORY: usize = 4_096;
 pub const MAX_PCT_SAMPLES: usize = 256;
 pub const MAX_IO_ROWS: usize = 300;
 pub const MAX_VITALS_BUCKETS: usize = 120; // 120 x 500ms = 60s rolling window
 pub const VITALS_BUCKET_MS: f64 = 500.0;
+
+#[derive(Clone, Debug)]
+pub struct PcSym {
+    pub name: String,
+    pub file: String,
+    pub line: u32,
+    pub slot: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AllocRec {
+    pub ts_ms: f64,
+    pub site: String,
+    pub pcs: [u64; 3],
+    pub bytes: u64,
+    pub is_free: bool,
+    pub thread: u32,
+}
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct VitalsBucket {
@@ -103,10 +122,19 @@ pub struct ThreadComp {
 #[derive(Clone, Debug)]
 pub struct HeapSiteComp {
     pub key: String,
+    pub pcs: [u64; 3],
+    pub display_stack: String,
+    pub top_fn: String,
+    pub file: String,
+    pub line: u32,
+    pub slot: Option<u32>,
+    pub thread: u32,
     pub allocs: u64,
     pub frees: u64,
     pub total_bytes: u64,
     pub retained_bytes: u64,
+    pub min_bytes: u64,
+    pub max_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -248,8 +276,9 @@ pub struct ProfilerWorld {
     /// Anchor mapping monotonic `ev.ts_ns` (when < 1e18) to browser wall-clock ms.
     pub ts_offset_ms: Option<f64>,
 
-    // Live heap pointers + snapshot diff
+    // Live heap pointers + snapshot diff + bounded time-windowed alloc history
     pub live_ptrs: HashMap<u64, (Entity, u64)>,
+    pub alloc_history: Vec<AllocRec>,
     pub heap_baseline: Option<HashMap<String, u64>>,
     pub heap_baseline_label: String,
 
@@ -275,6 +304,7 @@ pub struct ProfilerWorld {
     pub builds: Vec<BuildInfo>,
     pub slot_names: HashMap<u32, String>,
     pub slot_locs: HashMap<u32, (String, u32, bool)>,
+    pub pc_symbols: HashMap<u64, PcSym>,
 
     // Cached Rust source snippets (`(file, line) -> lines`)
     pub sources: HashMap<(String, u32), Vec<(u32, String)>>,
@@ -315,6 +345,7 @@ impl ProfilerWorld {
             trace_origin_ms: None,
             ts_offset_ms: None,
             live_ptrs: HashMap::new(),
+            alloc_history: Vec::with_capacity(512),
             heap_baseline: None,
             heap_baseline_label: String::new(),
             io_rows: Vec::with_capacity(MAX_IO_ROWS),
@@ -332,6 +363,7 @@ impl ProfilerWorld {
             builds: Vec::new(),
             slot_names: HashMap::new(),
             slot_locs: HashMap::new(),
+            pc_symbols: HashMap::new(),
             sources: HashMap::new(),
             pending_sources: HashSet::new(),
             resources: ProcessResources::default(),
@@ -353,6 +385,7 @@ impl ProfilerWorld {
         self.trace_origin_ms = None;
         self.ts_offset_ms = None;
         self.live_ptrs.clear();
+        self.alloc_history.clear();
         self.heap_baseline = None;
         self.heap_baseline_label.clear();
         self.io_rows.clear();
@@ -439,6 +472,95 @@ impl ProfilerWorld {
             .unwrap_or_else(|| format!("slot #{slot}"))
     }
 
+    pub fn resolve_pc(&self, pc: u64) -> Option<&PcSym> {
+        if pc == 0 {
+            return None;
+        }
+        self.pc_symbols.get(&pc)
+    }
+
+    pub fn pc_label(&self, pc: u64) -> String {
+        if let Some(sym) = self.resolve_pc(pc) {
+            return sym.name.clone();
+        }
+        format!("0x{pc:x}")
+    }
+
+    /// Resolve a 3-frame PC stack into `(display_stack, top_fn, slot, file, line)`.
+    /// Uses `pc_symbols` first; if no PCs are symbolized yet, correlates with recent active spans on `thread`.
+    pub fn resolve_stack(&self, pcs: [u64; 3], thread: u32) -> (String, String, Option<u32>, String, u32) {
+        let mut names: Vec<String> = Vec::with_capacity(3);
+        let mut any_resolved = false;
+        let mut top_fn = String::new();
+        let mut slot: Option<u32> = None;
+        let mut file = String::new();
+        let mut line = 0u32;
+
+        for &pc in &pcs {
+            if pc == 0 {
+                continue;
+            }
+            if let Some(sym) = self.resolve_pc(pc) {
+                any_resolved = true;
+                if top_fn.is_empty() {
+                    top_fn = sym.name.clone();
+                    slot = sym.slot;
+                    file = sym.file.clone();
+                    line = sym.line;
+                    if file.is_empty() {
+                        if let Some(sl) = slot {
+                            if let Some((f, l, _)) = self.slot_locs.get(&sl) {
+                                file = f.clone();
+                                line = *l;
+                            }
+                        }
+                    }
+                }
+                names.push(sym.name.clone());
+            } else {
+                names.push(format!("0x{pc:x}"));
+            }
+        }
+
+        if any_resolved {
+            return (names.join(" → "), top_fn, slot, file, line);
+        }
+
+        // Fallback: correlate with the thread's most recent active span call chain
+        if let Some(last_sp) = self.span_history.iter().rev().find(|s| s.thread == thread) {
+            let mut chain: Vec<String> = Vec::with_capacity(3);
+            let top_slot = last_sp.slot;
+            let top_name = self.fn_name(top_slot);
+            chain.push(top_name.clone());
+            if let Some(&fe) = self.slot_entity.get(&top_slot) {
+                if let Some(f) = self.fns.get(fe) {
+                    file = f.file.clone();
+                    line = f.line;
+                }
+            }
+            if file.is_empty() {
+                if let Some((f, l, _)) = self.slot_locs.get(&top_slot) {
+                    file = f.clone();
+                    line = *l;
+                }
+            }
+            if last_sp.parent_id != 0 {
+                if let Some(&(pslot, _)) = self.span_parent.get(&last_sp.parent_id) {
+                    chain.push(self.fn_name(pslot));
+                }
+            }
+            return (chain.join(" → "), top_name, Some(top_slot), file, line);
+        }
+
+        let fallback = if names.is_empty() {
+            "unknown".into()
+        } else {
+            names.join(" → ")
+        };
+        let top = names.first().cloned().unwrap_or_else(|| "unknown".into());
+        (fallback, top, None, String::new(), 0)
+    }
+
     fn apply_slot_metadata(&mut self) {
         let names = self.slot_names.clone();
         let locs = self.slot_locs.clone();
@@ -450,6 +572,22 @@ impl ProfilerWorld {
                 f.file = file.clone();
                 f.line = *line;
                 f.rebuilt = *rebuilt;
+            }
+        }
+        // Re-symbolize existing heap sites whenever new slot/PC metadata arrives
+        let keys: Vec<(Entity, [u64; 3], u32)> = self
+            .heap_sites
+            .iter()
+            .map(|(e, s)| (e, s.pcs, s.thread))
+            .collect();
+        for (e, pcs, thr) in keys {
+            let (disp, top_fn, slot, file, line) = self.resolve_stack(pcs, thr);
+            if let Some(hs) = self.heap_sites.get_mut(e) {
+                hs.display_stack = disp;
+                hs.top_fn = top_fn;
+                hs.slot = slot;
+                hs.file = file;
+                hs.line = line;
             }
         }
     }
@@ -656,20 +794,31 @@ impl ProfilerWorld {
             x if x == EventKind::Alloc as u8 => {
                 let ptr = ev.a;
                 let bytes = ev.b;
+                let pcs = [ev.c, ev.d, ev.e];
                 let key = format!("0x{:x} → 0x{:x} → 0x{:x}", ev.c, ev.d, ev.e);
                 let he = if let Some(&e) = self.heap_entity.get(&key) {
                     e
                 } else {
+                    let (display_stack, top_fn, slot, file, line) = self.resolve_stack(pcs, ev.thread);
                     let e = self.alloc.spawn();
                     self.heap_entity.insert(key.clone(), e);
                     self.heap_sites.insert(
                         e,
                         HeapSiteComp {
-                            key,
+                            key: key.clone(),
+                            pcs,
+                            display_stack,
+                            top_fn,
+                            file,
+                            line,
+                            slot,
+                            thread: ev.thread,
                             allocs: 0,
                             frees: 0,
                             total_bytes: 0,
                             retained_bytes: 0,
+                            min_bytes: u64::MAX,
+                            max_bytes: 0,
                         },
                     );
                     e
@@ -678,9 +827,29 @@ impl ProfilerWorld {
                     hs.allocs = hs.allocs.saturating_add(1);
                     hs.total_bytes = hs.total_bytes.saturating_add(bytes);
                     hs.retained_bytes = hs.retained_bytes.saturating_add(bytes);
+                    if bytes < hs.min_bytes {
+                        hs.min_bytes = bytes;
+                    }
+                    if bytes > hs.max_bytes {
+                        hs.max_bytes = bytes;
+                    }
+                    if hs.thread == 0 {
+                        hs.thread = ev.thread;
+                    }
                 }
                 if ptr != 0 {
                     self.live_ptrs.insert(ptr, (he, bytes));
+                }
+                self.alloc_history.push(AllocRec {
+                    ts_ms: now_ms,
+                    site: key,
+                    pcs,
+                    bytes,
+                    is_free: false,
+                    thread: ev.thread,
+                });
+                if self.alloc_history.len() > MAX_ALLOC_HISTORY {
+                    self.alloc_history.drain(0..256);
                 }
                 let ret_now = self.total_retained_bytes();
                 let vi = self.touch_vitals(now_ms);
@@ -706,10 +875,27 @@ impl ProfilerWorld {
             }
             x if x == EventKind::Free as u8 => {
                 if let Some((he, old_bytes)) = self.live_ptrs.remove(&ev.a) {
+                    let sub = if ev.b > 0 { ev.b } else { old_bytes };
+                    let mut site_key = String::new();
+                    let mut site_pcs = [0u64; 3];
                     if let Some(hs) = self.heap_sites.get_mut(he) {
                         hs.frees = hs.frees.saturating_add(1);
-                        let sub = if ev.b > 0 { ev.b } else { old_bytes };
                         hs.retained_bytes = hs.retained_bytes.saturating_sub(sub);
+                        site_key = hs.key.clone();
+                        site_pcs = hs.pcs;
+                    }
+                    if !site_key.is_empty() {
+                        self.alloc_history.push(AllocRec {
+                            ts_ms: now_ms,
+                            site: site_key,
+                            pcs: site_pcs,
+                            bytes: sub,
+                            is_free: true,
+                            thread: ev.thread,
+                        });
+                        if self.alloc_history.len() > MAX_ALLOC_HISTORY {
+                            self.alloc_history.drain(0..256);
+                        }
                     }
                 }
             }
@@ -849,6 +1035,57 @@ impl ProfilerWorld {
 
     pub fn total_retained_bytes(&self) -> u64 {
         self.heap_sites.iter().map(|(_, s)| s.retained_bytes).sum()
+    }
+
+    /// Returns heap allocation breakdown (either live totals or filtered to a dragged `[t0, t1]` window).
+    pub fn heap_sites_for_window(&self, win: Option<(f64, f64)>) -> Vec<HeapSiteComp> {
+        let Some((t0, t1)) = win else {
+            let mut sites: Vec<_> = self.heap_sites.iter().map(|(_, s)| s.clone()).collect();
+            sites.sort_by(|a, b| b.retained_bytes.cmp(&a.retained_bytes).then(b.total_bytes.cmp(&a.total_bytes)));
+            return sites;
+        };
+        let mut by_site: HashMap<&str, HeapSiteComp> = HashMap::new();
+        for rec in &self.alloc_history {
+            if rec.ts_ms < t0 || rec.ts_ms > t1 {
+                continue;
+            }
+            let entry = by_site.entry(rec.site.as_str()).or_insert_with(|| {
+                let (display_stack, top_fn, slot, file, line) = self.resolve_stack(rec.pcs, rec.thread);
+                HeapSiteComp {
+                    key: rec.site.clone(),
+                    pcs: rec.pcs,
+                    display_stack,
+                    top_fn,
+                    file,
+                    line,
+                    slot,
+                    thread: rec.thread,
+                    allocs: 0,
+                    frees: 0,
+                    total_bytes: 0,
+                    retained_bytes: 0,
+                    min_bytes: u64::MAX,
+                    max_bytes: 0,
+                }
+            });
+            if rec.is_free {
+                entry.frees = entry.frees.saturating_add(1);
+                entry.retained_bytes = entry.retained_bytes.saturating_sub(rec.bytes);
+            } else {
+                entry.allocs = entry.allocs.saturating_add(1);
+                entry.total_bytes = entry.total_bytes.saturating_add(rec.bytes);
+                entry.retained_bytes = entry.retained_bytes.saturating_add(rec.bytes);
+                if rec.bytes < entry.min_bytes {
+                    entry.min_bytes = rec.bytes;
+                }
+                if rec.bytes > entry.max_bytes {
+                    entry.max_bytes = rec.bytes;
+                }
+            }
+        }
+        let mut out: Vec<HeapSiteComp> = by_site.into_values().collect();
+        out.sort_by(|a, b| b.retained_bytes.cmp(&a.retained_bytes).then(b.total_bytes.cmp(&a.total_bytes)));
+        out
     }
 
     /// Computes live retained heap growth slope (bytes/sec) over recent vitals buckets.
@@ -1033,7 +1270,14 @@ impl ProfilerWorld {
                 .heap_sites
                 .iter()
                 .max_by_key(|(_, s)| s.retained_bytes)
-                .map(|(_, s)| format!("{} · {} live", fmt_bytes(s.retained_bytes as i64), self.live_ptrs.len()))
+                .map(|(_, s)| {
+                    format!(
+                        "{} · {} ({} live)",
+                        s.top_fn,
+                        fmt_bytes(s.retained_bytes as i64),
+                        self.live_ptrs.len()
+                    )
+                })
                 .unwrap_or_else(|| format!("{} live", self.live_ptrs.len()));
             out.push(Insight {
                 severity: if slope > 96_000.0 || ret >= 16 * 1024 * 1024 { 2 } else { 1 },
@@ -1291,6 +1535,39 @@ impl ProfilerWorld {
             }
             self.apply_slot_metadata();
         }
+        if let Some(pcs) = obj.get_obj("pc_symbols") {
+            self.ingest_pc_symbols(pcs);
+            self.apply_slot_metadata();
+        }
+    }
+
+    fn ingest_pc_symbols(&mut self, map: &[(String, JsonVal)]) {
+        for (k, v) in map {
+            let Some(addr) = parse_pc_key(k) else {
+                continue;
+            };
+            if let Some(name) = v.as_str() {
+                self.pc_symbols.insert(
+                    addr,
+                    PcSym {
+                        name: name.to_string(),
+                        file: String::new(),
+                        line: 0,
+                        slot: None,
+                    },
+                );
+            } else if let Some(name) = v.get_str("name") {
+                self.pc_symbols.insert(
+                    addr,
+                    PcSym {
+                        name: name.to_string(),
+                        file: v.get_str("file").unwrap_or("").to_string(),
+                        line: v.get_u64("line").unwrap_or(0) as u32,
+                        slot: v.get_u64("slot").map(|x| x as u32),
+                    },
+                );
+            }
+        }
     }
 
     fn apply_build_obj(&mut self, b: &JsonVal) {
@@ -1313,17 +1590,41 @@ impl ProfilerWorld {
         if let Some(locs) = b.get_obj("locations") {
             for (k, v) in locs {
                 if let Ok(id) = k.parse::<u32>() {
-                    if let Some(name) = v.get_str("name") {
-                        self.slot_names.insert(id, name.to_string());
+                    let name_opt = v.get_str("name").map(|s| s.to_string());
+                    if let Some(ref name) = name_opt {
+                        self.slot_names.insert(id, name.clone());
                     }
                     let file = v.get_str("file").unwrap_or("").to_string();
                     let line = v.get_u64("line").unwrap_or(0) as u32;
                     let rebuilt = v.get_bool("rebuilt").unwrap_or(false);
                     if !file.is_empty() {
-                        self.slot_locs.insert(id, (file, line, rebuilt));
+                        self.slot_locs.insert(id, (file.clone(), line, rebuilt));
+                    }
+                    let addr = v
+                        .get_str("pc")
+                        .and_then(parse_pc_key)
+                        .or_else(|| v.get_str("addr").and_then(parse_pc_key))
+                        .or_else(|| v.get_u64("pc"))
+                        .or_else(|| v.get_u64("addr"));
+                    if let Some(pc) = addr {
+                        let sym_name = name_opt
+                            .or_else(|| self.slot_names.get(&id).cloned())
+                            .unwrap_or_else(|| format!("slot #{id}"));
+                        self.pc_symbols.insert(
+                            pc,
+                            PcSym {
+                                name: sym_name,
+                                file,
+                                line,
+                                slot: Some(id),
+                            },
+                        );
                     }
                 }
             }
+        }
+        if let Some(pcs) = b.get_obj("pc_symbols") {
+            self.ingest_pc_symbols(pcs);
         }
         self.builds.push(BuildInfo {
             id: b.get_str("id").unwrap_or("").to_string(),
@@ -1682,5 +1983,14 @@ impl<'a> JsonParser<'a> {
                 _ => return None,
             }
         }
+    }
+}
+
+fn parse_pc_key(s: &str) -> Option<u64> {
+    let trimmed = s.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed.parse::<u64>().ok()
     }
 }

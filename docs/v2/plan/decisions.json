@@ -1578,6 +1578,14 @@
    "recommended": "As D99: the composer written once over the table; equality with the LIR evaluator and the Reference tier on generated programs and every ladder rung before it is the default.",
    "why": "The owner asked whether stencils should be the lowest tier; the plan already says so and only the stand-in exists. Every value in a stack cell is the slowest code blaze can make; tests run it.",
    "state": "decided 2026-11-21 17:10 (the owner: 'ok then do the proper way to do it iyo'); writer started; nothing compiled"
+  },
+  {
+   "id": "D196",
+   "date": "2026-11-21",
+   "decision": "A proc macro that keeps state between calls (napi-derive's process-global STRUCTS map: a `#[napi] impl` reads what the `#[napi] struct` call wrote) must work unchanged. The SEMANTICS of expanding a crate is rustc's: one instance of the macro crate per crate being compiled, its calls run in source order. Running each call alone in a fresh instance (today's way, what makes an expansion a record keyed by its own item) is an OPTIMISATION that is valid for a (macro crate, compiled crate) pair only while it is shown equal: the first expansion of a crate runs its calls both ways once and compares the outputs byte for byte; equal: the calls are keyed alone, as today; different: that pair is order-dependent and each call's key gains the digest of the calls before it. The comparison is rerun in the background after an edit (a finding if it stops being equal), never before the answer. No table of napi's own facts is built into blaze (no special case, rule 5).",
+   "recommended": "Build it with the proc-macro program path (D193 point 1, crates/blaze-macro-run), where one process per macro crate per command already exists; until then turso's two napi constructor errors stay.",
+   "why": "turso bindings/javascript: 'Did not find struct `Database` parsed before expand #[napi] for impl' (2 errors); a silent variant exists too (a renamed struct's impl would get the default name with no error), so retry-on-error is not enough.",
+   "state": "decided 2026-11-21 19:00; not built"
   }
  ]
 }

@@ -299,7 +299,7 @@ fn tally(bodies: &[Body], references: &[Reference], inline: bool, fast: &Fast<'_
     let mut t = Tally::default();
     for (body, reference) in bodies.iter().zip(references) {
         let callees = body.callees();
-        let names = InstanceNames { funcs: &callees, statics: &body.statics, vtables: &body.vtables, tls: &body.tls };
+        let names = InstanceNames { funcs: &callees, statics: &body.statics, c_statics: &[], vtables: &body.vtables, tls: &body.tls };
         let simplified = if inline {
             let stage = catch_unwind(AssertUnwindSafe(|| {
                 blaze_lir::simplify::simplify(body.func.view(), BodyId(body.symbol.0), &index, blaze_lir::inline::TRIVIAL, Global)
@@ -452,7 +452,7 @@ fn census(heap: &'static blaze_own::Heap) -> Result<i32, CensusError> {
     let mut references: Vec<Reference, Global> = Vec::with_capacity_in(bodies.len(), Global);
     for body in bodies.iter() {
         let callees = body.callees();
-        let names = InstanceNames { funcs: &callees, statics: &body.statics, vtables: &body.vtables, tls: &body.tls };
+        let names = InstanceNames { funcs: &callees, statics: &body.statics, c_statics: &[], vtables: &body.vtables, tls: &body.tls };
         let made = catch_unwind(AssertUnwindSafe(|| {
             emit_record_measured(body.func.verified(), &names, &RoutinePlaces::NONE, isa, &[], alloc).map(|(record, insts, _called)| (u64::from(insts), record.code.len() as u64))
         }));

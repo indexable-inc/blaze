@@ -41,6 +41,7 @@ fn xtask(meta: PackageMetaVars<'static>, test_or_bench: bool) -> CrateEnv<'stati
         build_script: false,
         script: None,
         test_or_bench,
+        bin_exes: blaze_scope::crate_env::BinNames::NONE,
         meta: Some(meta),
     };
     CrateEnv::of(facts, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the environment of tempo_xtask: {e}"))

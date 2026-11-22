@@ -1,7 +1,7 @@
 //! The names records of a program's crates, made ONE way for `blaze check` and `blaze run`
 //! (rule 30): front2's `Records` over front_load's `StoreLoad`, its `Log`, and the texts a body's
 //! macro calls expand with ([`names_records_with_snapshot`]). body_types.rs `checker` makes them for a file's
-//! owner; `blaze run` for the program's crate ([`open`]), which the lazy parent opens on its first
+//! owner; `blaze run` for the program's crate ([`names_in`]), which the lazy parent opens on its first
 //! need of them (run_parent.rs `CommandFront`, blaze-ladder make_one.rs `NamesRecords`).
 //!
 //! WHICH CRATES `blaze run` READS: the program's crate (the member crate rooted at the picked
@@ -171,7 +171,7 @@ impl<'n> ScopeCrates<'_, 'n> {
 /// that body's crate. The run is keyed by the call and by the caller's package and edition
 /// (rule 21), so it is the same whichever job asks for it. `env!` is still read for the owner
 /// only: a dependency's `env!` is refused by name (job_texts.rs `crate_env`); a run's names
-/// records ([`open`]) give every crate its own ([`RunEnvs`], through [`names_records_envs`]).
+/// records ([`names_in`]) give every crate its own ([`RunEnvs`], through [`names_records_envs`]).
 #[expect(clippy::too_many_arguments, reason = "the names records' edge: each argument one input of them")]
 pub(crate) fn names_records_over<'n>(
     cx: &'n Cx,
@@ -1056,11 +1056,30 @@ pub(crate) fn names_of<'n, 'm: 'n>(
     frame: &'n Frame,
     heap: &'static blaze_own::Heap,
 ) -> Result<NamesRecords<'n>, RunNamesError> {
+    let _cx = cx.span("run names: open the names records");
+    let crates = crates_of(cx, found, owner, store, kept, read, env, frame, heap)?;
+    names_in(cx, root, crates, procs, seen, frame)
+}
+
+/// The [`RunCrates`] of `found` ([`names_of`]'s first half, on the command thread): what every
+/// names records of the program are made of, each code worker's too (test_drive.rs `CodePool`).
+#[expect(clippy::too_many_arguments, reason = "the StartProgram site's edge: each argument one thing it holds")]
+pub(crate) fn crates_of<'n, 'm: 'n>(
+    cx: &Cx,
+    found: &'n Found<'_>,
+    owner: Owner,
+    store: &mut dyn Store<'m>,
+    kept: &mut Kept,
+    read: &mut EngineRecords<'m>,
+    env: &'n crate::fetch::FetchEnv<'_>,
+    frame: &'n Frame,
+    heap: &'static blaze_own::Heap,
+) -> Result<RunCrates<'n>, RunNamesError> {
     match found {
-        Found::Walked(program, snapshot) => open(cx, root, program, snapshot, store, read, env, procs, seen, frame, heap),
+        Found::Walked(program, snapshot) => read_crates(cx, program, snapshot, store, read, env, frame, heap),
         Found::Stood(rows, snapshot) => {
             let program = program_of(cx, rows, owner, store, kept, read, heap, frame)?;
-            open(cx, root, &program, snapshot, store, read, env, procs, seen, frame, heap)
+            read_crates(cx, &program, snapshot, store, read, env, frame, heap)
         }
     }
 }
@@ -1172,56 +1191,95 @@ impl<'n> crate::job_texts::EnvsByNeed<'n> for RunEnvs<'n> {
     }
 }
 
-/// The names records of `program` (the lazy parent's `names`), in `frame`: each crate's records
-/// read IN PLACE from the store's mapping through `read` (engine_records.rs, the one reader of
-/// `blaze check` too; for `'m`, the command's `Lent` borrow, which outlives `'n`), the list's
-/// trees each opened at the first read of a text from it ([`LazyTrees`], counted in `seen`), and
-/// the command's proc-macro runner: for `run` and `test`, made at a body's first proc-macro call
-/// (engine_start.rs `RunProcs`, job_texts.rs `Procs::ByNeed`); `Procs::None`: a body's
-/// proc-macro call is refused by name.
+/// What every names records of one program are made of, read ONCE on the command thread
+/// ([`read_crates`]: each crate's records read in place through the store's mapping): the crate
+/// list, the crates, each crate's list row and build-script row, the lang crates, the list's
+/// corrected texts and where its trees are opened from. All borrowed and read only, so it is
+/// `Sync`: the command's code workers (test_drive.rs `CodePool`, D194) each make their own names
+/// records of it ([`names_in`]), and the command thread makes its own the same way ([`names_of`]).
+///
+/// WHAT IS SHARED, AND WHAT IS NOT (D194 piece 2): shared read only are the crates' records
+/// (views of the store's mapping), the list, the snapshot, the corrected texts and the packs'
+/// home; per maker of names records ([`names_in`], one a worker a suite) are the trees opened by
+/// need ([`LazyTrees`], [`ListTrees`]: `Cell` and `RefCell`), their count ([`TreesSeen`]), the
+/// environments made by need ([`RunEnvs`]: `OnceCell`) and the records' own memo (`Records`, the
+/// `Log`, the job texts), all in that maker's frame.
+#[derive(Clone, Copy)]
+pub(crate) struct RunCrates<'n> {
+    list: &'n CrateList<'static>,
+    crates: &'n [Crate<'n>],
+    /// Reader crate `k`'s row of `list` (the owner at 0).
+    rows: &'n [usize],
+    /// [`Program::scripts`], sorted by row.
+    scripts: &'n [(usize, Input)],
+    lang: &'n [usize],
+    corrected: &'static [(u32, &'static str, &'static str)],
+    snapshot: &'n StoreSnapshot,
+    /// Where the list's packs are opened from (the home, its file tree, the heap a mapping is
+    /// kept on); its `home` is also where a native script's stored `OUT_DIR` files are.
+    from: PackHome<'n>,
+    /// The command's heap: the names records' tables (`names_records_envs`'s `g`).
+    heap: &'static blaze_own::Heap,
+}
+
+/// The [`RunCrates`] of `program`, in `frame`: each crate's records read IN PLACE from the
+/// store's mapping through `read` (engine_records.rs, the one reader of `blaze check` too).
 #[expect(clippy::too_many_arguments, reason = "the StartProgram site's edge: each argument one thing it holds")]
-pub(crate) fn open<'n, 'm: 'n>(
-    cx: &'n Cx,
-    root: &'n Dir<ReadWrite>,
+pub(crate) fn read_crates<'n, 'm: 'n>(
+    cx: &Cx,
     program: &Program,
     snapshot: &'n StoreSnapshot,
     store: &mut dyn Store<'m>,
     read: &mut EngineRecords<'m>,
     env: &'n crate::fetch::FetchEnv<'_>,
-    procs: crate::job_texts::Procs<'n>,
-    seen: &'n TreesSeen,
     frame: &'n Frame,
     heap: &'static blaze_own::Heap,
-) -> Result<NamesRecords<'n>, RunNamesError> {
-    let _cx = cx.span("run names: open the names records");
+) -> Result<RunCrates<'n>, RunNamesError> {
     let list: &'n CrateList<'static> = blaze_own::Box::leak(blaze_own::Box::new_in(program.list, frame));
-    let mut crates: Vec<Crate<'n>, &Frame> = Vec::with_capacity_in(program.crates.len(), frame);
+    let mut crates: Vec<Crate<'n>, &'n Frame> = Vec::with_capacity_in(program.crates.len(), frame);
     for (at, input) in program.crates.iter() {
         let crate_name = CrateGraph::name(list, *at);
         let records: CrateRecords<'m> = read.records(cx, store, input, list.key(*at), heap.alloc()).map_err(|error| RunNamesError::Records { crate_name, error: std::boxed::Box::new_in(error, Global) })?;
         crates.push(Crate { records, name: crate_name, package: list.shown_from(*at), world_at: *at });
     }
-    // The trees: none opened here; each at the first read of a text from it, at most once. The
-    // read of them all is the `UnitGraph`'s (the doc of body_types.rs `Kept::trees`).
-    let opener: &'n ListTrees<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(
-        ListTrees { cx, from: PackHome::of(env), list, scratch: frame, dirs: RefCell::new(PackDirs::default()) },
-        frame,
-    ));
-    let trees: &'n LazyTrees<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(LazyTrees::new(opener, list.trees(), seen, frame), frame));
     let corrected = crate::body_types::corrected_of(list, heap).map_err(|why| RunNamesError::Trees { why })?;
-    // Every crate's environment, each made at its first ask ([`RunEnvs`]): a body lowered by
-    // need reads its own crate's, as `blaze check` gives a body its owner's.
     let mut rows: Vec<usize, &'n Frame> = Vec::with_capacity_in(program.crates.len(), frame);
     rows.extend(program.crates.iter().map(|(at, _)| *at));
     let mut scripts: Vec<(usize, Input), &'n Frame> = Vec::with_capacity_in(program.scripts.len(), frame);
     scripts.extend_from_slice(&program.scripts);
-    let envs: &'n RunEnvs<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(RunEnvs::new(list, rows.leak(), scripts.leak(), snapshot, env.home, frame), frame));
-    let envs = Envs { owner: None, rest: Some(envs) };
-    let trees = (trees, None);
-    let opened = names_records_envs(cx, root, ScopeCrates::Opened(&crates), trees, corrected, procs, std::vec::Vec::new_in(Global), envs, Some(snapshot), None, frame, heap.alloc()).map_err(|error| match error {
-        NamesError::Items { at, why } => RunNamesError::Items { crate_name: program.crates.get(at).map_or("?", |(at, _)| CrateGraph::name(list, *at)), why },
-    })?;
     let mut lang: Vec<usize, &'n Frame> = Vec::with_capacity_in(program.lang.len(), frame);
     lang.extend_from_slice(&program.lang);
-    Ok(NamesRecords { records: opened.records, frame, lang_crates: lang.leak(), body_sources: Some(opened.sources) })
+    Ok(RunCrates { list, crates: crates.leak(), rows: rows.leak(), scripts: scripts.leak(), lang: lang.leak(), corrected, snapshot, from: PackHome::of(env), heap })
+}
+
+/// The names records over `crates`, in `frame`, on the calling thread (`cx`'s): the list's trees
+/// each opened at the first read of a text from it (counted in `seen`), every crate's
+/// environment made at its first ask, and `procs` the proc-macro runner a body's call reads.
+/// Everything it makes is this caller's own (the doc of [`RunCrates`]); nothing in `crates` is
+/// written.
+pub(crate) fn names_in<'n>(
+    cx: &'n Cx,
+    root: &'n Dir<ReadWrite>,
+    crates: RunCrates<'n>,
+    procs: crate::job_texts::Procs<'n>,
+    seen: &'n TreesSeen,
+    frame: &'n Frame,
+) -> Result<NamesRecords<'n>, RunNamesError> {
+    let RunCrates { list, crates: opened, rows, scripts, lang, corrected, snapshot, from, heap } = crates;
+    // The trees: none opened here; each at the first read of a text from it, at most once. The
+    // read of them all is the `UnitGraph`'s (the doc of body_types.rs `Kept::trees`).
+    let opener: &'n ListTrees<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(
+        ListTrees { cx, from, list, scratch: frame, dirs: RefCell::new(PackDirs::default()) },
+        frame,
+    ));
+    let trees: &'n LazyTrees<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(LazyTrees::new(opener, list.trees(), seen, frame), frame));
+    // Every crate's environment, each made at its first ask ([`RunEnvs`]): a body lowered by
+    // need reads its own crate's, as `blaze check` gives a body its owner's.
+    let envs: &'n RunEnvs<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(RunEnvs::new(list, rows, scripts, snapshot, from.home, frame), frame));
+    let envs = Envs { owner: None, rest: Some(envs) };
+    let trees = (trees, None);
+    let made = names_records_envs(cx, root, ScopeCrates::Opened(opened), trees, corrected, procs, std::vec::Vec::new_in(Global), envs, Some(snapshot), None, frame, heap.alloc()).map_err(|error| match error {
+        NamesError::Items { at, why } => RunNamesError::Items { crate_name: opened.get(at).map_or("?", |one| CrateGraph::name(list, one.world_at)), why },
+    })?;
+    Ok(NamesRecords { records: made.records, frame, lang_crates: lang, body_sources: Some(made.sources) })
 }

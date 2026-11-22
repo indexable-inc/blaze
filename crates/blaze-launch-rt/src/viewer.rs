@@ -352,6 +352,11 @@ fn handle_connection(mut stream: TcpStream, shared: &Arc<SharedState>) {
                 None => write_http(&mut stream, "404 Not Found", "application/json", cors_origin, r#"{"error":"source unavailable"}"#),
             }
         }
+        ("GET", "/api/resources") => {
+            let query = raw_path.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let body = read_process_resources_json(query);
+            write_http(&mut stream, "200 OK", "application/json", cors_origin, &body);
+        }
         ("POST", "/api/toggle") => {
             write_http(&mut stream, "200 OK", "application/json", cors_origin, r#"{"ok":true}"#);
         }
@@ -889,6 +894,136 @@ fn read_source_snippet_json(query: &str) -> Option<String> {
     }
     out.push_str("]}");
     Some(out)
+}
+
+/// Inspects a live process's open listening ports, established TCP/UDP sockets, and FD count.
+fn read_process_resources_json(query: &str) -> String {
+    let mut pid: u32 = 0;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == "pid" {
+                pid = v.parse::<u32>().unwrap_or(0);
+            }
+        }
+    }
+    if pid == 0 {
+        return String::from(r#"{"pid":0,"fd_count":0,"sockets":[],"files":[]}"#);
+    }
+
+    let mut fd_count: u32 = 0;
+    let mut sockets: Vec<(String, String, String, String, u16)> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("lsof")
+            .args(["-nP", "-a", "-p", &pid.to_string(), "-F", "ftPnT"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut cur_type = String::new();
+            let mut cur_proto = String::new();
+            let mut cur_name = String::new();
+            let mut cur_state = String::new();
+            let flush = |ty: &str,
+                         proto: &str,
+                         name: &str,
+                         state: &str,
+                         sockets: &mut Vec<(String, String, String, String, u16)>,
+                         files: &mut Vec<String>| {
+                if ty == "IPv4" || ty == "IPv6" {
+                    let (local, remote) = name.split_once("->").unwrap_or((name, ""));
+                    let port = local.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(0);
+                    let st = if state.is_empty() {
+                        if remote.is_empty() { "LISTEN" } else { "ESTABLISHED" }
+                    } else {
+                        state
+                    };
+                    if sockets.len() < 48 {
+                        sockets.push((
+                            if proto.is_empty() { "TCP".into() } else { proto.to_string() },
+                            local.to_string(),
+                            remote.to_string(),
+                            st.to_string(),
+                            port,
+                        ));
+                    }
+                } else if (ty == "REG" || ty == "VREG") && !name.is_empty() && files.len() < 24 {
+                    files.push(name.to_string());
+                }
+            };
+            for line in text.lines() {
+                let mut chars = line.chars();
+                let Some(tag) = chars.next() else { continue };
+                let rest = chars.as_str();
+                match tag {
+                    'f' => {
+                        if !cur_type.is_empty() {
+                            flush(&cur_type, &cur_proto, &cur_name, &cur_state, &mut sockets, &mut files);
+                        }
+                        cur_type.clear();
+                        cur_proto.clear();
+                        cur_name.clear();
+                        cur_state.clear();
+                        if rest.bytes().all(|b| b.is_ascii_digit()) {
+                            fd_count = fd_count.saturating_add(1);
+                        }
+                    }
+                    't' => cur_type = rest.to_string(),
+                    'P' => cur_proto = rest.to_string(),
+                    'n' => cur_name = rest.to_string(),
+                    'T' => {
+                        if let Some(st) = rest.strip_prefix("ST=") {
+                            cur_state = st.to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !cur_type.is_empty() {
+                flush(&cur_type, &cur_proto, &cur_name, &cur_state, &mut sockets, &mut files);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+            for ent in entries.flatten() {
+                fd_count = fd_count.saturating_add(1);
+                if let Ok(target) = std::fs::read_link(ent.path()) {
+                    let s = target.to_string_lossy().to_string();
+                    if s.starts_with('/') && files.len() < 24 {
+                        files.push(s);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = format!(r#"{{"pid":{pid},"fd_count":{fd_count},"sockets":["#);
+    for (i, (proto, local, remote, state, port)) in sockets.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(
+            out,
+            r#"{{"proto":"{}","local":"{}","remote":"{}","state":"{}","port":{port}}}"#,
+            escape_json(proto),
+            escape_json(local),
+            escape_json(remote),
+            escape_json(state),
+        );
+    }
+    out.push_str(r#"],"files":["#);
+    for (i, f) in files.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, r#""{}""#, escape_json(f));
+    }
+    out.push_str("]}");
+    out
 }
 
 /// Probes `http://127.0.0.1:<port>/api/info` with a tight loopback timeout.

@@ -1469,3 +1469,227 @@ fn the_native_library_is_the_first_frame() {
     assert!(after.is_empty(), "a refused library wrote a frame");
     std::println!("native: the library told first, its words slots 0 and 1; told late refused");
 }
+
+/// The toy's maker as a code worker keeps it: made for one entry and start (test_drive.rs
+/// `MadeFor`).
+struct ToyKept<'t> {
+    maker: ToyMaker<'t>,
+    entry: Option<ItemKey>,
+    start: blaze_ladder::run::special::MakerStart,
+}
+
+impl crate::test_drive::MadeFor for ToyKept<'_> {
+    fn made_for(&self) -> (Option<ItemKey>, blaze_ladder::run::special::MakerStart) {
+        (self.entry, self.start)
+    }
+}
+
+/// One code worker's makers over the toy: the fake beside the command's `SuiteMakers` at the
+/// seam's one trait (test_drive.rs `KeptMakers`, rule 78), its makers kept by the command's
+/// `Makers`. `panics`: how many makes left panic before they make (rule 20's plant).
+struct ToyMakers<'t> {
+    calls: &'t Cell<usize>,
+    kept: crate::test_drive::Makers<ToyKept<'t>>,
+    panics: usize,
+    forgot: usize,
+}
+
+impl crate::test_drive::KeptMakers for ToyMakers<'_> {
+    fn make(&mut self, job: &crate::test_drive::Job<'static>, entry: &mut AVec<'_, u8>) -> Result<(), crate::test_drive::Unmade> {
+        if self.panics > 0 {
+            self.panics -= 1;
+            panic!("a planted panic in a toy make");
+        }
+        let calls = self.calls;
+        let kept = self.kept.of(job, || Ok(ToyKept { maker: ToyMaker { calls, typed: true }, entry: job.entry, start: job.start }))?;
+        job.order.make(&mut kept.maker, &job.proof, job.name.as_slice(), entry)
+    }
+
+    fn forget(&mut self, suite: crate::test_loop::SuiteId) {
+        self.forgot += 1;
+        self.kept.forget(suite);
+    }
+}
+
+fn toy_makers(calls: &Cell<usize>, plant: crate::test_drive::MakersPlant, panics: usize) -> ToyMakers<'_> {
+    ToyMakers { calls, kept: crate::test_drive::Makers::new(blaze_own::testing::heap().alloc(), plant), panics, forgot: 0 }
+}
+
+/// A make of the toy's fn `item` for a test whose roots start at `entry`, as the relay hands it
+/// to a worker (test_drive.rs `Job`).
+fn toy_job(item: u128, entry: u128) -> crate::test_drive::Job<'static> {
+    let heap = blaze_own::testing::heap();
+    let mut name = blaze_engine::SVec::with_capacity_in(20, heap.shared());
+    name.extend_from_slice(&name_of(item));
+    crate::test_drive::Job {
+        suite: crate::test_loop::SuiteId(0),
+        order: blaze_ladder::body_ids::Order { tabled: ItemKey(item), kind: blaze_ladder::body_ids::RowKind::Instance },
+        name,
+        proof: Checked::Clean.runs(ItemKey(item)).expect("a clean body runs"),
+        entry: Some(ItemKey(entry)),
+        start: blaze_ladder::run::special::MakerStart::ByRule,
+    }
+}
+
+/// `symbol` resolved under `Codes::Pooled` through the real relay and the real pool's channels
+/// (test_drive.rs `CodeRelay`, `CodePool`, `Lanes`), its one code worker's turn driven inline
+/// (`WorkerLane::step`, the same make and hand-back as the worker's loop): each ask handed on, made,
+/// pumped back and answered, until the symbol's record comes. Its id and declares.
+#[expect(clippy::too_many_arguments, reason = "the seam's pieces, each handed in")]
+fn resolve_pooled(
+    lazy: &mut Lazy<'_, '_, ToyFront<'_>, &mut ToyFolder>,
+    symbol: &Symbol,
+    code: &crate::test_drive::CodeRelay<'_>,
+    lane: crate::test_drive::WorkerLane<'_, '_>,
+    makers: &mut dyn crate::test_drive::KeptMakers,
+    cx: &bstd::Cx,
+    clock: &bstd::clock::Clock,
+    heap: &'static blaze_own::Heap,
+) -> Result<([u8; 32], std::vec::Vec<Symbol>), ParentError> {
+    use blaze_engine::code_pool::Child;
+    use blaze_engine::code_pool::relay::Reply;
+
+    let child = Child(0);
+    let mut scratch: AVec<'static, u8> = blaze_own::Vec::new_in(heap.alloc());
+    for _ in 0..8 {
+        match lazy.resolve(symbol)? {
+            Resolved::Record { record, declares, .. } => return Ok((record.0, symbols(declares))),
+            Resolved::Unknown => panic!("the symbol is unknown under `Codes::Pooled`"),
+            Resolved::Waiting => {}
+        }
+        let ask = lazy.asked().expect("a waiting row names its make");
+        let mut name = blaze_engine::SVec::with_capacity_in(ask.name.len(), heap.shared());
+        name.extend_from_slice(ask.name);
+        let job = crate::test_drive::Job {
+            suite: crate::test_loop::SuiteId(0),
+            order: ask.order,
+            name,
+            proof: ask.proof,
+            entry: Some(ItemKey(MAIN)),
+            start: blaze_ladder::run::special::MakerStart::ByRule,
+        };
+        code.ask(child, ask.key, job).expect("the relay takes the ask");
+        assert!(lane.step(cx, clock, makers, &mut scratch, heap).expect("the worker's turn"), "the relay handed the worker no make");
+        code.pump().expect("the relay takes the made entry back");
+        let came = code
+            .answer(child, |reply| match reply {
+                Reply::Made(entry) => lazy.made(entry),
+                Reply::Refused(why) => Err(lazy.refused(why)),
+                Reply::RefusedElsewhere { .. } | Reply::Late { .. } => panic!("the one child's ask was refused elsewhere or late"),
+            })
+            .expect("the relay answers");
+        came.expect("the ask was answered in its turn")?;
+    }
+    panic!("the symbol did not resolve in eight makes");
+}
+
+/// THE SEAM TEST of D194 (rule 78): `Codes::Serial` and `Codes::Pooled` over one toy give equal
+/// records. Asserts, for `main` resolved once each way in a fresh store: (1) equal record ids
+/// and declares; (2) equal record bytes filed; (3) equal tallies, puts and makes. Pooled goes
+/// through the real relay, the real pool's channels and the worker's make (`make_one`), with the
+/// fake `KeptMakers`; the control of the makers is `a_maker_of_another_start_is_refused`.
+/// Prints "seam: serial and pooled equal: record ..., N bytes filed, M makes".
+#[test]
+fn pooled_codes_equal_serial() {
+    use crate::test_drive::{CodePool, CodeRelay, Lanes, MakersPlant};
+
+    let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let clock = io.need_clock().expect("the simulated world's clock");
+    let heap = blaze_own::testing::heap();
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+
+    // Serial: the make in the test's own turn.
+    let mut serial_store = MemoryStore::new_in(alloc);
+    let mut serial_folder = ToyFolder::default();
+    let (serial_calls, serial_starts) = (Cell::new(0), Cell::new(0));
+    let mut serial = Lazy::new(&cx, ToyFront { calls: &serial_calls, starts: &serial_starts, clean: true, root: MAIN }, &mut serial_folder, &mut serial_store, builder(), alloc);
+    let (serial_record, serial_declares) = match serial.resolve(&symbol_of(MAIN)).expect("main resolves serially") {
+        Resolved::Record { record, declares, .. } => (record.0, symbols(declares)),
+        Resolved::Unknown => panic!("main is unknown"),
+        Resolved::Waiting => panic!("main waited under `Codes::Serial`"),
+    };
+    let serial_tally = serial.tally();
+    drop(serial);
+
+    // Pooled: the make relayed to a worker.
+    let lanes = Lanes::new(core::num::NonZeroUsize::MIN, heap);
+    let pool = CodePool { lanes: &lanes, count: 1, cx: &cx, clock: &clock, procs: crate::job_texts::Procs::None };
+    let now = || blaze_run::Nanos(0);
+    let code = CodeRelay::new(1, &pool, &now, heap.shared(), 0x5eed).expect("a relay for one child");
+    let worker_calls = Cell::new(0);
+    let mut makers = toy_makers(&worker_calls, MakersPlant::None, 0);
+    let mut pooled_store = MemoryStore::new_in(alloc);
+    let mut pooled_folder = ToyFolder::default();
+    let (pooled_calls, pooled_starts) = (Cell::new(0), Cell::new(0));
+    let mut pooled = Lazy::new(&cx, ToyFront { calls: &pooled_calls, starts: &pooled_starts, clean: true, root: MAIN }, &mut pooled_folder, &mut pooled_store, builder(), alloc);
+    pooled.make_by(Codes::Pooled);
+    let (pooled_record, pooled_declares) = resolve_pooled(&mut pooled, &symbol_of(MAIN), &code, lanes.lane(0), &mut makers, &cx, &clock, heap).expect("main resolves pooled");
+    let pooled_tally = pooled.tally();
+    drop(pooled);
+    lanes.close();
+
+    assert_eq!(pooled_record, serial_record, "the pooled make filed another record than the serial one");
+    assert_eq!(pooled_declares, serial_declares, "the pooled record declares other symbols");
+    assert_eq!(pooled_folder.bytes, serial_folder.bytes, "the records filed differ in their bytes");
+    assert_eq!(pooled_tally, serial_tally, "the two runs counted differently");
+    assert_eq!(pooled_store.puts, serial_store.puts, "the two runs put a different number of entries");
+    assert_eq!(pooled_calls.get(), 0, "the pooled parent made an instance in its own turn");
+    assert_eq!(worker_calls.get(), serial_calls.get(), "the worker made a different number of instances than the serial turn");
+    let bytes: usize = serial_folder.bytes.values().map(|record| record.len()).sum();
+    std::println!("seam: serial and pooled equal: record {}, {bytes} bytes filed, {} makes", Hex(&serial_record), worker_calls.get());
+}
+
+/// THE SEAM TEST's control (rule 78, a planted bug): a worker whose makers are found by suite
+/// alone (`MakersPlant::BySuiteAlone`) hands a make of a test starting at `a` the maker made for
+/// `main`'s; `Makers::of` refuses it by name, typed, and never makes with it. Asserts the clean
+/// makers make both, and the planted ones refuse the second with the words of `ANOTHER_START`.
+/// Prints "seam control: a maker of another start refused".
+#[test]
+fn a_maker_of_another_start_is_refused() {
+    use crate::test_drive::{MakersPlant, make_one};
+
+    let heap = blaze_own::testing::heap();
+    let mut scratch: AVec<'static, u8> = blaze_own::Vec::new_in(heap.alloc());
+    for plant in [MakersPlant::None, MakersPlant::BySuiteAlone] {
+        let calls = Cell::new(0);
+        let mut makers = toy_makers(&calls, plant, 0);
+        make_one(&mut makers, &toy_job(MAIN, MAIN), &mut scratch, heap.shared()).expect("main's make");
+        let second = make_one(&mut makers, &toy_job(A, A), &mut scratch, heap.shared());
+        match plant {
+            MakersPlant::None => {
+                second.expect("a make of another test's roots gets a maker of its own");
+                assert_eq!(calls.get(), 2, "the clean makers did not make both");
+            }
+            MakersPlant::BySuiteAlone => {
+                let why = second.expect_err("the planted makers handed a maker of another start, and it was used");
+                assert!(why.walk.as_str().contains("another entry or start"), "the refusal does not name the start: {why}");
+                assert!(why.whole, "the refusal's words were cut");
+                assert_eq!(calls.get(), 1, "the maker of another start made the instance");
+            }
+        }
+    }
+    std::println!("seam control: a maker of another start refused");
+}
+
+/// Rule 20 on a code worker: a make that panics fails alone, typed, naming that it panicked;
+/// the worker forgets the suite's makers; its next make works. Asserts the refusal's words, one
+/// forget, and the next make's entry. Prints "code worker: a panicked make failed alone".
+#[test]
+fn a_panicking_make_fails_alone_and_the_next_one_makes() {
+    use crate::test_drive::{MakersPlant, make_one};
+
+    let heap = blaze_own::testing::heap();
+    let mut scratch: AVec<'static, u8> = blaze_own::Vec::new_in(heap.alloc());
+    let calls = Cell::new(0);
+    let mut makers = toy_makers(&calls, MakersPlant::None, 1);
+    let panicked = make_one(&mut makers, &toy_job(MAIN, MAIN), &mut scratch, heap.shared()).expect_err("a planted panic made an entry");
+    assert!(panicked.walk.as_str().contains("panicked on its code worker"), "the refusal does not say the make panicked: {panicked}");
+    assert_eq!(makers.forgot, 1, "the worker kept a suite's makers past a panic in them");
+    let made = make_one(&mut makers, &toy_job(MAIN, MAIN), &mut scratch, heap.shared()).expect("the make after the panic");
+    assert!(!made.is_empty(), "the make after the panic made nothing");
+    assert_eq!(calls.get(), 1, "the panicked make reached the maker");
+    std::println!("code worker: a panicked make failed alone");
+}

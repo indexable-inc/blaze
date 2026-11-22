@@ -113,7 +113,7 @@ fn a_record_backed_body_reads_data_relative_to_its_calling_file() {
         env: CrateEnv::of(EnvFacts {
             crate_name: "pkg", package: Some(("pkg", "1.0.0")), bin: None,
             seen: SeenRoot::Package, read_folder: "/7/pkg/", build_script: false,
-            script: None, test_or_bench: false, meta: None,
+            script: None, test_or_bench: false, bin_exes: blaze_scope::crate_env::BinNames::NONE, meta: None,
         }, alloc).expect("the reader's package"),
         reads: Cell::new(0),
     };

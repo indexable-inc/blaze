@@ -84,6 +84,7 @@ fn a_body_call_s_read_outside_the_member_is_one_finding_the_item_host_s() {
         build_script: false,
         script: None,
         test_or_bench: false,
+        bin_exes: blaze_scope::crate_env::BinNames::NONE,
         meta: None,
     };
     let env = CrateEnv::of(facts, alloc).unwrap_or_else(|e| panic!("the member's environment: {e:?}"));

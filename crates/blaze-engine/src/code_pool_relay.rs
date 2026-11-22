@@ -475,6 +475,11 @@ pub(crate) enum Plant {
     MakeTwice,
 }
 
+/// The marker blaze-sim's `Plant` extends (blaze_own `planted`): the relay simulation's
+/// `plants!` implements `Plant` over this enum (code_pool_relay_sim.rs).
+#[cfg(test)]
+impl blaze_own::planted::Plants for Plant {}
+
 #[cfg(test)]
 #[path = "code_pool_relay_sim.rs"]
 mod tests;

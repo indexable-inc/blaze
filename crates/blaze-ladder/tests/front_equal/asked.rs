@@ -492,6 +492,11 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         r
     }
 
+    fn foreign_static(&self, key: ItemKey) -> Option<&str> {
+        let r = self.inner.foreign_static(key);
+        self.note(format_args!("foreign_static {key:?}"), |o| write!(o, "{r:?}"));
+        r
+    }
     fn static_item(&self, key: ItemKey) -> Option<StaticItem> {
         let r = self.inner.static_item(key);
         self.note(format_args!("static_item {key:?}"), |o| write!(o, "{r:?}"));

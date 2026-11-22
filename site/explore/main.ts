@@ -220,8 +220,8 @@ async function buildBerkeleyMonoAtlas(): Promise<{ canvas: HTMLCanvasElement; ad
 		const row = Math.floor(i / ATLAS_COLS);
 		ctx.fillText(String.fromCharCode(32 + i), col * CELL_W + CELL_W * 0.5, row * CELL_H + baseline);
 	}
-	// Row 6: Crisp symbols (`·`, `×`, `µ`, `→`, `Δ`, `…`, `—`, `↵`, `↗`)
-	const syms = ['·', '×', 'µ', '→', 'Δ', '…', '—', '↵', '↗'];
+	// Row 6: Crisp symbols (`·`, `×`, `µ`, `→`, `Δ`, `…`, `—`, `↵`, `↗`, `←`)
+	const syms = ['·', '×', 'µ', '→', 'Δ', '…', '—', '↵', '↗', '←'];
 	for (let i = 0; i < syms.length; i++) {
 		ctx.fillText(syms[i], i * CELL_W + CELL_W * 0.5, 6 * CELL_H + baseline);
 	}

@@ -2847,9 +2847,9 @@ impl<'f> BodiesStage<'f> {
 
     /// The plan's notes into the request's lines (engine_body_plan.rs `Outside::lines`): a file
     /// no unit holds, said once, with no engine row; kept from `last` where no body of the file
-    /// was entered.
-    pub(crate) fn plan_lines(&self, outlined: &[Outlined<'_>], unread: &[Name], last: Option<&crate::engine_lines::Last<'_, '_>>, lines: &mut crate::engine_lines::Lines<'_>) {
-        self.outside.lines(self.ran.iter().map(|one| one.file), outlined, unread, last, lines);
+    /// was entered. Its scratch is `frame`'s.
+    pub(crate) fn plan_lines(&self, outlined: &[Outlined<'_>], unread: &[Name], last: Option<&crate::engine_lines::Last<'_, '_>>, lines: &mut crate::engine_lines::Lines<'_>, frame: &Frame) {
+        self.outside.lines(self.ran.iter().map(|one| one.file), outlined, unread, last, lines, frame);
         // The bodies a macro wrote that no task checks: named once a request, never silent.
         // Decided by this request's phase when it read the members' records; else the last
         // request's note stands (nothing it is a function of was read again).
@@ -4568,7 +4568,7 @@ impl<'f> BodiesStage<'f> {
             });
         }
         // A file no unit holds: one note each (engine_body_plan.rs).
-        notes.extend(self.outside.notes(outlined));
+        notes.extend(self.outside.notes(outlined, frame));
         // A body in a file no member holds, or no unit's, has no note of its own and was not
         // checked (never by its time: a simulated clock gives a fast body 0 ns).
         (notes, self.clean.saturating_sub(extra).saturating_sub(self.ownerless).saturating_sub(self.outside.len()))
@@ -4719,7 +4719,7 @@ impl<'f> BodiesStage<'f> {
             body.0 |= held;
             body.1 |= held && refused;
         }
-        self.outside.profile(self.ran.len(), by_view, outlined, into);
+        self.outside.profile(self.ran.len(), by_view, outlined, into, frame);
         let held_bodies = distinct.values().filter(|body| body.0).count();
         let refused_bodies = distinct.values().filter(|body| body.1).count();
         let _ = writeln!(

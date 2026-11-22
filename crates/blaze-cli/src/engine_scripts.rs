@@ -1149,7 +1149,18 @@ impl<'f> ScriptsStage<'f> {
                         for (_, read) in self.fresh.iter().filter(|(by, _)| *by == name) {
                             match self.given.binary_search_by_key(&read.name(), |(cell, _, _)| *cell) {
                                 Ok(at) if self.given[at].1 != read.answer => {
-                                    let subject = bstd::mem::format_in!(frame, "script {name} {:?} {:?}", read.kind, read.path);
+                                    // Named by its package (rule 19); the task name follows for
+                                    // the profile's rows.
+                                    let script = self.runs.binary_search_by_key(&name, |run| run.task.planned.name).ok().and_then(|at| self.runs[at].script);
+                                    let subject = match script {
+                                        Some((_, package, version, side)) => bstd::mem::format_in!(
+                                            frame,
+                                            "the build script of {package} {version} ({side:?} side, {name}) read {:?} {:?}, which changed while it ran",
+                                            read.kind,
+                                            read.path
+                                        ),
+                                        None => bstd::mem::format_in!(frame, "script {name} {:?} {:?}", read.kind, read.path),
+                                    };
                                     return Err(CliError::Changed { paths: subject.as_str().to_owned() });
                                 }
                                 Ok(_) => {}

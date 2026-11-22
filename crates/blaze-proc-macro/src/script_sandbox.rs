@@ -219,11 +219,40 @@ fn disk_node(root: &RealRoot, rel: &str, plant: impl blaze_own::planted::Planted
     if !plant.has(TreePlant::PrefixUnchecked) && !real.starts_with(root.path()) {
         return Err(TreeFault::Outside(PathBuf::from(rel)));
     }
+    // blaze's own folder and cargo's tagged build folder are no part of the checkout a script
+    // sees (blaze_build_script::served): absent, reached by name or through a link. Without
+    // this a run read `.blaze/v2/profile.txt`, which every command rewrites (turso c1851p).
+    if let Some(std::path::Component::Normal(first)) = real.strip_prefix(root.path()).ok().and_then(|inner| inner.components().next())
+        && !served_at_root(root, first.as_encoded_bytes())
+    {
+        return Ok(None);
+    }
     let meta = std::fs::metadata(&real).map_err(|error| fault("stat", error))?;
     if !meta.is_file() && !meta.is_dir() {
         return Err(TreeFault::Special(PathBuf::from(rel)));
     }
     Ok(Some((real, meta)))
+}
+
+/// Whether the root entry `name` of the tree at `root` is served (blaze_build_script::served):
+/// for a `target`, its `CACHEDIR.TAG`'s first bytes are read, as many as the signature has, so
+/// every answer under `target` is a function of the tag (tagging it later moves them).
+fn served_at_root(root: &RealRoot, name: &[u8]) -> bool {
+    use blaze_build_script::served::{self, CACHEDIR_SIGNATURE, CARGO_TARGET, CACHEDIR_TAG, RootName};
+    use std::io::Read as _;
+    if served::root_name(name) != RootName::Target {
+        return served::served_at_root(name, None);
+    }
+    let mut head = [0u8; CACHEDIR_SIGNATURE.len()];
+    let mut len = 0;
+    if let Ok(file) = std::fs::File::open(root.path().join(CARGO_TARGET).join(CACHEDIR_TAG)) {
+        let mut bounded = file.take(head.len() as u64);
+        while let Ok(read @ 1..) = bounded.read(&mut head[len..]) {
+            len += read;
+        }
+        return served::served_at_root(name, Some(&head[..len]));
+    }
+    served::served_at_root(name, None)
 }
 
 pub const NOT_A_FILE: ContentId = ContentId([0xA1; 32]);
@@ -326,6 +355,10 @@ impl Tree {
                         };
                         Ok((entry.file_name().into_encoded_bytes(), kind))
                     }).collect::<Result<Vec<_>, TreeFault>>()?;
+                    // The root's listing names neither folder `disk_node` serves as absent.
+                    if real.as_path() == root.path() {
+                        entries.retain(|(name, _)| served_at_root(root, name));
+                    }
                     entries.sort_by(|a, b| a.0.cmp(&b.0));
                     return Ok(Some(Node::Folder(entries)));
                 }
@@ -1972,3 +2005,5 @@ pub fn dir_tree(root: &RealRoot) -> Tree {
 mod side_refusal_tests;
 #[cfg(all(test, unix))]
 mod escape_tests;
+#[cfg(all(test, unix))]
+mod served_tests;

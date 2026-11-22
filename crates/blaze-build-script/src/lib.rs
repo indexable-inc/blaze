@@ -38,12 +38,14 @@ mod git_objects;
 pub mod host_tools;
 pub mod instr;
 pub mod key;
+pub mod metadata_ask;
 pub mod native;
 pub mod outputs;
 pub mod pinned;
 pub mod probe;
 pub mod probe_ask;
 pub mod probe_check;
+pub mod served;
 pub mod shelf_pins;
 pub mod toolchain;
 
@@ -69,6 +71,8 @@ mod git_attributes_tests;
 mod git_link_tests;
 #[cfg(test)]
 mod git_tests;
+#[cfg(test)]
+mod metadata_ask_tests;
 #[cfg(test)]
 mod probe_ask_tests;
 #[cfg(test)]

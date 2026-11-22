@@ -427,6 +427,10 @@ pub(crate) struct Taken<'f> {
     /// [`sweep::HOME_IGNORE_TEXT`] BEFORE the replays ([`take`]; [`CheckoutChanges::ignored_whole`]
     /// says why that order is the proof).
     blazes_ignored: bool,
+    /// The checkout's root `target` is cargo's (sweep.rs `cargo_target_tagged`), read BEFORE the
+    /// replays: names under it move no row then. A change to the tag itself is never dropped
+    /// ([`own`]) and moves the root's listing ([`Index::reaches`]).
+    target_tagged: bool,
     /// The wall clock as the replays began, kept beside the places ([`Stored`]'s `taken`).
     taken_wall_ns: u64,
     /// The journal helper's place to save beside the checkout unit's (blaze-watch since.rs
@@ -752,6 +756,7 @@ impl<'t> Taken<'t> {
     /// the places. `cx` carries the strategy's span and deadline.
     pub(crate) fn begin(cx: &Cx, root: &Dir<ReadWrite>, clock: &Clock, frame: &'t Frame) -> Result<Taken<'t>, CliError> {
         let blazes_ignored = blazes_folder_ignores_all(cx, root, frame)?;
+        let target_tagged = sweep::cargo_target_tagged(cx, root, frame)?;
         let taken_wall_ns = clock.wall().as_ns();
         Ok(Taken {
             names: Texts::new_in(frame),
@@ -762,6 +767,7 @@ impl<'t> Taken<'t> {
             streams: 0,
             replays: Replays::default(),
             blazes_ignored,
+            target_tagged,
             taken_wall_ns,
             helper_place: None,
             helper: None,
@@ -866,7 +872,8 @@ impl<'t> Taken<'t> {
         if let Some(changes) = &heard {
             // The checkout's alone: blaze's folder in the home is the store's too, written by
             // every request after its replay, so its names say nothing of the edit.
-            let counted = |path: &str| at == Where::Checkout && (!name.is_empty() || !own(path));
+            let target_tagged = self.target_tagged;
+            let counted = |path: &str| at == Where::Checkout && (!name.is_empty() || !own(path, target_tagged));
             let told = changes.files().filter(|it| counted(it)).count() + changes.lost().filter(|(it, _)| counted(it)).count();
             self.events = self.events.saturating_add(u64::try_from(told).unwrap_or(u64::MAX));
             if at == Where::Checkout {
@@ -942,7 +949,8 @@ impl<'t> Taken<'t> {
             let name = self.names.text(unit.name);
             // In the checkout's own folder, blaze's, git's and cargo's are read by no row.
             let skip_own = unit.at == Where::Checkout && name.is_empty();
-            let index = unit.heard.as_ref().and_then(|changes| Index::of(changes.files(), changes.lost(), skip_own, JournalPlant::None, frame));
+            let folders = skip_own.then_some(OwnFolders { target_tagged: self.target_tagged });
+            let index = unit.heard.as_ref().and_then(|changes| Index::of(changes.files(), changes.lost(), folders, JournalPlant::None, frame));
             if skip_own && let (Some(changes), Some(_)) = (&unit.heard, &index) {
                 // `.git` and `target` count here: a script's git fact reads `.git`.
                 let blazes = |path: &str| path.split('/').next() == Some(sweep::HOME);
@@ -1097,10 +1105,20 @@ impl fmt::Display for SweepParts {
     }
 }
 
-/// A name in the checkout's root that no row reads: blaze's folder, git's and cargo's.
-fn own(rel: &str) -> bool {
+/// A name in the checkout's root that no row reads: blaze's folder, git's, and cargo's when its
+/// `target` holds the tag (sweep.rs `not_the_checkouts`). `target` itself and its tag are never
+/// dropped: either changing can move `target` into or out of the root's listing.
+fn own(rel: &str, target_tagged: bool) -> bool {
     let first = rel.split('/').next().unwrap_or(rel);
-    sweep::not_the_checkouts(first)
+    rel != blaze_build_script::served::CARGO_TARGET && rel != sweep::TARGET_TAG && sweep::not_the_checkouts(first, target_tagged)
+}
+
+/// The checkout's own folder as an [`Index`] leaves it out: its root's names no row reads
+/// ([`own`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct OwnFolders {
+    /// The root's `target` is cargo's (sweep.rs `cargo_target_tagged`), read before the replay.
+    pub(crate) target_tagged: bool,
 }
 
 /// One unit's journal as sorted columns, relative to it.
@@ -1115,12 +1133,13 @@ pub(crate) struct Index<'a> {
 impl<'a> Index<'a> {
     /// The index of one unit's answer (sans-IO): `files`, the names told (in any order, a name
     /// possibly twice), and `lost`, the subtrees the journal lost.
-    /// `skip_own`: the unit is the checkout's own folder, where blaze's, git's and cargo's
-    /// folders are read by no row. `None` when the unit's folder itself is lost: every row of
-    /// it is looked at ([`judge`] refuses such a unit first; this keeps the index sound alone).
-    pub(crate) fn of(files: impl Iterator<Item = &'a str>, lost: impl Iterator<Item = (&'a str, Lost)>, skip_own: bool, plant: JournalPlant, frame: &'a Frame) -> Option<Index<'a>> {
+    /// `skip_own`: `Some` when the unit is the checkout's own folder, where blaze's, git's and
+    /// (tagged) cargo's folders are read by no row. `None` when the unit's folder itself is
+    /// lost: every row of it is looked at ([`judge`] refuses such a unit first; this keeps the
+    /// index sound alone).
+    pub(crate) fn of(files: impl Iterator<Item = &'a str>, lost: impl Iterator<Item = (&'a str, Lost)>, skip_own: Option<OwnFolders>, plant: JournalPlant, frame: &'a Frame) -> Option<Index<'a>> {
         let mut index = Index { files: Vec::new_in(frame), children: Vec::new_in(frame), lost: Vec::new_in(frame) };
-        let kept = |path: &str| !skip_own || !own(path);
+        let kept = |path: &str| skip_own.is_none_or(|folders| !own(path, folders.target_tagged));
         for file in files.filter(|it| kept(it)) {
             index.files.push(file);
             let (folder, last) = file.rsplit_once('/').unwrap_or(("", file));
@@ -1158,8 +1177,13 @@ impl<'a> Index<'a> {
             LeafKind::Listing => {
                 let last = rel.rsplit('/').next().unwrap_or(rel);
                 // Only a name the listing hands the layout moves it (sweep.rs `wanted`); a
-                // publish's temporary name beside a source file does not.
-                self.touched(rel, plant) || self.children_of(rel).any(|name| sweep::wanted(last, name, true) || sweep::wanted(last, name, false))
+                // publish's temporary name beside a source file does not. A root `target` is
+                // asked as if untagged (it may be listed), and a change to cargo's tag (or a
+                // lost `target`) moves the root's listing: the tag decides whether it holds
+                // `target`.
+                self.touched(rel, plant)
+                    || self.children_of(rel).any(|name| sweep::wanted(last, name, true, false) || sweep::wanted(last, name, false, false))
+                    || (rel.is_empty() && self.touched(sweep::TARGET_TAG, plant))
             }
             LeafKind::MacroFolder | LeafKind::HomeListing => self.touched(rel, plant) || self.children_of(rel).next().is_some(),
             // A build script's read (engine_script_reads.rs): a file's bytes and a path's stat

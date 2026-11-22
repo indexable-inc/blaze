@@ -166,6 +166,7 @@ fn a_member_macro_s_read_outside_its_dir_is_a_finding_the_same_from_a_kept_answe
         build_script: false,
         script: None,
         test_or_bench: false,
+        bin_exes: crate::crate_env::BinNames::NONE,
         meta: None,
     };
     let env = CrateEnv::of(facts, alloc).unwrap_or_else(|e| panic!("the member's environment: {e:?}"));

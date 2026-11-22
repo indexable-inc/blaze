@@ -2963,7 +2963,7 @@ fn build_from<P: FrontEnd>(
             // The soft-float routines after the instance's own references, as run/make_one.rs
             // binds them: `make_entry` declares those the emitter says the record calls.
             let routines = bound.bind(&mut funcs).map_err(fail)?;
-            let names = InstanceNames { funcs: &funcs, statics: &built.statics, vtables: &vtables, tls: &built.thread_locals };
+            let names = InstanceNames { funcs: &funcs, statics: &built.statics, c_statics: &[], vtables: &vtables, tls: &built.thread_locals };
             // A census walk (`RecordRun::census`): the instance's LIR and names go to the census,
             // which emits them itself; no record is made. The walk goes on to the slots it filled.
             if let Some(seen) = run.seen.as_deref_mut() {

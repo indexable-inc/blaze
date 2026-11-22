@@ -367,7 +367,7 @@ mod tests {
         let mut funcs: AVec<'_, Callee<'_>> = AVec::new_in(alloc);
         let routines = bound.bind(&mut funcs).expect("24 places fit");
         assert_eq!(funcs.len(), COUNT, "one function reference per routine");
-        let names = InstanceNames { funcs: &funcs, statics: &[], vtables: &[], tls: &[] };
+        let names = InstanceNames { funcs: &funcs, statics: &[], c_statics: &[], vtables: &[], tls: &[] };
         let mut declared: AVec<'_, Declared<'_>> = AVec::new_in(alloc);
         let isa = Isa { lse: true, os: Os::MacOs };
         let func = add_f128();

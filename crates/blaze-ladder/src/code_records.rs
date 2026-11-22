@@ -362,6 +362,11 @@ pub struct InstanceNames<'n> {
     /// The statics, by item key: each is named by its symbol (symbols.rs `static_symbol`) and
     /// declared by the entry, so the run's parent can send it before the record.
     pub statics: &'n [ItemKey],
+    /// The statics among `statics` an `extern` block declares, each with its C symbol (its
+    /// `#[link_name]`, else its name): its place is that symbol (bound as a foreign fn is,
+    /// blaze-emit record.rs `target_of`), and the entry does not declare it, since it has no
+    /// record of its own (the Reference, "External blocks", "Statics": no initializer).
+    pub c_statics: &'n [(ItemKey, &'n str)],
     pub vtables: &'n [Symbol],
     /// The thread-locals, by item key: each is named by its symbol (symbols.rs `tls_symbol`)
     /// and declared by the entry, so the run's parent can send its template before the record.
@@ -376,7 +381,10 @@ impl Names for InstanceNames<'_> {
                 Callee::Symbol(symbol) => Named::Symbol(symbol),
                 Callee::C(name) => Named::C(name),
             }),
-            Outside::Static(place) => self.statics.get(at(place)).map(|&s| Named::Symbol(static_symbol(s))),
+            Outside::Static(place) => self.statics.get(at(place)).map(|&s| match self.c_statics.iter().find(|(k, _)| *k == s) {
+                Some(&(_, c)) => Named::C(c),
+                None => Named::Symbol(static_symbol(s)),
+            }),
             Outside::Vtable(place) => self.vtables.get(at(place)).map(|&s| Named::Symbol(s)),
             Outside::Tls(place) => self.tls.get(at(place)).map(|&s| Named::Symbol(tls_symbol(s))),
             Outside::TlsDesc => Some(Named::Symbol(tls_desc_symbol())),
@@ -535,7 +543,10 @@ pub fn make_entry_with_vtables<'a, 'd>(
         out.extend_from_slice(&len(d.name.len(), "declared instance's name")?.to_le_bytes());
         out.extend_from_slice(d.name);
     }
-    put_statics(names.statics, &mut out, alloc).map_err(|what| CodeRecordError::Seal(RecordError::TooLarge { what }))?;
+    // A foreign static has no entry to send (its place is its C symbol): not declared.
+    let mut own: AVec<'_, ItemKey> = Vec::with_capacity_in(names.statics.len(), alloc);
+    own.extend(names.statics.iter().copied().filter(|s| !names.c_statics.iter().any(|(k, _)| k == s)));
+    put_statics(&own, &mut out, alloc).map_err(|what| CodeRecordError::Seal(RecordError::TooLarge { what }))?;
     // Form 5: the thread-locals, in the same keys form (each one's template is sent before the
     // record, as a static is).
     put_statics(names.tls, &mut out, alloc).map_err(|what| CodeRecordError::Seal(RecordError::TooLarge { what }))?;
@@ -600,7 +611,7 @@ pub fn getter_parts() -> KeyParts {
 pub fn make_getter_entry<'a>(isa: Isa, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, CodeRecordError> {
     let func = tls::index::getter(Global).map_err(CodeRecordError::Getter)?;
     let funcs = tls::index::GETTER_IMPORTS.map(Callee::C);
-    let names = InstanceNames { funcs: &funcs, statics: &[], vtables: &[], tls: &[] };
+    let names = InstanceNames { funcs: &funcs, statics: &[], c_statics: &[], vtables: &[], tls: &[] };
     let mut declared: AVec<'_, Declared<'_>> = Vec::new_in(alloc);
     make_entry(func.verified(), &names, crate::front2::builtins_shim::Routines::NONE, &mut declared, isa, alloc)
 }

@@ -260,6 +260,10 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     /// once, sorted by key: the seam's `static_item` and `static_records` (fill.rs
     /// `body_statics`).
     statics: crate::front2::statics::Statics,
+    /// Each static an `extern` block declares that a checked body named, with its C symbol,
+    /// sorted by key: a place at that symbol, never evaluated (fill.rs `foreign_static`; the
+    /// seam's `foreign_static`). Its kind is in `statics.kinds`, its record nowhere.
+    foreign_statics: std::vec::Vec<(ItemKey, Box<str>), Global>,
     /// The object table of each `dyn` principal a checked body's types name, and of every
     /// supertrait under it, made once per trait: the seam's `object_trait` (fill.rs
     /// `body_objects`).
@@ -349,6 +353,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             live: AVec::new_in(alloc),
             const_values: AVec::new_in(alloc),
             statics: crate::front2::statics::Statics { values: Vec::new_in(Global), kinds: Vec::new_in(Global) },
+            foreign_statics: std::vec::Vec::new_in(Global),
             objects: HashMap::new_in(Global),
             recipes: Vec::new_in(Global),
             start: None,

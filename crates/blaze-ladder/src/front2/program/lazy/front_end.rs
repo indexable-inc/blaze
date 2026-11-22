@@ -643,6 +643,10 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
         self.statics.kind(key)
     }
 
+    fn foreign_static(&self, key: ItemKey) -> Option<&str> {
+        self.foreign_static_symbol(key)
+    }
+
     /// The statics made so far, sorted by key: each one's own data record.
     fn static_records(&self) -> &[(ItemKey, DataRecord<Global>)] {
         &self.statics.values

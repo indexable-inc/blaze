@@ -22,7 +22,8 @@
 //! | `CARGO` | unset by rule: there is no cargo binary; a sandboxed macro could not run one (`proc-macro-crate` then reads the package's own manifest) |
 //! | the `[package]` metadata family (`CARGO_PKG_AUTHORS`, `_DESCRIPTION`, `_HOMEPAGE`, `_LICENSE`, `_LICENSE_FILE`, `_README`, `_REPOSITORY`, `_RUST_VERSION`) | set from the manifest (blaze-manifest layout meta.rs, the one table): authors joined by `:`, an inherited key the workspace's, an unstated one `""` as cargo sets it; unknown for a toolchain crate or a graph that does not carry it |
 //! | `CARGO_PRIMARY_PACKAGE` | `1` for a workspace member's crate; unset for a dependency's |
-//! | `CARGO_TARGET_TMPDIR`, `CARGO_BIN_EXE_<name>` | unknown for an integration test or a bench; unset elsewhere |
+//! | `CARGO_TARGET_TMPDIR` | unknown for an integration test or a bench; unset elsewhere |
+//! | `CARGO_BIN_EXE_<name>` | for an integration test or a bench, set for each binary of its package to the guest path of its launcher stub (blaze-scope crate_env.rs `bin_exe`); unset for any other name and elsewhere |
 //! | any other name (`PATH`, `HOME`, `DOCS_RS`, `CARGO_CFG_*`, ..) | unset: a build sees no ambient environment (rule 75), the same answer for anyone |
 //!
 //! The read's answer in a run's read list (`env:NAME`): a set value is the digest of its bytes,
@@ -50,8 +51,9 @@ pub struct PackageEnv {
     set: Vec<(String, String)>,
     /// Each unknown name, sorted, each once, none of them set.
     unknown: Vec<String>,
-    /// Name prefixes every name under which is unknown unless set (`CARGO_BIN_EXE_` for an
-    /// integration test or a bench), sorted, each once.
+    /// Name prefixes every name under which is unknown unless set, sorted, each once. No
+    /// crate's environment gives one today (blaze-cli proc_env.rs passes none); the tests plant
+    /// `CARGO_BIN_EXE_` to prove the mechanism.
     unknown_prefixes: Vec<String>,
 }
 

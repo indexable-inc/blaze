@@ -306,7 +306,7 @@ pub fn ender_parts() -> KeyParts {
 pub fn make_ender_entry<'a>(isa: blaze_emit::Isa, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, CodeRecordError> {
     let func = index::ender(Global).map_err(CodeRecordError::Ender)?;
     let funcs = index::ENDER_IMPORTS.map(Callee::C);
-    let names = InstanceNames { funcs: &funcs, statics: &[], vtables: &[], tls: &[] };
+    let names = InstanceNames { funcs: &funcs, statics: &[], c_statics: &[], vtables: &[], tls: &[] };
     let mut declared: AVec<'_, Declared<'_>> = Vec::new_in(alloc);
     make_entry(func.verified(), &names, crate::front2::builtins_shim::Routines::NONE, &mut declared, isa, alloc)
 }

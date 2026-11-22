@@ -272,8 +272,19 @@ pub(super) fn ctor_world<'n, S: NamesSource<'n>, T>(
     f: impl FnOnce(&BodyWorld<'_, 'n, S>) -> T,
 ) -> Result<T, tc::ResolveError> {
     let refused = tc::ResolveError::Missing(tc::Question::FnSig(ctor));
-    let Some(adt) = store.ctors.get(&ctor).map(|c| c.adt) else { return Err(refused) };
-    let Some(module) = keys.library_in(names, adt) else { return Err(refused) };
+    // A ctor's world is its ADT's. The other bodiless row that builds calls is a trait's method
+    // tabled for a function the language gives (the lang `Clone::clone` at a tuple or a
+    // closure, clone_shim.rs `language_clone`: each field's `clone` is resolved here): its
+    // world is its trait's. Every question it asks is at ground arguments (`Reveal::All`, the
+    // whole program's impls: coherence makes the answer the same in every world).
+    let at = match store.ctors.get(&ctor) {
+        Some(c) => c.adt,
+        None => match keys.origin(ctor) {
+            Some(super::keys::Origin::Member { container, .. }) if store.trait_defs.contains_key(container) => *container,
+            _ => return Err(refused),
+        },
+    };
+    let Some(module) = keys.library_in(names, at) else { return Err(refused) };
     let spell = Spelling::fixed();
     let blocks = super::block_traits::BlockTraits::module(store.tys.alloc());
     let self_ = SelfTy::None;

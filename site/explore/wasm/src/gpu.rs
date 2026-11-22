@@ -846,6 +846,7 @@ fn map_atlas_slot(ch: char) -> Option<usize> {
         '\u{2014}' | '\u{2013}' => Some(102), // —
         '\u{21b5}' => Some(103), // ↵
         '\u{2197}' => Some(104), // ↗
+        '\u{2190}' => Some(105), // ←
         c if (c as u32) > 32 && (c as u32) <= 126 => Some((c as u32 - 32) as usize),
         _ => None,
     }

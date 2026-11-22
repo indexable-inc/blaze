@@ -361,6 +361,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
             build_script: false,
             script: None,
             test_or_bench: false,
+            bin_exes: blaze_scope::crate_env::BinNames::NONE,
             meta: None,
         };
         envs.push(CrateEnv::of(facts, alloc.clone()).map_err(WorldError::Env)?);
@@ -430,6 +431,11 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                 // 0) its directory under the workspace, every fetched package `/package`.
                 let seen = if tree == 0 { SeenRoot::member(dir).map_err(|error| WorldError::MemberDir { package: &unit.name, error })? } else { SeenRoot::Package };
                 let shown_from: &'w str = keep(&shown_from, alloc.clone());
+                let test_or_bench = matches!(unit.kind, UnitKind::IntegrationTest(_) | UnitKind::Bench(_));
+                let bin_exes = match test_or_bench {
+                    true => blaze_scope::crate_env::package_bins(graph, unit.package, unit.crate_name.as_str(), alloc.clone()).map_err(WorldError::Env)?,
+                    false => blaze_scope::crate_env::BinNames::NONE,
+                };
                 let facts = EnvFacts {
                     crate_name: &unit.crate_name,
                     package: Some((&unit.name, &unit.version)),
@@ -441,7 +447,8 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                     read_folder: shown_from,
                     build_script: unit.build_script.is_some(),
                     script: None,
-                    test_or_bench: matches!(unit.kind, UnitKind::IntegrationTest(_) | UnitKind::Bench(_)),
+                    test_or_bench,
+                    bin_exes,
                     meta: graph.meta_of(unit.package).map(|meta| meta.vars()),
                 };
                 (root, shown_from, facts, Origin::Unit(id), unit.kind == UnitKind::ProcMacro, unit.name.as_str(), unit.version.as_str())
@@ -468,6 +475,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                     build_script: false,
                     script: None,
                     test_or_bench: false,
+                    bin_exes: blaze_scope::crate_env::BinNames::NONE,
                     meta: None,
                 };
                 (root, shown_from, facts, Origin::Toolchain(unit), false, c.name, version)

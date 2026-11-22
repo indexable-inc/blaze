@@ -1963,7 +1963,7 @@ fn lines_of<'a, 'f>(
         }
     }
     // The plan's notes (a file no unit holds), no task's: made now, or kept (engine_body_plan.rs).
-    bodies.plan_lines(outlined, unread, last_lines, &mut lines);
+    bodies.plan_lines(outlined, unread, last_lines, &mut lines, frame);
     for target in skipped.targets.iter() {
         let path = outlined.binary_search_by(|one| one.name.cmp(&target.root)).ok().and_then(|at| core::str::from_utf8(&outlined[at].path).ok()).unwrap_or("?");
         let target_name = path.rsplit('/').next().unwrap_or(path).strip_suffix(".rs").unwrap_or(path);

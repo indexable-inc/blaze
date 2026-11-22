@@ -504,8 +504,9 @@ pub fn read_manifest(
 /// One level, from bstd's `Dir::entries` (sorted by name bytes): the folder's own entries and
 /// nothing beneath them. A symbolic link counts as a file and is not followed; a FIFO, a
 /// socket, a device or an entry gone since the listing is no name the layout reads.
-/// blaze's home in the checkout's root (`.blaze/v2/...`): not listed.
-pub const HOME: &str = ".blaze";
+/// blaze's home in the checkout's root (`.blaze/v2/...`): not listed. The rule's one home is
+/// blaze_build_script::served.
+pub const HOME: &str = blaze_build_script::served::BLAZE_FOLDER;
 /// The ignore file of blaze's folder in the checkout's root, made by the first command (print.rs
 /// `ensure_checkout_ignore`) so its state stays out of the checkout's git status.
 pub const HOME_IGNORE: &str = ".blaze/.gitignore";
@@ -515,10 +516,27 @@ pub const HOME_IGNORE_TEXT: &[u8] = b"*\n";
 /// git's entry in the checkout's root: a directory in a clone, a file (`gitdir: ...`) in a
 /// worktree or a submodule. Not listed, whichever it is.
 const GIT: &str = ".git";
-/// cargo's build directory in the checkout's root (`Workspace::default_target_dir`, the root
-/// joined with `target`; `cargo package` leaves it out of a package's files the same way): made
-/// by the first `cargo` run there, no package of the checkout's. Not listed.
-const CARGO_TARGET: &str = "target";
+/// The tag cargo writes in its build directory in the checkout's root
+/// (`Workspace::default_target_dir`, the root joined with `target`): a `target` holding it whose
+/// first bytes are the Cache Directory Tagging signature is cargo's, no package's, and not
+/// listed; any other `target` is a package's folder (blaze_build_script::served, rule 4).
+pub(crate) const TARGET_TAG: &str = "target/CACHEDIR.TAG";
+
+/// Whether the root's `target` is cargo's build directory: the first bytes of
+/// [`TARGET_TAG`], as many as the signature has (blaze_build_script::served::tagged). Read inside
+/// the root's listing, so the listing's row moves when the tag comes or goes. No tag (or no
+/// `target`): `false`.
+pub(crate) fn cargo_target_tagged(cx: &Cx, root: &Dir<ReadWrite>, frame: &Frame) -> Result<bool, CliError> {
+    use blaze_build_script::served::{CACHEDIR_SIGNATURE, tagged};
+    let file = match root.open_read(cx, &Path::new(TARGET_TAG)?) {
+        Ok(file) => file,
+        Err(error) if matches!(error.kind, FsKind::NotFound | FsKind::NotADirectory) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let mut head = Bytes::new_in(frame, "cargo's CACHEDIR.TAG");
+    file.read_at(cx, 0, CACHEDIR_SIGNATURE.len(), &mut head)?;
+    Ok(tagged(Some(head.as_slice())))
+}
 
 pub fn list_dir<'f>(cx: &Cx, root: &Dir<ReadWrite>, dir: &str, frame: &'f Frame) -> Result<Option<Listing<'f>>, CliError> {
     let mut names: Texts<&'f Frame> = Texts::new_in(frame);
@@ -531,6 +549,8 @@ pub fn list_dir<'f>(cx: &Cx, root: &Dir<ReadWrite>, dir: &str, frame: &'f Frame)
             None => return Ok(None),
         },
     };
+    // Only the root's listing asks: only there is a `target` cargo's.
+    let target_tagged = dir.is_empty() && cargo_target_tagged(cx, root, frame)?;
     let last = dir.rsplit('/').next().unwrap_or(dir);
     for i in 0..listed.len() {
         let first = listed.name(i);
@@ -539,7 +559,7 @@ pub fn list_dir<'f>(cx: &Cx, root: &Dir<ReadWrite>, dir: &str, frame: &'f Frame)
             bstd::fs::EntryKind::File | bstd::fs::EntryKind::Link | bstd::fs::EntryKind::Unknown => false,
             bstd::fs::EntryKind::Other | bstd::fs::EntryKind::Gone => continue,
         };
-        if wanted(last, first, is_dir) {
+        if wanted(last, first, is_dir, target_tagged) {
             names.push(first);
             kinds.push(is_dir);
         }
@@ -547,26 +567,29 @@ pub fn list_dir<'f>(cx: &Cx, root: &Dir<ReadWrite>, dir: &str, frame: &'f Frame)
     Ok(Some(Listing { names, dirs: kinds }))
 }
 
-/// Whether `name`, in the checkout's root, is blaze's, git's or cargo's folder: no row is under
-/// it, and the journal's names there move none (journal_sweep.rs).
-pub(crate) fn not_the_checkouts(name: &str) -> bool {
-    name == HOME || name == GIT || name == CARGO_TARGET
+/// Whether `name`, in the checkout's root, is blaze's, git's or cargo's folder (`target` only
+/// when `target_tagged`, [`cargo_target_tagged`]): no row is under it, and the journal's names
+/// there move none (journal_sweep.rs).
+pub(crate) fn not_the_checkouts(name: &str, target_tagged: bool) -> bool {
+    use blaze_build_script::served::{CACHEDIR_SIGNATURE, served_at_root};
+    name == GIT || !served_at_root(name.as_bytes(), target_tagged.then_some(CACHEDIR_SIGNATURE))
 }
 
 /// Whether the layout reads entry `name` of the folder whose last component is `last` (`""`
-/// for the checkout's root).
-pub(crate) fn wanted(last: &str, name: &str, is_dir: bool) -> bool {
+/// for the checkout's root); `target_tagged`: the root's `target` is cargo's
+/// ([`cargo_target_tagged`]).
+pub(crate) fn wanted(last: &str, name: &str, is_dir: bool, target_tagged: bool) -> bool {
     match (last, is_dir) {
         // blaze's own home is derived data, never the checkout's: a first command makes it,
         // and a listing that held it would move the layout under the second (a certificate
-        // missed after every cold run, the probe's "sometimes", 2026-11-16).
-        ("", _) if name == HOME => false,
-        // The same for what git and cargo keep in the root: the listing is in the units'
-        // source (`units_source`), so a worktree (whose `.git` is a file, a clone's a
-        // directory) or a checkout where cargo made `target/` laid out its units again
-        // (`Units` and `UnitGraph` rerun on a second checkout's first check, 2026-11-17). No
-        // manifest is under either: a member glob that matched one named a missing manifest.
-        ("", _) if name == GIT || name == CARGO_TARGET => false,
+        // missed after every cold run, the probe's "sometimes", 2026-11-16). The same for what
+        // git and cargo keep in the root: the listing is in the units' source
+        // (`units_source`), so a worktree (whose `.git` is a file, a clone's a directory) or a
+        // checkout where cargo made `target/` laid out its units again (`Units` and
+        // `UnitGraph` rerun on a second checkout's first check, 2026-11-17). No manifest is
+        // under either: a member glob that matched one named a missing manifest. A `target`
+        // without cargo's tag is a package's folder and listed (rule 4).
+        ("", _) if not_the_checkouts(name, target_tagged) => false,
         ("src", true) => name == "bin",
         ("src", false) => name == "lib.rs" || name == "main.rs",
         ("bin", false) => name.ends_with(".rs"),
@@ -1338,7 +1361,13 @@ mod tests {
         put(&clone, "target/debug/.cargo-lock");
         put(&worktree, ".git");
         let base = source(&worktree, &["Cargo.toml"]);
+        // cargo's `target/` is the one holding its tag; without it, it is a package's folder.
+        assert_ne!(source(&clone, &["Cargo.toml"]), base, "control: an untagged `target/` is listed");
+        clone.publish(&cx, &Path::new(TARGET_TAG).expect("a path"), Content::bytes(b"Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n"), Durable::No).expect("the tag");
         assert_eq!(source(&clone, &["Cargo.toml"]), base, "a clone's `.git` folder and cargo's `target/` moved the units' source");
+        clone.publish(&cx, &Path::new(TARGET_TAG).expect("a path"), Content::bytes(b"Signature: not cargo's\n"), Durable::No).expect("the tag");
+        assert_ne!(source(&clone, &["Cargo.toml"]), base, "control: a tag without the signature lists `target/` again");
+        clone.publish(&cx, &Path::new(TARGET_TAG).expect("a path"), Content::bytes(b"Signature: 8a477f597d28d172789f06886806bc55\n"), Durable::No).expect("the tag");
         assert_ne!(source(&worktree, &["Cargo.toml", "crates/b/Cargo.toml"]), base, "control: a manifest probed absent is in the source");
         put(&worktree, "src/main.rs");
         let with_src = source(&worktree, &["Cargo.toml"]);
@@ -1387,13 +1416,17 @@ mod tests {
     #[test]
     fn target_folders_list_their_rust_files() {
         for folder in ["tests", "examples", "benches"] {
-            assert!(super::wanted(folder, "mm.rs", false), "{folder}/mm.rs is not listed");
-            assert!(!super::wanted(folder, "notes.txt", false), "control: {folder}/notes.txt is listed");
+            assert!(super::wanted(folder, "mm.rs", false, false), "{folder}/mm.rs is not listed");
+            assert!(!super::wanted(folder, "notes.txt", false, false), "control: {folder}/notes.txt is listed");
         }
-        assert!(!super::wanted("m", "mm.rs", false), "control: a package folder lists only lib.rs, main.rs and build.rs");
+        assert!(!super::wanted("m", "mm.rs", false, false), "control: a package folder lists only lib.rs, main.rs and build.rs");
         // A member's build script is found by its file (layout `RawBuild::Auto`); the root
         // package's folder too.
-        assert!(super::wanted("app", "build.rs", false), "a member's build.rs is not listed");
-        assert!(super::wanted("", "build.rs", false), "the root package's build.rs is not listed");
+        assert!(super::wanted("app", "build.rs", false, false), "a member's build.rs is not listed");
+        assert!(super::wanted("", "build.rs", false, false), "the root package's build.rs is not listed");
+        // The root's `target`: cargo's only with its tag; `.blaze` and `.git` never listed.
+        assert!(super::wanted("", "target", true, false) && !super::wanted("", "target", true, true), "a `target` is listed exactly when untagged");
+        assert!(!super::wanted("", ".blaze", true, false) && !super::wanted("", ".git", true, false));
+        assert!(super::wanted("crates", "target", true, true), "control: only the root's `target` can be cargo's");
     }
 }

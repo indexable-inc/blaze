@@ -1190,6 +1190,18 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         {
             return true;
         }
+        // A fn pointer type's parameter name (`fn(_: u8)`, `fn(x: u8)`; the Reference, "Function
+        // pointer types", `MaybeNamedParam`) is no pattern and binds nothing: never a pattern
+        // of the body (quickcheck_macros' `p as fn(_: T) -> bool` left PatId(0) untyped). The
+        // `PARAM` then reads no `V::Pat` (its `pat` is `None`), as a fn pointer's unnamed one.
+        // The nodes nest FN_PTR_TYPE > PARAM_LIST > PARAM > pattern (parser params.rs
+        // `Flavor::FnPointer`).
+        if p.kind == PARAM
+            && matches!(kind, WILDCARD_PAT | IDENT_PAT)
+            && self.frames.len().checked_sub(3).and_then(|i| self.frames.get(i)).is_some_and(|g| g.kind == FN_PTR_TYPE)
+        {
+            return true;
+        }
         let depth = self.frames.len();
         let parent_is_root = depth == self.root_depth.wrapping_add(1);
         match self.mode {

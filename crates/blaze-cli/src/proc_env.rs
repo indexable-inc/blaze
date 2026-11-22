@@ -63,7 +63,7 @@ pub(crate) enum UnitPackageError {
 
 /// The package a proc macro called in the crate with environment `env` is shown: `files`, the
 /// variables [`unit_env`] gives, and the names `env` holds no value for that cargo sets
-/// (`CrateEnv::unknown`, `unknown_prefixes`): the macro's `getenv` of one is refused by name,
+/// (`CrateEnv::unknown`): the macro's `getenv` of one is refused by name,
 /// as `env!` of it is, never answered unset (macro-env-unknown, rule 3). Every other name is
 /// unset. An error names a bug of `env` (a name both set and unknown), or a path variable that
 /// is not where `files` are served (D96).
@@ -73,8 +73,9 @@ pub(crate) fn unit_package(env: &CrateEnv<'_>, files: Files) -> Result<Package, 
     let mut set = std::vec::Vec::with_capacity(vars.len());
     set.extend(vars);
     let unknown = env.unknown().map(String::from).collect();
-    let unknown_prefixes = env.unknown_prefixes().map(String::from).collect();
-    let env = PackageEnv::new(set, unknown, unknown_prefixes).map_err(UnitPackageError::Env)?;
+    // No name of a crate's environment is unknown by a prefix: each `CARGO_BIN_EXE_<name>` of
+    // a test or bench is set (blaze-scope crate_env.rs).
+    let env = PackageEnv::new(set, unknown, Vec::new()).map_err(UnitPackageError::Env)?;
     // D96: the path variables equal where `files` are served, or the package is refused.
     Package::new(files, env).map_err(UnitPackageError::Seen)
 }
@@ -163,6 +164,7 @@ mod tests {
             build_script: false,
             script: None,
             test_or_bench: false,
+            bin_exes: blaze_scope::crate_env::BinNames::NONE,
             meta: None,
         };
         CrateEnv::of(facts, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the environment of {crate_name}: {e}"))

@@ -40,7 +40,7 @@
 
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_own::{AVec, Alloc};
-use blaze_scope::crate_env::{EnvFacts, SeenRoot};
+use blaze_scope::crate_env::{BinNames, EnvFacts, SeenRoot};
 use blaze_scope::resolve::SourceTexts;
 use blaze_unit_graph::PackageMetaVars;
 
@@ -55,8 +55,10 @@ const MAGIC: &[u8; 4] = b"BZCL";
 /// runs, producers, macros); a version-5 list is refused by name, so its unit graph is made
 /// again (D160). 7: each tree row's pack kind ([`TreeRow::kind`], the byte after the origin's),
 /// so a reader of the list knows a tree's kind without mapping its pack; a version-6 list is
-/// refused by name and made again.
-pub const VERSION: u16 = 7;
+/// refused by name and made again. 8: each row's package binaries ([`BIN_EXES_AT`]: an
+/// integration test's `CARGO_BIN_EXE_<name>`); a version-7 list is refused by name and made
+/// again.
+pub const VERSION: u16 = 8;
 /// magic 4, version 2, pad 2, `n` 4, `d` 4, heap 4, sysroot 16, `t` 4, `c` 4, `m` 4, `u` 4,
 /// `q` 4, `p` 4.
 pub const HEADER_LEN: usize = 60;
@@ -100,8 +102,10 @@ const SOURCE: u8 = 2;
 /// subject 32, then the crate's environment facts (blaze-scope `EnvFacts`, from its
 /// `CrateEnv::facts`): crate name 8, package name 8, package version 8, binary name 8, the
 /// member's dir 8, env flags 1 ([`ENV_PACKAGE`] ..), pad 3, then the package's metadata: 8
-/// strings of 8 in `PackageMetaVars::NAMES`' order (all `""` without [`ENV_META`]).
-pub const ROW: usize = 208;
+/// strings of 8 in `PackageMetaVars::NAMES`' order (all `""` without [`ENV_META`]), then the
+/// package's binaries 8 (blaze-scope `BinNames`, joined by `\n`; `""` for a crate not a test or
+/// bench).
+pub const ROW: usize = 216;
 /// Where a row's flags byte is ([`TEST`], [`PUBLIC`] ..): after the key, the five ranges and the
 /// side.
 pub const FLAGS_AT: usize = 65;
@@ -109,6 +113,8 @@ pub const FLAGS_AT: usize = 65;
 const ENV_AT: usize = 100;
 /// Where a row's package metadata starts.
 const META_AT: usize = 144;
+/// Where a row's package binaries are (after the 8 metadata strings).
+const BIN_EXES_AT: usize = META_AT + 64;
 
 /// The crate has a package (name and version at 108, 116); a toolchain crate has none.
 const ENV_PACKAGE: u8 = 1;
@@ -431,6 +437,7 @@ pub fn encode_with<'a>(world: &World<'_>, facts: &dyn ListFacts, alloc: Alloc<'a
         for value in env.meta.unwrap_or_default().values() {
             rows.extend_from_slice(&text(value, &mut heap)?);
         }
+        rows.extend_from_slice(&text(env.bin_exes.joined(), &mut heap)?);
     }
     // The trees past the checkout, in the world's order (tree `k` is pack `k - 1`).
     let (packs, origins) = (world.texts.packs(), world.texts.origins());
@@ -691,10 +698,14 @@ impl<'b> CrateList<'b> {
             if row[64] > 1 {
                 return Err(form("a side that is neither target nor macro", HEADER_LEN + r * ROW + 64));
             }
-            for at in [ENV_AT, ENV_AT + 8, ENV_AT + 16, ENV_AT + 24, ENV_AT + 32].into_iter().chain((0..8).map(|i| META_AT + 8 * i)) {
+            for at in [ENV_AT, ENV_AT + 8, ENV_AT + 16, ENV_AT + 24, ENV_AT + 32].into_iter().chain((0..8).map(|i| META_AT + 8 * i)).chain([BIN_EXES_AT]) {
                 if !text_ok(row, at) {
                     return Err(form("a row's environment string is outside the heap", HEADER_LEN + r * ROW + at));
                 }
+            }
+            // The binaries are checked here once, so the facts read later need no check.
+            if BinNames::new(list.text(row, BIN_EXES_AT)).is_none() {
+                return Err(form("a row's package binaries are not sorted names, each once", HEADER_LEN + r * ROW + BIN_EXES_AT));
             }
             if row[ENV_AT + 40] & !ENV_FLAGS != 0 || row[ENV_AT + 41..ENV_AT + 44] != [0, 0, 0] {
                 return Err(form("a row's environment flags name no fact", HEADER_LEN + r * ROW + ENV_AT + 40));
@@ -939,6 +950,8 @@ impl<'b> CrateList<'b> {
             build_script: flags & ENV_BUILD_SCRIPT != 0,
             script: None,
             test_or_bench: flags & ENV_TEST_OR_BENCH != 0,
+            // Checked a `BinNames` at `open`: the `NONE` arm is never taken.
+            bin_exes: BinNames::new(self.text(row, BIN_EXES_AT)).unwrap_or(BinNames::NONE),
             meta: (flags & ENV_META != 0).then(|| PackageMetaVars::from_values(core::array::from_fn(|i| self.text(row, META_AT + 8 * i)))),
         }
     }
@@ -954,6 +967,7 @@ fn same_facts(a: &EnvFacts<'_>, b: &EnvFacts<'_>) -> bool {
         && a.read_folder.trim_end_matches('/') == b.read_folder.trim_end_matches('/')
         && a.build_script == b.build_script
         && a.test_or_bench == b.test_or_bench
+        && a.bin_exes == b.bin_exes
         && a.meta == b.meta
 }
 

@@ -743,56 +743,87 @@ impl Outside {
         u32::try_from(self.bodies.len()).unwrap_or(u32::MAX)
     }
 
-    /// The files no unit holds, by outline index, sorted, each once.
-    fn files(&self) -> Vec<u32, Global> {
-        let mut files: Vec<u32, Global> = Vec::new_in(Global);
+    /// The outlines no unit holds this request, by index, sorted, each once. In `frame`.
+    fn not_held<'f>(&self, frame: &'f Frame) -> Vec<u32, &'f Frame> {
+        let mut files: Vec<u32, &'f Frame> = Vec::new_in(frame);
         files.extend(self.bodies.iter().filter(|one| one.2 == OutsideIs::FileNotHeld).map(|one| one.1));
         files.sort_unstable();
         files.dedup();
         files
     }
 
-    /// The plan's notes into the request's lines: for each outline with bodies, a block under
-    /// [`note_name`] of its path. A file with a body `entered` this request is decided now (its
-    /// note when no unit holds it, else none); a file with none entered keeps the last request's
-    /// block, if any: its bodies' rows stand, so nothing they read (each unit's items cell,
-    /// [`Holders::cells`]) moved, and the fact is the same. No engine row and no finding carries
-    /// it, so a request with nothing changed is certified and replays it from the lines record
-    /// (engine_check.rs: the certificate prints that record's blocks alone).
+    /// The FILES no unit holds, each by its first outline with bodies, sorted: a file is no
+    /// unit's when every outline of it ([`by_file`]: one a name it is planned by,
+    /// [`outline_at_path`]) is. A file one crate holds by one name and another crate cuts by
+    /// another is checked, by the first, and never noted (D191). In `frame`.
+    fn files<'f>(&self, outlined: &[Outlined<'_>], frame: &'f Frame) -> Vec<u32, &'f Frame> {
+        let not_held = self.not_held(frame);
+        let mut files: Vec<u32, &'f Frame> = Vec::new_in(frame);
+        for file in by_file(outlined, frame).chunk_by(|a, b| a.0 == b.0) {
+            if file.iter().all(|one| not_held.binary_search(&one.1).is_ok()) {
+                files.push(file[0].1);
+            }
+        }
+        files.sort_unstable();
+        files
+    }
+
+    /// The plan's notes into the request's lines: for each FILE with bodies, one block under
+    /// [`note_name`] of its path, decided at its first outline ([`by_file`]: a file named twice
+    /// has two outlines and one note). A file a body of which was `entered` this request is
+    /// decided now (its note when no unit holds it, [`Outside::files`], else none); a file with
+    /// none entered keeps the last request's block, if any: its bodies' rows stand, so nothing
+    /// they read (each unit's items cell, [`Holders::cells`]) moved, and the fact is the same. A
+    /// file named twice whose entered outlines no unit holds and whose others were not entered
+    /// keeps its last block too: the others' rows stand, so the last request's word on the whole
+    /// file is today's. No engine row and no finding carries it, so a request with nothing
+    /// changed is certified and replays it from the lines record (engine_check.rs: the
+    /// certificate prints that record's blocks alone).
     /// `unread`: the notes ([`note_name`]) of the files the request did not read back (the ready
     /// setup's: their outlines stand and no body of them was entered), each its last block, as a
     /// read-back outline with none entered keeps it.
-    pub(crate) fn lines(&self, entered: impl Iterator<Item = u32>, outlined: &[Outlined<'_>], unread: &[Name], last: Option<&crate::engine_lines::Last<'_, '_>>, lines: &mut crate::engine_lines::Lines<'_>) {
+    /// Its scratch is `frame`'s.
+    pub(crate) fn lines(&self, entered: impl Iterator<Item = u32>, outlined: &[Outlined<'_>], unread: &[Name], last: Option<&crate::engine_lines::Last<'_, '_>>, lines: &mut crate::engine_lines::Lines<'_>, frame: &Frame) {
         for name in unread.iter() {
             if let Some(block) = last.and_then(|last| last.block(*name)) {
                 lines.keep(*name, block);
             }
         }
-        let mut entered_files: Vec<u32, Global> = Vec::new_in(Global);
+        let mut entered_files: Vec<u32, &Frame> = Vec::new_in(frame);
         entered_files.extend(entered);
         entered_files.sort_unstable();
         entered_files.dedup();
-        let files = self.files();
-        for (at, one) in outlined.iter().enumerate() {
-            let at = u32::try_from(at).unwrap_or(u32::MAX);
-            if bodies_of(outlined, at) == 0 {
-                continue;
-            }
+        let files = self.files(outlined, frame);
+        let not_held = self.not_held(frame);
+        // Each file by its first outline, in outline order (the order the notes were always
+        // put in): (first, entered any, entered all, every entered one not held).
+        let mut decided: Vec<(u32, bool, bool, bool), &Frame> = Vec::new_in(frame);
+        for file in by_file(outlined, frame).chunk_by(|a, b| a.0 == b.0) {
+            let entered = |one: &(&[u8], u32)| entered_files.binary_search(&one.1).is_ok();
+            let any = file.iter().any(entered);
+            let all = file.iter().all(entered);
+            let none_held = file.iter().filter(|one| entered(*one)).all(|one| not_held.binary_search(&one.1).is_ok());
+            decided.push((file[0].1, any, all, none_held));
+        }
+        decided.sort_unstable_by_key(|one| one.0);
+        for (at, any, all, none_held) in decided.iter().copied() {
+            let Some(one) = outlined.get(at as usize) else { continue };
             let name = note_name(&one.path);
-            if entered_files.binary_search(&at).is_ok() {
-                if files.binary_search(&at).is_ok() {
-                    lines.note(name, crate::engine_lines::Class::Told, std::format!("{}", FileWords { outlined, file: at }).as_bytes());
-                }
-            } else if let Some(block) = last.and_then(|last| last.block(name)) {
+            if any && files.binary_search(&at).is_ok() {
+                lines.note(name, crate::engine_lines::Class::Told, std::format!("{}", FileWords { outlined, file: at }).as_bytes());
+            } else if (!any || (!all && none_held))
+                && let Some(block) = last.and_then(|last| last.block(name))
+            {
                 lines.keep(name, block);
             }
         }
     }
 
-    /// Every file's note, in outline order: what the command's tests read.
-    pub(crate) fn notes(&self, outlined: &[Outlined<'_>]) -> std::vec::Vec<std::string::String, Global> {
+    /// Every file's note, in outline order: what the command's tests read. Its scratch is
+    /// `frame`'s.
+    pub(crate) fn notes(&self, outlined: &[Outlined<'_>], frame: &Frame) -> std::vec::Vec<std::string::String, Global> {
         let mut notes = std::vec::Vec::new_in(Global);
-        for file in self.files().iter() {
+        for file in self.files(outlined, frame).iter() {
             notes.push(std::format!("{}", FileWords { outlined, file: *file }));
         }
         notes
@@ -800,15 +831,16 @@ impl Outside {
 
     /// The plan's line of the profile: the body rows entered, by view ([`RowsByView`]), the
     /// entries no unit's records hold, the files no unit holds and their bodies, and the first
-    /// files' paths (8 at most).
-    pub(crate) fn profile(&self, entered: usize, rows: RowsByView, outlined: &[Outlined<'_>], into: &mut blaze_own::String<&Frame>) {
+    /// files' paths (8 at most). Its scratch is `frame`'s.
+    pub(crate) fn profile(&self, entered: usize, rows: RowsByView, outlined: &[Outlined<'_>], into: &mut blaze_own::String<&Frame>, frame: &Frame) {
         use core::fmt::Write as _;
         let absent = self.bodies.iter().filter(|one| one.2 == OutsideIs::EntryAbsent).count();
-        let in_files = self.bodies.iter().filter(|one| one.2 == OutsideIs::FileNotHeld).count();
-        let files = self.files();
+        let files = self.files(outlined, frame);
+        // A file's bodies once: by its first outline (a file named twice has two).
+        let in_files = self.bodies.iter().filter(|one| one.2 == OutsideIs::FileNotHeld && files.binary_search(&one.1).is_ok()).count();
         let _ = writeln!(
             into,
-            "bodies: {entered} rows entered; {absent} entries of outlines not in their unit's records (cfg or macro); {} file(s) no unit holds under its cfg ({in_files} bodies); base rows {} checked, {} not; view rows {} checked, {} not; undecided at plan time: {}",
+            "bodies: {entered} rows entered; {absent} entries of outlines not in their unit's records (cfg or macro); {} file(s) no unit holds (cfg or macro) ({in_files} bodies); base rows {} checked, {} not; view rows {} checked, {} not; undecided at plan time: {}",
             files.len(),
             rows.base_checked,
             rows.base_not,
@@ -834,7 +866,25 @@ fn bodies_of(outlined: &[Outlined<'_>], file: u32) -> usize {
     outlined.get(file as usize).and_then(|one| one.made.as_ref().ok()).map_or(0, |record| record.parts.iter().filter(|part| matches!((part.name.kind, part.locate), (Kind::BodyCheck, Locate::Source(_)))).count())
 }
 
-/// The note of a file no unit holds.
+/// The outlines with bodies, each with its path, sorted by (path, index): a run of one path is
+/// one file's outlines, one a name it is planned by ([`outline_at_path`]).
+fn by_file<'o, 'f>(outlined: &'o [Outlined<'_>], frame: &'f Frame) -> Vec<(&'o [u8], u32), &'f Frame> {
+    let mut files: Vec<(&'o [u8], u32), &'f Frame> = Vec::with_capacity_in(outlined.len(), frame);
+    for (at, one) in outlined.iter().enumerate() {
+        let at = u32::try_from(at).unwrap_or(u32::MAX);
+        if bodies_of(outlined, at) > 0 {
+            files.push((one.path.as_slice(), at));
+        }
+    }
+    files.sort_unstable();
+    files
+}
+
+/// The note of a file no unit holds. It says what the plan knows: no unit whose module tree
+/// reaches the file has it in its items record (engine_bodies.rs `groups`, the not-held claim),
+/// and the ways that is so, never one of them as the cause (a `#[cfg]` is not known to be it:
+/// a macro call whose expansion did not write its `mod` is the same claim). Each `mod` that
+/// names the file is named, of every outline of it (a file named twice, [`by_file`]).
 struct FileWords<'o, 'h> {
     outlined: &'o [Outlined<'h>],
     file: u32,
@@ -842,21 +892,34 @@ struct FileWords<'o, 'h> {
 
 impl fmt::Display for FileWords<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let path = self.outlined.get(self.file as usize).map_or("?", |one| core::str::from_utf8(&one.path).unwrap_or("?"));
+        let path = self.outlined.get(self.file as usize).map_or(&b"?"[..], |one| one.path.as_slice());
         let count = bodies_of(self.outlined, self.file);
-        // The file whose outline lists this one as a file part: where its `mod` is written.
-        let name = self.outlined.get(self.file as usize).map(|one| one.name);
-        let parent = self.outlined.iter().find(|one| {
-            one.made.as_ref().is_ok_and(|record| record.parts.iter().any(|part| Some(part.name) == name && matches!(part.locate, Locate::File { .. })))
-        });
-        f.write_fmt(format_args!("`{path}`: not part of this build: no unit of its crate holds this file under its cfg ("))?;
-        match parent.map(|one| core::str::from_utf8(&one.path).unwrap_or("?")) {
-            Some(parent) => f.write_fmt(format_args!("the `mod` in `{parent}` that names it"))?,
-            None => f.write_str("the `mod` that names it")?,
+        // The files whose outlines list an outline of this file as a file part (`outlined` is
+        // sorted by name): where each of its `mod`s is written, each once, in outline order.
+        let outlined = self.outlined;
+        let names_it = |one: &Outlined<'_>| {
+            one.made.as_ref().is_ok_and(|record| {
+                record.parts.iter().any(|part| matches!(part.locate, Locate::File { .. }) && outlined.binary_search_by(|o| o.name.cmp(&part.name)).is_ok_and(|at| outlined[at].path.as_slice() == path))
+            })
+        };
+        let text = core::str::from_utf8(path).unwrap_or("?");
+        f.write_fmt(format_args!("`{text}`: no unit checks this file: no unit whose module tree reaches it ("))?;
+        let mut said = 0u32;
+        for (at, one) in outlined.iter().enumerate() {
+            // A parent file named twice (two outlines) is said at its first.
+            if !names_it(one) || outlined[..at].iter().any(|before| before.path == one.path && names_it(before)) {
+                continue;
+            }
+            let parent = core::str::from_utf8(&one.path).unwrap_or("?");
+            f.write_fmt(format_args!("{}the `mod` in `{parent}`", if said == 0 { "by " } else { ", or " }))?;
+            said += 1;
+        }
+        if said == 0 {
+            f.write_str("by the `mod` that names it")?;
         }
         write!(
             f,
-            " is cut in every unit by its cfg: a `#[cfg]` with a feature off, `test` or another target); its {count} body(ies) are no unit's: not checked, and not counted among the items blaze could not check ({RULE})"
+            ") has it in its items record, which is so when a `#[cfg]` on that `mod` or in the file is false in the unit (a feature off, `test`, another target), or when the `mod` is in a macro call whose expansion did not write it; its {count} body(ies) are no unit's: not checked, and not counted among the items blaze could not check ({RULE})"
         )
     }
 }

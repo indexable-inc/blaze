@@ -436,6 +436,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 t
             }
             Def::TyParam(i) => self.mk(TyView::Param(i))?,
+            // `Trait::NAME` that the world did not answer as the trait's fn (a constant, pyo3's
+            // `FunctionArgumentHolder::INIT`): `<_ as Trait>::NAME`.
+            // A name the trait does not declare fails at that segment, after the trait (rustc's
+            // E0425 "cannot find value `x` in trait `Tr`"; suite/path_miss.rs).
+            Def::Trait(tr) => {
+                if self.reads.assoc_item(tr, segs[consumed].name)?.is_none() {
+                    let miss = PathMiss::At { segment: res.consumed, after: Some(PathPrefix::Def(res.def)), why: MissWhy::NotFound };
+                    self.path_miss(at, &names, miss);
+                    return Ok(self.common.err);
+                }
+                return self.trait_relative_value(at, cause, tr, segs[consumed - 1], segs[consumed]);
+            }
             // The Reference, "Paths": a type-relative path may begin at a primitive type; its
             // items are its inherent impls' (core's `impl u32 { .. }`), then traits in scope.
             Def::Prim(p) => self.mk(match p {
@@ -551,6 +563,38 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         self.register_trait(tr, trait_args, self.written_cause(anchor.ty_range, cause))?;
         self.assoc_item_ty(at, cause, item.item, item.kind, trait_args, Some(*seg))
+    }
+
+    /// `Trait::NAME` written without a qualified self type: the trait's own associated item
+    /// `NAME` with `Self` inferred, the path `<_ as Trait>::NAME` (the Reference, "Paths",
+    /// "Paths in expressions": a path to an associated item through its trait; "Qualified
+    /// paths": `<_ as Trait>` leaves the self type to inference; rustc_resolve's
+    /// `TraitItem` resolution of a value path whose prefix is a trait). pyo3 0.29's
+    /// `#[pymethods]` writes `let mut holder = ::pyo3::impl_::extract_argument::
+    /// FunctionArgumentHolder::INIT;` and the later `&mut holder` argument fixes `Self`. The
+    /// trait's arguments are the ones written on its segment (`Tr::<A>::C`), `Self` fresh, or
+    /// all fresh where none are written, as a trait's fn reached this way takes them
+    /// ([`Self::parent_args`]); `Self: Trait` is registered. A name the trait does not declare
+    /// is E0576's class, `NoAssocItem`, never "not found in this scope".
+    fn trait_relative_value(&mut self, at: At, cause: Cause, tr: ItemKey, tseg: Segment, seg: Segment) -> Result<Ty, Stop> {
+        let Some(def) = self.reads.trait_def(tr)? else {
+            self.diag(DiagCode::UnresolvedPath, at, About::path(Some(tseg.name)));
+            return Ok(self.common.err);
+        };
+        let trait_args = if tseg.has_args {
+            let self_ty = self.fresh_generic_args(tr, 0, 1)?;
+            let rest = self.explicit_args(at, Some(tseg), tr, 1, def.generics.saturating_sub(1))?;
+            self.concat(self_ty, rest)?
+        } else {
+            self.fresh_generic_args(tr, 0, def.generics)?
+        };
+        let Some(item) = self.reads.assoc_item(tr, seg.name)? else {
+            let self_ty = if self.ty.list_len(trait_args) == 0 { self.common.err } else { self.ty.list_get(trait_args, 0) };
+            self.diag(DiagCode::NoAssocItem, at, About::found_named(self_ty, seg.name));
+            return Ok(self.common.err);
+        };
+        self.register_trait(tr, trait_args, cause)?;
+        self.assoc_item_ty(at, cause, item.item, item.kind, trait_args, Some(seg))
     }
 
     /// `Self` used as a value in an impl (the Reference, "Paths", "`Self`": "In an

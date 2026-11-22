@@ -28,14 +28,24 @@
 //!   never where the checkout is, nor the folder the host reads its files under (that is
 //!   [`CrateEnv::read_folder`], the caller's path space: two values, two types, rule 76);
 //! - `OUT_DIR` and every `cargo::rustc-env` pair: from the build script's joined outputs record
-//!   (blaze-build-script's `OutputsRef`), a later pair of one name winning as cargo gives it.
+//!   (blaze-build-script's `OutputsRef`), a later pair of one name winning as cargo gives it;
+//! - `CARGO_BIN_EXE_<name>` of an integration test or a bench, one per binary of its package
+//!   (the cargo book: "The absolute path to a binary target's executable. This is only set when
+//!   building an integration test or benchmark"): the GUEST path [`bin_exe`] gives,
+//!   `/target/debug/bin/<package>/<name>`, a constant of the package and the binary, as
+//!   `OUT_DIR` is `/target/debug/build/..` (D96: never where the checkout or the home is, so a
+//!   key holds nothing of the machine, rule 25). The binaries are the package's `UnitKind::Bin`
+//!   units on the target side, which are the ones cargo builds (blaze-unit-graph resolve.rs
+//!   skips a target whose `required-features` are off), so `option_env!` of another name is
+//!   `None` as under cargo. What is at the path is the RUN side's (docs/v2/plan/design/test.md,
+//!   "End-to-end tests", piece 17): a launcher stub for that binary.
 //!
 //! `CARGO` is unset: there is no cargo binary ([`CARGO_ALWAYS`]'s doc).
 //!
 //! A name cargo always sets whose value this build does not know (every `CARGO_PKG_*` of a
 //! toolchain crate, or of a package whose metadata the graph does not carry; `OUT_DIR` of a
-//! unit whose script's record is not joined; `CARGO_TARGET_TMPDIR` and `CARGO_BIN_EXE_<name>`
-//! of a test or bench) is UNKNOWN: a read of it is
+//! unit whose script's record is not joined; `CARGO_TARGET_TMPDIR` of a test or bench) is
+//! UNKNOWN: a read of it is
 //! refused by name ([`EnvUnknown`]), never answered unset (rule 3: an unset answer would turn a
 //! valid program into a false `env!` error, or an `option_env!` into a wrong `None`). Any other
 //! name is unset: blaze's builds see no ambient environment (rule 75), so `env!` of it is the
@@ -87,6 +97,60 @@ pub const CARGO_ALWAYS: &[&str] = &[
     "CARGO_PKG_VERSION_PRE",
 ];
 
+/// Where an integration test or a bench is told binary `name` of its package `package` is
+/// (`CARGO_BIN_EXE_<name>`): the guest path `/target/debug/bin/<package>/<name>`. A package's
+/// name holds no `/` (the cargo book, "The `name` field": alphanumerics, `-` and `_`), nor
+/// does a binary's, so one (package, binary) is one path. The run side serves a launcher stub
+/// there (docs/v2/plan/design/test.md piece 17); this is the one place the path is spelled.
+pub fn bin_exe<'b>(package: &str, name: &str, alloc: Alloc<'b>) -> AString<'b> {
+    let mut out = AString::with_capacity_in(BIN_EXE_ROOT.len() + package.len() + 1 + name.len(), alloc);
+    out.push_str(BIN_EXE_ROOT);
+    out.push_str(package);
+    out.push_str("/");
+    out.push_str(name);
+    out
+}
+
+/// The guest folder under which [`bin_exe`] places each package's binaries.
+pub const BIN_EXE_ROOT: &str = "/target/debug/bin/";
+
+/// The names of a package's binaries, sorted, each once, joined by `\n` (empty: none): what an
+/// integration test or a bench of it is given a `CARGO_BIN_EXE_<name>` for. Made only by
+/// [`BinNames::new`], which checks the form, so every reader may split it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BinNames<'p>(&'p str);
+
+impl<'p> BinNames<'p> {
+    /// No binary.
+    pub const NONE: BinNames<'static> = BinNames("");
+
+    /// `joined` as binary names: `None` unless each is non-empty, holds no `\n` and is after
+    /// the one before it (sorted, each once).
+    pub fn new(joined: &'p str) -> Option<BinNames<'p>> {
+        if joined.is_empty() {
+            return Some(BinNames(joined));
+        }
+        let mut last: Option<&str> = None;
+        for name in joined.split('\n') {
+            if name.is_empty() || last.is_some_and(|before| before >= name) {
+                return None;
+            }
+            last = Some(name);
+        }
+        Some(BinNames(joined))
+    }
+
+    /// The names, sorted.
+    pub fn names(self) -> impl Iterator<Item = &'p str> {
+        self.0.split('\n').filter(|name| !name.is_empty())
+    }
+
+    /// The names joined by `\n`, as [`BinNames::new`] took them.
+    pub fn joined(self) -> &'p str {
+        self.0
+    }
+}
+
 /// The facts a crate's environment is made from ([`CrateEnv::of`]).
 #[derive(Clone, Copy)]
 pub struct EnvFacts<'p> {
@@ -106,9 +170,12 @@ pub struct EnvFacts<'p> {
     pub build_script: bool,
     /// Its outputs record, once joined (`UnitCrates::join_scripts`).
     pub script: Option<OutputsRef<'p>>,
-    /// An integration test or a bench: `CARGO_TARGET_TMPDIR` and `CARGO_BIN_EXE_<name>` are set
-    /// for it, to values this build does not know yet.
+    /// An integration test or a bench: `CARGO_TARGET_TMPDIR` is set for it, to a value this
+    /// build does not know yet, and `CARGO_BIN_EXE_<name>` for each of `bin_exes`.
     pub test_or_bench: bool,
+    /// The package's binaries (read only with `test_or_bench`): each is a
+    /// `CARGO_BIN_EXE_<name>` at [`bin_exe`].
+    pub bin_exes: BinNames<'p>,
     /// The package's `[package]` metadata (`CARGO_PKG_AUTHORS`, ..), when the graph carries it
     /// (`UnitGraph::meta_of`); `None`: those names are [`EnvUnknown`]. Read only with `package`.
     pub meta: Option<PackageMetaVars<'p>>,
@@ -120,9 +187,10 @@ pub struct CrateEnv<'a> {
     vars: AVec<'a, (AString<'a>, AString<'a>)>,
     /// The names cargo sets for this crate whose values are not known, sorted.
     unknown: AVec<'a, &'static str>,
-    /// `CARGO_BIN_EXE_<name>` is set for this crate (an integration test or a bench) but not
-    /// known.
-    bin_exe_unknown: bool,
+    /// An integration test or a bench ([`EnvFacts::test_or_bench`]).
+    test_or_bench: bool,
+    /// Its package's binaries, as [`BinNames`] joins them ([`EnvFacts::bin_exes`]).
+    bin_exes: AString<'a>,
     /// The root the crate sees (D96).
     seen: SeenRoot<'a>,
     /// The package's name and version as the lock gives them (never a build script's
@@ -157,6 +225,9 @@ pub enum CrateEnvError<'a> {
     NotItsUnit { krate: &'a str, at: usize },
     /// No crate at `at`.
     NoCrate { at: usize },
+    /// A binary of the package of test or bench `krate` has a name no `CARGO_BIN_EXE_<name>`
+    /// can be made of (empty, or holding a line break).
+    BinName { krate: &'a str, name: &'a str },
 }
 
 impl fmt::Display for CrateEnvError<'_> {
@@ -168,6 +239,7 @@ impl fmt::Display for CrateEnvError<'_> {
             ),
             CrateEnvError::NotItsUnit { krate, at } => write!(f, "crate `{krate}` (at {at}): not a unit of the graph given"),
             CrateEnvError::NoCrate { at } => write!(f, "no crate at {at} of the list"),
+            CrateEnvError::BinName { krate, name } => write!(f, "crate `{krate}`: its package's binary {name:?} has no name a `CARGO_BIN_EXE_<name>` can be made of (crate_env.rs `package_bins`)"),
         }
     }
 }
@@ -227,6 +299,15 @@ impl<'a> CrateEnv<'a> {
         if let Some(bin) = facts.bin {
             put(&mut given, "CARGO_BIN_NAME", bin);
         }
+        // A toolchain crate (no package) has no test or bench of a package to be given these.
+        if let (true, Some((package, _))) = (facts.test_or_bench, facts.package) {
+            for name in facts.bin_exes.names() {
+                let mut var = AString::with_capacity_in("CARGO_BIN_EXE_".len() + name.len(), alloc);
+                var.push_str("CARGO_BIN_EXE_");
+                var.push_str(name);
+                put(&mut given, var.as_str(), bin_exe(package, name, alloc).as_str());
+            }
+        }
         if let Some(script) = facts.script {
             put(&mut given, "OUT_DIR", script.out_dir());
             for (name, value) in script.env() {
@@ -261,7 +342,8 @@ impl<'a> CrateEnv<'a> {
         Ok(CrateEnv {
             vars,
             unknown,
-            bin_exe_unknown: facts.test_or_bench,
+            test_or_bench: facts.test_or_bench,
+            bin_exes: AString::from_str_in(facts.bin_exes.joined(), alloc),
             seen: facts.seen,
             package,
             read_folder,
@@ -296,7 +378,9 @@ impl<'a> CrateEnv<'a> {
             read_folder: self.read_folder.as_str(),
             build_script: self.build_script,
             script: self.script,
-            test_or_bench: self.bin_exe_unknown,
+            test_or_bench: self.test_or_bench,
+            // Made from a `BinNames` in `of`, copied byte for byte since.
+            bin_exes: BinNames(self.bin_exes.as_str()),
             meta: self.meta_vars(),
         }
     }
@@ -329,7 +413,8 @@ impl<'a> CrateEnv<'a> {
         Ok(CrateEnv {
             vars,
             unknown,
-            bin_exe_unknown: self.bin_exe_unknown,
+            test_or_bench: self.test_or_bench,
+            bin_exes: text(self.bin_exes.as_str()),
             seen,
             package,
             read_folder: text(self.read_folder.as_str()),
@@ -379,7 +464,8 @@ impl<'a> CrateEnv<'a> {
         CrateEnv {
             vars,
             unknown,
-            bin_exe_unknown: self.bin_exe_unknown,
+            test_or_bench: self.test_or_bench,
+            bin_exes: text(self.bin_exes.as_str()),
             seen,
             package,
             read_folder: text(self.read_folder.as_str()),
@@ -398,7 +484,7 @@ impl<'a> CrateEnv<'a> {
         if let Ok(at) = self.vars.binary_search_by(|v| v.0.as_str().cmp(name)) {
             return Ok(Some(self.vars[at].1.as_str()));
         }
-        if self.unknown.binary_search_by(|u| (*u).cmp(name)).is_ok() || (self.bin_exe_unknown && name.starts_with("CARGO_BIN_EXE_")) {
+        if self.unknown.binary_search_by(|u| (*u).cmp(name)).is_ok() {
             return Err(EnvUnknown);
         }
         Ok(None)
@@ -441,17 +527,11 @@ impl<'a> CrateEnv<'a> {
     }
 
     /// Every name cargo sets for this crate whose value this build does not know, sorted: what
-    /// [`CrateEnv::get`] answers [`EnvUnknown`] for, besides [`CrateEnv::unknown_prefixes`].
-    /// A proc macro's sandbox is given these, so its `getenv` of one is refused by name too
-    /// (blaze-proc-macro package_env.rs, macro-env-unknown).
+    /// [`CrateEnv::get`] answers [`EnvUnknown`] for. A proc macro's sandbox is given these, so
+    /// its `getenv` of one is refused by name too (blaze-proc-macro package_env.rs,
+    /// macro-env-unknown). No name is unknown by a prefix: each `CARGO_BIN_EXE_<name>` is set.
     pub fn unknown(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.unknown.iter().copied()
-    }
-
-    /// The name prefixes every unset name under which is [`EnvUnknown`]: `CARGO_BIN_EXE_` for
-    /// an integration test or a bench, none otherwise.
-    pub fn unknown_prefixes(&self) -> impl Iterator<Item = &'static str> {
-        self.bin_exe_unknown.then_some("CARGO_BIN_EXE_").into_iter()
     }
 }
 
@@ -507,6 +587,11 @@ impl<'a> UnitCrates<'a> {
                 if unit.crate_name.as_str() != c.name {
                     return Err(CrateEnvError::NotItsUnit { krate: c.name, at });
                 }
+                let test_or_bench = matches!(unit.kind, UnitKind::IntegrationTest(_) | UnitKind::Bench(_));
+                let bin_exes = match test_or_bench {
+                    true => package_bins(graph, unit.package, c.name, alloc)?,
+                    false => BinNames::NONE,
+                };
                 EnvFacts {
                     crate_name: c.name,
                     package: Some((unit.name.as_str(), unit.version.as_str())),
@@ -518,7 +603,8 @@ impl<'a> UnitCrates<'a> {
                     read_folder: c.shown_from.as_str(),
                     build_script: c.build_script,
                     script: c.script,
-                    test_or_bench: matches!(unit.kind, UnitKind::IntegrationTest(_) | UnitKind::Bench(_)),
+                    test_or_bench,
+                    bin_exes,
                     meta: graph.meta_of(unit.package).map(|meta| meta.vars()),
                 }
             }
@@ -531,11 +617,41 @@ impl<'a> UnitCrates<'a> {
                 build_script: false,
                 script: None,
                 test_or_bench: false,
+                bin_exes: BinNames::NONE,
                 meta: None,
             },
         };
         CrateEnv::of(facts, alloc)
     }
+}
+
+/// The binaries of package `package` in `graph`: its target-side `UnitKind::Bin` units (a
+/// binary whose `required-features` are off has no unit: blaze-unit-graph resolve.rs skips
+/// it, as cargo builds it not), sorted, each once. `krate`: the test or bench asking, named
+/// by the refusal of a name that cannot be one of a list ([`CrateEnvError::BinName`]). The one
+/// source of [`EnvFacts::bin_exes`] for a unit (this file's `env_of`, blaze-world list.rs).
+pub fn package_bins<'a>(graph: &UnitGraph<'_>, package: blaze_manifest::lock::LockId, krate: &'a str, alloc: Alloc<'a>) -> Result<BinNames<'a>, CrateEnvError<'a>> {
+    let mut names: AVec<'_, &str> = AVec::new_in(alloc);
+    for unit in graph.units.iter().filter(|unit| unit.package == package && !unit.for_host) {
+        if let UnitKind::Bin(name) = &unit.kind {
+            names.push(name.as_str());
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    let mut joined = AString::new_in(alloc);
+    for name in names.iter() {
+        if name.is_empty() || name.contains('\n') {
+            let name = blaze_own::Box::leak(AString::from_str_in(name, alloc).into_boxed_str());
+            return Err(CrateEnvError::BinName { krate, name });
+        }
+        if !joined.is_empty() {
+            joined.push_str("\n");
+        }
+        joined.push_str(name);
+    }
+    // Sorted, each once, none empty or holding a `\n`: `BinNames::new`'s form, checked above.
+    Ok(BinNames(blaze_own::Box::leak(joined.into_boxed_str())))
 }
 
 /// `fmt::Write` into an arena string.
@@ -553,7 +669,7 @@ mod tests {
     use blaze_expand::seen::SeenRoot;
     use blaze_own::Alloc;
 
-    use super::{CrateEnv, EnvFacts, EnvUnknown};
+    use super::{BinNames, CrateEnv, EnvFacts, EnvUnknown};
 
     fn facts(version: &'static str) -> EnvFacts<'static> {
         EnvFacts {
@@ -565,8 +681,38 @@ mod tests {
             build_script: false,
             script: None,
             test_or_bench: false,
+            bin_exes: BinNames::NONE,
             meta: None,
         }
+    }
+
+    /// turso cli/tests/non_interactive_exit_code.rs reads `env!("CARGO_BIN_EXE_tursodb")`; the
+    /// check refused it (`Host(HostError { ask: Env, why: Refused })`, 28 notes). The cargo
+    /// book, "Environment variables Cargo sets for crates": "CARGO_BIN_EXE_<name> — The
+    /// absolute path to a binary target's executable. This is only set when building an
+    /// integration test or benchmark." THE CAUSE REMOVED: an integration test is given one
+    /// variable per binary of its package, each the guest path `/target/debug/bin/<package>/
+    /// <name>`, so `env!` of it is answered. TWIN: the crate's facts given back answer it
+    /// equal (a body job's environment, from the crate list). CONTROL: a name no binary has is
+    /// unset (`option_env!` gives `None`, as cargo does), and the package's library (not a
+    /// test) has none, though its binaries are named.
+    #[test]
+    fn an_integration_test_is_told_where_each_binary_of_its_package_is() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let bins = BinNames::new("tursodb\ntursodb-mcp").expect("sorted names");
+        let test = CrateEnv::of(EnvFacts { test_or_bench: true, bin_exes: bins, package: Some(("turso_cli", "0.4.0")), ..facts("0.4.0") }, alloc).expect("a SemVer version");
+        assert_eq!(test.get("CARGO_BIN_EXE_tursodb"), Ok(Some("/target/debug/bin/turso_cli/tursodb")));
+        assert_eq!(test.get("CARGO_BIN_EXE_tursodb-mcp"), Ok(Some("/target/debug/bin/turso_cli/tursodb-mcp")));
+        assert_eq!(super::bin_exe("turso_cli", "tursodb", alloc).as_str(), "/target/debug/bin/turso_cli/tursodb", "the one spelling");
+        let again = CrateEnv::of(test.facts(), alloc).expect("a SemVer version");
+        assert_eq!(again.get("CARGO_BIN_EXE_tursodb"), test.get("CARGO_BIN_EXE_tursodb"), "TWIN: its facts answer it equal");
+        assert_eq!(test.clone_in(alloc).expect("no script record").get("CARGO_BIN_EXE_tursodb-mcp"), test.get("CARGO_BIN_EXE_tursodb-mcp"), "TWIN: a copy answers it equal");
+        assert_eq!(test.get("CARGO_BIN_EXE_sqlite3"), Ok(None), "CONTROL: no binary of that name: unset, never unknown");
+        let lib = CrateEnv::of(EnvFacts { bin_exes: bins, ..facts("0.4.0") }, alloc).expect("a SemVer version");
+        assert_eq!(lib.get("CARGO_BIN_EXE_tursodb"), Ok(None), "CONTROL: a library is no test: none set");
+        assert!(BinNames::new("b\na").is_none() && BinNames::new("a\na").is_none() && BinNames::new("a\n").is_none(), "unsorted, twice, or an empty name is refused");
+        assert_eq!(BinNames::new("").map(|names| names.names().count()), Some(0));
     }
 
     /// CLEAN: `env!("CARGO_PKG_NAME")` and the version's parts are the package's;
@@ -616,7 +762,8 @@ mod tests {
     #[test]
     fn of_its_facts_answers_as_the_original() {
         let alloc = Alloc::global();
-        let given = EnvFacts { bin: Some("tempo"), seen: SeenRoot::member("bin/tempo").expect("a plain dir"), build_script: true, test_or_bench: true, ..facts("1.2.3-rc.1") };
+        let bin_exes = BinNames::new("tempo\nx").expect("sorted names");
+        let given = EnvFacts { bin: Some("tempo"), seen: SeenRoot::member("bin/tempo").expect("a plain dir"), build_script: true, test_or_bench: true, bin_exes, ..facts("1.2.3-rc.1") };
         let env = CrateEnv::of(given, alloc).expect("a SemVer version");
         let again = CrateEnv::of(env.facts(), alloc).expect("a SemVer version");
         for name in super::CARGO_ALWAYS.iter().copied().chain(["CARGO_BIN_NAME", "OUT_DIR", "CARGO_TARGET_TMPDIR", "CARGO_BIN_EXE_x", "UNSET"]) {
@@ -677,13 +824,13 @@ mod tests {
         let alloc = Alloc::global();
         let copy = {
             let dir = std::string::String::from("crates/node");
-            let facts = EnvFacts { seen: SeenRoot::member(dir.as_str()).expect("a plain dir"), test_or_bench: true, ..facts("1.2.0") };
+            let facts = EnvFacts { seen: SeenRoot::member(dir.as_str()).expect("a plain dir"), test_or_bench: true, bin_exes: BinNames::new("node").expect("one name"), ..facts("1.2.0") };
             let env = CrateEnv::of(facts, alloc).expect("a SemVer version");
             env.clone_in(alloc).expect("no script record to open")
         };
         assert_eq!(copy.get("CARGO_MANIFEST_DIR"), Ok(Some("/workspace/crates/node")));
         assert_eq!(copy.get("CARGO_PKG_VERSION_MINOR"), Ok(Some("2")));
-        assert_eq!(copy.get("CARGO_BIN_EXE_node"), Err(EnvUnknown));
+        assert_eq!(copy.get("CARGO_BIN_EXE_node"), Ok(Some("/target/debug/bin/tempo-node/node")));
         assert_eq!(copy.shown_file("src/lib.rs", alloc).as_ref().map(|s| s.as_str()), Some("crates/node/src/lib.rs"));
         assert_eq!(copy.read_folder(), "/7/");
     }

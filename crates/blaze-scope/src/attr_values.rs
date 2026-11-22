@@ -806,6 +806,7 @@ mod tests {
             build_script: false,
             script: None,
             test_or_bench: false,
+            bin_exes: crate::crate_env::BinNames::NONE,
             meta: None,
         };
         let sources = OneCrate { text, env: CrateEnv::of(facts, alloc).unwrap_or_else(|e| panic!("the crate's environment: {e:?}")) };

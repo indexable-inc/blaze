@@ -146,29 +146,21 @@ impl Default for DockTree {
 
 impl DockTree {
     pub fn default_layout() -> Self {
-        let root = DockNode::Split {
+        let root = DockNode::Leaf {
             id: 1,
-            dir: SplitDir::Vertical,
-            ratio: 0.52,
-            a: Box::new(DockNode::Leaf {
-                id: 2,
-                tabs: vec![PaneId::Overview, PaneId::Timeline],
-                active: 0,
-            }),
-            b: Box::new(DockNode::Leaf {
-                id: 3,
-                tabs: vec![
-                    PaneId::CodeMap,
-                    PaneId::FlameGraph,
-                    PaneId::HotSpots,
-                    PaneId::CpuTopology,
-                    PaneId::HeapDiff,
-                    PaneId::Builds,
-                    PaneId::Advisor,
-                    PaneId::IoLocks,
-                ],
-                active: 0,
-            }),
+            tabs: vec![
+                PaneId::Overview,
+                PaneId::HotSpots,
+                PaneId::HeapDiff,
+                PaneId::FlameGraph,
+                PaneId::Timeline,
+                PaneId::CpuTopology,
+                PaneId::IoLocks,
+                PaneId::CodeMap,
+                PaneId::Builds,
+                PaneId::Advisor,
+            ],
+            active: 0,
         };
         Self {
             root,
@@ -216,7 +208,7 @@ impl DockTree {
         node_contains(&self.root, pane)
     }
 
-    /// Focuses `pane` if already docked; if `Inspector` isn't open yet, docks it on the right at 30% width!
+    /// Focuses `pane` if already docked; if not open yet, docks it on the right at 30% width.
     pub fn focus_or_open(&mut self, pane: PaneId) {
         if self.maximized.is_some() && self.maximized != Some(pane) {
             self.maximized = None;
@@ -238,6 +230,47 @@ impl DockTree {
             id: split_id,
             dir: SplitDir::Horizontal,
             ratio: if pane == PaneId::Inspector { 0.70 } else { 0.58 },
+            a: Box::new(old_root),
+            b: Box::new(DockNode::Leaf {
+                id: leaf_id,
+                tabs: vec![pane],
+                active: 0,
+            }),
+        };
+    }
+
+    /// Ensures `pane` is visible in its own split alongside `Overview` (e.g. dragging `HEAP` opens `Heap` below).
+    pub fn open_split(&mut self, pane: PaneId, dir: SplitDir, ratio: f32) {
+        if self.maximized.is_some() && self.maximized != Some(pane) {
+            self.maximized = None;
+        }
+        if let Some(leaf_id) = leaf_containing(&self.root, pane) {
+            let overview_leaf = leaf_containing(&self.root, PaneId::Overview);
+            if Some(leaf_id) != overview_leaf {
+                focus_pane(&mut self.root, pane);
+                return;
+            }
+            if leaf_tab_count(&self.root, leaf_id) > 1 {
+                remove_pane_from_leaf(&mut self.root, leaf_id, pane);
+                prune_empty(&mut self.root);
+            } else {
+                return;
+            }
+        }
+        let split_id = self.alloc_id();
+        let leaf_id = self.alloc_id();
+        let old_root = core::mem::replace(
+            &mut self.root,
+            DockNode::Leaf {
+                id: 0,
+                tabs: Vec::new(),
+                active: 0,
+            },
+        );
+        self.root = DockNode::Split {
+            id: split_id,
+            dir,
+            ratio,
             a: Box::new(old_root),
             b: Box::new(DockNode::Leaf {
                 id: leaf_id,
@@ -453,6 +486,14 @@ fn node_contains(node: &DockNode, pane: PaneId) -> bool {
     match node {
         DockNode::Leaf { tabs, .. } => tabs.contains(&pane),
         DockNode::Split { a, b, .. } => node_contains(a, pane) || node_contains(b, pane),
+    }
+}
+
+fn leaf_containing(node: &DockNode, pane: PaneId) -> Option<u32> {
+    match node {
+        DockNode::Leaf { id, tabs, .. } if tabs.contains(&pane) => Some(*id),
+        DockNode::Leaf { .. } => None,
+        DockNode::Split { a, b, .. } => leaf_containing(a, pane).or_else(|| leaf_containing(b, pane)),
     }
 }
 

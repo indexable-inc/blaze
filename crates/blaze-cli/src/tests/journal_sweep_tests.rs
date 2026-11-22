@@ -121,7 +121,9 @@ impl Tree {
             }
             LeafKind::Listing => {
                 let last = path.rsplit('/').next().unwrap_or(path);
-                let wanted = self.entries(path).map(|entries| entries.into_iter().filter(|(name, dir)| sweep::wanted(last, name, *dir)).collect::<StdVec<_>>());
+                // The fixture's `target` is cargo's, as the replays' index takes it
+                // (`OwnFolders { target_tagged: true }`).
+                let wanted = self.entries(path).map(|entries| entries.into_iter().filter(|(name, dir)| sweep::wanted(last, name, *dir, true)).collect::<StdVec<_>>());
                 std::format!("{wanted:?}")
             }
             LeafKind::ScriptListing => std::format!("{:?}", self.entries(path)),
@@ -263,7 +265,7 @@ fn case(tape: &Tape, plant: JournalPlant) -> Result<(), Broke> {
     for (k, unit) in units.iter().enumerate() {
         let index = match refused[k] {
             true => None,
-            false => Index::of(files_of[k].iter().copied(), lost_of[k].iter().copied(), unit.is_empty(), plant, &frame),
+            false => Index::of(files_of[k].iter().copied(), lost_of[k].iter().copied(), unit.is_empty().then_some(OwnFolders { target_tagged: true }), plant, &frame),
         };
         views.push(UnitView { at: Where::Checkout, name: unit, index });
     }
@@ -334,7 +336,7 @@ fn a_quiet_journal_of_the_root_looks_at_no_row_of_the_checkout() {
     let bytes = table(&rows, &frame);
     let (leaves, _) = Leaves::of(&bytes).expect("the leaf table");
     let looked_with = |told: &'static [&'static str]| {
-        let index = Index::of(told.iter().copied(), core::iter::empty(), true, JournalPlant::None, &frame);
+        let index = Index::of(told.iter().copied(), core::iter::empty(), Some(OwnFolders { target_tagged: true }), JournalPlant::None, &frame);
         let views = [UnitView { at: Where::Checkout, name: "", index }];
         marks(&leaves, &views, JournalPlant::None, &frame)
     };
@@ -404,12 +406,40 @@ fn an_edit_the_answer_omits_is_missed_by_events_alone() {
     let row = (0..leaves.len()).find(|&i| leaves.path(i) == "a/b/y.rs").expect("the slot's row");
     let looked_with = |names: &[&'static str]| {
         assert_eq!(judge(Some(SINCE), Cursor::FsEvents { event: 1_001, volume: [1; 16] }, None, JournalPlant::None), None);
-        let index = Index::of(names.iter().copied(), core::iter::empty(), true, JournalPlant::None, &frame);
+        let index = Index::of(names.iter().copied(), core::iter::empty(), Some(OwnFolders { target_tagged: true }), JournalPlant::None, &frame);
         let views = [UnitView { at: Where::Checkout, name: "", index }];
         marks(&leaves, &views, JournalPlant::None, &frame)[row]
     };
     assert!(!looked_with(&[]), "an omitted edit is not looked at: the gap the periodic audit would close");
     assert!(looked_with(&["a/b/y.rs"]), "CONTROL: the edit named is looked at");
+}
+
+/// cargo's `target` is left out of the root's listing only with its `CACHEDIR.TAG`
+/// (blaze_build_script::served, sweep.rs `wanted`), so the journal must move the root's listing
+/// when the tag (or `target` itself) changes, and drop a name under a tagged `target` only.
+/// CONTROL: a build's name in a tagged `target` moves nothing; under an untagged `target` (a
+/// package's folder) its slot is looked at.
+#[test]
+fn cargos_tag_moves_the_root_listing_and_only_a_tagged_target_is_dropped() {
+    let frame = frame();
+    let rows = [(LeafKind::Listing, 0, ""), (LeafKind::Slot, 0, "target/gen.rs"), (LeafKind::Manifest, 0, "Cargo.toml")];
+    let bytes = table(&rows, &frame);
+    let (leaves, _) = Leaves::of(&bytes).expect("the leaf table");
+    let at = |path: &str| (0..leaves.len()).find(|&i| leaves.path(i) == path).expect("the row");
+    let (listing, slot) = (at(""), at("target/gen.rs"));
+    let looked = |names: &'static [&'static str], lost: &'static [(&'static str, Lost)], target_tagged: bool| {
+        let index = Index::of(names.iter().copied(), lost.iter().copied(), Some(OwnFolders { target_tagged }), JournalPlant::None, &frame);
+        let views = [UnitView { at: Where::Checkout, name: "", index }];
+        let marked = marks(&leaves, &views, JournalPlant::None, &frame);
+        (marked[listing], marked[slot])
+    };
+    for tagged in [true, false] {
+        assert!(looked(&["target/CACHEDIR.TAG"], &[], tagged).0, "the tag's change moves the root's listing (tagged {tagged})");
+        assert!(looked(&[], &[("target", Lost::Rescan)], tagged).0, "a lost `target` moves the root's listing (tagged {tagged})");
+    }
+    assert_eq!(looked(&["target/debug/build/a-0/output"], &[], true), (false, false), "CONTROL: a build's file under a tagged `target` moves nothing");
+    assert_eq!(looked(&["target/gen.rs"], &[], false), (false, true), "an untagged `target` is a package's folder: its file is looked at");
+    assert_eq!(looked(&[], &[], false), (false, false));
 }
 
 /// The profile's line, in D150's form.

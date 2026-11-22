@@ -1819,6 +1819,23 @@ fn lifetime_names(v: &View<'_>, out: &mut Vec<Name, Alloc<'static>>) -> Result<(
 /// `fns`, `preds`, `trait_defs`, `ctors`) are [`Rows`]: each row filed once at an address that
 /// holds until the store drops, filed through `&self`, so a row filed during a check moves no
 /// row an earlier answer of that check holds (front2 rows.rs says why that is sound).
+/// An impl constant whose row waits on a constant leaf being evaluated ([`Store::impl_`]): its
+/// impl, its name, and the leaf's need key (front2/const_inherent.rs `need_key`).
+///
+/// Why (turso's divan, `impl KnownCounterKind { const COUNT: usize = 4; const ALL: [Self;
+/// Self::COUNT] = ..; }`): finding the leaf `KnownCounterKind::COUNT` makes the impl's header,
+/// which made every constant's row, and `ALL`'s type needs `COUNT`'s value, which was being
+/// evaluated: the impl was refused as a cycle, and every head naming `COUNT` with it. The
+/// Reference, "Associated Items": a path to an associated item is the type's path and the
+/// item's name, so finding `COUNT` reads the impls' names, never `ALL`'s type; "Constant
+/// evaluation" refuses only a constant that needs ITSELF.
+#[derive(Clone, Copy, Debug)]
+pub struct ConstWait {
+    pub impl_: LibKey,
+    pub name: Name,
+    pub need: LibKey,
+}
+
 pub struct Store<'n> {
     pub tys: PortableTys<'static>,
     pub maps: Maps,
@@ -1876,6 +1893,10 @@ pub struct Store<'n> {
     /// Each impl's frame its fns' signatures are made in ([`member_fn::MemberFrame`]), kept
     /// when its head is made, by the impl's checker key.
     member_frames: Rows<ItemKey, member_fn::MemberFrame>,
+    /// The impl constants whose row waits on a constant leaf being evaluated now, by the
+    /// constant's key ([`ConstWait`], [`Store::impl_`]); each is made again when its leaf is
+    /// answered ([`Store::remake_waiting`]).
+    const_waits: Rows<ItemKey, ConstWait>,
     /// Each tuple struct's and tuple variant's constructor fn, by the variant's key: made with
     /// its ADT's head.
     pub ctors: Rows<ItemKey, CtorSig>,
@@ -2299,6 +2320,7 @@ impl<'n> Store<'n> {
             fn_gaps: Rows::new_in(alloc),
             gat_const_params: Rows::new_in(alloc),
             member_frames: Rows::new_in(alloc),
+            const_waits: Rows::new_in(alloc),
             ctors: Rows::new_in(alloc),
             statics: Rows::new_in(alloc),
             opaques: Rows::new_in(alloc),
@@ -3987,41 +4009,27 @@ impl<'n> Store<'n> {
         self.container_scopes.insert(ck, Scope::container(&life_names, group, alloc).map_err(Why::Regions)?);
         file_regions(self, ck, filed);
         let mut consts = Vec::with_capacity_in(const_texts.len(), Global);
+        // Every constant's name and key, for the waits below (`ConstWait`).
+        let mut declared_consts = Vec::with_capacity_in(const_texts.len(), Global);
+        declared_consts.extend(const_texts.iter().map(|&(name, mk, ..)| (name, mk)));
         for &(name, mk, text, written_by) in &const_texts {
-            let low = lower(names, key, text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
-            let cv = low.view();
-            let at = Range::new(0, text.len() as u32);
-            let t = cv.head_opt(head::TY).ok_or(Why::Unsupported("an associated constant with no type", at))?;
-            let marks = super::item_site::member_marks(names, key, written_by, text).map_err(MarksLost::why)?;
-            let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks };
-            // An associated constant has no generics of its own: the impl's lifetimes.
-            let mut cp = Preds::new_in(preds.scope.clone());
-            cp.inherit(&preds.clauses);
-            // Its type and regions from one walk ([`const_regions`]), in the members' group
-            // filed above; its inherited clauses' columns are the impl's filed regions'.
-            let member_scope = self.container_scopes.get(&ck).ok_or(Why::Regions(RegionsRefusal::Disagree { what: "an impl's constant whose impl's lifetimes are not filed" }))?;
-            let ra = self.tys.alloc();
-            let (output, filed) = const_regions(&cb, &mut self.tys, &env, &cv, lf::TypeId(t), (self.container_regions.get(&ck).ok_or(ck), member_scope, self.regions.made(ck).map(super::head_record::FiledRegions::arity)), (&cp, self.regions.made(ck).map(super::head_record::FiledRegions::regions)), ra)?;
-            file_regions(self, mk, filed);
-            let mut own_bounds = Vec::new_in(Global);
-            own_bounds.extend_from_slice(&bounds);
-            let mut self_assoc = Vec::with_capacity_in(assoc.len(), Global);
-            self_assoc.extend_from_slice(&assoc);
-            let header = tc::FnPtrHeader::RUST;
-            self.preds.insert(mk, cp);
-            // An impl's constant has its value written (`pub const MAX: Self = !0;` inside
-            // `impl usize`): its body is lowered by `lower_member` like a member fn's, which
-            // is what the constant evaluator reads when another constant names it
-            // (`usize::MAX >> 1`). Read from the text, never assumed.
-            let has_body = cv.head[head::FLAGS] & sig::HAS_BODY != 0;
-            let alloc = *ps.allocator();
-            let row = FnHead {
-                qualifiers: FnQualifiers::of(&cv)?,
-                lib: key, text, text_prefix: None, container: Some(ck), parent: generics, own: 0, declared: 0, self_param: false,
-                header, c_variadic: false, legacy_const_generics: Vec::new_in(alloc), inputs: Vec::new_in(alloc), output, has_body,
-                module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc,
-            };
-            self.fns.insert(mk, row);
+            match self.impl_const(names, key, ck, mk, text, written_by, &env, (&preds.scope, preds.clauses.as_slice()), &bounds, generics) {
+                Ok(()) => {
+                    self.fn_gaps.remove(&mk);
+                }
+                // A constant whose type names a sibling constant being evaluated now (`const
+                // ALL: [Self; Self::COUNT]` while `COUNT` is: the leaf's evaluation made this
+                // header to find `COUNT`) waits for it: the header is made without its row,
+                // which is made when the leaf is answered ([`Store::remake_waiting`]). Any
+                // other refusal (a need first) is the header's, as before.
+                Err(why) => match self.waits_on_running(self_ty, &declared_consts, &why) {
+                    Some(need) => {
+                        self.const_waits.insert(mk, ConstWait { impl_: key, name, need });
+                        self.fn_gaps.insert(mk, why);
+                    }
+                    None => return Err(why),
+                },
+            }
             consts.push((name, mk));
         }
         // The frame its fns' signatures are made in, each by its own want (`Store::member_fn`).
@@ -4032,6 +4040,136 @@ impl<'n> Store<'n> {
         self.impls.insert(ck, ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, fn_vis, consts, polarity });
         self.maps.const_params.insert(key, cs);
         Ok(())
+    }
+
+    /// The row of impl `key`'s associated constant `mk` (checker key of the impl `ck`), whose
+    /// text is `text`: its type and regions walked in the impl's frame `env` (its parameters,
+    /// bounds `bounds`, `Self`, associated types), its clauses the impl's (`scope`, `clauses`),
+    /// filed in `fns` as the checker reads a constant (no inputs, its type the output). Made
+    /// with its impl's head ([`Store::impl_`]), or after it when it waited on a leaf
+    /// ([`Store::remake_waiting`]): one maker, so both rows are the same.
+    #[expect(clippy::too_many_arguments, reason = "one constant's text and its impl's frame")]
+    fn impl_const<S: NamesSource<'n>>(&mut self, names: S, key: LibKey, ck: ItemKey, mk: ItemKey, text: &'n str, written_by: Option<LibKey>, env: &Env<'_>, (scope, clauses): (&Scope, &[PClause]), bounds: &[ParamBound], generics: u32) -> Result<(), Why> {
+        let whole = Range::new(0, 0);
+        let low = lower(names, key, text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
+        let cv = low.view();
+        let at = Range::new(0, text.len() as u32);
+        let t = cv.head_opt(head::TY).ok_or(Why::Unsupported("an associated constant with no type", at))?;
+        let marks = super::item_site::member_marks(names, key, written_by, text).map_err(MarksLost::why)?;
+        let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+        // An associated constant has no generics of its own: the impl's lifetimes.
+        let mut cp = Preds::new_in(scope.clone());
+        cp.inherit(clauses);
+        // Its type and regions from one walk ([`const_regions`]), in the members' group filed
+        // with the impl's head; its inherited clauses' columns are the impl's filed regions'.
+        let member_scope = self.container_scopes.get(&ck).ok_or(Why::Regions(RegionsRefusal::Disagree { what: "an impl's constant whose impl's lifetimes are not filed" }))?;
+        let ra = self.tys.alloc();
+        let (output, filed) = const_regions(&cb, &mut self.tys, env, &cv, lf::TypeId(t), (self.container_regions.get(&ck).ok_or(ck), member_scope, self.regions.made(ck).map(super::head_record::FiledRegions::arity)), (&cp, self.regions.made(ck).map(super::head_record::FiledRegions::regions)), ra)?;
+        file_regions(self, mk, filed);
+        let mut own_bounds = Vec::with_capacity_in(bounds.len(), Global);
+        own_bounds.extend_from_slice(bounds);
+        let mut self_assoc = Vec::with_capacity_in(env.self_assoc.len(), Global);
+        self_assoc.extend_from_slice(env.self_assoc);
+        let mut params = Vec::with_capacity_in(env.params.len(), Global);
+        params.extend_from_slice(env.params);
+        let mut consts = Vec::with_capacity_in(env.consts.len(), Global);
+        consts.extend_from_slice(env.consts);
+        let header = tc::FnPtrHeader::RUST;
+        self.preds.insert(mk, cp);
+        // An impl's constant has its value written (`pub const MAX: Self = !0;` inside `impl
+        // usize`): its body is lowered by `lower_member` like a member fn's, which is what the
+        // constant evaluator reads when another constant names it (`usize::MAX >> 1`). Read
+        // from the text, never assumed.
+        let has_body = cv.head[head::FLAGS] & sig::HAS_BODY != 0;
+        let row = FnHead {
+            qualifiers: FnQualifiers::of(&cv)?,
+            lib: key, text, text_prefix: None, container: Some(ck), parent: generics, own: 0, declared: 0, self_param: false,
+            header, c_variadic: false, legacy_const_generics: Vec::new_in(Global), inputs: Vec::new_in(Global), output, has_body,
+            module: env.module, params, consts, bounds: own_bounds, self_: env.self_, self_assoc,
+        };
+        self.fns.insert(mk, row);
+        Ok(())
+    }
+
+    /// Makes the rows of the impl constants that waited on the leaf `need` ([`ConstWait`]),
+    /// now that it is answered or refused (front2/const_inherent.rs `file`): each in its
+    /// impl's kept frame, by the maker its head used ([`Store::impl_const`]). A row refused now
+    /// is that constant's own gap (`fn_gaps`), by why, never its impl's; one that waits on
+    /// another leaf being evaluated waits on that one.
+    pub(super) fn remake_waiting<S: NamesSource<'n>>(&mut self, names: S, need: LibKey) {
+        let mut due: Vec<(ItemKey, ConstWait), Global> = Vec::new_in(Global);
+        due.extend(self.const_waits.iter().filter(|(_, w)| w.need == need).map(|(k, w)| (*k, *w)));
+        for (mk, w) in due {
+            self.const_waits.remove(&mk);
+            match self.remake_const(names, w, mk) {
+                Ok(()) => {
+                    self.fn_gaps.remove(&mk);
+                }
+                Err(why) => {
+                    let ck = checker_of(w.impl_);
+                    let again = match self.impls.get(&ck) {
+                        Some(h) => self.waits_on_running(h.self_ty, &h.consts, &why),
+                        None => None,
+                    };
+                    if let Some(next) = again {
+                        self.const_waits.insert(mk, ConstWait { need: next, ..w });
+                    }
+                    self.fn_gaps.insert(mk, why);
+                    self.regions.file_refused(mk);
+                }
+            }
+        }
+    }
+
+    /// One waiting constant's row ([`Store::remake_waiting`]), in the frame its impl's head
+    /// kept, as [`Store::member_fn`] makes a fn's signature.
+    fn remake_const<S: NamesSource<'n>>(&mut self, names: S, w: ConstWait, mk: ItemKey) -> Result<(), Why> {
+        let whole = Range::new(0, 0);
+        let ck = checker_of(w.impl_);
+        let lost = |what: &str| Why::Program(format!("impl {ck:?}: its constant {mk:?} waited on a leaf, and {what}").into_boxed_str(), whole);
+        let frame = self.member_frames.get(&ck).ok_or_else(|| lost("its members' frame is not kept"))?;
+        let (module, generics, self_) = (frame.module, frame.generics, frame.self_);
+        let mut params = Vec::with_capacity_in(frame.params.len(), Global);
+        params.extend_from_slice(&frame.params);
+        let mut consts = Vec::with_capacity_in(frame.consts.len(), Global);
+        consts.extend_from_slice(&frame.consts);
+        let mut bounds = Vec::with_capacity_in(frame.bounds.len(), Global);
+        bounds.extend_from_slice(&frame.bounds);
+        let head = self.impls.get(&ck).ok_or_else(|| lost("its impl's head is not made"))?;
+        let mut self_assoc = Vec::with_capacity_in(head.assoc.len(), Global);
+        self_assoc.extend_from_slice(&head.assoc);
+        let clauses = self.preds.get(&ck).ok_or_else(|| lost("its impl's clauses are not filed"))?;
+        let scope = clauses.scope.clone();
+        let mut inherited: Vec<PClause, Global> = Vec::with_capacity_in(clauses.clauses.len(), Global);
+        inherited.extend_from_slice(&clauses.clauses);
+        let env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
+        let ms = members(names, w.impl_).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
+        for m in &ms {
+            if !matches!(m.detail, ItemDetail::Const { .. }) || Name::of(m.name) != w.name {
+                continue;
+            }
+            let low = lower(names, w.impl_, m.text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
+            if low.view().cfg_out() {
+                continue;
+            }
+            return self.impl_const(names, w.impl_, ck, mk, m.text, m.written_by, &env, (&scope, inherited.as_slice()), &bounds, generics);
+        }
+        Err(lost("its impl holds no constant of its name that its crate's cfg keeps"))
+    }
+
+    /// The leaf a constant's refused row waits on: `why` is a constant path's refusal and a
+    /// leaf of the impl's own self type (`self_ty`, a ground ADT) whose name the impl declares
+    /// (`consts`) is being evaluated now (front2/const_inherent.rs `running_sibling`). `None`:
+    /// the refusal is the row's own.
+    fn waits_on_running(&self, self_ty: PTy, consts: &[(Name, ItemKey)], why: &Why) -> Option<LibKey> {
+        if !matches!(why, Why::ConstPath(..)) {
+            return None;
+        }
+        let adt = match self.tys.view().get(self_ty).copied()? {
+            PNode::Adt(k, args) if args.len == 0 => k,
+            _ => return None,
+        };
+        super::const_inherent::running_sibling(&self.maps.inherents, adt, &|n| consts.iter().any(|&(c, _)| c == n))
     }
 
     /// A member fn's head: as [`Store::fn_head`], but a refusal other than a need is filed in

@@ -345,8 +345,47 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             if !self.ty.may_hold(Goal::Trait { trait_: tr, args: parent }, &mut self.reads)? {
                 return Ok(None);
             }
+        } else if !self.impl_clauses_may_hold(c.container, parent, cause)? {
+            return Ok(None);
         }
         Ok(Some((parent, args)))
+    }
+
+    /// Whether every where-clause of the inherent impl `imp` may hold at its arguments `args`:
+    /// an inherent candidate whose impl's clause is decided false does not apply, at this step
+    /// and autoref, and the probe goes on (rustc_hir_typeck method/probe.rs `consider_probe`,
+    /// `InherentImplCandidate`: "Check whether the impl imposes obligations we have to worry
+    /// about", the impl's `clauses_of` registered and any error `ProbeResult::NoMatch`). So the
+    /// "autoref specialization" two crates turso reaches rely on picks as rustc does:
+    /// - pyo3 0.29 impl_/wrap.rs: `converter(&r).wrap(r)` at the step
+    ///   `IntoPyObjectConverter<Result<(), PyErr>>` finds `impl<T: IntoPyObject> ..<T>` and
+    ///   `impl<T: IntoPyObject, E> ..<Result<T, E>>`; only the second's clauses hold, so it is
+    ///   the pick, not E0034 (turso c1851p, 22 errors).
+    /// - miette 7.6 macro_helpers.rs: `OptionalWrapper::<SourceSpan>::new().to_option(&s)` finds
+    ///   `impl<T: IsOption> OptionalWrapper<T>` by value, refused since `SourceSpan: IsOption`
+    ///   does not hold, and then the trait `ToOption for &OptionalWrapper<T>` at the autoref,
+    ///   not E0277 at the inherent pick.
+    /// The answer has three values (end-state.md D193 point 5: unknown is not absent):
+    /// - `Ok(false)`: some clause is decided false. The candidate is dropped (rustc's NoMatch).
+    /// - `Ok(true)`: every clause holds or may hold. A clause still undecided because an
+    ///   argument is a variable keeps the candidate, as rustc's `try_evaluate_obligations`
+    ///   reports only true errors.
+    /// - `Err(Stop)`: a clause the world could not read or answer (`Stop::Need`, or the gap
+    ///   it becomes). This is the candidate kept as unknown. The probe tries clauses only after
+    ///   the candidate's `self` matched the adjusted receiver, and it stops at the first group
+    ///   where any candidate applies. So an unknown candidate is always either the pick or one
+    ///   of an ambiguous group, and the body is "not checked: <the gap>" (a note), never an
+    ///   error and never a quiet drop. A candidate whose `self` does not match is never asked,
+    ///   so the right pick beside it stands (suite/inherent_impl_clauses.rs, `r` and `s`).
+    fn impl_clauses_may_hold(&mut self, imp: ItemKey, args: TyList, cause: Cause) -> Result<bool, Stop> {
+        let wc = self.reads.predicates(imp)?;
+        for &clause in wc.clauses.iter() {
+            let Some(goal) = self.clause_goal(wc.types, clause, args, cause)? else { continue };
+            if !self.ty.may_hold(goal, &mut self.reads)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// `ConfirmContext::confirm`: the inputs after `self` and the output.

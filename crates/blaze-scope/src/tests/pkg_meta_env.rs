@@ -40,6 +40,7 @@ fn facts(seen: SeenRoot<'static>, meta: Option<PackageMetaVars<'static>>) -> Env
         build_script: false,
         script: None,
         test_or_bench: false,
+        bin_exes: crate::crate_env::BinNames::NONE,
         meta,
     }
 }

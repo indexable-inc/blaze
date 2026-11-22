@@ -517,7 +517,7 @@ fn make_shim_entry<'a>(shim: &Shim<'_>, isa: Isa, alloc: Alloc<'a>) -> Result<AV
     let func = b.finish_verified().map_err(|error| CodeRecordError::Shim(blaze_build::BuildError::Lir(error)))?;
     // By place: `lang_start::<T>` at 0, `main` at 1.
     let funcs = [Callee::Symbol(shim.lang_start.symbol), Callee::Symbol(shim.main.symbol)];
-    let names = InstanceNames { funcs: &funcs, statics: &[], vtables: &[], tls: &[] };
+    let names = InstanceNames { funcs: &funcs, statics: &[], c_statics: &[], vtables: &[], tls: &[] };
     let mut declared: AVec<'_, Declared<'_>> = Vec::new_in(alloc);
     declared.push(Declared { tabled: shim.lang_start.tabled, name: shim.lang_start.name });
     declared.push(Declared { tabled: shim.main.tabled, name: shim.main.name });

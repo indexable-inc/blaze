@@ -33,27 +33,49 @@ use blaze_typeck::{ItemKey, LangItem, List, PNode, PTy, PortableTys, ResolveErro
 
 use crate::seam::{FrontEnd, LangRefusal};
 
+/// The record walk's builtin clone of one `Self` ([`language_clone`]): the trait's `clone` (the
+/// row it is tabled at) and what its function does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LanguageClone {
+    /// The lang trait's `clone`.
+    pub clone: ItemKey,
+    /// `true`: `Self`'s bytes copied (a fn item or fn pointer, `Copy` by its type alone).
+    /// `false`: each field through its own `Clone::clone`, in order (a tuple's, a closure's
+    /// captures), clone_fn.rs `clone_fields`.
+    pub bytes: bool,
+}
+
 /// THE RECORD WALK'S BUILTIN CLONE (run/make_one.rs): `called` as `Clone::clone` at a `Self`
-/// the language makes `Copy` by its TYPE alone, a fn item or a fn pointer (the Reference,
-/// "Special types and traits": `Clone` and `Copy` are implemented for "Function item types"
-/// and "Function pointer types"; core's clone.rs `mod impls`: "Implementations that cannot be
-/// described in Rust are implemented in `traits::SelectionContext::copy_clone_conditions()`",
-/// no impl item); its function is a copy of `Self`'s bytes (rustc_mir_transform shim.rs:
-/// `ty::FnDef(..) | ty::FnPtr(..) => builder.copy_shim()`). The clone's item when it is one,
-/// `None` for any other call. Tabled at the trait's `clone` row (made from its head: it has no
-/// body), keyed by its name `clone::<Self>` alone: `Self: Copy` is `true` for every such
-/// `Self`, so the name covers every input (rule 21). A tuple's or a closure's builtin clone
-/// depends on its fields' `Copy` (an impl elsewhere), which the name does not hold: those stay
-/// the selection refusal they are on this path (run.rs `build_from` keys them by
-/// [`Clones::key_args`]).
-pub(crate) fn language_copy_clone<P: FrontEnd>(program: &P, called: Instance, ground: &PortableTys<'_>) -> Option<ItemKey> {
+/// whose `Clone` the LANGUAGE gives (the Reference, "Special types and traits", `Clone`:
+/// "function item types, function pointer types, closures that capture no values or only
+/// values that implement `Clone`, tuples of types that implement `Clone`"; core's clone.rs `mod
+/// impls`: no impl item). Tabled at the trait's `clone` row (made from its head: it has no
+/// body), keyed by its name `clone::<Self>` alone, so what the function does is a function of
+/// `Self`'s TYPE alone (rule 21):
+/// - a fn item or fn pointer: `Copy` by its type, its clone is its bytes (rustc_mir_transform
+///   shim.rs: `ty::FnDef(..) | ty::FnPtr(..) => builder.copy_shim()`);
+/// - a tuple or a closure: FIELD-WISE, each field's own `Clone::clone` instance called in order
+///   (shim.rs `tuple_like_shim`), whatever its fields' `Copy`; each field's call is an instance
+///   of its own, selected by its own name. rustc copies the bytes instead when `Self: Copy`
+///   (shim.rs `build_clone_shim`: `_ if is_copy => builder.copy_shim()`): the two differ only
+///   for a field of a `Copy` type whose hand-written `clone` is not `*self` (core's clone.rs: a
+///   `Copy` type's `Clone` "is equivalent to `*self`", a contract clippy's
+///   `expl_impl_clone_on_copy` checks), and keying the copy by `Self: Copy` would need that
+///   answer in the instance's name (run.rs `build_from` does: [`Clones::key_args`]).
+///
+/// `None` for any other call.
+pub(crate) fn language_clone<P: FrontEnd>(program: &P, called: Instance, ground: &PortableTys<'_>) -> Option<LanguageClone> {
     let clone = program.lang_trait_fn(LangItem::Clone, "clone")?;
     if called.item != clone {
         return None;
     }
     let view = ground.view();
     let &[me] = view.list(called.args).ok()? else { return None };
-    matches!(view.node(me).ok()?, PNode::FnDef(..) | PNode::FnPtr(..)).then_some(clone)
+    match view.node(me).ok()? {
+        PNode::FnDef(..) | PNode::FnPtr(..) => Some(LanguageClone { clone, bytes: true }),
+        PNode::Tuple(_) | PNode::Closure { .. } => Some(LanguageClone { clone, bytes: false }),
+        _ => None,
+    }
 }
 
 /// Why a builtin clone's `Self: Copy` has no answer: the solver's (a record it could not make),

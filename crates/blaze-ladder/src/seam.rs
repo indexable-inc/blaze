@@ -443,6 +443,14 @@ pub trait FrontEnd {
     fn valid_range(&self, key: ItemKey) -> blaze_build::layout::ValidRange;
     fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic>;
     fn static_item(&self, key: ItemKey) -> Option<StaticItem>;
+    /// Static `key`'s C symbol when an `extern` block declares it (the Reference, "External
+    /// blocks", "Statics": no initializer, its storage the foreign object's): its place is
+    /// that symbol and it has no record. `None` for any other static, and from a front end
+    /// that evaluates every static (the old front, the eager program).
+    fn foreign_static(&self, key: ItemKey) -> Option<&str> {
+        let _ = key;
+        None
+    }
     /// Variant `variant` of enum `adt`'s discriminant value, explicit or implicit; `None` is
     /// its index (the old front refuses an explicit discriminant, so it answers `None`).
     fn discriminant(&self, adt: ItemKey, variant: u32) -> Option<i128> {
