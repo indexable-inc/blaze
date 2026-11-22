@@ -12,10 +12,6 @@ harness-native-flecs = { path = "../harness-native-flecs" }
 harness-native-api = { path = "../harness-native-api" }
 harness-native-blaze = { path = "../harness-native-blaze" }
 harness-native-kip = { path = "../harness-native-kip" }
-# Kip's shaders (src/kip.rs): `artifact = "gpu"` is blaze's device build of the crate for `naga-unknown-unknown`, its
-# entries lowered to MSL and the file named in BLAZE_GPU_MSL_HARNESS_NATIVE_SHADERS; `lib = true` also links its host
-# library, whose slots (`mascot::<entry>::<param>`) and types the host binds by. A blaze extension: cargo refuses it.
-harness-native-shaders = { path = "../harness-native-shaders", artifact = "gpu", lib = true }
 harness-native-ui-timeline-api = { path = "../harness-native-ui-timeline-api" }
 tree-sitter-highlight = "0.25"
 tree-sitter-bash = "0.25"
@@ -76,6 +72,7 @@ blaze-sim = { path = "../../blaze-sim" }
 # shader_port.rs checks harness-native-shaders' port of shaders/harness.slang against this crate's structs, binding table
 # and HDR curves until it replaces the Slang.
 gpu = { path = "../../gpu" }
+harness-native-shaders = { path = "../harness-native-shaders" }
 
 [lints.rust]
 unsafe_code = "allow"

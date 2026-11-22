@@ -35,6 +35,7 @@ mod library;
 mod floats;
 mod fold;
 mod keys;
+mod learn;
 mod maps;
 pub use floats::Float;
 #[cfg(target_os = "macos")]
@@ -76,6 +77,7 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/genui.flecs", include_str!("../scene/widgets/genui.flecs")),
     ("scene/widgets/steps.flecs", include_str!("../scene/widgets/steps.flecs")),
     ("scene/widgets/web.flecs", include_str!("../scene/widgets/web.flecs")),
+    ("scene/widgets/learn.flecs", include_str!("../scene/widgets/learn.flecs")),
     ("scene/widgets/palette.flecs", include_str!("../scene/widgets/palette.flecs")),
     ("scene/widgets/picker.flecs", include_str!("../scene/widgets/picker.flecs")),
     ("scene/widgets/theme.flecs", include_str!("../scene/widgets/theme.flecs")),
@@ -183,6 +185,8 @@ const HOVER_DEPTH: usize = 16;
 /// The view's fixed nodes, by entity id.
 struct Ids {
     tree: u64,
+    /// The sidebar's head (hn.SideNew): New, and the courses as rows (src/app/learn.rs fill_side_courses).
+    side_new: u64,
     device: u64,
     /// `hn.LinkNote` over the Archive row: the link's refusal, when it is refused.
     link_note: u64,
@@ -322,6 +326,15 @@ pub struct App {
     tree: sidebar::TreeScroll,
     /// The Archive list's scroll (app/archive.rs).
     arch_scroll: archive::ListScroll,
+    /// Learn, the home: its courses, what was learned, the lesson being walked (app/learn.rs).
+    learn: std::cell::RefCell<learn::Learn>,
+    /// At home: nothing is selected on purpose, so the main card shows Learn and no session is selected in its place.
+    /// True at launch and after the sidebar's Learn row; false once anything is selected.
+    home: bool,
+    /// What the start page asked, sent as the first message of the chat it started once that chat is up.
+    first_message: Option<String>,
+    /// The scroll of a lesson's step (app/learn.rs learn_wheel): the text areas' physics and overlay scroller.
+    learn_scroll: std::cell::RefCell<view::field::FieldScroll>,
     /// The sidebar tree's rows across frames, for folding rows in and away (src/app/fold.rs).
     fold: fold::TreeFold,
     /// The tree has the keyboard (a tree row was pressed): arrows move in it until a pane is pressed or another key typed.
@@ -537,6 +550,8 @@ impl App {
         if let Some(w) = side_w {
             set_side_width(side.entity(), w);
         }
+        // The sidebar's head: New, then the courses (scene/widgets/learn.flecs hn.SideNew).
+        let side_new = side.child("hn.SideNew").id();
         let tree = side.child("hn.Tree");
         let foot = side.child("hn.SideFoot");
         let link_note = foot.child("hn.LinkNote");
@@ -561,6 +576,7 @@ impl App {
         row_menu.set(Laid::default());
         let ids = Ids {
             tree: tree.id(),
+            side_new,
             device: device.id(),
             link_note: link_note.id(),
             main: main.id(),
@@ -640,6 +656,10 @@ impl App {
             headroom: harness_native_render::hdr::Headroom::SDR,
             tree: sidebar::TreeScroll::default(),
             arch_scroll: archive::ListScroll::default(),
+            learn: std::cell::RefCell::new(learn::Learn::default()),
+            home: true,
+            learn_scroll: std::cell::RefCell::new(view::field::FieldScroll::default()),
+            first_message: None,
             fold: fold::TreeFold::default(),
             tree_focus: false,
             press: (0, KeyMods::default()),
@@ -881,14 +901,44 @@ impl App {
         self.sync_marks(up);
         let w = self.world.world_ref();
         let rows = model::tree(w);
+        // Learn's tutor is plumbing, never a row: a session by the name the app gives its tutor (app/learn.rs) is closed
+        // out of the tree, running or ended.
+        // Closed as cmd+W closes (in `closed`, which the marks are kept from every frame): a tag alone would be taken off
+        // again by the next sync and the row would fold away and back for ever.
+        let tutors: Vec<u64> = rows
+            .iter()
+            .map(|(e, _)| *e)
+            .filter(|e| {
+                let o = w.entity_from_id(*e);
+                !o.has(model::Closed::id()) && o.try_cloned::<&model::Name>().is_some_and(|n| n.s.as_str() == learn::TUTOR_NAME)
+            })
+            .collect();
+        let mut closed_some = false;
+        for e in tutors {
+            if let Some(key) = self.key_of(e) {
+                if self.closed.insert(key) {
+                    self.world.entity_from_id(e).add(model::Closed::id());
+                    closed_some = true;
+                }
+            }
+        }
+        if closed_some {
+            self.save_marks();
+        }
+        let w = self.world.world_ref();
         // Once the daemon's first list is in: the object selected when the app last ran, if it is still there.
         if up && let Some(last) = self.restore.take() {
-            if let Some(e) = last.and_then(|sid| self.entity_of(sid)) {
+            // The app opens on Learn, its home: what was selected last is a press away in the sidebar.
+            if let Some(e) = last.and_then(|sid| self.entity_of(sid)).filter(|_| !self.home) {
                 model::select(w, Some(e));
             }
         }
-        // Nothing selected (or it went): the first running object, else the first.
-        if self.restore.is_none() && self.selected().is_none() && !rows.is_empty() {
+        // Anything selected leaves home; home is left only by selecting something.
+        if self.selected().is_some() {
+            self.home = false;
+        }
+        // Nothing selected (or it went), and not at home: the first running object, else the first.
+        if !self.home && self.restore.is_none() && self.selected().is_none() && !rows.is_empty() {
             let first = rows
                 .iter()
                 .find(|(e, _)| self.status_of(*e) == "running")
@@ -906,6 +956,10 @@ impl App {
                 self.chat_started_on(p.sid, p.model.as_deref(), p.effort.as_deref());
                 model::select(w, Some(e));
                 *self.spawned.lock().unwrap() = None;
+                if let Some(text) = self.first_message.take() {
+                    crate::audio::cue("send");
+                    self.link.chat_send(p.sid, &text, Vec::new());
+                }
                 if let Some(why) = self.refuse_spawned.take() {
                     refused = Some((p.sid, why));
                 }
@@ -981,11 +1035,20 @@ impl App {
         if note.entity().try_cloned::<&Size>().is_none_or(|s| s.h != h) {
             note.set(Size { w: Sizing::GROW, h });
         }
+        self.fill_side_courses(self.ids.side_new);
         let tree = View::of(w.entity_from_id(self.ids.tree));
         let hint: HashMap<u64, usize> =
             rows.iter().enumerate().map(|(i, &(e, _))| (e, i)).collect();
         let info: Vec<(String, &str, model::Row)> = model::rows(w)
             .into_iter()
+            // A chat nothing was ever asked in is no row: it says nothing a person would come back to (only the one in
+            // front shows).
+            .filter(|r| {
+                let o = w.entity_from_id(r.e);
+                sel == Some(r.e)
+                    || !o.has(model::ChatMode::id())
+                    || o.try_cloned::<&model::Name>().is_some_and(|n| n.s.as_str() != model::UNTITLED_CHAT)
+            })
             .map(|r| {
                 let prefab = if self.run_of(r.e).is_some() { "hn.RunRow" } else { "hn.ObjRow" };
                 (format!("o{}", r.e), prefab, r)
@@ -995,7 +1058,6 @@ impl App {
         let info = self.fold.merge(info, w);
         let menu_for = self.row_menu_for();
         let me = &*self;
-        let agent_models = self.link.agent_models();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
@@ -1107,16 +1169,6 @@ impl App {
                 // Its name being renamed (chat/rename.rs): the field's words in its place, alone
                 // on the row (no trailing words or shortcut).
                 let edit = me.rename_shown(e);
-                let sid = o.try_cloned::<&model::Object>().map(|ob| ob.id);
-                let (mut profile, profile_tip, profile_effort) = if edit.is_none() && o.has(model::ChatMode::id()) {
-                    let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
-                    let chats = me.chats.borrow();
-                    let transcript = o.try_cloned::<&model::Object>().and_then(|ob| chats.get(&ob.id));
-                    me.sidebar_profile(sid.expect("chat row has no session identity"), transcript, kind, &agent_models, (listed.s.as_str(), listed.effort.as_str()), status != "running")
-                } else {
-                    (String::new(), String::new(), None)
-                };
-                if profile.is_empty() && edit.is_none() && o.has(model::ChatMode::id()) { profile = "Model".to_owned(); }
                 let (name, meta, hint) = match &edit {
                     Some((shown, _)) => (shown.clone(), String::new(), String::new()),
                     None => (name, meta, hint),
@@ -1133,53 +1185,10 @@ impl App {
                             ("hint", Prop::Str(&hint)),
                             ("edit", Prop::Bool(edit.is_some())),
                             ("mark", Prop::Str(mark)),
-                            ("profile", Prop::Str(&profile)),
-                            ("profile_tip", Prop::Str(&profile_tip)),
                         ],
                     ]
                     .concat(),
                 );
-                if let Some(controls) = row.part("profile") {
-                    if let Some(icon) = controls.part("label").and_then(|p| p.part("icon")) {
-                        chat::model_icon(icon, &profile, kind);
-                    }
-                    if let Some(sid) = sid.filter(|_| edit.is_none() && o.has(model::ChatMode::id())) {
-                        let chats = me.chats.borrow();
-                        let empty = model::chat::Transcript::default();
-                        me.fill_sidebar_context(controls, sid, chats.get(&sid).unwrap_or(&empty), kind, busy, o.try_cloned::<&model::AgentContext>());
-                    } else {
-                        for name in ["context", "context_pop"] {
-                            if let Some(slot) = controls.part(name) { view::for_each_of(slot, std::iter::empty::<(&str, &str, ())>(), |_, (), _| {}); }
-                        }
-                    }
-                    let editable = sid.is_some_and(|sid| me.external_session(sid).is_none()) && !profile.is_empty();
-                    for (part, page) in [("label", "model"), ("effort", "effort")] {
-                        if let Some(control) = controls.part(part) {
-                            let active = editable && (part != "effort" || profile_effort.is_some());
-                            if active {
-                                control.add(harness_native_ui_input_api::Pressable::id()).action(&format!("chat:pick:{}:{page}", sid.unwrap()));
-                            } else {
-                                control.entity().remove(harness_native_ui_input_api::Pressable::id());
-                                control.action("");
-                            }
-                            let mut lines = profile_tip.lines();
-                            let model = lines.next().unwrap_or(&profile);
-                            let effort = profile_tip.lines().find(|line| line.ends_with("thinking effort"));
-                            let description = if part == "effort" {
-                                format!("{}\n{model}", effort.unwrap_or("Thinking effort"))
-                            } else {
-                                profile_tip.lines().filter(|line| !line.ends_with("thinking effort")).collect::<Vec<_>>().join("\n")
-                            };
-                            let hint = if !active { "Read-only transcript" } else if part == "effort" { "Click to choose · swipe to adjust" } else { "Choose model · ⌘/" };
-                            control.set(harness_native_ui_input_api::Tooltip { text: format!("{description}\n{hint}").as_str().into() });
-                        }
-                    }
-                }
-                if let Some(slot) = row.part("profile").and_then(|p| p.part("effort")) {
-                    view::for_each_of(slot, profile_effort.map(|level| ("meter", "hn.ChatEffort", level)), |meter, level, _| {
-                        chat::effort_meter(meter, Some(level), tone(w, "ink_muted"), tone(w, "ink_faint"));
-                    });
-                }
                 // Before its title, a mark only when there is something to say, so a quiet tree is plain words: a dot in
                 // the strong ink while its agent works, the same dot in the error ink when it failed (the row's one
                 // colour: its trailing words stay faint), nothing else. The dot is the chat's own running glyph
@@ -1958,27 +1967,30 @@ impl App {
             .unwrap_or_else(|| "claude".to_owned())
     }
 
-    /// cmd+N: a chat of the last agent kind on its last model and effort ([`Self::remember_choice`]). A remembered model
-    /// (or effort) its kind no longer lists is not started on: the chat starts as its agent does by default, its models'
-    /// menu open with an error naming what is gone.
     /// Whether the chat `sid` has had a message sent in it: a chat with none is still the new chat Cmd-N would make.
     pub(in crate::app) fn sent(&self, sid: u64) -> bool {
         self.chats.borrow().get(&sid).is_some_and(|t| t.items.iter().any(|i| matches!(i, model::chat::Item::User { .. })))
     }
 
+    /// cmd+N and the sidebar's New row: the start page, its field taking the keys. One place where everything starts:
+    /// what is typed there is asked of an agent (Return) or made into a course (cmd+Return), src/app/learn.rs.
     pub(in crate::app) fn new_chat(&mut self) {
-        self.relit = self.world.try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
-        // Cmd-N on a chat nothing has been sent in yet does nothing: that chat already is the new one.
-        if let Some(sid) = self.selected().and_then(|e| self.session_of(e))
-            && self.chats.borrow().contains_key(&sid)
-            && !self.sent(sid)
-        {
-            // It says so: the lantern is struck again and the cue plays.
-            crate::audio::cue("fresh");
-            self.poke();
-            return;
-        }
         crate::audio::cue("fresh");
+        self.learn_start_page();
+        self.home = true;
+        self.tree_focus = false;
+        self.select(None);
+        self.poke();
+    }
+
+    /// A chat that opens with `text` asked, of the last agent kind on its last model and effort
+    /// ([`Self::remember_choice`]), the text sent once it is up. A remembered model (or effort) its kind no longer lists
+    /// is not started on: the chat starts as its agent does by default, its models' menu open with an error naming what
+    /// is gone.
+    pub(in crate::app) fn ask_new_chat(&mut self, text: String) {
+        self.relit = self.world.try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
+        self.first_message = Some(text);
+        self.home = false;
         let kind = self.chat_kind();
         let c = self.choice_of(&kind);
         let kept = self.link.agent_models();
@@ -2118,6 +2130,10 @@ impl App {
         }
         self.sync_side_status();
         self.step_archive_scroll();
+        self.step_learn_scroll();
+        // The start page and lessons' web page: opened, sent its screen, its messages done (app/learn/page.rs).
+        let focused = self.learn_focused();
+        self.learn_page(focused);
         self.step_chat_scroll();
         let w = self.world.world_ref();
         if w.try_get::<&Viewport>(|v| (v.w, v.h)) != Some(view) {
@@ -2458,6 +2474,19 @@ impl App {
             } else if a == "chat:tuck" {
                 // Put the window away until the chat in front is done (src/window/mini.rs).
                 self.tuck = self.focused_chat().map(|(_, _, sid)| sid);
+            } else if let Some(sid) = a.strip_prefix("chat:send:").and_then(|s| s.parse::<u64>().ok()) {
+                // The composer's button (hn.ChatSend): what Return does.
+                self.tree_focus = false;
+                self.chat_send_draft(sid);
+            } else if let Some(sid) = a.strip_prefix("chat:stop:").and_then(|s| s.parse::<u64>().ok()) {
+                // The composer's button while a turn runs (hn.ChatSendStop): what Escape does.
+                self.link.chat_interrupt(sid);
+            } else if a == "chat:new" {
+                // The sidebar's New chat row: what cmd+N does.
+                self.new_chat();
+            } else if let Some(what) = a.strip_prefix("learn:") {
+                // A press in Learn, the home (app/learn.rs).
+                self.learn_action(what);
             } else if a == "chat:focus" {
                 self.tree_focus = false;
             } else if a == "pal:close" {

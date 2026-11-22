@@ -9,6 +9,7 @@
 use crate::cdp_ids::{Asker, CdpIds, HostAsk, Incoming};
 use crate::ring::{Copy as Blit, Frames, Gpu, Ring, SLOTS};
 use crate::slots::After;
+use crate::ui::Origin;
 use crate::{handlers, kernel, manage};
 use cef::*;
 use crossbeam_channel::{Receiver, Sender};
@@ -148,7 +149,21 @@ pub struct Page {
     frames: Frames,
     /// Why it is closing, once something closed it.
     closing: Option<String>,
+    /// A UI view's lock and first url (README.md, "UI views"); None for every other view.
+    ui: Option<UiPage>,
 }
+
+/// What a UI view keeps: the url it was opened at (loaded once its binding is in, named in its errors) and that url's
+/// origin, which it never leaves.
+struct UiPage {
+    url: String,
+    origin: Origin,
+    /// The host has loaded `url` (its binding is in): until then nothing may navigate the view.
+    loaded: bool,
+}
+
+/// The binding a UI view's documents get: `window.harnessPost(string)`.
+pub const BINDING: &str = "harnessPost";
 
 pub struct Host {
     gpu: Gpu,
@@ -234,6 +249,17 @@ impl Host {
         self.pages.values().map(|p| p.info.clone()).collect() // alloc: one list per change, sent at once
     }
 
+    /// The views a socket client sees: all but the UI views, which are the app's alone.
+    fn kernel_views(&self) -> Vec<ViewInfo> {
+        self.pages.values().filter(|p| p.ui.is_none()).map(|p| p.info.clone()).collect() // alloc: one list per request
+    }
+
+    /// Why connection `conn` may not `act` on view `view`: it is a UI view (None: it may, or there is no such view).
+    fn kernel_refused(&self, conn: u64, act: &str, view: u64) -> Option<String> {
+        let ui = self.pages.get(&view)?.ui.as_ref()?;
+        Some(format!("connection {conn} cannot {act} view {view} ({}): it is a UI view, the app's own page", ui.url))
+    }
+
     fn views_changed(&mut self) {
         let views = self.views();
         self.to_app(&AppDown::Views { views });
@@ -272,6 +298,8 @@ fn app_kind(msg: &AppDown) -> &'static str {
         AppDown::Opened { .. } => "opened",
         AppDown::Closed { .. } => "closed",
         AppDown::Extensions { .. } => "extensions",
+        AppDown::Message { .. } => "a UI view's message",
+        AppDown::Link { .. } => "a UI view's link",
         AppDown::Error { .. } => "an error",
     }
 }
@@ -369,6 +397,8 @@ pub struct OpenSpec {
     pub keep: bool,
     pub attached: BTreeSet<u64>,
     pub waiter: Option<WaiterSpec>,
+    /// A UI view (the app's `AppUp::Open { ui: true }`).
+    pub ui: bool,
 }
 
 /// Who an opened view answers.
@@ -380,13 +410,19 @@ pub enum WaiterSpec {
 /// Open a view: the page goes in the table first (CEF asks for its rect while it creates the browser), then the
 /// browser, its DevTools observer, and the `Target.getTargetInfo` whose answer gives the waiter its `Opened`.
 ///
+/// A UI view's browser is made at its url, and its DevTools session is sent `Runtime.enable` and
+/// `Runtime.addBinding { name: "harnessPost" }` at once; the binding's answer loads its url again ([`devtools`]). So
+/// the binding is in that document before any of its script runs. The first load may have no binding: the page draws
+/// nothing without it (crates/harness/web), and the reload replaces it.
+///
 /// # Errors
-/// CEF refused the browser or the observer, naming the view and the url. The waiter is not answered (the caller
-/// answers the error).
+/// CEF refused the browser or the observer, naming the view and the url; a UI view at a url that is not `file://`,
+/// `http://` or `https://`. The waiter is not answered (the caller answers the error).
 pub fn open(spec: OpenSpec) -> Result<u64, String> {
     if spec.size[0] == 0 || spec.size[1] == 0 {
         return Err(format!("a view {}x{} points at {} is empty", spec.size[0], spec.size[1], spec.url));
     }
+    let ui = if spec.ui { Some(UiPage { url: spec.url.clone(), origin: Origin::of(&spec.url)?, loaded: false }) } else { None };
     let url = spec.url.clone();
     let view = with("opening a view", |h| {
         if let Some(why) = &h.quitting {
@@ -404,7 +440,16 @@ pub fn open(spec: OpenSpec) -> Result<u64, String> {
             Page {
                 browser: None,
                 _observer: None,
-                info: ViewInfo { view, url: spec.url.clone(), owner: spec.owner.clone(), size: spec.size, scale: DEFAULT_SCALE, loading: true, ..Default::default() },
+                info: ViewInfo {
+                    view,
+                    url: spec.url.clone(),
+                    owner: spec.owner.clone(),
+                    size: spec.size,
+                    scale: DEFAULT_SCALE,
+                    loading: true,
+                    ui: ui.is_some(),
+                    ..Default::default()
+                },
                 opener: spec.opener,
                 keep: spec.keep,
                 attached: spec.attached,
@@ -412,11 +457,16 @@ pub fn open(spec: OpenSpec) -> Result<u64, String> {
                 watched: false,
                 frames: Frames::default(),
                 closing: None,
+                ui,
             },
         );
         Ok(view)
     })
     .unwrap_or_else(|| Err(format!("opening {url}: the host is not running")))?;
+    // A UI view starts at its page too: a browser made with no url has no renderer to answer the Runtime domain, and
+    // one made on about:blank turns the load of a file:// page into a new window. Its binding comes with the reload
+    // once the binding is in (the function's doc); the page draws nothing until it has the binding.
+    let first = url.as_str();
 
     let fail = |e: String| {
         with("a view that failed to open", |h| h.pages.remove(&view));
@@ -425,7 +475,7 @@ pub fn open(spec: OpenSpec) -> Result<u64, String> {
     let info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, runtime_style: RuntimeStyle::ALLOY, ..Default::default() };
     let settings = BrowserSettings { windowless_frame_rate: FPS_IDLE, ..Default::default() };
     let mut client = handlers::view_client(view);
-    let Some(browser) = browser_host_create_browser_sync(Some(&info), Some(&mut client), Some(&CefString::from(url.as_str())), Some(&settings), None, None) else {
+    let Some(browser) = browser_host_create_browser_sync(Some(&info), Some(&mut client), Some(&CefString::from(first)), Some(&settings), None, None) else {
         return fail(format!("CEF refused to create view {view}'s browser at {url} (cef.log says why)"));
     };
     let Some(bhost) = browser.host() else {
@@ -436,25 +486,35 @@ pub fn open(spec: OpenSpec) -> Result<u64, String> {
         bhost.close_browser(1);
         return fail(format!("CEF refused a DevTools observer on view {view} ({url})"));
     };
-    let ask = with("a new view's target request", |h| {
+    // The host's own requests, in the order the session runs them: a UI view's Runtime.enable (bindingCalled is a
+    // Runtime event) and its binding first, then the target id every view's opener waits for.
+    let asks = with("a new view's own DevTools requests", |h| {
         let page = h.pages.get_mut(&view)?;
         page.browser = Some(browser.clone());
         page._observer = Some(reg);
-        Some(h.cdp.host_request(view, HostAsk::TargetInfo, "Target.getTargetInfo", serde_json::json!({})))
+        let mut asks = Vec::with_capacity(3); // alloc: per view, at most three
+        if spec.ui {
+            asks.push(("Runtime.enable", h.cdp.host_request(view, HostAsk::RuntimeEnable, "Runtime.enable", serde_json::json!({}))));
+            asks.push(("Runtime.addBinding", h.cdp.host_request(view, HostAsk::AddBinding, "Runtime.addBinding", serde_json::json!({ "name": BINDING }))));
+        }
+        asks.push(("Target.getTargetInfo", h.cdp.host_request(view, HostAsk::TargetInfo, "Target.getTargetInfo", serde_json::json!({}))));
+        Some(asks)
     })
     .flatten();
-    let ask = match ask {
-        Some(Ok(ask)) => ask,
-        Some(Err(e)) => {
-            close(view, e.clone());
-            return Err(e);
+    // Closed while it was being made (its OnBeforeClose already took the page).
+    let Some(asks) = asks else { return Err(format!("view {view} ({url}) closed while it was being opened")) };
+    for (method, ask) in asks {
+        let ask = match ask {
+            Ok(ask) => ask,
+            Err(e) => {
+                close(view, e.clone());
+                return Err(e);
+            }
+        };
+        if bhost.send_dev_tools_message(Some(ask.as_bytes())) != 1 {
+            close(view, format!("CEF refused the host's {method} for view {view} ({url})"));
+            return Err(format!("CEF refused to send {method} to view {view} ({url})"));
         }
-        // Closed while it was being made (its OnBeforeClose already took the page).
-        None => return Err(format!("view {view} ({url}) closed while it was being opened")),
-    };
-    if bhost.send_dev_tools_message(Some(ask.as_bytes())) != 1 {
-        close(view, format!("CEF refused the Target.getTargetInfo that names view {view}'s page target"));
-        return Err(format!("CEF refused to send Target.getTargetInfo to view {view} ({url})"));
     }
     with("a new view", |h| h.views_changed());
     Ok(view)
@@ -489,6 +549,7 @@ fn kernel_msg(conn: u64, msg: KernelUp) {
                 keep,
                 attached: BTreeSet::from([conn]),
                 waiter: Some(WaiterSpec::Kernel { conn, req }),
+                ui: false,
             };
             if let Err(error) = open(spec) {
                 with("an open refused", |h| h.to_conn(conn, &KernelDown::Error { req: Some(req), error }));
@@ -496,6 +557,9 @@ fn kernel_msg(conn: u64, msg: KernelUp) {
         }
         KernelUp::Attach { req, view } => {
             with("attach", |h| {
+                if let Some(error) = h.kernel_refused(conn, "attach to", view) {
+                    return h.to_conn(conn, &KernelDown::Error { req: Some(req), error });
+                }
                 let Some(p) = h.pages.get_mut(&view) else {
                     return h.to_conn(conn, &KernelDown::Error { req: Some(req), error: format!("connection {conn} cannot attach to view {view}: there is no such view") });
                 };
@@ -510,16 +574,23 @@ fn kernel_msg(conn: u64, msg: KernelUp) {
         }
         KernelUp::Cdp { view, message } => cdp(conn, view, &message),
         KernelUp::Close { view } => {
-            let known = with("close", |h| h.pages.contains_key(&view)).unwrap_or(false);
-            if known {
+            let refused = with("close", |h| {
+                let error = match h.kernel_refused(conn, "close", view) {
+                    Some(e) => e,
+                    None if h.pages.contains_key(&view) => return false,
+                    None => format!("connection {conn} closed view {view}, which does not exist"),
+                };
+                h.to_conn(conn, &KernelDown::Error { req: None, error });
+                true
+            })
+            .unwrap_or(true);
+            if !refused {
                 close(view, format!("connection {conn} closed it"));
-            } else {
-                with("close", |h| h.to_conn(conn, &KernelDown::Error { req: None, error: format!("connection {conn} closed view {view}, which does not exist") }));
             }
         }
         KernelUp::Views { req } => {
             with("views", |h| {
-                let views = h.views();
+                let views = h.kernel_views();
                 h.to_conn(conn, &KernelDown::Views { req, views });
             });
         }
@@ -551,10 +622,11 @@ fn cdp(conn: u64, view: u64, message: &str) {
         }
     };
     let out = with("a CDP message", |h| {
-        let attached = match h.pages.get(&view) {
-            None => Err(format!("connection {conn} sent a CDP message to view {view}, which does not exist")),
-            Some(p) if !p.attached.contains(&conn) => Err(format!("connection {conn} is not attached to view {view} (send attach first)")),
-            Some(_) => Ok(()),
+        let attached = match (h.pages.get(&view), h.kernel_refused(conn, "send CDP messages to", view)) {
+            (None, _) => Err(format!("connection {conn} sent a CDP message to view {view}, which does not exist")),
+            (Some(_), Some(e)) => Err(e),
+            (Some(p), None) if !p.attached.contains(&conn) => Err(format!("connection {conn} is not attached to view {view} (send attach first)")),
+            (Some(_), None) => Ok(()),
         };
         let r = attached.and_then(|()| h.browser_host(view)).and_then(|bh| h.cdp.outgoing(view, conn, message).map(|(id, text)| (bh, id, text)));
         match r {
@@ -607,6 +679,8 @@ fn open_popup(opener: u64, url: String) {
             keep: p.keep,
             attached: p.attached.clone(),
             waiter: None,
+            // A UI view's popups never open (popup_requested sends them to the app as links).
+            ui: false,
         })
     })
     .flatten();
@@ -680,7 +754,13 @@ pub fn force_quit() {
 /// A DevTools message from view `view`'s browser (the observer, on the UI thread). The bytes are only valid during
 /// the call: everything is decided and sent before it returns.
 pub fn devtools(view: u64, message: &[u8]) {
-    let close_why = with("a DevTools message", |h| {
+    /// What the message leaves to do once the host has let go.
+    enum Then {
+        Close(String),
+        /// A UI view's binding is in: load its page.
+        Load(Browser, String),
+    }
+    let then = with("a DevTools message", |h| {
         let r = h.cdp.incoming(view, message);
         match r {
             Err(e) => {
@@ -689,6 +769,19 @@ pub fn devtools(view: u64, message: &[u8]) {
             }
             Ok(Incoming::Orphan { .. }) => None,
             Ok(Incoming::Event) => {
+                // A UI view has no connection to hear its events (none can attach); its one event of use is a call of
+                // its binding, which goes to the app.
+                if h.pages.get(&view)?.ui.is_some() {
+                    match binding_call(message) {
+                        Ok(Some(msg)) => h.to_app(&AppDown::Message { view, msg }),
+                        Ok(None) => {}
+                        Err(e) => {
+                            let url = h.pages.get(&view).and_then(|p| p.ui.as_ref()).map(|u| u.url.clone()).unwrap_or_default();
+                            h.app_error(None, format!("UI view {view} ({url}): {e}"));
+                        }
+                    }
+                    return None;
+                }
                 let Some(p) = h.pages.get(&view) else { return None };
                 let text = String::from_utf8_lossy(message).into_owned();
                 for c in &p.attached {
@@ -699,6 +792,23 @@ pub fn devtools(view: u64, message: &[u8]) {
             Ok(Incoming::Answer { asker: Asker::Conn { conn, .. }, message, .. }) => {
                 h.to_conn(conn, &KernelDown::Cdp { view, message });
                 None
+            }
+            Ok(Incoming::Answer { asker: Asker::Host(ask @ (HostAsk::RuntimeEnable | HostAsk::AddBinding)), value, .. }) => {
+                let p = h.pages.get(&view)?;
+                let url = p.ui.as_ref().map_or_else(|| p.info.url.clone(), |u| u.url.clone());
+                let method = if ask == HostAsk::AddBinding { "Runtime.addBinding" } else { "Runtime.enable" };
+                if let Some(err) = value.get("error") {
+                    // Without its binding a UI view cannot talk to the app: it closes, saying why.
+                    return Some(Then::Close(format!("UI view {view} ({url}): the host's {method} failed: {err}")));
+                }
+                if ask != HostAsk::AddBinding {
+                    return None;
+                }
+                let b = p.browser.clone()?;
+                if let Some(u) = h.pages.get_mut(&view).and_then(|p| p.ui.as_mut()) {
+                    u.loaded = true;
+                }
+                Some(Then::Load(b, url))
             }
             Ok(Incoming::Answer { asker: Asker::Host(HostAsk::TargetInfo), value, .. }) => {
                 let target = value.get("result").and_then(|r| r.get("targetInfo")).and_then(|t| t.get("targetId")).and_then(Value::as_str).map(str::to_owned);
@@ -719,15 +829,43 @@ pub fn devtools(view: u64, message: &[u8]) {
                         for w in waiters {
                             h.answer(w, Err(why.clone()));
                         }
-                        Some(why)
+                        Some(Then::Close(why))
                     }
                 }
             }
         }
     })
     .flatten();
-    if let Some(why) = close_why {
-        close(view, why);
+    match then {
+        None => {}
+        Some(Then::Close(why)) => close(view, why),
+        Some(Then::Load(b, url)) => match b.main_frame() {
+            Some(f) => f.load_url(Some(&CefString::from(url.as_str()))),
+            None => close(view, format!("UI view {view} has no main frame to load {url} in")),
+        },
+    }
+}
+
+/// The payload of a DevTools event if it is a call of a UI view's binding (`Runtime.bindingCalled` named
+/// [`BINDING`]); None for any other event.
+///
+/// # Errors
+/// A `Runtime.bindingCalled` for the binding with no string payload.
+fn binding_call(message: &[u8]) -> Result<Option<String>, String> {
+    #[derive(serde::Deserialize)]
+    struct Event {
+        #[serde(default)]
+        method: String,
+        #[serde(default)]
+        params: Value,
+    }
+    let e: Event = serde_json::from_slice(message).map_err(|e| format!("a DevTools event that is not JSON: {e}"))?;
+    if e.method != "Runtime.bindingCalled" || e.params.get("name").and_then(Value::as_str) != Some(BINDING) {
+        return Ok(None);
+    }
+    match e.params.get("payload").and_then(Value::as_str) {
+        Some(p) => Ok(Some(p.to_owned())),
+        None => Err(format!("its {BINDING} call carried no string payload: {}", e.params)),
     }
 }
 
@@ -744,7 +882,10 @@ pub fn closed(view: u64) {
         for w in page.waiters.iter().copied() {
             h.answer(w, Err(format!("view {view} closed before it opened: {why}")));
         }
-        h.to_all(&KernelDown::Closed { view, why: why.clone() });
+        // Socket clients never saw a UI view.
+        if page.ui.is_none() {
+            h.to_all(&KernelDown::Closed { view, why: why.clone() });
+        }
         h.to_app(&AppDown::Closed { view, why });
         h.views_changed();
         let quit = h.quitting.clone().filter(|_| h.pages.is_empty());
@@ -766,8 +907,12 @@ pub fn renderer_gone(view: u64, why: String) {
     close(view, why);
 }
 
-/// A page asked for a new window: it opens as a view of its own (posted, so it is made outside CEF's callback).
+/// A page asked for a new window: it opens as a view of its own (posted, so it is made outside CEF's callback). A UI
+/// view's never opens: it goes to the app as a link ([`ui_link`]).
 pub fn popup_requested(opener: u64, url: String) {
+    if is_ui(opener) {
+        return ui_link(opener, url);
+    }
     if !post(Cmd::OpenPopup { opener, url: url.clone() }) {
         eprintln!("harness-browser: view {opener}'s popup {url} is not opened: the host is stopping");
     }
@@ -1056,4 +1201,72 @@ pub fn tell_app(msg: AppDown) {
 /// Whether a view exists.
 pub fn exists(view: u64) -> bool {
     with("a view lookup", |h| h.pages.contains_key(&view)).unwrap_or(false)
+}
+
+// ---------------------------------------------------------------- UI views (README.md, "UI views")
+
+/// Whether `view` is a UI view.
+pub fn is_ui(view: u64) -> bool {
+    with("a UI view lookup", |h| h.pages.get(&view).is_some_and(|p| p.ui.is_some())).unwrap_or(false)
+}
+
+/// UI view `view` tried to go to `url`, which it may not: the app hears it as a link to open where it opens links.
+pub fn ui_link(view: u64, url: String) {
+    eprintln!("harness-browser: UI view {view} stays on its page; {url} goes to the app as a link");
+    with("a UI view's link", |h| h.to_app(&AppDown::Link { view, url }));
+}
+
+/// A top-level navigation of `view` to `url` (`OnBeforeBrowse` of its main frame): whether it is cancelled. Only a
+/// UI view's is: before the host loaded its page (no navigation is the page's then; it is cancelled and logged), or
+/// when `url` is outside the origin it opened at (that url goes to the app as a link).
+pub fn navigation_refused(view: u64, url: &str) -> bool {
+    /// Why a UI view's navigation is cancelled.
+    enum No {
+        Early,
+        Outside,
+    }
+    let no = with("a navigation", |h| {
+        let u = h.pages.get(&view)?.ui.as_ref()?;
+        if !u.loaded {
+            (!u.origin.admits(url)).then_some(No::Early)
+        } else if !u.origin.admits(url) {
+            Some(No::Outside)
+        } else {
+            None
+        }
+    })
+    .flatten();
+    match no {
+        None => false,
+        Some(No::Early) => {
+            eprintln!("harness-browser: UI view {view} was navigated to {url} before the host loaded its page; cancelled");
+            true
+        }
+        Some(No::Outside) => {
+            ui_link(view, url.to_owned());
+            true
+        }
+    }
+}
+
+/// `AppUp::Post`: the main frame of UI view `view`, and the script that hands `msg` to its page's `harnessRecv`.
+///
+/// # Errors
+/// No such view, a view that is not a UI view, text that is not JSON, or no main frame, naming the view (and its url).
+pub fn ui_post(view: u64, msg: &str) -> Result<(Frame, String), String> {
+    let b = with("a post to a UI view", |h| {
+        let p = h.pages.get(&view).ok_or_else(|| format!("the app posted to view {view}, which does not exist"))?;
+        let ui = p.ui.as_ref().ok_or_else(|| format!("the app posted to view {view} ({}), which is not a UI view", p.info.url))?;
+        if let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(msg) {
+            return Err(format!("the app posted text that is not JSON to UI view {view} ({}): {e}", ui.url));
+        }
+        let b = p.browser.clone().ok_or_else(|| format!("UI view {view} ({}) has no browser yet", ui.url))?;
+        Ok((b, ui.url.clone()))
+    })
+    .unwrap_or_else(|| Err(format!("posting to view {view}: the host is not running")))?;
+    let (b, url) = b;
+    let f = b.main_frame().ok_or_else(|| format!("UI view {view} ({url}) has no main frame to post to"))?;
+    // JSON text is a JavaScript expression; a page with no harnessRecv yet (still loading) gets nothing, and says
+    // `ready` once it has one.
+    Ok((f, format!("window.harnessRecv && window.harnessRecv({msg});")))
 }

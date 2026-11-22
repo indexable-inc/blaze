@@ -3,8 +3,9 @@
 //! back with the client's own id restored and goes only to the connection that asked. Events (no id) go to every
 //! connection attached to the view, which the driver decides; this core only tells answers from events.
 //!
-//! The host's own requests (`Target.getTargetInfo` after a view opens) take ids from the same space, with
-//! [`Asker::Host`] as their asker.
+//! The host's own requests (`Target.getTargetInfo` after a view opens; a UI view's `Runtime.enable` and
+//! `Runtime.addBinding`) take ids from the same space, with [`Asker::Host`] as their asker, so no connection's
+//! renumbered id can be one of them and their answers go to the host alone.
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -23,6 +24,10 @@ pub enum Asker {
 pub enum HostAsk {
     /// `Target.getTargetInfo`, to learn a new view's page target id.
     TargetInfo,
+    /// A UI view's `Runtime.enable` and `Runtime.addBinding { name: "harnessPost" }` (host.rs `open`): the binding's
+    /// answer is when the view loads its page.
+    RuntimeEnable,
+    AddBinding,
 }
 
 /// What a message from a browser is.

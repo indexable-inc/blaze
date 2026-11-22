@@ -66,6 +66,7 @@ fn kind(up: &AppUp) -> &'static str {
         AppUp::Latched { .. } => "latched",
         AppUp::Nav { .. } => "nav",
         AppUp::Open { .. } => "open",
+        AppUp::Post { .. } => "post",
         AppUp::Close { .. } => "close",
         AppUp::Manage { .. } => "manage",
         AppUp::Extensions { .. } => "extensions",
@@ -137,8 +138,21 @@ fn handle(up: AppUp) -> Result<(), String> {
                 }
             }
         }
-        AppUp::Open { req, url } => {
-            host::open(OpenSpec { url, owner: Some("app".into()), size: host::DEFAULT_SIZE, opener: None, keep: true, attached: BTreeSet::new(), waiter: Some(WaiterSpec::App { req }) })?;
+        AppUp::Open { req, url, ui } => {
+            host::open(OpenSpec {
+                url,
+                owner: Some(if ui { "ui" } else { "app" }.into()),
+                size: host::DEFAULT_SIZE,
+                opener: None,
+                keep: true,
+                attached: BTreeSet::new(),
+                waiter: Some(WaiterSpec::App { req }),
+                ui,
+            })?;
+        }
+        AppUp::Post { view, msg } => {
+            let (f, script) = host::ui_post(view, &msg)?;
+            f.execute_java_script(Some(&CefString::from(script.as_str())), None, 0);
         }
         AppUp::Close { view } => {
             if !host::exists(view) {
@@ -170,6 +184,7 @@ fn handle(up: AppUp) -> Result<(), String> {
                 keep: true,
                 attached: BTreeSet::new(),
                 waiter: Some(WaiterSpec::App { req }),
+                ui: false,
             })?;
         }
     }

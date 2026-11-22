@@ -63,6 +63,20 @@ BUNDLE_ID = "inc.indexable.harness.browser"
 NATIVE_APP = "blaze"
 # What macOS shows when it asks the person to let the browser read where the Mac is.
 LOCATION_WHY = "Pages you open in harness, and agents you ask, can use where this Mac is."
+# Why the browser may use each privacy-protected device, in every plist that can be asked: the host's own, and
+# blaze.app's. macOS (TCC) checks the *responsible* app's plist, and once blaze.app launches the daemon that launches
+# the host, that is blaze.app, not Harness Browser.app. A request whose responsible plist lacks the key is not refused:
+# the process is killed (SIGABRT, "attempted to access privacy-sensitive data without a usage description"). Chromium
+# reaches Bluetooth when a page offers a passkey (its phone-as-passkey path, e.g. a sign-in page), the camera and the
+# microphone when a page asks for them, and Core Location for navigator.geolocation (and ts location()); without the
+# location keys that times out and macOS never asks.
+PRIVACY_WHY = {
+    "NSBluetoothAlwaysUsageDescription": "Pages you open in harness can sign you in with a passkey on your phone or a security key.",
+    "NSCameraUsageDescription": "Pages you open in harness can use the camera when you allow it.",
+    "NSMicrophoneUsageDescription": "Pages you open in harness can use the microphone when you allow it.",
+    "NSLocationUsageDescription": LOCATION_WHY,
+    "NSLocationWhenInUseUsageDescription": LOCATION_WHY,
+}
 # CEF's helper kinds on macOS: the suffix Chromium appends to the helper's name, and our bundle id's. No "(Alerts)"
 # helper: it exists only to post macOS notifications, which the host turns off (harness-browser/src/handlers.rs), and its
 # first launch makes macOS ask the person for notification permission. Anything that still asks for it fails to launch.
@@ -192,10 +206,7 @@ def info_plist(name: str, ident: str) -> bytes:
             "LSMinimumSystemVersion": "13.0",
             # No Dock icon and no menu bar: the host draws nothing of its own but the manage window.
             "LSUIElement": True,
-            # Chromium reads the Mac's position through Core Location, which answers only an app whose plist says
-            # why: without these a page's navigator.geolocation (and ts location()) times out and macOS never asks.
-            "NSLocationUsageDescription": LOCATION_WHY,
-            "NSLocationWhenInUseUsageDescription": LOCATION_WHY,
+            **PRIVACY_WHY,
             "NSPrincipalClass": "NSApplication",
             "NSSupportsAutomaticGraphicsSwitching": True,
         }
@@ -295,6 +306,8 @@ async def install(inp: Input) -> None:
             "NSHighResolutionCapable": True,
             "NSPrincipalClass": "NSApplication",
             "NSSupportsAutomaticGraphicsSwitching": True,
+            # The browser host runs under this app, so macOS checks its privacy requests against this plist.
+            **PRIVACY_WHY,
         }))
         (contents / "PkgInfo").write_bytes(b"APPL????")
         # Only PATH is carried from the install environment: never credentials or the rest of env.
